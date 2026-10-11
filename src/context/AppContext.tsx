@@ -134,28 +134,31 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       setFindings(p.findings);
       setActionItems(p.actions);
       setStoreProfile(p.storeProfile);
-      addToast('Session Restored', 'Restored verified catalog state from local storage.', 'info');
+      addToast('Session Restored', 'Your verified catalog workspace has been loaded.', 'info');
     } else if (result.type === 'not_found') {
       // First boot: save initial seed envelope
       persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
     } else if (result.type === 'corrupt') {
-      // Recovered safely: seed data loaded, backup preserved
+      // Technical diagnostic in console for developers
+      console.warn(`[AIXSHOP Storage] Corrupted local data detected and preserved in backup: ${result.backupKey}`);
       addToast(
-        'Storage Corruption Recovered',
-        `Corrupted local data was backed up to "${result.backupKey || 'backup'}". Initialized safely with seed catalog.`,
+        'Workspace Restored',
+        'A problem was detected with local session data. Your workspace has been safely restored with default catalog items.',
         'warning'
       );
     } else if (result.type === 'unsupported_version') {
-      // Future schema version: enter read-only compatibility mode
+      // Technical diagnostic in console for developers
+      console.warn(`[AIXSHOP Storage] Future schema version (${result.foundVersion}) detected. Enabling read-only mode.`);
       setIsReadOnlyMode(true);
       setReadOnlyReason(storageAdapter.getReadOnlyReason());
       addToast(
-        'Future Schema Detected (v' + result.foundVersion + ')',
-        'Operating in read-only compatibility mode to protect stored future-version data.',
+        'Read-Only Mode Active',
+        'This catalog was updated in a newer version. Editing is temporarily paused to protect your store data.',
         'warning'
       );
     } else if (result.type === 'storage_failure') {
-      addToast('Storage Unavailable', result.error, 'warning');
+      console.warn(`[AIXSHOP Storage] Storage error: ${result.error}`);
+      addToast('Storage Restricted', 'Local storage is currently restricted. Your catalog is available for this session.', 'warning');
     }
   }, []);
 

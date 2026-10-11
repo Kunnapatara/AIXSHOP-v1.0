@@ -335,9 +335,9 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
             <div className="mb-5 p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2.5 shadow-xs" role="alert">
               <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
               <div className="flex-1">
-                <span className="font-semibold block">Read-Only Compatibility Mode Active</span>
+                <span className="font-semibold block">Read-Only Mode Active</span>
                 <span className="text-amber-800">
-                  {readOnlyReason || 'Stored data uses an unsupported future schema version. Local mutations are disabled to protect data integrity.'}
+                  This catalog was updated in a newer version of the application. Editing is temporarily paused to protect your store data.
                 </span>
               </div>
             </div>
