@@ -1,0 +1,6 @@
+{
+  "name": "AIXSHOP v1.0",
+  "description": "AI Commerce Visibility & Product Catalog Intelligence for online merchants.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
