@@ -13,7 +13,8 @@ import {
   ExternalLink,
   ChevronRight,
   ShieldCheck,
-  Sparkles
+  Sparkles,
+  AlertTriangle
 } from 'lucide-react';
 import { ToastContainer } from '../common/ToastContainer';
 
@@ -29,7 +30,9 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
     mobileMenuOpen, 
     setMobileMenuOpen,
     findings,
-    actionItems 
+    actionItems,
+    isReadOnlyMode,
+    readOnlyReason
   } = useApp();
 
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -328,6 +331,17 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
 
         {/* Content Body with bottom padding on mobile for the fixed bottom nav */}
         <main className="flex-1 px-4 py-5 md:px-8 md:py-6 pb-24 md:pb-10 max-w-7xl w-full mx-auto">
+          {isReadOnlyMode && (
+            <div className="mb-5 p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2.5 shadow-xs" role="alert">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <span className="font-semibold block">Read-Only Compatibility Mode Active</span>
+                <span className="text-amber-800">
+                  {readOnlyReason || 'Stored data uses an unsupported future schema version. Local mutations are disabled to protect data integrity.'}
+                </span>
+              </div>
+            </div>
+          )}
           {children}
         </main>
 

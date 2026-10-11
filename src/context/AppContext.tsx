@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useMemo, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useMemo, useEffect, ReactNode, useRef } from 'react';
 import { 
   NavigationPage, 
   Product, 
@@ -13,6 +13,8 @@ import {
   initialFindings, 
   initialActionItems 
 } from '../data/mockData';
+import { CatalogStorageAdapter } from '../domain/storage/storageAdapter';
+import { StoragePayloadV1, StorageLoadResult } from '../domain/storage/storageTypes';
 
 export interface ToastMessage {
   id: string;
@@ -34,6 +36,9 @@ interface AppContextType {
   isCheckingStore: boolean;
   selectedProduct: Product | null;
   mobileMenuOpen: boolean;
+  isReadOnlyMode: boolean;
+  readOnlyReason: string | null;
+  storageLoadResult: StorageLoadResult | null;
   setMobileMenuOpen: (open: boolean) => void;
   navigateTo: (page: NavigationPage, productId?: string, fromPage?: NavigationPage) => void;
   viewProductDetail: (productId: string, fromPage?: NavigationPage) => void;
@@ -47,11 +52,18 @@ interface AppContextType {
   toggleConnectorSync: (connectorId: string) => void;
   addToast: (title: string, message: string, type?: ToastMessage['type']) => void;
   removeToast: (id: string) => void;
+  resetToSeedData: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
-export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
+export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?: CatalogStorageAdapter }> = ({ 
+  children, 
+  customStorageAdapter 
+}) => {
+  const storageAdapterRef = useRef<CatalogStorageAdapter>(customStorageAdapter || new CatalogStorageAdapter());
+  const storageAdapter = storageAdapterRef.current;
+
   const [currentPage, setCurrentPage] = useState<NavigationPage>('home');
   const [previousPage, setPreviousPage] = useState<NavigationPage>('home');
   const [selectedProductId, setSelectedProductId] = useState<string | null>('prod_solstice_01');
@@ -63,6 +75,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [quickCheckResult, setQuickCheckResult] = useState<QuickHealthCheckResult | null>(null);
   const [isCheckingStore, setIsCheckingStore] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
+  const [isReadOnlyMode, setIsReadOnlyMode] = useState<boolean>(false);
+  const [readOnlyReason, setReadOnlyReason] = useState<string | null>(null);
+  const [storageLoadResult, setStorageLoadResult] = useState<StorageLoadResult | null>(null);
+
+  const isInitializedRef = useRef<boolean>(false);
 
   const addToast = (title: string, message: string, type: ToastMessage['type'] = 'info') => {
     const id = `toast_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
@@ -75,6 +92,72 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const removeToast = (id: string) => {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
+
+  // Helper to persist current application state
+  const persistState = (
+    nextProducts: Product[],
+    nextFindings: Finding[],
+    nextActions: ActionItem[],
+    nextProfile: StoreProfile
+  ) => {
+    if (isReadOnlyMode) {
+      return;
+    }
+
+    const payload: StoragePayloadV1 = {
+      products: nextProducts,
+      variants: nextProducts.flatMap(p => p.variants || []),
+      offers: nextProducts.flatMap(p => p.offers || []),
+      findings: nextFindings,
+      actions: nextActions,
+      evidence: nextProducts.flatMap(p => p.evidenceDocuments || []),
+      storeProfile: nextProfile,
+    };
+
+    const res = storageAdapter.save(payload);
+    if (!res.success && res.isQuotaExceeded) {
+      addToast('Storage Quota Full', 'Local browser storage quota exceeded. State is preserved in memory only.', 'warning');
+    }
+  };
+
+  // Hydrate from Storage on initial mount
+  useEffect(() => {
+    if (isInitializedRef.current) return;
+    isInitializedRef.current = true;
+
+    const result = storageAdapter.load();
+    setStorageLoadResult(result);
+
+    if (result.type === 'valid') {
+      const p = result.envelope.payload;
+      setProducts(p.products);
+      setFindings(p.findings);
+      setActionItems(p.actions);
+      setStoreProfile(p.storeProfile);
+      addToast('Session Restored', 'Restored verified catalog state from local storage.', 'info');
+    } else if (result.type === 'not_found') {
+      // First boot: save initial seed envelope
+      persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
+    } else if (result.type === 'corrupt') {
+      // Recovered safely: seed data loaded, backup preserved
+      addToast(
+        'Storage Corruption Recovered',
+        `Corrupted local data was backed up to "${result.backupKey || 'backup'}". Initialized safely with seed catalog.`,
+        'warning'
+      );
+    } else if (result.type === 'unsupported_version') {
+      // Future schema version: enter read-only compatibility mode
+      setIsReadOnlyMode(true);
+      setReadOnlyReason(storageAdapter.getReadOnlyReason());
+      addToast(
+        'Future Schema Detected (v' + result.foundVersion + ')',
+        'Operating in read-only compatibility mode to protect stored future-version data.',
+        'warning'
+      );
+    } else if (result.type === 'storage_failure') {
+      addToast('Storage Unavailable', result.error, 'warning');
+    }
+  }, []);
 
   const navigateTo = (page: NavigationPage, productId?: string, fromPage?: NavigationPage) => {
     setMobileMenuOpen(false);
@@ -114,7 +197,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const runStoreCheck = async (url: string) => {
     setIsCheckingStore(true);
-    // Simulate real network analysis with explicit demo notification
     await new Promise(resolve => setTimeout(resolve, 900));
     
     const mockResult: QuickHealthCheckResult = {
@@ -143,29 +225,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const approveAction = (actionId: string) => {
+    if (isReadOnlyMode) {
+      addToast('Action Disabled', 'Catalog is in read-only compatibility mode (future schema version detected).', 'warning');
+      return;
+    }
+
     const item = actionItems.find(a => a.id === actionId);
     if (!item) return;
 
-    setActionItems(prev => prev.map(act => {
+    const nextActions = actionItems.map(act => {
       if (act.id === actionId) {
         return {
           ...act,
-          status: 'approved',
+          status: 'approved' as const,
           approvedAt: new Date().toISOString(),
-          verificationStatus: 'verified_in_catalog',
+          verificationStatus: 'verified_in_catalog' as const,
           recheckNotes: 'Merchant approved in AIXSHOP. Internal catalog model updated.',
         };
       }
       return act;
-    }));
+    });
 
-    // Update corresponding finding
-    setFindings(prev => prev.map(f => {
+    const nextFindings = findings.map(f => {
       if (f.actionItemId === actionId) {
         return { ...f, merchantVerified: true };
       }
       return f;
-    }));
+    });
+
+    setActionItems(nextActions);
+    setFindings(nextFindings);
+    persistState(products, nextFindings, nextActions, storeProfile);
 
     addToast(
       'Remediation Approved',
@@ -175,18 +265,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const dismissAction = (actionId: string) => {
-    setActionItems(prev => prev.map(act => {
+    if (isReadOnlyMode) {
+      addToast('Action Disabled', 'Catalog is in read-only compatibility mode.', 'warning');
+      return;
+    }
+
+    const nextActions = actionItems.map(act => {
       if (act.id === actionId) {
         return {
           ...act,
-          status: 'dismissed',
+          status: 'dismissed' as const,
           dismissedAt: new Date().toISOString(),
-          verificationStatus: 'unverified',
+          verificationStatus: 'unverified' as const,
         };
       }
       return act;
-    }));
+    });
 
+    setActionItems(nextActions);
+    persistState(products, findings, nextActions, storeProfile);
     addToast('Action Dismissed', 'Item moved to dismissed queue.', 'info');
   };
 
@@ -195,34 +292,38 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!item) return;
 
     if (item.status === 'approved') {
-      setActionItems(prev => prev.map(act => {
+      const nextActions = actionItems.map(act => {
         if (act.id === actionId) {
           return {
             ...act,
-            verificationStatus: 'verified_in_catalog',
+            verificationStatus: 'verified_in_catalog' as const,
             lastRecheckTimestamp: new Date().toISOString(),
             recheckNotes: 'Re-check validated against local catalog schema rules: All format requirements met.',
           };
         }
         return act;
-      }));
+      });
+      setActionItems(nextActions);
+      persistState(products, findings, nextActions, storeProfile);
       addToast(
         'Re-check Verified',
         `Catalog consistency confirmed for "${item.title}". Meets schema requirements.`,
         'success'
       );
     } else {
-      setActionItems(prev => prev.map(act => {
+      const nextActions = actionItems.map(act => {
         if (act.id === actionId) {
           return {
             ...act,
-            verificationStatus: 'recheck_required',
+            verificationStatus: 'recheck_required' as const,
             lastRecheckTimestamp: new Date().toISOString(),
             recheckNotes: 'Re-check failed: Action has not been approved or applied yet. Human review required.',
           };
         }
         return act;
-      }));
+      });
+      setActionItems(nextActions);
+      persistState(products, findings, nextActions, storeProfile);
       addToast(
         'Action Still Pending',
         `Re-check observed that "${item.title}" still requires merchant review or evidence.`,
@@ -238,7 +339,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return;
     }
 
-    setProducts(prev => prev.map(p => {
+    const nextProducts = products.map(p => {
       if (p.id === productId) {
         return {
           ...p,
@@ -246,7 +347,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         };
       }
       return p;
-    }));
+    });
+
+    setProducts(nextProducts);
+    persistState(nextProducts, findings, actionItems, storeProfile);
 
     addToast(
       'Catalog Re-check Executed',
@@ -256,26 +360,52 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const updateStoreProfile = (updates: Partial<StoreProfile>) => {
-    setStoreProfile(prev => ({ ...prev, ...updates }));
-    addToast('Store Settings Saved', 'Store configuration updated.', 'success');
+    if (isReadOnlyMode) {
+      addToast('Settings Locked', 'Cannot modify store settings in read-only compatibility mode.', 'warning');
+      return;
+    }
+    const nextProfile = { ...storeProfile, ...updates };
+    setStoreProfile(nextProfile);
+    persistState(products, findings, actionItems, nextProfile);
+    addToast('Store Settings Saved', 'Store configuration updated and persisted.', 'success');
   };
 
   const toggleConnectorSync = (connectorId: string) => {
-    setStoreProfile(prev => ({
-      ...prev,
-      connectors: prev.connectors.map(c => {
-        if (c.id === connectorId) {
-          const newStatus = c.status === 'connected' ? 'disconnected' : 'connected';
-          return {
-            ...c,
-            status: newStatus,
-            lastSync: newStatus === 'connected' ? 'Just now' : c.lastSync,
-          };
-        }
-        return c;
-      }),
-    }));
+    if (isReadOnlyMode) {
+      addToast('Connector Locked', 'Connectors cannot be modified in read-only compatibility mode.', 'warning');
+      return;
+    }
+
+    const nextConnectors = storeProfile.connectors.map(c => {
+      if (c.id === connectorId) {
+        const newStatus = c.status === 'connected' ? 'disconnected' as const : 'connected' as const;
+        return {
+          ...c,
+          status: newStatus,
+          lastSync: newStatus === 'connected' ? 'Just now' : c.lastSync,
+        };
+      }
+      return c;
+    });
+
+    const nextProfile = { ...storeProfile, connectors: nextConnectors };
+    setStoreProfile(nextProfile);
+    persistState(products, findings, actionItems, nextProfile);
     addToast('Connector Updated', 'Connector status was modified.', 'info');
+  };
+
+  const resetToSeedData = () => {
+    if (isReadOnlyMode) {
+      addToast('Reset Blocked', 'Cannot reset storage while an unsupported future schema version is preserved.', 'warning');
+      return;
+    }
+    storageAdapter.clear();
+    setProducts(initialProducts);
+    setFindings(initialFindings);
+    setActionItems(initialActionItems);
+    setStoreProfile(initialStoreProfile);
+    persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
+    addToast('Catalog Reset', 'Reset all catalog data to default Solstice seed fixtures.', 'info');
   };
 
   return (
@@ -293,6 +423,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         isCheckingStore,
         selectedProduct,
         mobileMenuOpen,
+        isReadOnlyMode,
+        readOnlyReason,
+        storageLoadResult,
         setMobileMenuOpen,
         navigateTo,
         viewProductDetail,
@@ -306,6 +439,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         toggleConnectorSync,
         addToast,
         removeToast,
+        resetToSeedData,
       }}
     >
       {children}
