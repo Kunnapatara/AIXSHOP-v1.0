@@ -216,6 +216,33 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2 Remediation)', () 
       }
     });
 
+    it('treats backup read-back returning null as unsuccessful verification and preserves primary key', () => {
+      const corruptRaw = '{"schemaVersion": 1, "corrupted_null_read_test';
+      backend.setItem(STORAGE_KEY, corruptRaw);
+
+      // Writing backup succeeds, but reading the backup key back returns null
+      const originalGetItem = backend.getItem.bind(backend);
+      backend.getItem = (key: string) => {
+        if (key.startsWith(`${STORAGE_KEY}_corrupt_`)) {
+          return null;
+        }
+        return originalGetItem(key);
+      };
+
+      const result = adapter.load();
+      assert.equal(result.type, 'corrupt');
+      if (result.type === 'corrupt') {
+        // 1. backupPreserved === false
+        assert.equal(result.backupPreserved, false);
+        // 2. primaryCleared === false
+        assert.equal(result.primaryCleared, false);
+        // 3. Original corrupted primary value remains intact and readable at the primary storage key
+        assert.equal(backend.getItem(STORAGE_KEY), corruptRaw);
+        // 4. Adapter does not report a successful backup or allow primary removal
+        assert.equal(result.backupKey, undefined);
+      }
+    });
+
     it('reports accurate structured flags if primary-key removal fails after backup succeeded', () => {
       const corruptRaw = '{"schemaVersion": 1, "bad_syntax';
       backend.setItem(STORAGE_KEY, corruptRaw);
