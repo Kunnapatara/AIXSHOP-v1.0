@@ -333,25 +333,29 @@ export class CatalogStorageAdapter {
   /**
    * Safe, non-destructive corruption recovery handler:
    * 1. Attempts to persist corrupted raw data to a timestamped backup key.
-   * 2. NEVER removes the original corrupted value from the primary key unless
-   *    the backup has been successfully verified/persisted.
-   * 3. Returns an accurate structured result reflecting backupPreserved and primaryCleared.
+   * 2. Reads back the saved backup and verifies exact byte/string equality with the original raw value.
+   * 3. NEVER removes the original corrupted value from the primary key unless
+   *    the backup has been successfully written, read back, and verified.
+   * 4. Returns an accurate structured result reflecting backupPreserved and primaryCleared.
    */
   private handleCorruption(raw: string, errorReason: string): StorageLoadResult {
     const backupKey = `${STORAGE_KEY}_corrupt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     let backupPreserved = false;
     let primaryCleared = false;
 
-    // 1. Attempt to write to backup key first
+    // 1. Attempt to write to backup key first and verify by reading it back
     try {
       this.backend.setItem(backupKey, raw);
-      backupPreserved = true;
+      const readBack = this.backend.getItem(backupKey);
+      if (readBack === raw) {
+        backupPreserved = true;
+      }
     } catch {
-      // Backup preservation failed (e.g. disk quota or permission)
+      // Backup preservation or read-back verification failed (e.g. disk quota, permissions, or read error)
       backupPreserved = false;
     }
 
-    // 2. ONLY remove primary key IF backup was successfully preserved!
+    // 2. ONLY remove primary key IF backup was successfully verified!
     // Never discard the only recoverable copy of merchant data.
     if (backupPreserved) {
       try {

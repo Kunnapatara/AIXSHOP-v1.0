@@ -166,6 +166,56 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2 Remediation)', () 
       }
     });
 
+    it('NEVER removes original corrupted value if backup read-back throws an error', () => {
+      const corruptRaw = '{"schemaVersion": 1, "corrupted_read_throw_test';
+      backend.setItem(STORAGE_KEY, corruptRaw);
+
+      // setItem succeeds, but getItem on the backupKey throws
+      const originalGetItem = backend.getItem.bind(backend);
+      backend.getItem = (key: string) => {
+        if (key.startsWith(`${STORAGE_KEY}_corrupt_`)) {
+          throw new Error('Read error while verifying backup integrity');
+        }
+        return originalGetItem(key);
+      };
+
+      const result = adapter.load();
+      assert.equal(result.type, 'corrupt');
+      if (result.type === 'corrupt') {
+        assert.equal(result.backupPreserved, false);
+        assert.equal(result.primaryCleared, false);
+        assert.equal(result.backupKey, undefined);
+
+        // Primary key must remain untouched
+        assert.equal(backend.getItem(STORAGE_KEY), corruptRaw);
+      }
+    });
+
+    it('NEVER removes original corrupted value if backup read-back mismatches raw value', () => {
+      const corruptRaw = '{"schemaVersion": 1, "corrupted_mismatch_test';
+      backend.setItem(STORAGE_KEY, corruptRaw);
+
+      // setItem succeeds, but getItem on the backupKey returns mismatched / truncated content
+      const originalGetItem = backend.getItem.bind(backend);
+      backend.getItem = (key: string) => {
+        if (key.startsWith(`${STORAGE_KEY}_corrupt_`)) {
+          return 'mismatched_corrupted_content';
+        }
+        return originalGetItem(key);
+      };
+
+      const result = adapter.load();
+      assert.equal(result.type, 'corrupt');
+      if (result.type === 'corrupt') {
+        assert.equal(result.backupPreserved, false);
+        assert.equal(result.primaryCleared, false);
+        assert.equal(result.backupKey, undefined);
+
+        // Primary key must remain untouched
+        assert.equal(backend.getItem(STORAGE_KEY), corruptRaw);
+      }
+    });
+
     it('reports accurate structured flags if primary-key removal fails after backup succeeded', () => {
       const corruptRaw = '{"schemaVersion": 1, "bad_syntax';
       backend.setItem(STORAGE_KEY, corruptRaw);
@@ -466,4 +516,69 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2 Remediation)', () 
       }
     });
   });
+
+  describe('Sample Fixture GTIN-13 Validation & Truth Boundaries', () => {
+    function isValidGtin13(barcode: string): boolean {
+      if (!/^\d{13}$/.test(barcode)) return false;
+      let sum = 0;
+      for (let i = 0; i < 12; i++) {
+        const digit = parseInt(barcode[i], 10);
+        sum += digit * (i % 2 === 0 ? 1 : 3);
+      }
+      const checkDigit = (10 - (sum % 10)) % 10;
+      return checkDigit === parseInt(barcode[12], 10);
+    }
+
+    it('verifies all non-empty sample variant barcodes satisfy GTIN-13 check digit algorithm', () => {
+      const checkedBarcodes: string[] = [];
+      for (const prod of initialProducts) {
+        for (const variant of prod.variants || []) {
+          if (variant.barcode) {
+            assert.ok(
+              isValidGtin13(variant.barcode),
+              `Variant ${variant.sku} has invalid GTIN-13 barcode: ${variant.barcode}`
+            );
+            checkedBarcodes.push(variant.barcode);
+          }
+        }
+      }
+      assert.ok(checkedBarcodes.length >= 7, 'Expected at least 7 active sample barcodes checked');
+      // Explicit assertion on the previously invalid 0850029381014
+      assert.ok(!checkedBarcodes.includes('0850029381014'), 'Must not contain invalid check digit 0850029381014');
+      assert.ok(checkedBarcodes.includes('0850029381013'), 'Must contain corrected check digit 0850029381013');
+    });
+
+    it('verifies suggested GTIN-13 correction in findings and actions has valid check digit 0850029381082', () => {
+      const gtinFinding = initialFindings.find(f => f.targetField === 'barcode');
+      assert.ok(gtinFinding, 'Finding for missing barcode must exist');
+      assert.equal(gtinFinding.recommendedValue, '0850029381082');
+      assert.ok(isValidGtin13(gtinFinding.recommendedValue));
+
+      const gtinAction = initialActionItems.find(a => a.id === 'act_01');
+      assert.ok(gtinAction, 'Action item act_01 must exist');
+      assert.equal(gtinAction.proposedChange.to, '0850029381082');
+      assert.ok(isValidGtin13(gtinAction.proposedChange.to));
+    });
+
+    it('never invents or claims official GS1 assignment or verification', () => {
+      const gtinFinding = initialFindings.find(f => f.targetField === 'barcode');
+      assert.ok(gtinFinding);
+      assert.ok(
+        !gtinFinding.suggestedCorrection?.includes('GS1 verified'),
+        'Must not claim unverified GS1 verification in suggestedCorrection'
+      );
+
+      const gtinAction = initialActionItems.find(a => a.id === 'act_01');
+      assert.ok(gtinAction);
+      assert.ok(
+        !gtinAction.title.includes('GS1 GTIN/UPC'),
+        'Must not claim GS1 assignment in title'
+      );
+      assert.ok(
+        !gtinAction.evidenceProvided?.includes('GS1 Company Prefix Registry block'),
+        'Must not invent official GS1 registry claims'
+      );
+    });
+  });
 });
+
