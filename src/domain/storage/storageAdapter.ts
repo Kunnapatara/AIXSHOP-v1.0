@@ -5,15 +5,100 @@ import {
   StorageSaveResult, 
   StorageBackend 
 } from './storageTypes';
-import { Product, StoreProfile } from '../../types';
+import { 
+  Product, 
+  Variant, 
+  Offer, 
+  Finding, 
+  ActionItem, 
+  EvidenceDocument, 
+  StoreProfile 
+} from '../../types';
 
 export const STORAGE_KEY = 'aixshop_catalog_v1';
 export const CURRENT_SCHEMA_VERSION = 1;
 export const APP_VERSION = '1.0.0';
 export const DEFAULT_TENANT_ID = 'tenant_solstice_demo';
 
-// Safe memory storage fallback for environments without localStorage (e.g. SSR or testing)
+/**
+ * Safely tests whether window.localStorage is accessible in the current execution context.
+ * Any access exception (e.g. security policy, private mode, iframe block) is safely caught.
+ */
+export function isLocalStorageAvailable(): boolean {
+  try {
+    if (typeof window === 'undefined') return false;
+    const storage = window.localStorage;
+    if (!storage) return false;
+    const testKey = '__aixshop_storage_test__';
+    storage.setItem(testKey, '1');
+    const val = storage.getItem(testKey);
+    storage.removeItem(testKey);
+    return val === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Persistent browser storage backend wrapping window.localStorage.
+ */
+export class LocalStorageBackend implements StorageBackend {
+  readonly isDurable = true;
+
+  getItem(key: string): string | null {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (e) {
+      throw new Error(`LocalStorage read failed: ${(e as Error).message}`);
+    }
+  }
+
+  setItem(key: string, value: string): void {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (e) {
+      throw e;
+    }
+  }
+
+  removeItem(key: string): void {
+    try {
+      window.localStorage.removeItem(key);
+    } catch (e) {
+      throw e;
+    }
+  }
+
+  key(index: number): string | null {
+    try {
+      return window.localStorage.key(index);
+    } catch {
+      return null;
+    }
+  }
+
+  get length(): number {
+    try {
+      return window.localStorage.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  clear(): void {
+    try {
+      window.localStorage.clear();
+    } catch (e) {
+      throw e;
+    }
+  }
+}
+
+/**
+ * Safe in-memory storage fallback for environments without durable storage.
+ */
 export class MemoryStorageBackend implements StorageBackend {
+  readonly isDurable = false;
   private store = new Map<string, string>();
 
   getItem(key: string): string | null {
@@ -43,60 +128,136 @@ export class MemoryStorageBackend implements StorageBackend {
 }
 
 export function getDefaultBackend(): StorageBackend {
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      // Test storage accessibility
-      const testKey = '__aixshop_storage_test__';
-      window.localStorage.setItem(testKey, '1');
-      window.localStorage.removeItem(testKey);
-      return window.localStorage;
-    } catch {
-      // localStorage is blocked (e.g. strict private mode or quota exception)
-      return new MemoryStorageBackend();
-    }
+  if (isLocalStorageAvailable()) {
+    return new LocalStorageBackend();
   }
   return new MemoryStorageBackend();
 }
 
 /**
- * Validates the structural integrity of a candidate StoragePayloadV1.
+ * Validates the structural integrity and required domain fields of a candidate StoragePayloadV1.
  */
 export function validateStoragePayload(payload: unknown): payload is StoragePayloadV1 {
-  if (!payload || typeof payload !== 'object') {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return false;
   }
 
   const p = payload as Record<string, unknown>;
 
-  // Products collection check
+  // 1. Products collection check
   if (!Array.isArray(p.products)) {
     return false;
   }
   for (const item of p.products) {
-    if (!item || typeof item !== 'object') return false;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
     const prod = item as Partial<Product>;
-    if (typeof prod.id !== 'string' || typeof prod.title !== 'string' || typeof prod.attributes !== 'object') {
+    if (
+      typeof prod.id !== 'string' || prod.id.trim() === '' ||
+      typeof prod.title !== 'string' || prod.title.trim() === '' ||
+      typeof prod.brand !== 'string' || prod.brand.trim() === '' ||
+      typeof prod.category !== 'string' || prod.category.trim() === '' ||
+      !prod.attributes || typeof prod.attributes !== 'object' || Array.isArray(prod.attributes) ||
+      typeof prod.completenessScore !== 'number' || isNaN(prod.completenessScore)
+    ) {
       return false;
     }
   }
 
-  // Collections type assertions
-  if (!Array.isArray(p.variants) || !Array.isArray(p.offers)) {
+  // 2. Variants collection check
+  if (!Array.isArray(p.variants)) {
     return false;
   }
-  if (!Array.isArray(p.findings) || !Array.isArray(p.actions)) {
+  for (const item of p.variants) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const v = item as Partial<Variant>;
+    if (
+      typeof v.id !== 'string' || v.id.trim() === '' ||
+      typeof v.title !== 'string' || v.title.trim() === '' ||
+      typeof v.sku !== 'string' || v.sku.trim() === '' ||
+      typeof v.price !== 'number' || isNaN(v.price)
+    ) {
+      return false;
+    }
+  }
+
+  // 3. Offers collection check
+  if (!Array.isArray(p.offers)) {
     return false;
   }
+  for (const item of p.offers) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const o = item as Partial<Offer>;
+    if (
+      typeof o.id !== 'string' || o.id.trim() === '' ||
+      typeof o.price !== 'number' || isNaN(o.price) ||
+      typeof o.currency !== 'string' || o.currency.trim() === '' ||
+      typeof o.availability !== 'string' || o.availability.trim() === ''
+    ) {
+      return false;
+    }
+  }
+
+  // 4. Findings collection check
+  if (!Array.isArray(p.findings)) {
+    return false;
+  }
+  for (const item of p.findings) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const f = item as Partial<Finding>;
+    if (
+      typeof f.id !== 'string' || f.id.trim() === '' ||
+      typeof f.title !== 'string' || f.title.trim() === '' ||
+      typeof f.severity !== 'string' || f.severity.trim() === '' ||
+      typeof f.scope !== 'string' || f.scope.trim() === ''
+    ) {
+      return false;
+    }
+  }
+
+  // 5. Actions collection check
+  if (!Array.isArray(p.actions)) {
+    return false;
+  }
+  for (const item of p.actions) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const a = item as Partial<ActionItem>;
+    if (
+      typeof a.id !== 'string' || a.id.trim() === '' ||
+      typeof a.title !== 'string' || a.title.trim() === '' ||
+      typeof a.status !== 'string' || a.status.trim() === ''
+    ) {
+      return false;
+    }
+  }
+
+  // 6. Evidence collection check
   if (!Array.isArray(p.evidence)) {
     return false;
   }
+  for (const item of p.evidence) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+    const e = item as Partial<EvidenceDocument>;
+    if (
+      typeof e.id !== 'string' || e.id.trim() === '' ||
+      typeof e.title !== 'string' || e.title.trim() === '' ||
+      typeof e.type !== 'string' || e.type.trim() === ''
+    ) {
+      return false;
+    }
+  }
 
-  // StoreProfile assertion
-  if (!p.storeProfile || typeof p.storeProfile !== 'object') {
+  // 7. StoreProfile assertion
+  if (!p.storeProfile || typeof p.storeProfile !== 'object' || Array.isArray(p.storeProfile)) {
     return false;
   }
   const store = p.storeProfile as Partial<StoreProfile>;
-  if (typeof store.name !== 'string' || typeof store.platform !== 'string' || typeof store.currency !== 'string') {
+  if (
+    typeof store.name !== 'string' || store.name.trim() === '' ||
+    typeof store.domain !== 'string' || store.domain.trim() === '' ||
+    typeof store.platform !== 'string' || store.platform.trim() === '' ||
+    typeof store.currency !== 'string' || store.currency.trim() === '' ||
+    !Array.isArray(store.connectors)
+  ) {
     return false;
   }
 
@@ -104,33 +265,42 @@ export function validateStoragePayload(payload: unknown): payload is StoragePayl
 }
 
 /**
- * Filters payload against an explicit allowlist to prevent arbitrary state
- * or sensitive credentials from entering client storage.
+ * Regex identifying sensitive key patterns in any casing or separator style.
  */
-export function sanitizePayloadAllowlist(payload: StoragePayloadV1): StoragePayloadV1 {
-  const SENSITIVE_KEYS = ['apiKey', 'oauthToken', 'clientSecret', 'password', 'bearerToken', 'secret'];
+const SENSITIVE_KEY_PATTERN = /^(api[-_]?key|oauth[-_]?token|client[-_]?secret|password|pwd|bearer[-_]?token|secret|token|auth[-_]?token|authorization|private[-_]?key)$/i;
 
-  const cleanObject = <T>(obj: T): T => {
-    if (!obj || typeof obj !== 'object') return obj;
-    if (Array.isArray(obj)) return obj.map(cleanObject) as unknown as T;
-
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(obj)) {
-      if (!SENSITIVE_KEYS.includes(key)) {
-        result[key] = val;
+/**
+ * Recursively removes sensitive credential keys from objects and nested arrays.
+ */
+export function sanitizeValue<T>(val: T): T {
+  if (val === null || val === undefined) return val;
+  if (Array.isArray(val)) {
+    return val.map(item => sanitizeValue(item)) as unknown as T;
+  }
+  if (typeof val === 'object') {
+    const res: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+      if (!SENSITIVE_KEY_PATTERN.test(k)) {
+        res[k] = sanitizeValue(v);
       }
     }
-    return result as T;
-  };
+    return res as T;
+  }
+  return val;
+}
 
+/**
+ * Filters payload against an explicit allowlist and recursively strips sensitive keys.
+ */
+export function sanitizePayloadAllowlist(payload: StoragePayloadV1): StoragePayloadV1 {
   return {
-    products: cleanObject(payload.products),
-    variants: cleanObject(payload.variants),
-    offers: cleanObject(payload.offers),
-    findings: cleanObject(payload.findings),
-    actions: cleanObject(payload.actions),
-    evidence: cleanObject(payload.evidence),
-    storeProfile: cleanObject(payload.storeProfile),
+    products: sanitizeValue(payload.products || []),
+    variants: sanitizeValue(payload.variants || []),
+    offers: sanitizeValue(payload.offers || []),
+    findings: sanitizeValue(payload.findings || []),
+    actions: sanitizeValue(payload.actions || []),
+    evidence: sanitizeValue(payload.evidence || []),
+    storeProfile: sanitizeValue(payload.storeProfile || {} as StoreProfile),
   };
 }
 
@@ -147,6 +317,10 @@ export class CatalogStorageAdapter {
     return this.readOnlyMode;
   }
 
+  public isDurable(): boolean {
+    return this.backend.isDurable;
+  }
+
   public getReadOnlyReason(): string | null {
     return this.readOnlyReason;
   }
@@ -157,18 +331,45 @@ export class CatalogStorageAdapter {
   }
 
   /**
-   * Safe corruption backup helper: persists corrupt raw data to a timestamped backup key
-   * and clears the standard storage slot.
+   * Safe, non-destructive corruption recovery handler:
+   * 1. Attempts to persist corrupted raw data to a timestamped backup key.
+   * 2. NEVER removes the original corrupted value from the primary key unless
+   *    the backup has been successfully verified/persisted.
+   * 3. Returns an accurate structured result reflecting backupPreserved and primaryCleared.
    */
-  private backupAndClear(raw: string): string {
+  private handleCorruption(raw: string, errorReason: string): StorageLoadResult {
     const backupKey = `${STORAGE_KEY}_corrupt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    let backupPreserved = false;
+    let primaryCleared = false;
+
+    // 1. Attempt to write to backup key first
     try {
       this.backend.setItem(backupKey, raw);
-      this.backend.removeItem(STORAGE_KEY);
+      backupPreserved = true;
     } catch {
-      // Ignore backup write failure if backend is write-restricted
+      // Backup preservation failed (e.g. disk quota or permission)
+      backupPreserved = false;
     }
-    return backupKey;
+
+    // 2. ONLY remove primary key IF backup was successfully preserved!
+    // Never discard the only recoverable copy of merchant data.
+    if (backupPreserved) {
+      try {
+        this.backend.removeItem(STORAGE_KEY);
+        primaryCleared = true;
+      } catch {
+        primaryCleared = false;
+      }
+    }
+
+    return {
+      type: 'corrupt',
+      error: errorReason,
+      rawValue: raw,
+      backupKey: backupPreserved ? backupKey : undefined,
+      backupPreserved,
+      primaryCleared,
+    };
   }
 
   /**
@@ -195,24 +396,12 @@ export class CatalogStorageAdapter {
     try {
       parsed = JSON.parse(raw);
     } catch {
-      const backupKey = this.backupAndClear(raw);
-      return {
-        type: 'corrupt',
-        error: 'JSON_PARSE_ERROR',
-        rawValue: raw,
-        backupKey,
-      };
+      return this.handleCorruption(raw, 'JSON_PARSE_ERROR');
     }
 
     // 2. Object validation
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      const backupKey = this.backupAndClear(raw);
-      return {
-        type: 'corrupt',
-        error: 'INVALID_ENVELOPE_TYPE',
-        rawValue: raw,
-        backupKey,
-      };
+      return this.handleCorruption(raw, 'INVALID_ENVELOPE_TYPE');
     }
 
     const envelope = parsed as Record<string, unknown>;
@@ -223,18 +412,13 @@ export class CatalogStorageAdapter {
       !Number.isInteger(envelope.schemaVersion) || 
       envelope.schemaVersion < 1
     ) {
-      const backupKey = this.backupAndClear(raw);
-      return {
-        type: 'corrupt',
-        error: 'MISSING_SCHEMA_VERSION',
-        rawValue: raw,
-        backupKey,
-      };
+      return this.handleCorruption(raw, 'MISSING_SCHEMA_VERSION');
     }
 
     // 4. Future schema version protection
+    // CRITICAL: Preserve the future-version primary key and value unchanged!
+    // Do NOT treat as corruption, do not overwrite, and do not remove!
     if (envelope.schemaVersion > CURRENT_SCHEMA_VERSION) {
-      // PRESERVE the key untouched! Do not overwrite with seed data or delete!
       this.readOnlyMode = true;
       this.readOnlyReason = `Stored data uses future schema version ${envelope.schemaVersion} (supported: ${CURRENT_SCHEMA_VERSION}). Local mutations are disabled.`;
       return {
@@ -244,29 +428,24 @@ export class CatalogStorageAdapter {
       };
     }
 
-    // 5. Envelope metadata and payload structural validation
+    // 5. Envelope metadata validation for v1
+    const isValidIsoDate = (str: unknown): boolean => {
+      if (typeof str !== 'string' || str.trim() === '') return false;
+      const parsedTime = Date.parse(str);
+      return !isNaN(parsedTime) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(str);
+    };
+
     if (
-      typeof envelope.appVersion !== 'string' || 
-      typeof envelope.tenantId !== 'string' ||
-      typeof envelope.timestamp !== 'string'
+      typeof envelope.appVersion !== 'string' || envelope.appVersion.trim() === '' ||
+      typeof envelope.tenantId !== 'string' || envelope.tenantId.trim() === '' ||
+      !isValidIsoDate(envelope.timestamp)
     ) {
-      const backupKey = this.backupAndClear(raw);
-      return {
-        type: 'corrupt',
-        error: 'INVALID_ENVELOPE_METADATA',
-        rawValue: raw,
-        backupKey,
-      };
+      return this.handleCorruption(raw, 'INVALID_ENVELOPE_METADATA');
     }
 
+    // 6. Payload structural validation
     if (!envelope.payload || !validateStoragePayload(envelope.payload)) {
-      const backupKey = this.backupAndClear(raw);
-      return {
-        type: 'corrupt',
-        error: 'INVALID_PAYLOAD_STRUCTURE',
-        rawValue: raw,
-        backupKey,
-      };
+      return this.handleCorruption(raw, 'INVALID_PAYLOAD_STRUCTURE');
     }
 
     return {
@@ -284,6 +463,7 @@ export class CatalogStorageAdapter {
         success: false,
         error: this.readOnlyReason || 'Storage is in read-only compatibility mode.',
         isBlockedByReadOnly: true,
+        isDurable: this.backend.isDurable,
       };
     }
 
@@ -300,7 +480,11 @@ export class CatalogStorageAdapter {
     try {
       const serialized = JSON.stringify(envelope);
       this.backend.setItem(STORAGE_KEY, serialized);
-      return { success: true, timestamp: envelope.timestamp };
+      return { 
+        success: true, 
+        timestamp: envelope.timestamp, 
+        isDurable: this.backend.isDurable 
+      };
     } catch (e) {
       const errorMsg = (e as Error).message || 'Write failed';
       const isQuota = errorMsg.toLowerCase().includes('quota') || (e as Error).name === 'QuotaExceededError';
@@ -308,6 +492,7 @@ export class CatalogStorageAdapter {
         success: false,
         error: errorMsg,
         isQuotaExceeded: isQuota,
+        isDurable: this.backend.isDurable,
       };
     }
   }

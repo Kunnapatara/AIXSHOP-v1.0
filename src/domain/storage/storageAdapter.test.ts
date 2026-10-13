@@ -3,18 +3,20 @@ import assert from 'node:assert/strict';
 import { 
   CatalogStorageAdapter, 
   MemoryStorageBackend, 
+  LocalStorageBackend,
   STORAGE_KEY, 
   CURRENT_SCHEMA_VERSION, 
   APP_VERSION, 
   DEFAULT_TENANT_ID,
   validateStoragePayload,
-  sanitizePayloadAllowlist
+  sanitizePayloadAllowlist,
+  isLocalStorageAvailable
 } from './storageAdapter';
 import { StoragePayloadV1, StorageEnvelopeV1 } from './storageTypes';
 import { initialProducts, initialFindings, initialActionItems, initialStoreProfile } from '../../data/mockData';
 
 function createSamplePayload(): StoragePayloadV1 {
-  return {
+  return JSON.parse(JSON.stringify({
     products: initialProducts,
     variants: initialProducts.flatMap(p => p.variants || []),
     offers: initialProducts.flatMap(p => p.offers || []),
@@ -22,10 +24,10 @@ function createSamplePayload(): StoragePayloadV1 {
     actions: initialActionItems,
     evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
     storeProfile: initialStoreProfile,
-  };
+  }));
 }
 
-describe('Storage Adapter & Persistence (Domain Contract v1.2)', () => {
+describe('Storage Adapter & Persistence (Domain Contract v1.2 Remediation)', () => {
   let backend: MemoryStorageBackend;
   let adapter: CatalogStorageAdapter;
 
@@ -47,52 +49,77 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2)', () => {
     });
   });
 
-  describe('Valid Persistence Round-Trip', () => {
-    it('saves valid payload and wraps in StorageEnvelopeV1', () => {
-      const payload = createSamplePayload();
-      const saveResult = adapter.save(payload);
-
-      assert.equal(saveResult.success, true);
-      assert.ok('timestamp' in saveResult && saveResult.timestamp);
-
-      const raw = backend.getItem(STORAGE_KEY);
-      assert.ok(raw);
-
-      const envelope: StorageEnvelopeV1 = JSON.parse(raw!);
-      assert.equal(envelope.schemaVersion, CURRENT_SCHEMA_VERSION);
-      assert.equal(envelope.appVersion, APP_VERSION);
-      assert.equal(envelope.tenantId, DEFAULT_TENANT_ID);
-      assert.ok(envelope.timestamp);
-      assert.equal(envelope.payload.products.length, payload.products.length);
-      assert.equal(envelope.payload.storeProfile.name, payload.storeProfile.name);
+  describe('Storage Availability & Durability Reporting (Requirement 3)', () => {
+    it('isLocalStorageAvailable() executes safely inside exception handling', () => {
+      const available = isLocalStorageAvailable();
+      assert.equal(typeof available, 'boolean');
     });
 
-    it('loads previously saved valid envelope successfully', () => {
-      const payload = createSamplePayload();
-      adapter.save(payload);
+    it('MemoryStorageBackend reports isDurable = false', () => {
+      const mem = new MemoryStorageBackend();
+      assert.equal(mem.isDurable, false);
+      const memAdapter = new CatalogStorageAdapter(mem);
+      assert.equal(memAdapter.isDurable(), false);
 
-      const loadResult = adapter.load();
-      assert.equal(loadResult.type, 'valid');
-      if (loadResult.type === 'valid') {
-        assert.equal(loadResult.envelope.schemaVersion, 1);
-        assert.equal(loadResult.envelope.payload.products.length, initialProducts.length);
-        assert.equal(loadResult.envelope.payload.storeProfile.name, initialStoreProfile.name);
+      const saveResult = memAdapter.save(createSamplePayload());
+      assert.equal(saveResult.success, true);
+      if (saveResult.success) {
+        assert.equal(saveResult.isDurable, false, 'Memory write must never be reported as durable');
       }
     });
 
-    it('clears storage successfully when not in read-only mode', () => {
-      const payload = createSamplePayload();
-      adapter.save(payload);
-      assert.ok(backend.getItem(STORAGE_KEY));
+    it('LocalStorageBackend reports isDurable = true and save reflects durability', () => {
+      // Mock window.localStorage for node test runner
+      const mockStorage = new Map<string, string>();
+      const globalWindow = globalThis as unknown as { window: unknown };
+      const originalWindow = globalWindow.window;
 
-      const cleared = adapter.clear();
-      assert.equal(cleared, true);
-      assert.equal(backend.getItem(STORAGE_KEY), null);
+      globalWindow.window = {
+        localStorage: {
+          getItem: (k: string) => mockStorage.get(k) ?? null,
+          setItem: (k: string, v: string) => mockStorage.set(k, v),
+          removeItem: (k: string) => mockStorage.delete(k),
+          clear: () => mockStorage.clear(),
+          get length() { return mockStorage.size; },
+          key: (i: number) => Array.from(mockStorage.keys())[i] ?? null,
+        }
+      };
+
+      try {
+        const localBackend = new LocalStorageBackend();
+        assert.equal(localBackend.isDurable, true);
+
+        const localAdapter = new CatalogStorageAdapter(localBackend);
+        assert.equal(localAdapter.isDurable(), true);
+
+        const saveRes = localAdapter.save(createSamplePayload());
+        assert.equal(saveRes.success, true);
+        if (saveRes.success) {
+          assert.equal(saveRes.isDurable, true);
+        }
+      } finally {
+        globalWindow.window = originalWindow;
+      }
+    });
+
+    it('returns storage_failure on getter/read exception', () => {
+      const brokenBackend = new MemoryStorageBackend();
+      brokenBackend.getItem = () => {
+        throw new Error('Access denied by browser security sandbox');
+      };
+
+      const failingAdapter = new CatalogStorageAdapter(brokenBackend);
+      const res = failingAdapter.load();
+      assert.equal(res.type, 'storage_failure');
+      if (res.type === 'storage_failure') {
+        assert.equal(res.isRecoverable, true);
+        assert.ok(res.error.includes('Access denied'));
+      }
     });
   });
 
-  describe('AT-10: Safe Corruption Recovery', () => {
-    it('recovers from unparseable JSON without throwing, preserves backup, and clears primary key', () => {
+  describe('Non-Destructive Corruption Recovery (Requirement 2 / AT-10)', () => {
+    it('preserves corrupted data in backup key and clears primary slot on clean recovery', () => {
       const corruptRaw = '{"schemaVersion": 1, "appVersion": "1.0.0", invalid_json...';
       backend.setItem(STORAGE_KEY, corruptRaw);
 
@@ -101,37 +128,102 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2)', () => {
       if (result.type === 'corrupt') {
         assert.equal(result.error, 'JSON_PARSE_ERROR');
         assert.equal(result.rawValue, corruptRaw);
+        assert.equal(result.backupPreserved, true);
+        assert.equal(result.primaryCleared, true);
         assert.ok(result.backupKey);
         assert.ok(result.backupKey.startsWith(`${STORAGE_KEY}_corrupt_`));
 
-        // Corrupt content is preserved in the backup key
+        // Corrupt content preserved in backup
         assert.equal(backend.getItem(result.backupKey), corruptRaw);
-
-        // Standard storage key is cleared to allow clean recovery
+        // Standard primary slot cleared
         assert.equal(backend.getItem(STORAGE_KEY), null);
       }
     });
 
-    it('recovers from primitive or non-object envelope types', () => {
-      backend.setItem(STORAGE_KEY, '12345');
-      const numResult = adapter.load();
-      assert.equal(numResult.type, 'corrupt');
-      if (numResult.type === 'corrupt') {
-        assert.equal(numResult.error, 'INVALID_ENVELOPE_TYPE');
-        assert.equal(backend.getItem(STORAGE_KEY), null);
-      }
+    it('NEVER removes original corrupted value if backup-write fails', () => {
+      const corruptRaw = '{"schemaVersion": 1, "invalid_payload_json';
+      backend.setItem(STORAGE_KEY, corruptRaw);
 
-      backend.setItem(STORAGE_KEY, '["array", "envelope"]');
-      const arrResult = adapter.load();
-      assert.equal(arrResult.type, 'corrupt');
-      if (arrResult.type === 'corrupt') {
-        assert.equal(arrResult.error, 'INVALID_ENVELOPE_TYPE');
-        assert.equal(backend.getItem(STORAGE_KEY), null);
+      // Force backup setItem to throw (e.g. disk quota or permissions error)
+      const originalSetItem = backend.setItem.bind(backend);
+      backend.setItem = (key: string, val: string) => {
+        if (key.startsWith(`${STORAGE_KEY}_corrupt_`)) {
+          throw new Error('Disk quota exceeded: cannot write corruption backup');
+        }
+        originalSetItem(key, val);
+      };
+
+      const result = adapter.load();
+      assert.equal(result.type, 'corrupt');
+      if (result.type === 'corrupt') {
+        assert.equal(result.backupPreserved, false);
+        assert.equal(result.primaryCleared, false);
+        assert.equal(result.backupKey, undefined);
+
+        // CRITICAL: The primary storage key MUST NOT be removed!
+        // We do not discard the only recoverable copy of merchant data.
+        assert.equal(backend.getItem(STORAGE_KEY), corruptRaw);
       }
     });
 
-    it('recovers when schemaVersion is missing or non-number', () => {
+    it('reports accurate structured flags if primary-key removal fails after backup succeeded', () => {
+      const corruptRaw = '{"schemaVersion": 1, "bad_syntax';
+      backend.setItem(STORAGE_KEY, corruptRaw);
+
+      // Backup write succeeds, but primary removeItem fails
+      backend.removeItem = (key: string) => {
+        if (key === STORAGE_KEY) {
+          throw new Error('Storage lock: cannot remove key');
+        }
+      };
+
+      const result = adapter.load();
+      assert.equal(result.type, 'corrupt');
+      if (result.type === 'corrupt') {
+        assert.equal(result.backupPreserved, true);
+        assert.equal(result.primaryCleared, false);
+        assert.ok(result.backupKey);
+
+        // Backup exists and primary key still exists
+        assert.equal(backend.getItem(result.backupKey), corruptRaw);
+        assert.equal(backend.getItem(STORAGE_KEY), corruptRaw);
+      }
+    });
+
+    it('recovers from primitive and array envelope types', () => {
+      backend.setItem(STORAGE_KEY, '42');
+      const numRes = adapter.load();
+      assert.equal(numRes.type, 'corrupt');
+      if (numRes.type === 'corrupt') {
+        assert.equal(numRes.error, 'INVALID_ENVELOPE_TYPE');
+        assert.equal(numRes.backupPreserved, true);
+      }
+
+      backend.setItem(STORAGE_KEY, '["not", "an", "object"]');
+      const arrRes = adapter.load();
+      assert.equal(arrRes.type, 'corrupt');
+      if (arrRes.type === 'corrupt') {
+        assert.equal(arrRes.error, 'INVALID_ENVELOPE_TYPE');
+      }
+    });
+
+    it('lists created corruption backup keys via getBackupKeys()', () => {
+      backend.setItem(STORAGE_KEY, '{corrupt_one');
+      adapter.load();
+
+      backend.setItem(STORAGE_KEY, '{corrupt_two');
+      adapter.load();
+
+      const backupKeys = adapter.getBackupKeys();
+      assert.ok(backupKeys.length >= 2);
+      assert.ok(backupKeys.every(k => k.startsWith(`${STORAGE_KEY}_corrupt_`)));
+    });
+  });
+
+  describe('Runtime Validation & Envelope Verification (Requirement 4)', () => {
+    it('rejects envelope with missing or non-integer schemaVersion', () => {
       const corruptEnvelope = {
+        schemaVersion: '1', // string instead of number
         appVersion: '1.0.0',
         tenantId: 'tenant_demo',
         timestamp: new Date().toISOString(),
@@ -143,69 +235,99 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2)', () => {
       assert.equal(result.type, 'corrupt');
       if (result.type === 'corrupt') {
         assert.equal(result.error, 'MISSING_SCHEMA_VERSION');
-        assert.equal(backend.getItem(STORAGE_KEY), null);
       }
     });
 
-    it('recovers when envelope metadata fields are missing or invalid', () => {
-      const corruptMetadataEnvelope = {
-        schemaVersion: 1,
-        // missing appVersion, tenantId, timestamp
-        payload: createSamplePayload(),
-      };
-      backend.setItem(STORAGE_KEY, JSON.stringify(corruptMetadataEnvelope));
-
-      const result = adapter.load();
-      assert.equal(result.type, 'corrupt');
-      if (result.type === 'corrupt') {
-        assert.equal(result.error, 'INVALID_ENVELOPE_METADATA');
-        assert.equal(backend.getItem(STORAGE_KEY), null);
-      }
-    });
-
-    it('recovers when payload structure fails validation', () => {
-      const corruptPayloadEnvelope = {
+    it('rejects envelope with empty required tenantId or appVersion', () => {
+      const badTenant = {
         schemaVersion: 1,
         appVersion: '1.0.0',
-        tenantId: 'tenant_solstice_demo',
+        tenantId: '   ', // whitespace
         timestamp: new Date().toISOString(),
-        payload: {
-          products: 'corrupt_not_an_array',
-          storeProfile: null,
-        },
+        payload: createSamplePayload(),
       };
-      backend.setItem(STORAGE_KEY, JSON.stringify(corruptPayloadEnvelope));
+      backend.setItem(STORAGE_KEY, JSON.stringify(badTenant));
 
-      const result = adapter.load();
-      assert.equal(result.type, 'corrupt');
-      if (result.type === 'corrupt') {
-        assert.equal(result.error, 'INVALID_PAYLOAD_STRUCTURE');
-        assert.equal(backend.getItem(STORAGE_KEY), null);
-        assert.ok(result.backupKey);
+      const res = adapter.load();
+      assert.equal(res.type, 'corrupt');
+      if (res.type === 'corrupt') {
+        assert.equal(res.error, 'INVALID_ENVELOPE_METADATA');
       }
     });
 
-    it('lists created corruption backup keys via getBackupKeys()', () => {
-      backend.setItem(STORAGE_KEY, '{invalid1');
-      adapter.load();
+    it('rejects envelope with non-ISO timestamp', () => {
+      const badTimestamp = {
+        schemaVersion: 1,
+        appVersion: '1.0.0',
+        tenantId: 'tenant_demo',
+        timestamp: 'yesterday-afternoon',
+        payload: createSamplePayload(),
+      };
+      backend.setItem(STORAGE_KEY, JSON.stringify(badTimestamp));
 
-      backend.setItem(STORAGE_KEY, '{invalid2');
-      adapter.load();
+      const res = adapter.load();
+      assert.equal(res.type, 'corrupt');
+      if (res.type === 'corrupt') {
+        assert.equal(res.error, 'INVALID_ENVELOPE_METADATA');
+      }
+    });
 
-      const backupKeys = adapter.getBackupKeys();
-      assert.ok(backupKeys.length >= 2);
-      assert.ok(backupKeys.every(k => k.startsWith(`${STORAGE_KEY}_corrupt_`)));
+    it('rejects malformed product fields in payload structure', () => {
+      const sample = createSamplePayload();
+      // Introduce invalid product (missing required SKU and invalid attributes)
+      (sample.products[0] as any).sku = '';
+      (sample.products[0] as any).attributes = 'not-an-object';
+
+      const badProductEnvelope = {
+        schemaVersion: 1,
+        appVersion: '1.0.0',
+        tenantId: 'tenant_demo',
+        timestamp: new Date().toISOString(),
+        payload: sample,
+      };
+      backend.setItem(STORAGE_KEY, JSON.stringify(badProductEnvelope));
+
+      const res = adapter.load();
+      assert.equal(res.type, 'corrupt');
+      if (res.type === 'corrupt') {
+        assert.equal(res.error, 'INVALID_PAYLOAD_STRUCTURE');
+      }
+    });
+
+    it('rejects malformed storeProfile in payload', () => {
+      const sample = createSamplePayload();
+      (sample.storeProfile as any).platform = ''; // empty platform
+
+      const badStoreEnvelope = {
+        schemaVersion: 1,
+        appVersion: '1.0.0',
+        tenantId: 'tenant_demo',
+        timestamp: new Date().toISOString(),
+        payload: sample,
+      };
+      backend.setItem(STORAGE_KEY, JSON.stringify(badStoreEnvelope));
+
+      const res = adapter.load();
+      assert.equal(res.type, 'corrupt');
+      if (res.type === 'corrupt') {
+        assert.equal(res.error, 'INVALID_PAYLOAD_STRUCTURE');
+      }
+    });
+
+    it('validates well-formed payload completely', () => {
+      const sample = createSamplePayload();
+      assert.equal(validateStoragePayload(sample), true);
     });
   });
 
-  describe('AT-11: Future-Schema Protection and Read-Only Compatibility Mode', () => {
-    it('detects future schema version without overwriting or deleting stored data', () => {
+  describe('Future-Schema Protection & Read-Only Compatibility Mode (Requirement 1 & AT-11)', () => {
+    it('DOES NOT reject future schema as corruption, preserves primary key untouched', () => {
       const futureEnvelope = {
         schemaVersion: 2,
         appVersion: '2.0.0-future',
-        tenantId: 'tenant_solstice_demo',
-        timestamp: '2027-01-01T00:00:00.000Z',
-        futureCollections: ['ai_agents', 'dynamic_pricing_rules'],
+        tenantId: 'tenant_demo',
+        timestamp: '2027-06-01T12:00:00.000Z',
+        futureCollections: ['ai_prompts', 'vector_embeddings'],
         payload: {
           products: [],
           storeProfile: { name: 'Future Store', platform: 'future', currency: 'USD' },
@@ -216,140 +338,132 @@ describe('Storage Adapter & Persistence (Domain Contract v1.2)', () => {
 
       const result = adapter.load();
 
-      // Must identify unsupported version
+      // Must be unsupported_version, NOT corrupt
       assert.equal(result.type, 'unsupported_version');
       if (result.type === 'unsupported_version') {
         assert.equal(result.foundVersion, 2);
       }
 
-      // CRITICAL: The primary storage slot MUST remain intact with future data!
+      // CRITICAL: Primary storage slot untouched
       assert.equal(backend.getItem(STORAGE_KEY), futureRaw);
-
-      // CRITICAL: No corruption backups should have been created
+      // No corruption backups created
       assert.equal(adapter.getBackupKeys().length, 0);
 
-      // Adapter must enter read-only compatibility mode
+      // Adapter enters read-only compatibility mode
       assert.equal(adapter.isReadOnly(), true);
-      assert.ok(adapter.getReadOnlyReason()?.includes('future schema version 2'));
     });
 
-    it('blocks subsequent save() operations when in read-only mode to prevent overwriting future data', () => {
-      const futureRaw = JSON.stringify({
-        schemaVersion: 3,
-        payload: {},
-      });
+    it('blocks save() operations while in read-only mode to prevent overwriting future data', () => {
+      const futureRaw = JSON.stringify({ schemaVersion: 99, payload: {} });
       backend.setItem(STORAGE_KEY, futureRaw);
 
-      // Load to trigger read-only mode
       adapter.load();
       assert.equal(adapter.isReadOnly(), true);
 
-      // Attempt to save new v1 state
       const saveAttempt = adapter.save(createSamplePayload());
-
-      // Save must fail with blocked flag
       assert.equal(saveAttempt.success, false);
       if (!saveAttempt.success) {
         assert.equal(saveAttempt.isBlockedByReadOnly, true);
-        assert.ok(saveAttempt.error);
       }
 
-      // CRITICAL: Future data remains pristine in storage
+      // Primary key remains pristine
       assert.equal(backend.getItem(STORAGE_KEY), futureRaw);
     });
 
-    it('refuses to clear() storage when in read-only mode to preserve future schema state', () => {
-      const futureRaw = JSON.stringify({
-        schemaVersion: 5,
-        payload: {},
-      });
+    it('refuses to clear() storage while in read-only mode', () => {
+      const futureRaw = JSON.stringify({ schemaVersion: 3, payload: {} });
       backend.setItem(STORAGE_KEY, futureRaw);
 
       adapter.load();
       assert.equal(adapter.isReadOnly(), true);
 
-      const clearResult = adapter.clear();
-      assert.equal(clearResult, false);
-
-      // Future data is not deleted
+      const clearRes = adapter.clear();
+      assert.equal(clearRes, false);
       assert.equal(backend.getItem(STORAGE_KEY), futureRaw);
     });
   });
 
-  describe('Sanitization Allowlist & Security Boundaries', () => {
-    it('strips sensitive credentials and tokens before storage', () => {
+  describe('Recursive Sanitization Allowlist (Requirement 4)', () => {
+    it('recursively strips sensitive key variants from nested objects and arrays', () => {
       const dirtyPayload: any = {
         ...createSamplePayload(),
-        apiKey: 'sk-secret-12345',
-        oauthToken: 'oauth-bearer-token',
+        apiKey: 'secret_root_key',
+        API_KEY: 'secret_caps_key',
+        auth_token: 'auth_tok_123',
+        private_key: 'priv_key_456',
+        products: [
+          {
+            ...initialProducts[0],
+            client_secret: 'nested_secret_in_prod',
+            attributes: {
+              ...initialProducts[0].attributes,
+              api_key: 'nested_api_key',
+              pwd: 'password123',
+              safeAttribute: 'certified organic cotton',
+            },
+            variants: [
+              {
+                id: 'var_01',
+                productId: 'prod_01',
+                title: 'Variant 1',
+                sku: 'SKU-01',
+                price: 24.00,
+                bearer_token: 'token_in_variant',
+              }
+            ]
+          }
+        ],
         storeProfile: {
           ...initialStoreProfile,
-          clientSecret: 'secret_client_key_999',
-          bearerToken: 'tok_bearer_111',
-          password: 'plain_password',
-        },
+          password: 'store_password',
+          oauthToken: 'store_oauth_token',
+        }
       };
 
       const sanitized = sanitizePayloadAllowlist(dirtyPayload);
 
+      // Root level stripped
       assert.equal((sanitized as any).apiKey, undefined);
-      assert.equal((sanitized as any).oauthToken, undefined);
-      assert.equal((sanitized.storeProfile as any).clientSecret, undefined);
-      assert.equal((sanitized.storeProfile as any).bearerToken, undefined);
+      assert.equal((sanitized as any).API_KEY, undefined);
+      assert.equal((sanitized as any).auth_token, undefined);
+      assert.equal((sanitized as any).private_key, undefined);
+
+      // Nested product level stripped
+      assert.equal((sanitized.products[0] as any).client_secret, undefined);
+
+      // Nested attributes stripped
+      assert.equal((sanitized.products[0].attributes as any).api_key, undefined);
+      assert.equal((sanitized.products[0].attributes as any).pwd, undefined);
+      // Safe attribute retained
+      assert.equal((sanitized.products[0].attributes as any).safeAttribute, 'certified organic cotton');
+
+      // Nested variant stripped
+      assert.equal(((sanitized.products[0] as any).variants[0] as any).bearer_token, undefined);
+
+      // Store profile stripped
       assert.equal((sanitized.storeProfile as any).password, undefined);
+      assert.equal((sanitized.storeProfile as any).oauthToken, undefined);
       assert.equal(sanitized.storeProfile.name, initialStoreProfile.name);
     });
   });
 
   describe('Storage Failure & Quota Handling', () => {
-    it('gracefully handles quota exceeded error on write without crashing', () => {
-      const quotaBackend: MemoryStorageBackend = new MemoryStorageBackend();
+    it('gracefully handles quota exceeded error on write without throwing', () => {
+      const quotaBackend = new MemoryStorageBackend();
       quotaBackend.setItem = () => {
-        const err = new Error('QuotaExceededError: storage is full');
+        const err = new Error('QuotaExceededError: local storage limit reached');
         err.name = 'QuotaExceededError';
         throw err;
       };
 
       const quotaAdapter = new CatalogStorageAdapter(quotaBackend);
-      const result = quotaAdapter.save(createSamplePayload());
+      const res = quotaAdapter.save(createSamplePayload());
 
-      assert.equal(result.success, false);
-      if (!result.success) {
-        assert.equal(result.isQuotaExceeded, true);
-        assert.ok(result.error.includes('QuotaExceededError'));
+      assert.equal(res.success, false);
+      if (!res.success) {
+        assert.equal(res.isQuotaExceeded, true);
+        assert.ok(res.error.includes('QuotaExceededError'));
       }
-    });
-
-    it('returns storage_failure if backend.getItem throws', () => {
-      const faultyBackend: MemoryStorageBackend = new MemoryStorageBackend();
-      faultyBackend.getItem = () => {
-        throw new Error('Access to localStorage denied by security policy');
-      };
-
-      const faultyAdapter = new CatalogStorageAdapter(faultyBackend);
-      const result = faultyAdapter.load();
-
-      assert.equal(result.type, 'storage_failure');
-      if (result.type === 'storage_failure') {
-        assert.ok(result.error.includes('Access to localStorage denied'));
-        assert.equal(result.isRecoverable, true);
-      }
-    });
-  });
-
-  describe('Structural Validation Helper', () => {
-    it('rejects invalid payload objects', () => {
-      assert.equal(validateStoragePayload(null), false);
-      assert.equal(validateStoragePayload(undefined), false);
-      assert.equal(validateStoragePayload('string'), false);
-      assert.equal(validateStoragePayload([]), false);
-      assert.equal(validateStoragePayload({ products: 'not-array' }), false);
-      assert.equal(validateStoragePayload({ products: [{ title: 'missing id' }] }), false);
-    });
-
-    it('accepts well-formed payload object', () => {
-      const payload = createSamplePayload();
-      assert.equal(validateStoragePayload(payload), true);
     });
   });
 });

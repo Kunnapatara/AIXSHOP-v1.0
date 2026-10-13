@@ -39,6 +39,7 @@ interface AppContextType {
   isReadOnlyMode: boolean;
   readOnlyReason: string | null;
   storageLoadResult: StorageLoadResult | null;
+  isDurableStorage: boolean;
   setMobileMenuOpen: (open: boolean) => void;
   navigateTo: (page: NavigationPage, productId?: string, fromPage?: NavigationPage) => void;
   viewProductDetail: (productId: string, fromPage?: NavigationPage) => void;
@@ -229,7 +230,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const approveAction = (actionId: string) => {
     if (isReadOnlyMode) {
-      addToast('Action Disabled', 'Catalog is in read-only compatibility mode (future schema version detected).', 'warning');
+      addToast('Action Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
       return;
     }
 
@@ -269,7 +270,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const dismissAction = (actionId: string) => {
     if (isReadOnlyMode) {
-      addToast('Action Disabled', 'Catalog is in read-only compatibility mode.', 'warning');
+      addToast('Action Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
       return;
     }
 
@@ -291,6 +292,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   };
 
   const recheckAction = (actionId: string) => {
+    if (isReadOnlyMode) {
+      addToast('Re-check Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
+      return;
+    }
+
     const item = actionItems.find(a => a.id === actionId);
     if (!item) return;
 
@@ -336,6 +342,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   };
 
   const recheckProduct = (productId: string) => {
+    if (isReadOnlyMode) {
+      addToast('Re-check Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
+      return;
+    }
+
     const prod = products.find(p => p.id === productId);
     if (!prod) {
       addToast('Error', 'Product not found for re-check', 'error');
@@ -364,7 +375,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const updateStoreProfile = (updates: Partial<StoreProfile>) => {
     if (isReadOnlyMode) {
-      addToast('Settings Locked', 'Cannot modify store settings in read-only compatibility mode.', 'warning');
+      addToast('Settings Locked', 'Store settings cannot be changed while read-only mode is active.', 'warning');
       return;
     }
     const nextProfile = { ...storeProfile, ...updates };
@@ -375,7 +386,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const toggleConnectorSync = (connectorId: string) => {
     if (isReadOnlyMode) {
-      addToast('Connector Locked', 'Connectors cannot be modified in read-only compatibility mode.', 'warning');
+      addToast('Connector Locked', 'Connectors cannot be modified while read-only mode is active.', 'warning');
       return;
     }
 
@@ -399,7 +410,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const resetToSeedData = () => {
     if (isReadOnlyMode) {
-      addToast('Reset Blocked', 'Cannot reset storage while an unsupported future schema version is preserved.', 'warning');
+      addToast('Reset Unavailable', 'Catalog cannot be reset while read-only mode is active.', 'warning');
       return;
     }
     storageAdapter.clear();
@@ -429,6 +440,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         isReadOnlyMode,
         readOnlyReason,
         storageLoadResult,
+        isDurableStorage: storageAdapter.isDurable(),
         setMobileMenuOpen,
         navigateTo,
         viewProductDetail,

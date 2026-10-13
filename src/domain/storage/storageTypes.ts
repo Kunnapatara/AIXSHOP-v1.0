@@ -29,18 +29,27 @@ export interface StorageEnvelopeV1 {
 export type StorageLoadResult =
   | { type: 'valid'; envelope: StorageEnvelopeV1 }
   | { type: 'not_found' }
-  | { type: 'corrupt'; error: string; rawValue: string | null; backupKey?: string }
+  | { 
+      type: 'corrupt'; 
+      error: string; 
+      rawValue: string | null; 
+      backupKey?: string;
+      backupPreserved: boolean;
+      primaryCleared: boolean;
+    }
   | { type: 'unsupported_version'; foundVersion: number; rawEnvelope: unknown }
   | { type: 'storage_failure'; error: string; isRecoverable: boolean };
 
 export type StorageSaveResult =
-  | { success: true; timestamp: string }
-  | { success: false; error: string; isBlockedByReadOnly?: boolean; isQuotaExceeded?: boolean };
+  | { success: true; timestamp: string; isDurable: boolean }
+  | { success: false; error: string; isBlockedByReadOnly?: boolean; isQuotaExceeded?: boolean; isDurable?: boolean };
 
 export interface StorageBackend {
+  readonly isDurable: boolean;
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
   key?(index: number): string | null;
   length?: number;
+  clear?(): void;
 }
