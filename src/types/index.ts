@@ -136,6 +136,11 @@ export interface StoreProfile {
   catalogCompletenessAvg: number;
   evidenceCoverageAvg: number;
   truthBoundaryStrictness: 'strict' | 'standard' | 'relaxed';
+  catalogPolicy?: {
+    units?: string;
+    [key: string]: unknown;
+  };
+  shippingSla?: Record<string, string>;
 }
 
 export interface QuickHealthCheckResult {

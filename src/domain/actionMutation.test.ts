@@ -304,9 +304,264 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
     });
   });
 
+  describe('P0: Variant Field-to-Property Integrity & Validation', () => {
+    it('variants[0].barcode updates only barcode and leaves sku, price, title untouched', () => {
+      const candle = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const originalSku = candle.variants[0].sku;
+      const originalPrice = candle.variants[0].price;
+      const originalTitle = candle.variants[0].title;
+
+      const res = coordinator.approveAction('act_01');
+      assert.equal(res.success, true);
+
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfter.variants[0].barcode, '0850029381082');
+      assert.equal(candleAfter.variants[0].sku, originalSku, 'SKU must not be touched');
+      assert.equal(candleAfter.variants[0].price, originalPrice, 'Price must not be touched');
+      assert.equal(candleAfter.variants[0].title, originalTitle, 'Title must not be touched');
+    });
+
+    it('variants[0].sku updates only SKU and leaves barcode, price, title untouched', () => {
+      coordinator.actionItems.push({
+        id: 'act_var_sku',
+        findingId: 'find_var_sku',
+        productId: 'prod_solstice_04',
+        title: 'Update Variant SKU',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].sku',
+          from: 'SOL-CNDL-AMB-01',
+          to: 'SOL-CNDL-AMB-REV2',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const candleBefore = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const originalBarcode = candleBefore.variants[0].barcode;
+      const originalPrice = candleBefore.variants[0].price;
+      const originalTitle = candleBefore.variants[0].title;
+
+      const res = coordinator.approveAction('act_var_sku');
+      assert.equal(res.success, true);
+
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfter.variants[0].sku, 'SOL-CNDL-AMB-REV2');
+      assert.equal(candleAfter.variants[0].barcode, originalBarcode, 'Barcode must not be overwritten with SKU');
+      assert.equal(candleAfter.variants[0].price, originalPrice, 'Price must not be touched');
+      assert.equal(candleAfter.variants[0].title, originalTitle, 'Title must not be touched');
+
+      // Re-check verifies exact SKU
+      const recheck = coordinator.recheckAction('act_var_sku');
+      assert.equal(recheck.success, true);
+      assert.equal(recheck.isVerified, true);
+      assert.equal(recheck.verificationStatus, 'verified_in_catalog');
+    });
+
+    it('variants[0].price updates price and rejects invalid numeric values', () => {
+      // 1. Rejects invalid non-numeric price
+      coordinator.actionItems.push({
+        id: 'act_bad_price',
+        findingId: 'find_bad_price',
+        productId: 'prod_solstice_04',
+        title: 'Set Invalid Price',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: 'invalid_price_abc',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const resBad = coordinator.approveAction('act_bad_price');
+      assert.equal(resBad.success, false);
+      assert.equal(resBad.errorCode, 'UNSUPPORTED_FIELD');
+
+      // 2. Rejects negative price
+      coordinator.actionItems.push({
+        id: 'act_neg_price',
+        findingId: 'find_neg_price',
+        productId: 'prod_solstice_04',
+        title: 'Set Negative Price',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '-10.50',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const resNeg = coordinator.approveAction('act_neg_price');
+      assert.equal(resNeg.success, false);
+      assert.equal(resNeg.errorCode, 'UNSUPPORTED_FIELD');
+
+      // 3. Accepts valid numeric price and updates variant.price as number
+      coordinator.actionItems.push({
+        id: 'act_valid_price',
+        findingId: 'find_valid_price',
+        productId: 'prod_solstice_04',
+        title: 'Update Variant Price',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '38.50',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const candleBefore = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const originalBarcode = candleBefore.variants[0].barcode;
+
+      const resValid = coordinator.approveAction('act_valid_price');
+      assert.equal(resValid.success, true);
+
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfter.variants[0].price, 38.5);
+      assert.equal(typeof candleAfter.variants[0].price, 'number');
+      assert.equal(candleAfter.variants[0].barcode, originalBarcode, 'Barcode must not be overwritten with price');
+
+      // Re-check verifies exact price
+      const recheck = coordinator.recheckAction('act_valid_price');
+      assert.equal(recheck.success, true);
+      assert.equal(recheck.isVerified, true);
+      assert.equal(recheck.verificationStatus, 'verified_in_catalog');
+    });
+
+    it('variants[0].title updates only title property', () => {
+      coordinator.actionItems.push({
+        id: 'act_var_title',
+        findingId: 'find_var_title',
+        productId: 'prod_solstice_04',
+        title: 'Update Variant Title',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].title',
+          from: '8 oz Standard Jar',
+          to: '8 oz Amber Glass Tumbler',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const candleBefore = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const originalBarcode = candleBefore.variants[0].barcode;
+
+      const res = coordinator.approveAction('act_var_title');
+      assert.equal(res.success, true);
+
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfter.variants[0].title, '8 oz Amber Glass Tumbler');
+      assert.equal(candleAfter.variants[0].barcode, originalBarcode, 'Barcode must not be overwritten with title');
+
+      // Re-check verifies exact title
+      const recheck = coordinator.recheckAction('act_var_title');
+      assert.equal(recheck.success, true);
+      assert.equal(recheck.isVerified, true);
+    });
+
+    it('rejects unsupported variant property with UNSUPPORTED_FIELD', () => {
+      coordinator.actionItems.push({
+        id: 'act_bad_prop',
+        findingId: 'find_bad_prop',
+        productId: 'prod_solstice_04',
+        title: 'Update Unsupported Property',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].unsupportedProperty',
+          from: '',
+          to: 'value',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const res = coordinator.approveAction('act_bad_prop');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'UNSUPPORTED_FIELD');
+    });
+  });
+
+  describe('P0: Global Fields & Claim Routing Integrity', () => {
+    it('store.catalogPolicy.units updates storeProfile.catalogPolicy.units and re-check confirms it', () => {
+      const res = coordinator.approveAction('act_04');
+      assert.equal(res.success, true);
+
+      assert.equal(coordinator.storeProfile.catalogPolicy?.units, 'Dual-unit standard: Metric (Imperial)');
+
+      const recheck = coordinator.recheckAction('act_04');
+      assert.equal(recheck.success, true);
+      assert.equal(recheck.isVerified, true);
+      assert.equal(recheck.verificationStatus, 'verified_in_catalog');
+    });
+
+    it('connectors.gmc.shipping_sla updates storeProfile.shippingSla.gmc and re-check confirms it', () => {
+      const res = coordinator.approveAction('act_06');
+      assert.equal(res.success, true);
+
+      assert.equal(coordinator.storeProfile.shippingSla?.gmc, '2 business days');
+
+      const recheck = coordinator.recheckAction('act_06');
+      assert.equal(recheck.success, true);
+      assert.equal(recheck.isVerified, true);
+      assert.equal(recheck.verificationStatus, 'verified_in_catalog');
+    });
+
+    it('unsupported global field fails without mutating storeProfile, actions, or catalog', () => {
+      coordinator.actionItems.push({
+        id: 'act_bad_global',
+        findingId: 'find_bad_global',
+        title: 'Unsupported Global Config',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'store.unsupportedGlobalConfig',
+          from: 'a',
+          to: 'b',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const storeSnapshot = JSON.stringify(coordinator.storeProfile);
+      const catalogSnapshot = JSON.stringify(coordinator.products);
+
+      const res = coordinator.approveAction('act_bad_global');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'UNSUPPORTED_FIELD');
+
+      assert.equal(JSON.stringify(coordinator.storeProfile), storeSnapshot);
+      assert.equal(JSON.stringify(coordinator.products), catalogSnapshot);
+      assert.equal(coordinator.actionItems.find(a => a.id === 'act_bad_global')!.status, 'pending_review');
+    });
+
+    it('explicit title / marketing claims reconciles to verifiedBurnTime without ambiguous routing', () => {
+      const res = coordinator.approveAction('act_07');
+      assert.equal(res.success, true);
+
+      const candle = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candle.attributes.verifiedBurnTime, 'Up to 50 Hours (Verified Lab Burn Rate)');
+
+      const recheck = coordinator.recheckAction('act_07');
+      assert.equal(recheck.success, true);
+      assert.equal(recheck.isVerified, true);
+      assert.equal(recheck.verificationStatus, 'verified_in_catalog');
+    });
+  });
+
   describe('Phase C: Mutation Validation & Target Safeguards', () => {
     it('rejects unsupported field without mutating catalog or action status', () => {
-      // Create an action with an unallowlisted field
       coordinator.actionItems.push({
         id: 'act_malicious',
         findingId: 'find_malicious',
@@ -380,7 +635,6 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
     });
 
     it('rejects out-of-bounds variant index and NEVER silently falls back to variant[0]', () => {
-      // Candle prod_solstice_04 has exactly 1 variant (index 0)
       coordinator.actionItems.push({
         id: 'act_out_of_bounds_variant',
         findingId: 'find_oob_var',
@@ -405,7 +659,6 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(res.errorCode, 'VARIANT_OUT_OF_BOUNDS');
 
       const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
-      // Crucial Phase C requirement: Must NEVER fall back to variant[0]
       assert.equal(candleAfter.variants[0].barcode, barcodeBefore, 'Variant[0] must NOT be silently mutated');
     });
 
@@ -433,18 +686,15 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
       const recalculated = calculateProductCompleteness(candleAfter);
       assert.equal(candleAfter.completenessScore, recalculated);
-      // Valid GTIN-13 raises variant score from 0/20 to 20/20 (+20 points)
       assert.ok(candleAfter.completenessScore > initialScore);
       assert.ok(candleAfter.completenessScore <= 100);
     });
 
     it('no-op mutation does not increase completeness score', () => {
-      // Apply act_02
       coordinator.approveAction('act_02');
       const mugAfterFirst = coordinator.products.find(p => p.id === 'prod_solstice_02')!;
       const scoreFirst = mugAfterFirst.completenessScore;
 
-      // Recalculating without new fields produces the exact same score
       const scoreRecheck = calculateProductCompleteness(mugAfterFirst);
       assert.equal(scoreRecheck, scoreFirst);
     });
@@ -483,7 +733,6 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
     });
 
     it('rolls back in-memory state atomically if persistence fails', () => {
-      // Simulate backend persistence failure
       coordinator.backend.setItem = () => {
         throw new Error('Disk quota exceeded');
       };
@@ -495,7 +744,6 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(res.success, false);
       assert.equal((res as { rolledBack?: boolean }).rolledBack, true);
 
-      // In-memory state MUST NOT have been updated!
       const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
       assert.equal(candleAfter.variants[0].barcode, '', 'In-memory catalog must roll back on save failure');
 
@@ -527,14 +775,13 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.ok(loaded.type === 'corrupt' && loaded.backupKey);
       if (loaded.type === 'corrupt' && loaded.backupKey) {
         assert.ok(loaded.backupKey.startsWith('aixshop_catalog_v1_corrupt_'));
-        // Original corrupted data preserved in backup
         const backupVal = coordinator.backend.getItem(loaded.backupKey);
         assert.equal(backupVal, '{malformed_json:::');
       }
     });
   });
 
-  describe('Phase F: Full Product Readiness - Real Store Check', () => {
+  describe('P1: Truthful Store Check & Non-Fabricated Metrics', () => {
     it('normalizes store URLs correctly with various protocols and trailing paths', () => {
       const res1 = normalizeStoreUrl('solsticemercantile.com');
       assert.equal(res1.isValid, true);
@@ -562,7 +809,25 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.ok(check.sampleIssues.length > 0);
     });
 
-    it('ingests and evaluates real Shopify catalog feed via customFetch', async () => {
+    it('assigns 0% completeness to empty store catalog without inventing points', async () => {
+      const customFetch = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ products: [] }),
+      } as unknown as Response);
+
+      const res = await ingestAndAnalyzeStore('https://empty-store.myshopify.com', {
+        customFetch: customFetch as unknown as typeof fetch,
+      });
+
+      assert.equal(res.scanStatus, 'real_scan');
+      assert.equal(res.catalogCompletenessEstimate, 0, 'Empty catalog must have 0 completeness');
+      assert.equal(res.gtinPresentRatio, 0);
+      assert.ok(res.sampleIssues.some(i => i.includes('0 active public products')));
+    });
+
+    it('ingests and evaluates real Shopify catalog feed without fabricating inventory or evidence', async () => {
       const mockShopifyResponse = {
         products: [
           {
@@ -585,31 +850,29 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
           {
             id: 102,
             title: 'Campfire Enamel Cup',
-            vendor: 'Trail & Forge',
-            product_type: 'Drinkware',
-            body_html: '<p>Durable steel cup.</p>', // Short description (<20 chars) triggers issue
+            vendor: '', // Missing vendor
+            product_type: '', // Missing product type
+            body_html: '<p>Steel cup.</p>', // Short description (<20 chars)
             variants: [
               {
                 id: 202,
                 title: 'Default Title',
                 sku: 'TF-CUP-01',
-                barcode: '', // Missing barcode triggers issue
+                barcode: '', // Missing barcode
                 price: '18.00',
-                available: true,
+                available: false,
               },
             ],
           },
         ],
       };
 
-      const customFetch = async () => {
-        return {
-          ok: true,
-          status: 200,
-          statusText: 'OK',
-          json: async () => mockShopifyResponse,
-        } as unknown as Response;
-      };
+      const customFetch = async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => mockShopifyResponse,
+      } as unknown as Response);
 
       const result = await ingestAndAnalyzeStore('https://trail-and-forge.myshopify.com', {
         customFetch: customFetch as unknown as typeof fetch,
@@ -619,21 +882,22 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(result.schemaFound, true);
       // 1 out of 2 variants has valid GTIN = 50%
       assert.equal(result.gtinPresentRatio, 50);
-      assert.ok(result.detectedPlatform.includes('Shopify Live Storefront'));
-      // Evidence-based issues identified
+      // Sample label correctly documents sample scope
+      assert.ok(result.detectedPlatform.includes('Shopify Public Storefront Sample'));
+      // Identified genuine missing fields
       assert.ok(result.sampleIssues.some(i => i.includes('Missing GTIN/UPC')));
-      assert.ok(result.sampleIssues.some(i => i.includes('lacks detailed physical description')));
+      assert.ok(result.sampleIssues.some(i => i.includes('description')));
+      assert.ok(result.sampleIssues.some(i => i.includes('brand')));
+      assert.ok(result.sampleIssues.some(i => i.includes('taxonomy')));
     });
 
     it('handles restricted / non-public storefront gracefully as unsupported_store', async () => {
-      const customFetch = async () => {
-        return {
-          ok: false,
-          status: 403,
-          statusText: 'Forbidden',
-          json: async () => ({}),
-        } as unknown as Response;
-      };
+      const customFetch = async () => ({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: async () => ({}),
+      } as unknown as Response);
 
       const result = await ingestAndAnalyzeStore('https://private-store.com', {
         customFetch: customFetch as unknown as typeof fetch,
@@ -644,7 +908,7 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.ok(result.notice?.includes('Settings'));
     });
 
-    it('handles network / CORS fetch failure gracefully as network_failure', async () => {
+    it('handles network / CORS fetch failure gracefully as network_failure without claiming scan succeeded', async () => {
       const customFetch = async () => {
         throw new Error('Failed to fetch (CORS header missing)');
       };
@@ -654,13 +918,13 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       });
 
       assert.equal(result.scanStatus, 'network_failure');
+      assert.equal(result.catalogCompletenessEstimate, 0);
       assert.ok(result.sampleIssues.some(i => i.includes('CORS')));
     });
   });
 
   describe('Phase D: End-to-End Workflow & Regression Verification', () => {
     it('executes the full lifecycle: inspect -> approve -> persist -> re-check -> verify', () => {
-      // 1. Initial State
       const action = coordinator.actionItems.find(a => a.id === 'act_01')!;
       const finding = coordinator.findings.find(f => f.actionItemId === action.id)!;
       const product = coordinator.products.find(p => p.id === action.productId)!;
@@ -671,11 +935,11 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(product.variants[0].barcode, '');
       const initialScore = product.completenessScore;
 
-      // 2. Approval
+      // Approval
       const approveRes = coordinator.approveAction('act_01');
       assert.equal(approveRes.success, true);
 
-      // 3. Post-Approval State Check
+      // Post-Approval State Check
       const approvedAction = coordinator.actionItems.find(a => a.id === 'act_01')!;
       const updatedFinding = coordinator.findings.find(f => f.actionItemId === action.id)!;
       const updatedProduct = coordinator.products.find(p => p.id === action.productId)!;
@@ -686,7 +950,7 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(updatedProduct.variants[0].barcode, '0850029381082');
       assert.ok(updatedProduct.completenessScore > initialScore);
 
-      // 4. Persistence Verification
+      // Persistence Verification
       const loaded = coordinator.adapter.load();
       assert.equal(loaded.type, 'valid');
       if (loaded.type === 'valid') {
@@ -694,13 +958,13 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         assert.equal(persistedProduct.variants[0].barcode, '0850029381082');
       }
 
-      // 5. Re-check Execution
+      // Re-check Execution
       const recheckRes = coordinator.recheckAction('act_01');
       assert.equal(recheckRes.success, true);
       assert.equal(recheckRes.isVerified, true);
       assert.equal(recheckRes.verificationStatus, 'verified_in_catalog');
 
-      // 6. Final Verified State
+      // Final Verified State
       const verifiedAction = coordinator.actionItems.find(a => a.id === 'act_01')!;
       const verifiedFinding = coordinator.findings.find(f => f.actionItemId === action.id)!;
 

@@ -12,6 +12,12 @@ export const initialStoreProfile: StoreProfile = {
   catalogCompletenessAvg: 84,
   evidenceCoverageAvg: 68,
   truthBoundaryStrictness: 'strict',
+  catalogPolicy: {
+    units: 'Mixed single-system units',
+  },
+  shippingSla: {
+    gmc: '3-5 business days',
+  },
   connectors: [
     {
       id: 'conn_shopify_01',

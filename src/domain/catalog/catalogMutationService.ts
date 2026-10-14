@@ -36,9 +36,9 @@ export function calculateProductCompleteness(product: Product): number {
   let score = 0;
 
   // 1. Core entity properties (up to 40 pts)
-  if (product.title && product.title.trim().length >= 3) score += 10;
-  if (product.brand && product.brand.trim().length > 0) score += 8;
-  if (product.category && product.category.trim().length > 0) score += 8;
+  if (product.title && product.title.trim().length >= 3 && product.title.trim() !== 'Untitled Product') score += 10;
+  if (product.brand && product.brand.trim().length > 0 && product.brand.trim() !== 'Unknown Brand' && product.brand.trim() !== 'Unspecified') score += 8;
+  if (product.category && product.category.trim().length > 0 && product.category.trim() !== 'General Merchandise' && product.category.trim() !== 'Unspecified') score += 8;
   if (product.description && product.description.trim().length >= 10) score += 8;
   if (product.image && product.image.trim().length > 0) score += 6;
 
@@ -229,6 +229,9 @@ export function executeActionApproval(
     : item.proposedChange.to;
 
   let nextProducts = ctx.products;
+  let nextStoreProfile: StoreProfile = {
+    ...ctx.storeProfile,
+  };
 
   // If the action targets a specific canonical product
   if (item.productId) {
@@ -249,12 +252,12 @@ export function executeActionApproval(
 
     // Variant-specific mutation
     if (changeField.startsWith('variants[')) {
-      const match = changeField.match(/variants\[(\d+)\]/);
+      const match = changeField.match(/^variants\[(\d+)\]\.(barcode|sku|price|title)$/);
       if (!match) {
         return {
           success: false,
           errorCode: 'INVALID_VARIANT_TARGET',
-          message: `Could not parse variant target index from "${changeField}".`,
+          message: `Could not parse variant target index and property from "${changeField}".`,
           nextProducts: ctx.products,
           nextFindings: ctx.findings,
           nextActions: ctx.actionItems,
@@ -263,6 +266,8 @@ export function executeActionApproval(
       }
 
       const targetIndex = parseInt(match[1], 10);
+      const targetProperty = match[2] as 'barcode' | 'sku' | 'price' | 'title';
+
       if (isNaN(targetIndex) || targetIndex < 0 || targetIndex >= targetProduct.variants.length) {
         return {
           success: false,
@@ -275,11 +280,47 @@ export function executeActionApproval(
         };
       }
 
+      let numericPrice: number | undefined;
+      if (targetProperty === 'price') {
+        numericPrice = Number(valueToApply);
+        if (isNaN(numericPrice) || numericPrice < 0 || !isFinite(numericPrice)) {
+          return {
+            success: false,
+            errorCode: 'UNSUPPORTED_FIELD',
+            message: `Invalid price "${valueToApply}". Price must be a valid non-negative finite number.`,
+            nextProducts: ctx.products,
+            nextFindings: ctx.findings,
+            nextActions: ctx.actionItems,
+            nextStoreProfile: ctx.storeProfile,
+          };
+        }
+      } else if (targetProperty === 'sku' || targetProperty === 'title') {
+        if (!valueToApply || valueToApply.trim() === '') {
+          return {
+            success: false,
+            errorCode: 'UNSUPPORTED_FIELD',
+            message: `Variant ${targetProperty} cannot be empty.`,
+            nextProducts: ctx.products,
+            nextFindings: ctx.findings,
+            nextActions: ctx.actionItems,
+            nextStoreProfile: ctx.storeProfile,
+          };
+        }
+      }
+
       nextProducts = ctx.products.map(p => {
         if (p.id !== item.productId) return p;
         const updatedVariants = p.variants.map((v, idx) => {
           if (idx === targetIndex) {
-            return { ...v, barcode: valueToApply };
+            if (targetProperty === 'barcode') {
+              return { ...v, barcode: valueToApply };
+            } else if (targetProperty === 'sku') {
+              return { ...v, sku: valueToApply.trim() };
+            } else if (targetProperty === 'title') {
+              return { ...v, title: valueToApply.trim() };
+            } else if (targetProperty === 'price' && numericPrice !== undefined) {
+              return { ...v, price: numericPrice };
+            }
           }
           return v;
         });
@@ -293,6 +334,18 @@ export function executeActionApproval(
       });
     } else if (changeField.startsWith('attributes.')) {
       const attrKey = changeField.replace('attributes.', '');
+      if (!SUPPORTED_ATTRIBUTES_ALLOWLIST.has(attrKey)) {
+        return {
+          success: false,
+          errorCode: 'UNSUPPORTED_FIELD',
+          message: `Attribute "${attrKey}" is not a recognized structured attribute.`,
+          nextProducts: ctx.products,
+          nextFindings: ctx.findings,
+          nextActions: ctx.actionItems,
+          nextStoreProfile: ctx.storeProfile,
+        };
+      }
+
       nextProducts = ctx.products.map(p => {
         if (p.id !== item.productId) return p;
         const updatedProduct: Product = {
@@ -306,8 +359,8 @@ export function executeActionApproval(
         updatedProduct.completenessScore = calculateProductCompleteness(updatedProduct);
         return updatedProduct;
       });
-    } else if (changeField.includes('title')) {
-      // Marketing claim reconciliation
+    } else if (changeField === 'title / marketing claims') {
+      // Explicit marketing claim reconciliation
       nextProducts = ctx.products.map(p => {
         if (p.id !== item.productId) return p;
         const updatedProduct: Product = {
@@ -321,8 +374,50 @@ export function executeActionApproval(
         updatedProduct.completenessScore = calculateProductCompleteness(updatedProduct);
         return updatedProduct;
       });
+    } else {
+      return {
+        success: false,
+        errorCode: 'UNSUPPORTED_FIELD',
+        message: `Field "${changeField}" is not supported for product mutation.`,
+        nextProducts: ctx.products,
+        nextFindings: ctx.findings,
+        nextActions: ctx.actionItems,
+        nextStoreProfile: ctx.storeProfile,
+      };
+    }
+  } else {
+    // Global / store-level mutation
+    const changeField = item.proposedChange.field;
+    if (changeField === 'store.catalogPolicy.units') {
+      nextStoreProfile = {
+        ...nextStoreProfile,
+        catalogPolicy: {
+          ...nextStoreProfile.catalogPolicy,
+          units: valueToApply,
+        },
+      };
+    } else if (changeField === 'connectors.gmc.shipping_sla') {
+      nextStoreProfile = {
+        ...nextStoreProfile,
+        shippingSla: {
+          ...nextStoreProfile.shippingSla,
+          gmc: valueToApply,
+        },
+      };
+    } else {
+      return {
+        success: false,
+        errorCode: 'UNSUPPORTED_FIELD',
+        message: `Global field "${changeField}" is not supported for store mutation.`,
+        nextProducts: ctx.products,
+        nextFindings: ctx.findings,
+        nextActions: ctx.actionItems,
+        nextStoreProfile: ctx.storeProfile,
+      };
     }
   }
+
+  nextStoreProfile.catalogCompletenessAvg = calculateStoreCompletenessAvg(nextProducts);
 
   // Update Action Item state
   // CRITICAL: verificationStatus remains 'recheck_required'! Approval does NOT equal verification!
@@ -350,11 +445,6 @@ export function executeActionApproval(
     }
     return f;
   });
-
-  const nextStoreProfile: StoreProfile = {
-    ...ctx.storeProfile,
-    catalogCompletenessAvg: calculateStoreCompletenessAvg(nextProducts),
-  };
 
   const updatedAction = nextActions.find(a => a.id === actionId);
 
@@ -485,19 +575,43 @@ export function executeActionRecheck(
       const expectedValue = item.proposedChange.to;
 
       if (changeField.startsWith('variants[')) {
-        const match = changeField.match(/variants\[(\d+)\]/);
-        const targetIndex = match ? parseInt(match[1], 10) : 0;
-        const targetVariant = targetProd.variants[targetIndex];
+        const match = changeField.match(/^variants\[(\d+)\]\.(barcode|sku|price|title)$/);
+        if (!match) {
+          isValid = false;
+          failureReason = `Could not parse variant field "${changeField}".`;
+        } else {
+          const targetIndex = parseInt(match[1], 10);
+          const targetProperty = match[2] as 'barcode' | 'sku' | 'price' | 'title';
+          const targetVariant = targetProd.variants[targetIndex];
 
-        if (!targetVariant) {
-          isValid = false;
-          failureReason = `Target variant index [${targetIndex}] does not exist on product.`;
-        } else if (targetVariant.barcode !== expectedValue) {
-          isValid = false;
-          failureReason = `Variant barcode "${targetVariant.barcode || '(empty)'}" does not match approved value "${expectedValue}".`;
-        } else if (!isValidGtin13(targetVariant.barcode)) {
-          isValid = false;
-          failureReason = `Variant barcode "${targetVariant.barcode}" fails GTIN-13 check digit validation.`;
+          if (!targetVariant) {
+            isValid = false;
+            failureReason = `Target variant index [${targetIndex}] does not exist on product.`;
+          } else if (targetProperty === 'barcode') {
+            if (targetVariant.barcode !== expectedValue) {
+              isValid = false;
+              failureReason = `Variant barcode "${targetVariant.barcode || '(empty)'}" does not match approved value "${expectedValue}".`;
+            } else if (!isValidGtin13(targetVariant.barcode)) {
+              isValid = false;
+              failureReason = `Variant barcode "${targetVariant.barcode}" fails GTIN-13 check digit validation.`;
+            }
+          } else if (targetProperty === 'sku') {
+            if (targetVariant.sku !== expectedValue) {
+              isValid = false;
+              failureReason = `Variant SKU "${targetVariant.sku || '(empty)'}" does not match approved value "${expectedValue}".`;
+            }
+          } else if (targetProperty === 'title') {
+            if (targetVariant.title !== expectedValue) {
+              isValid = false;
+              failureReason = `Variant title "${targetVariant.title || '(empty)'}" does not match approved value "${expectedValue}".`;
+            }
+          } else if (targetProperty === 'price') {
+            const expectedPrice = Number(expectedValue);
+            if (targetVariant.price !== expectedPrice) {
+              isValid = false;
+              failureReason = `Variant price "${targetVariant.price}" does not match approved value "${expectedPrice}".`;
+            }
+          }
         }
       } else if (changeField.startsWith('attributes.')) {
         const attrKey = changeField.replace('attributes.', '');
@@ -506,12 +620,36 @@ export function executeActionRecheck(
           isValid = false;
           failureReason = `Attribute "${attrKey}" (${currentVal || '(none)'}) does not match approved value "${expectedValue}".`;
         }
-      } else if (changeField.includes('title')) {
+      } else if (changeField === 'title / marketing claims') {
         if (targetProd.attributes.verifiedBurnTime !== expectedValue) {
           isValid = false;
           failureReason = `Specification claim reconciliation not found in attributes. Expected "${expectedValue}".`;
         }
+      } else {
+        isValid = false;
+        failureReason = `Unsupported field "${changeField}" for product re-check.`;
       }
+    }
+  } else {
+    // Global / store-level re-check
+    const changeField = item.proposedChange.field;
+    const expectedValue = item.proposedChange.to;
+
+    if (changeField === 'store.catalogPolicy.units') {
+      const currentUnits = ctx.storeProfile.catalogPolicy?.units;
+      if (currentUnits !== expectedValue) {
+        isValid = false;
+        failureReason = `Store catalog units policy "${currentUnits || '(none)'}" does not match approved value "${expectedValue}".`;
+      }
+    } else if (changeField === 'connectors.gmc.shipping_sla') {
+      const currentSla = ctx.storeProfile.shippingSla?.gmc;
+      if (currentSla !== expectedValue) {
+        isValid = false;
+        failureReason = `Connector GMC shipping SLA "${currentSla || '(none)'}" does not match approved value "${expectedValue}".`;
+      }
+    } else {
+      isValid = false;
+      failureReason = `Unrecognized global field "${changeField}" for store re-check.`;
     }
   }
 

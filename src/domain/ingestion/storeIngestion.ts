@@ -155,7 +155,7 @@ export async function ingestAndAnalyzeStore(
       return {
         url: origin,
         timestamp,
-        catalogCompletenessEstimate: 10,
+        catalogCompletenessEstimate: 0, // Empty catalog has 0% completeness
         schemaFound: true,
         gtinPresentRatio: 0,
         conflictingClaimsCount: 0,
@@ -163,32 +163,37 @@ export async function ingestAndAnalyzeStore(
         detectedPlatform: 'Shopify Storefront (Empty Catalog)',
         sampleIssues: ['Store catalog endpoint contains 0 active public products.'],
         scanStatus: 'real_scan',
-        notice: '0 products found in public feed.',
+        notice: '0 products found in public feed. Empty catalog cannot be evaluated.',
       };
     }
 
     // Convert raw public Shopify products into our domain model and evaluate
+    // NOTE: Only observed source facts are recorded; zero inventory or evidence values are fabricated.
     const domainProducts: Product[] = rawProducts.map((p, pIdx) => {
       const variants: Variant[] = (p.variants || []).map((v, vIdx) => ({
         id: `v_${v.id || `${pIdx}_${vIdx}`}`,
-        sku: v.sku || `SKU-${v.id || vIdx}`,
-        title: v.title || 'Default Title',
+        sku: (v.sku || '').trim(),
+        title: (v.title || '').trim(),
         barcode: (v.barcode || '').trim(),
         price: typeof v.price === 'string' ? parseFloat(v.price) || 0 : (v.price || 0),
-        inventoryCount: v.available ? 10 : 0,
+        inventoryCount: 0, // Public storefront JSON does not provide warehouse inventory quantities
         attributes: {},
       }));
 
+      const observedVendor = (p.vendor || '').trim();
+      const observedType = (p.product_type || '').trim();
+      const observedTitle = (p.title || '').trim();
+
       const prod: Product = {
         id: `p_${p.id || pIdx}`,
-        title: p.title || 'Untitled Product',
-        brand: p.vendor || 'Unknown Brand',
-        category: p.product_type || 'General Merchandise',
+        title: observedTitle,
+        brand: observedVendor, // Do not inject 'Unknown Brand' placeholder
+        category: observedType, // Do not inject 'General Merchandise' placeholder
         description: (p.body_html || '').replace(/<[^>]*>?/gm, '').trim(),
         image: '',
         status: 'active',
         completenessScore: 0,
-        evidenceCoverageScore: 50,
+        evidenceCoverageScore: 0, // Public storefront feeds do not provide lab evidence documents
         externalDiscoveryStatus: 'observed_in_sample',
         attributes: {},
         variants,
@@ -205,7 +210,7 @@ export async function ingestAndAnalyzeStore(
     return evaluateProductsCatalog(
       domainProducts, 
       origin, 
-      `Shopify Live Storefront (${domainProducts.length} Products Sampled)`, 
+      `Shopify Public Storefront Sample (${domainProducts.length} Products Sampled)`, 
       'real_scan'
     );
   } catch (err: unknown) {
@@ -268,8 +273,29 @@ export function evaluateProductsCatalog(
 
     if (!p.description || p.description.length < 20) {
       missingAttrsTotal++;
-      if (issues.length < 3 && !issues.some(i => i.includes('description'))) {
-        issues.push(`Product "${p.title}" lacks detailed physical description`);
+      if (issues.length < 6 && !issues.some(i => i.includes('description'))) {
+        issues.push(`Product "${p.title || 'Untitled'}" lacks detailed physical description`);
+      }
+    }
+
+    if (!p.brand || p.brand.trim() === '') {
+      missingAttrsTotal++;
+      if (issues.length < 6 && !issues.some(i => i.includes('brand'))) {
+        issues.push(`Product "${p.title || 'Untitled'}" lacks manufacturer brand specification`);
+      }
+    }
+
+    if (!p.category || p.category.trim() === '') {
+      missingAttrsTotal++;
+      if (issues.length < 6 && !issues.some(i => i.includes('category'))) {
+        issues.push(`Product "${p.title || 'Untitled'}" lacks standardized taxonomy/category`);
+      }
+    }
+
+    if (!p.image || p.image.trim() === '') {
+      missingAttrsTotal++;
+      if (issues.length < 6 && !issues.some(i => i.includes('image'))) {
+        issues.push(`Product "${p.title || 'Untitled'}" lacks primary product image asset`);
       }
     }
   }
@@ -300,7 +326,7 @@ export function evaluateProductsCatalog(
     sampleIssues: issues,
     scanStatus,
     notice: scanStatus === 'demo_fixture'
-      ? 'Evaluated Solstice Mercantile catalog fixtures using deterministic rules.'
-      : `Live scan evaluated ${products.length} products and ${totalVariants} variants.`,
+      ? 'Evaluated Solstice Mercantile demo catalog fixtures using deterministic rules.'
+      : `Sample evaluation scanned ${products.length} products and ${totalVariants} variants from public feed. Full inventory requires authorized Store Connector.`,
   };
 }
