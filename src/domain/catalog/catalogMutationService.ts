@@ -224,8 +224,8 @@ export function executeActionApproval(
     };
   }
 
-  const valueToApply = customApprovedValue !== undefined && customApprovedValue.trim() !== ''
-    ? customApprovedValue.trim()
+  const valueToApply = customApprovedValue !== undefined
+    ? customApprovedValue
     : item.proposedChange.to;
 
   let nextProducts = ctx.products;
@@ -282,7 +282,19 @@ export function executeActionApproval(
 
       let numericPrice: number | undefined;
       if (targetProperty === 'price') {
-        numericPrice = Number(valueToApply);
+        const rawPrice = valueToApply === undefined || valueToApply === null ? '' : String(valueToApply);
+        if (rawPrice.trim() === '') {
+          return {
+            success: false,
+            errorCode: 'UNSUPPORTED_FIELD',
+            message: `Invalid price "${valueToApply}". Price cannot be empty or whitespace.`,
+            nextProducts: ctx.products,
+            nextFindings: ctx.findings,
+            nextActions: ctx.actionItems,
+            nextStoreProfile: ctx.storeProfile,
+          };
+        }
+        numericPrice = Number(rawPrice.trim());
         if (isNaN(numericPrice) || numericPrice < 0 || !isFinite(numericPrice)) {
           return {
             success: false,
@@ -606,10 +618,16 @@ export function executeActionRecheck(
               failureReason = `Variant title "${targetVariant.title || '(empty)'}" does not match approved value "${expectedValue}".`;
             }
           } else if (targetProperty === 'price') {
-            const expectedPrice = Number(expectedValue);
-            if (targetVariant.price !== expectedPrice) {
+            const rawExpected = expectedValue === undefined || expectedValue === null ? '' : String(expectedValue).trim();
+            if (rawExpected === '') {
               isValid = false;
-              failureReason = `Variant price "${targetVariant.price}" does not match approved value "${expectedPrice}".`;
+              failureReason = `Expected price is empty or invalid.`;
+            } else {
+              const expectedPrice = Number(rawExpected);
+              if (isNaN(expectedPrice) || !isFinite(expectedPrice) || targetVariant.price !== expectedPrice) {
+                isValid = false;
+                failureReason = `Variant price "${targetVariant.price}" does not match approved value "${expectedPrice}".`;
+              }
             }
           }
         }

@@ -359,50 +359,135 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(recheck.verificationStatus, 'verified_in_catalog');
     });
 
-    it('variants[0].price updates price and rejects invalid numeric values', () => {
-      // 1. Rejects invalid non-numeric price
+    it('variants[0].price updates price and strictly validates all numeric and string boundaries', () => {
+      const candle = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const originalPrice = candle.variants[0].price;
+      const originalBarcode = candle.variants[0].barcode;
+
+      // 1. Rejects empty string (both via proposedChange.to and customApprovedValue)
       coordinator.actionItems.push({
-        id: 'act_bad_price',
-        findingId: 'find_bad_price',
+        id: 'act_empty_price',
+        findingId: 'find_empty_price',
         productId: 'prod_solstice_04',
-        title: 'Set Invalid Price',
+        title: 'Set Empty Price',
         severity: 'medium',
         status: 'pending_review',
         evidenceRequired: false,
         proposedChange: {
           field: 'variants[0].price',
           from: '34',
-          to: 'invalid_price_abc',
+          to: '',
         },
         verificationStatus: 'unverified',
       });
 
-      const resBad = coordinator.approveAction('act_bad_price');
-      assert.equal(resBad.success, false);
-      assert.equal(resBad.errorCode, 'UNSUPPORTED_FIELD');
+      const resEmpty = coordinator.approveAction('act_empty_price');
+      assert.equal(resEmpty.success, false, 'Empty string price must be rejected');
+      assert.equal(resEmpty.errorCode, 'UNSUPPORTED_FIELD');
+      assert.equal(candle.variants[0].price, originalPrice, 'Stored price must not be modified by empty string');
+      assert.equal(coordinator.actionItems.find(a => a.id === 'act_empty_price')?.status, 'pending_review');
 
-      // 2. Rejects negative price
+      // Also reject when customApprovedValue is empty string
       coordinator.actionItems.push({
-        id: 'act_neg_price',
-        findingId: 'find_neg_price',
+        id: 'act_custom_empty_price',
+        findingId: 'find_custom_empty_price',
         productId: 'prod_solstice_04',
-        title: 'Set Negative Price',
+        title: 'Set Custom Empty Price',
         severity: 'medium',
         status: 'pending_review',
         evidenceRequired: false,
         proposedChange: {
           field: 'variants[0].price',
           from: '34',
-          to: '-10.50',
+          to: '45.00',
+        },
+        verificationStatus: 'unverified',
+      });
+      const resCustomEmpty = coordinator.approveAction('act_custom_empty_price', '');
+      assert.equal(resCustomEmpty.success, false, 'Custom empty string price must be rejected');
+      assert.equal(resCustomEmpty.errorCode, 'UNSUPPORTED_FIELD');
+      assert.equal(candle.variants[0].price, originalPrice, 'Stored price must not be modified by custom empty string');
+
+      // 2. Rejects whitespace-only string (spaces, tabs, newlines)
+      coordinator.actionItems.push({
+        id: 'act_whitespace_price',
+        findingId: 'find_ws_price',
+        productId: 'prod_solstice_04',
+        title: 'Set Whitespace Price',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '   \t  \n  ',
         },
         verificationStatus: 'unverified',
       });
 
-      const resNeg = coordinator.approveAction('act_neg_price');
-      assert.equal(resNeg.success, false);
-      assert.equal(resNeg.errorCode, 'UNSUPPORTED_FIELD');
+      const resWs = coordinator.approveAction('act_whitespace_price');
+      assert.equal(resWs.success, false, 'Whitespace-only price must be rejected');
+      assert.equal(resWs.errorCode, 'UNSUPPORTED_FIELD');
+      assert.equal(candle.variants[0].price, originalPrice, 'Stored price must not be modified by whitespace-only string');
+      assert.equal(coordinator.actionItems.find(a => a.id === 'act_whitespace_price')?.status, 'pending_review');
 
-      // 3. Accepts valid numeric price and updates variant.price as number
+      // 3. Rejects negative values, non-numeric values, NaN, and positive/negative infinity
+      const invalidPriceValues = ['-10.50', '-0.01', 'invalid_price_abc', 'NaN', 'Infinity', '-Infinity'];
+      for (const [idx, badVal] of invalidPriceValues.entries()) {
+        const badId = `act_bad_val_${idx}`;
+        coordinator.actionItems.push({
+          id: badId,
+          findingId: `find_bad_val_${idx}`,
+          productId: 'prod_solstice_04',
+          title: `Set Bad Price ${badVal}`,
+          severity: 'medium',
+          status: 'pending_review',
+          evidenceRequired: false,
+          proposedChange: {
+            field: 'variants[0].price',
+            from: '34',
+            to: badVal,
+          },
+          verificationStatus: 'unverified',
+        });
+
+        const resBad = coordinator.approveAction(badId);
+        assert.equal(resBad.success, false, `Price value "${badVal}" must be rejected`);
+        assert.equal(resBad.errorCode, 'UNSUPPORTED_FIELD');
+        assert.equal(candle.variants[0].price, originalPrice, `Stored price must not be modified by "${badVal}"`);
+        assert.equal(coordinator.actionItems.find(a => a.id === badId)?.status, 'pending_review');
+      }
+
+      // 4. Accepts valid numeric zero and updates variant.price as number 0
+      coordinator.actionItems.push({
+        id: 'act_zero_price',
+        findingId: 'find_zero_price',
+        productId: 'prod_solstice_04',
+        title: 'Set Promotional Zero Price',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '0',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const resZero = coordinator.approveAction('act_zero_price');
+      assert.equal(resZero.success, true, 'Valid numeric zero price must be accepted');
+      const candleZero = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleZero.variants[0].price, 0);
+      assert.equal(typeof candleZero.variants[0].price, 'number');
+
+      // Re-check verifies numeric zero
+      const recheckZero = coordinator.recheckAction('act_zero_price');
+      assert.equal(recheckZero.success, true);
+      assert.equal(recheckZero.isVerified, true);
+      assert.equal(recheckZero.verificationStatus, 'verified_in_catalog');
+
+      // 5. Accepts a valid positive price and updates variant.price as number
       coordinator.actionItems.push({
         id: 'act_valid_price',
         findingId: 'find_valid_price',
@@ -413,22 +498,19 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         evidenceRequired: false,
         proposedChange: {
           field: 'variants[0].price',
-          from: '34',
+          from: '0',
           to: '38.50',
         },
         verificationStatus: 'unverified',
       });
 
-      const candleBefore = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
-      const originalBarcode = candleBefore.variants[0].barcode;
-
       const resValid = coordinator.approveAction('act_valid_price');
       assert.equal(resValid.success, true);
 
-      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleAfter.variants[0].price, 38.5);
-      assert.equal(typeof candleAfter.variants[0].price, 'number');
-      assert.equal(candleAfter.variants[0].barcode, originalBarcode, 'Barcode must not be overwritten with price');
+      const candlePositive = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candlePositive.variants[0].price, 38.5);
+      assert.equal(typeof candlePositive.variants[0].price, 'number');
+      assert.equal(candlePositive.variants[0].barcode, originalBarcode, 'Barcode must not be overwritten with price');
 
       // Re-check verifies exact price
       const recheck = coordinator.recheckAction('act_valid_price');
