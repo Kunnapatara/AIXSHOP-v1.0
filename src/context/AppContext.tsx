@@ -15,6 +15,7 @@ import {
 } from '../data/mockData';
 import { CatalogStorageAdapter } from '../domain/storage/storageAdapter';
 import { StoragePayloadV1, StorageLoadResult } from '../domain/storage/storageTypes';
+import { isValidGtin13 } from '../domain/validation/gtin';
 
 export interface ToastMessage {
   id: string;
@@ -27,6 +28,7 @@ interface AppContextType {
   currentPage: NavigationPage;
   previousPage: NavigationPage;
   selectedProductId: string | null;
+  selectedActionId: string | null;
   storeProfile: StoreProfile;
   products: Product[];
   findings: Finding[];
@@ -41,11 +43,12 @@ interface AppContextType {
   storageLoadResult: StorageLoadResult | null;
   isDurableStorage: boolean;
   setMobileMenuOpen: (open: boolean) => void;
-  navigateTo: (page: NavigationPage, productId?: string, fromPage?: NavigationPage) => void;
+  setSelectedActionId: (id: string | null) => void;
+  navigateTo: (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => void;
   viewProductDetail: (productId: string, fromPage?: NavigationPage) => void;
   returnFromProductDetail: () => void;
   runStoreCheck: (url: string) => Promise<void>;
-  approveAction: (actionId: string) => void;
+  approveAction: (actionId: string, customApprovedValue?: string) => void;
   dismissAction: (actionId: string) => void;
   recheckAction: (actionId: string) => void;
   recheckProduct: (productId: string) => void;
@@ -68,6 +71,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [currentPage, setCurrentPage] = useState<NavigationPage>('home');
   const [previousPage, setPreviousPage] = useState<NavigationPage>('home');
   const [selectedProductId, setSelectedProductId] = useState<string | null>('prod_solstice_01');
+  const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
   const [storeProfile, setStoreProfile] = useState<StoreProfile>(initialStoreProfile);
   const [products, setProducts] = useState<Product[]>(initialProducts);
   const [findings, setFindings] = useState<Finding[]>(initialFindings);
@@ -102,7 +106,12 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     nextProfile: StoreProfile
   ) => {
     if (isReadOnlyMode) {
-      return;
+      return {
+        success: false,
+        error: 'Storage is in read-only compatibility mode.',
+        isBlockedByReadOnly: true,
+        isDurable: storageAdapter.isDurable(),
+      };
     }
 
     const payload: StoragePayloadV1 = {
@@ -119,6 +128,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     if (!res.success && res.isQuotaExceeded) {
       addToast('Storage Quota Full', 'Local browser storage quota exceeded. State is preserved in memory only.', 'warning');
     }
+    return res;
   };
 
   // Hydrate from Storage on initial mount
@@ -163,20 +173,24 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   }, []);
 
-  const navigateTo = (page: NavigationPage, productId?: string, fromPage?: NavigationPage) => {
+  const navigateTo = (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => {
     setMobileMenuOpen(false);
     window.scrollTo({ top: 0, behavior: 'smooth' });
 
     if (page === 'product-detail') {
-      if (productId) {
-        setSelectedProductId(productId);
+      if (entityId) {
+        setSelectedProductId(entityId);
       }
       setPreviousPage(fromPage || currentPage);
       setCurrentPage('product-detail');
       return;
     }
 
-    setPreviousPage(currentPage);
+    if (page === 'actions' && entityId) {
+      setSelectedActionId(entityId);
+    }
+
+    setPreviousPage(fromPage || currentPage);
     setCurrentPage(page);
   };
 
@@ -228,7 +242,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     );
   };
 
-  const approveAction = (actionId: string) => {
+  const approveAction = (actionId: string, customApprovedValue?: string) => {
     if (isReadOnlyMode) {
       addToast('Action Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
       return;
@@ -237,12 +251,25 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     const item = actionItems.find(a => a.id === actionId);
     if (!item) return;
 
+    if (item.status !== 'pending_review') {
+      addToast('Action Ineligible', `Action "${item.title}" is already ${item.status.replace(/_/g, ' ')}.`, 'info');
+      return;
+    }
+
+    const valueToApply = customApprovedValue !== undefined && customApprovedValue.trim() !== ''
+      ? customApprovedValue
+      : item.proposedChange.to;
+
     const nextActions = actionItems.map(act => {
       if (act.id === actionId) {
         return {
           ...act,
           status: 'approved' as const,
           approvedAt: new Date().toISOString(),
+          proposedChange: {
+            ...act.proposedChange,
+            to: valueToApply,
+          },
           verificationStatus: 'verified_in_catalog' as const,
           recheckNotes: 'Merchant approved in AIXSHOP. Internal catalog model updated.',
         };
@@ -257,15 +284,73 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       return f;
     });
 
+    // Update target product specification in the catalog if action targets a product
+    let nextProducts = products;
+    if (item.productId) {
+      const targetExists = products.some(prod => prod.id === item.productId);
+      if (!targetExists) {
+        addToast(
+          'Target Not Found',
+          `Cannot approve action: Target product "${item.productId}" was not found in catalog.`,
+          'error'
+        );
+        return;
+      }
+
+      nextProducts = products.map(prod => {
+        if (prod.id !== item.productId) return prod;
+
+        const updatedProd = { ...prod };
+        const changeField = item.proposedChange.field;
+
+        if (changeField.startsWith('variants[') && changeField.includes('barcode')) {
+          // Parse index if specified, e.g. variants[0].barcode
+          const match = changeField.match(/variants\[(\d+)\]/);
+          const targetIndex = match ? parseInt(match[1], 10) : 0;
+          updatedProd.variants = prod.variants.map((v, idx) => {
+            if (idx === targetIndex || (!v.barcode && idx === 0)) {
+              return { ...v, barcode: valueToApply };
+            }
+            return v;
+          });
+        } else if (changeField.startsWith('attributes.')) {
+          const attrKey = changeField.replace('attributes.', '');
+          updatedProd.attributes = {
+            ...prod.attributes,
+            [attrKey]: valueToApply,
+          };
+        } else if (changeField.includes('title')) {
+          // Marketing claim reconciliation
+          updatedProd.attributes = {
+            ...prod.attributes,
+            verifiedBurnTime: valueToApply,
+          };
+        }
+
+        // Increment completeness score upon verified remediation without exceeding 100
+        updatedProd.completenessScore = Math.min(100, prod.completenessScore + 6);
+        return updatedProd;
+      });
+      setProducts(nextProducts);
+    }
+
     setActionItems(nextActions);
     setFindings(nextFindings);
-    persistState(products, nextFindings, nextActions, storeProfile);
+    const saveRes = persistState(nextProducts, nextFindings, nextActions, storeProfile);
 
-    addToast(
-      'Remediation Approved',
-      `Approved change for ${item.title}. AIXSHOP internal catalog updated. Note: External live write-back requires connector authorization.`,
-      'success'
-    );
+    if (saveRes && !saveRes.success) {
+      addToast(
+        'Action Approved (Session Only)',
+        `Approved ${item.title}. Warning: Persistence to storage failed (${saveRes.error}).`,
+        'warning'
+      );
+    } else {
+      addToast(
+        'Remediation Approved',
+        `Approved change for ${item.title}. AIXSHOP internal catalog updated. Note: External live write-back requires connector authorization.`,
+        'success'
+      );
+    }
   };
 
   const dismissAction = (actionId: string) => {
@@ -300,26 +385,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     const item = actionItems.find(a => a.id === actionId);
     if (!item) return;
 
-    if (item.status === 'approved') {
-      const nextActions = actionItems.map(act => {
-        if (act.id === actionId) {
-          return {
-            ...act,
-            verificationStatus: 'verified_in_catalog' as const,
-            lastRecheckTimestamp: new Date().toISOString(),
-            recheckNotes: 'Re-check validated against local catalog schema rules: All format requirements met.',
-          };
-        }
-        return act;
-      });
-      setActionItems(nextActions);
-      persistState(products, findings, nextActions, storeProfile);
-      addToast(
-        'Re-check Verified',
-        `Catalog consistency confirmed for "${item.title}". Meets schema requirements.`,
-        'success'
-      );
-    } else {
+    if (item.status !== 'approved') {
       const nextActions = actionItems.map(act => {
         if (act.id === actionId) {
           return {
@@ -338,6 +404,82 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         `Re-check observed that "${item.title}" still requires merchant review or evidence.`,
         'warning'
       );
+      return;
+    }
+
+    // Execute genuine validation against catalog data
+    let isValid = true;
+    let failureReason = '';
+
+    if (item.productId) {
+      const targetProd = products.find(p => p.id === item.productId);
+      if (!targetProd) {
+        isValid = false;
+        failureReason = `Target product "${item.productId}" not found in catalog.`;
+      } else {
+        const changeField = item.proposedChange.field;
+        const expectedValue = item.proposedChange.to;
+
+        if (changeField.startsWith('variants[') && changeField.includes('barcode')) {
+          const match = changeField.match(/variants\[(\d+)\]/);
+          const targetIndex = match ? parseInt(match[1], 10) : 0;
+          const targetVariant = targetProd.variants[targetIndex] || targetProd.variants[0];
+
+          if (!targetVariant || targetVariant.barcode !== expectedValue) {
+            isValid = false;
+            failureReason = `Variant barcode does not match approved value (${targetVariant?.barcode || 'empty'}).`;
+          } else if (!isValidGtin13(targetVariant.barcode)) {
+            isValid = false;
+            failureReason = `Variant barcode "${targetVariant.barcode}" fails GTIN-13 check digit validation.`;
+          }
+        } else if (changeField.startsWith('attributes.')) {
+          const attrKey = changeField.replace('attributes.', '');
+          const currentVal = targetProd.attributes[attrKey];
+          if (currentVal !== expectedValue) {
+            isValid = false;
+            failureReason = `Attribute "${attrKey}" does not match approved value.`;
+          }
+        } else if (changeField.includes('title')) {
+          if (targetProd.attributes.verifiedBurnTime !== expectedValue) {
+            isValid = false;
+            failureReason = 'Specification claim reconciliation not found in attributes.';
+          }
+        }
+      }
+    }
+
+    const nextVerificationStatus = isValid ? ('verified_in_catalog' as const) : ('verification_failed' as const);
+    const recheckNotes = isValid
+      ? 'Re-check validated against local catalog schema rules: All format requirements met.'
+      : `Re-check failed: ${failureReason}`;
+
+    const nextActions = actionItems.map(act => {
+      if (act.id === actionId) {
+        return {
+          ...act,
+          verificationStatus: nextVerificationStatus,
+          lastRecheckTimestamp: new Date().toISOString(),
+          recheckNotes,
+        };
+      }
+      return act;
+    });
+
+    setActionItems(nextActions);
+    persistState(products, findings, nextActions, storeProfile);
+
+    if (isValid) {
+      addToast(
+        'Re-check Verified',
+        `Catalog consistency confirmed for "${item.title}". Meets schema requirements.`,
+        'success'
+      );
+    } else {
+      addToast(
+        'Re-check Failed',
+        `Verification failed for "${item.title}": ${failureReason}`,
+        'error'
+      );
     }
   };
 
@@ -353,6 +495,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       return;
     }
 
+    const hasInvalidBarcode = prod.variants.some(v => v.barcode && !isValidGtin13(v.barcode));
+    const hasMissingBarcode = prod.variants.some(v => !v.barcode);
+
     const nextProducts = products.map(p => {
       if (p.id === productId) {
         return {
@@ -366,11 +511,25 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     setProducts(nextProducts);
     persistState(nextProducts, findings, actionItems, storeProfile);
 
-    addToast(
-      'Catalog Re-check Executed',
-      `Re-analyzed schema consistency for "${prod.title}". Findings updated.`,
-      'info'
-    );
+    if (hasInvalidBarcode) {
+      addToast(
+        'Validation Warning',
+        `Variant on "${prod.title}" has invalid GTIN check digit.`,
+        'warning'
+      );
+    } else if (hasMissingBarcode) {
+      addToast(
+        'Catalog Re-check Executed',
+        `Re-analyzed schema consistency for "${prod.title}". Missing GTIN detected on variant.`,
+        'info'
+      );
+    } else {
+      addToast(
+        'Catalog Re-check Executed',
+        `Re-analyzed schema consistency for "${prod.title}". All variant identifiers valid.`,
+        'success'
+      );
+    }
   };
 
   const updateStoreProfile = (updates: Partial<StoreProfile>) => {
@@ -428,6 +587,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         currentPage,
         previousPage,
         selectedProductId,
+        selectedActionId,
         storeProfile,
         products,
         findings,
@@ -442,6 +602,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         storageLoadResult,
         isDurableStorage: storageAdapter.isDurable(),
         setMobileMenuOpen,
+        setSelectedActionId,
         navigateTo,
         viewProductDetail,
         returnFromProductDetail,

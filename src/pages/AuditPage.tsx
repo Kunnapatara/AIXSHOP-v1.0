@@ -274,7 +274,7 @@ export const AuditPage: React.FC = () => {
                   </div>
 
                   <button
-                    onClick={() => navigateTo('actions')}
+                    onClick={() => navigateTo('actions', finding.actionItemId)}
                     className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-1.5 transition-colors shrink-0 shadow-xs min-h-[38px]"
                   >
                     <span>Inspect in Action Center</span>

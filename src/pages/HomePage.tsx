@@ -252,7 +252,7 @@ export const HomePage: React.FC = () => {
                       Why it matters: {finding.whyItMatters.substring(0, 70)}...
                     </span>
                     <button
-                      onClick={() => navigateTo('actions')}
+                      onClick={() => navigateTo('actions', finding.actionItemId)}
                       className="text-xs font-semibold text-orange-600 hover:text-orange-700 shrink-0 ml-2"
                     >
                       Remediate →
@@ -304,7 +304,7 @@ export const HomePage: React.FC = () => {
                       {action.evidenceRequired ? 'Evidence required' : 'Self-certifiable'}
                     </span>
                     <button
-                      onClick={() => navigateTo('actions')}
+                      onClick={() => navigateTo('actions', action.id)}
                       className="text-xs font-semibold text-stone-900 hover:text-orange-600"
                     >
                       Review & Approve

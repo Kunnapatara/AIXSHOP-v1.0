@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import { ActionItem, ActionStatus } from '../types';
 import { 
@@ -23,6 +23,8 @@ export const ActionsPage: React.FC = () => {
     dismissAction, 
     recheckAction, 
     viewProductDetail,
+    selectedActionId,
+    setSelectedActionId,
     navigateTo 
   } = useApp();
 
@@ -30,6 +32,19 @@ export const ActionsPage: React.FC = () => {
   const [selectedAction, setSelectedAction] = useState<ActionItem | null>(null);
   const [editedValue, setEditedValue] = useState<string>('');
   const [isEditingValue, setIsEditingValue] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (selectedActionId) {
+      const target = actionItems.find(a => a.id === selectedActionId);
+      if (target) {
+        setStatusFilter('all');
+        setSelectedAction(target);
+        setEditedValue(target.proposedChange.to);
+        setIsEditingValue(false);
+      }
+      setSelectedActionId(null);
+    }
+  }, [selectedActionId, actionItems, setSelectedActionId]);
 
   const filteredActions = useMemo(() => {
     return actionItems.filter(act => {
@@ -46,7 +61,7 @@ export const ActionsPage: React.FC = () => {
 
   const handleConfirmApproval = () => {
     if (!selectedAction) return;
-    approveAction(selectedAction.id);
+    approveAction(selectedAction.id, editedValue);
     setSelectedAction(null);
   };
 

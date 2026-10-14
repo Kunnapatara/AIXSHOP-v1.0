@@ -70,7 +70,7 @@ export const ProductDetailPage: React.FC = () => {
           aria-label={`Return to ${previousPage}`}
         >
           <ArrowLeft className="w-4 h-4" />
-          <span>Back to {previousPage === 'audit' ? 'Audit Findings' : previousPage === 'actions' ? 'Action Center' : 'Products Catalog'}</span>
+          <span>Back to {previousPage === 'audit' ? 'Audit Findings' : previousPage === 'actions' ? 'Action Center' : previousPage === 'home' ? 'Store Home' : 'Products Catalog'}</span>
         </button>
 
         <div className="flex items-center gap-2">
@@ -169,7 +169,7 @@ export const ProductDetailPage: React.FC = () => {
             </div>
 
             <button
-              onClick={() => navigateTo('actions')}
+              onClick={() => navigateTo('actions', productFindings[0]?.actionItemId)}
               className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg shrink-0 whitespace-nowrap shadow-xs"
             >
               Resolve in Actions →
