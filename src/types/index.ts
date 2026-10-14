@@ -148,4 +148,6 @@ export interface QuickHealthCheckResult {
   missingAttributesCount: number;
   detectedPlatform: string;
   sampleIssues: string[];
+  scanStatus?: 'real_scan' | 'partial_scan' | 'unsupported_store' | 'network_failure' | 'demo_fixture';
+  notice?: string;
 }

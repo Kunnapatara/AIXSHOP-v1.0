@@ -25,7 +25,8 @@ export const ActionsPage: React.FC = () => {
     viewProductDetail,
     selectedActionId,
     setSelectedActionId,
-    navigateTo 
+    navigateTo,
+    isReadOnlyMode 
   } = useApp();
 
   const [statusFilter, setStatusFilter] = useState<'all' | ActionStatus>('all');
@@ -220,7 +221,13 @@ export const ActionsPage: React.FC = () => {
                   {/* Re-check Button */}
                   <button
                     onClick={() => recheckAction(action.id)}
-                    className="px-2.5 py-1 text-xs font-medium text-stone-700 bg-stone-100 hover:bg-stone-200 rounded flex items-center gap-1 transition-colors"
+                    disabled={isReadOnlyMode}
+                    title={isReadOnlyMode ? 'Re-check is disabled in read-only mode' : 'Run Re-check'}
+                    className={`px-2.5 py-1 text-xs font-medium rounded flex items-center gap-1 transition-colors ${
+                      isReadOnlyMode
+                        ? 'bg-stone-100 text-stone-400 cursor-not-allowed opacity-60'
+                        : 'text-stone-700 bg-stone-100 hover:bg-stone-200'
+                    }`}
                   >
                     <RefreshCw className="w-3 h-3" />
                     <span>Run Re-check</span>
@@ -245,13 +252,25 @@ export const ActionsPage: React.FC = () => {
                       <>
                         <button
                           onClick={() => dismissAction(action.id)}
-                          className="px-3 py-2 text-xs font-medium text-stone-600 hover:text-rose-700 hover:bg-rose-50 rounded-lg transition-colors min-h-[38px]"
+                          disabled={isReadOnlyMode}
+                          title={isReadOnlyMode ? 'Disabled in read-only mode' : 'Dismiss action'}
+                          className={`px-3 py-2 text-xs font-medium rounded-lg transition-colors min-h-[38px] ${
+                            isReadOnlyMode
+                              ? 'text-stone-400 bg-stone-50 cursor-not-allowed opacity-60'
+                              : 'text-stone-600 hover:text-rose-700 hover:bg-rose-50'
+                          }`}
                         >
                           Dismiss
                         </button>
                         <button
                           onClick={() => approveAction(action.id)}
-                          className="px-4 py-2 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-700 rounded-lg shadow-xs transition-colors min-h-[38px]"
+                          disabled={isReadOnlyMode}
+                          title={isReadOnlyMode ? 'Disabled in read-only mode' : 'Approve Remediation'}
+                          className={`px-4 py-2 text-xs font-semibold rounded-lg shadow-xs transition-colors min-h-[38px] ${
+                            isReadOnlyMode
+                              ? 'bg-stone-300 text-stone-500 cursor-not-allowed'
+                              : 'text-white bg-orange-600 hover:bg-orange-700'
+                          }`}
                         >
                           Approve Remediation
                         </button>
@@ -337,16 +356,26 @@ export const ActionsPage: React.FC = () => {
                 {selectedAction.status === 'pending_review' && (
                   <button
                     onClick={handleConfirmDismiss}
-                    className="px-3 py-2 text-xs font-medium text-rose-700 hover:bg-rose-50 rounded-lg"
+                    disabled={isReadOnlyMode}
+                    className={`px-3 py-2 text-xs font-medium rounded-lg ${
+                      isReadOnlyMode
+                        ? 'text-stone-400 bg-stone-50 cursor-not-allowed opacity-60'
+                        : 'text-rose-700 hover:bg-rose-50'
+                    }`}
                   >
                     Dismiss Finding
                   </button>
                 )}
                 <button
                   onClick={handleConfirmApproval}
-                  className="px-4 py-2 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-700 rounded-lg shadow-xs"
+                  disabled={isReadOnlyMode}
+                  className={`px-4 py-2 text-xs font-semibold rounded-lg shadow-xs ${
+                    isReadOnlyMode
+                      ? 'bg-stone-300 text-stone-500 cursor-not-allowed'
+                      : 'text-white bg-orange-600 hover:bg-orange-700'
+                  }`}
                 >
-                  Approve & Record Verification
+                  Approve Remediation
                 </button>
               </div>
             </div>

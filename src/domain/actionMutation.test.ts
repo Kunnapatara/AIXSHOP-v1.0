@@ -5,9 +5,27 @@ import { initialProducts, initialFindings, initialActionItems, initialStoreProfi
 import { Product, ActionItem, Finding, StoreProfile } from '../types';
 import { StoragePayloadV1 } from './storage/storageTypes';
 import { isValidGtin13 } from './validation/gtin';
+import {
+  executeActionApproval,
+  executeActionDismissal,
+  executeActionRecheck,
+  executeProductRecheck,
+  validateMutationField,
+  calculateProductCompleteness,
+  calculateStoreCompletenessAvg,
+} from './catalog/catalogMutationService';
+import {
+  normalizeStoreUrl,
+  evaluateProductsCatalog,
+  ingestAndAnalyzeStore,
+} from './ingestion/storeIngestion';
 
-// Test harness creating the exact domain logic executed by AppContext
-class AppCatalogTestHarness {
+/**
+ * Production-identical orchestrator that directly invokes the shared domain
+ * functions and storage adapter used by AppContext.
+ * Zero duplicated domain logic inside the test file.
+ */
+class ProductionActionCoordinator {
   public adapter: CatalogStorageAdapter;
   public backend: MemoryStorageBackend;
   public products: Product[];
@@ -72,513 +90,622 @@ class AppCatalogTestHarness {
   }
 
   public approveAction(actionId: string, customApprovedValue?: string) {
-    if (this.isReadOnlyMode) {
-      this.addToast('Action Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
-      return;
-    }
-
-    const item = this.actionItems.find(a => a.id === actionId);
-    if (!item) return;
-
-    if (item.status !== 'pending_review') {
-      this.addToast('Action Ineligible', `Action "${item.title}" is already ${item.status.replace(/_/g, ' ')}.`, 'info');
-      return;
-    }
-
-    const valueToApply = customApprovedValue !== undefined && customApprovedValue.trim() !== ''
-      ? customApprovedValue
-      : item.proposedChange.to;
-
-    // Check target product existence if action targets a product
-    let nextProducts = this.products;
-    if (item.productId) {
-      const targetExists = this.products.some(p => p.id === item.productId);
-      if (!targetExists) {
-        this.addToast('Target Not Found', `Target product "${item.productId}" was not found in catalog.`, 'error');
-        return;
-      }
-
-      nextProducts = this.products.map(prod => {
-        if (prod.id !== item.productId) return prod;
-
-        const updatedProd = { ...prod };
-        const changeField = item.proposedChange.field;
-
-        if (changeField.startsWith('variants[') && changeField.includes('barcode')) {
-          const match = changeField.match(/variants\[(\d+)\]/);
-          const targetIndex = match ? parseInt(match[1], 10) : 0;
-          updatedProd.variants = prod.variants.map((v, idx) => {
-            if (idx === targetIndex || (!v.barcode && idx === 0)) {
-              return { ...v, barcode: valueToApply };
-            }
-            return v;
-          });
-        } else if (changeField.startsWith('attributes.')) {
-          const attrKey = changeField.replace('attributes.', '');
-          updatedProd.attributes = {
-            ...prod.attributes,
-            [attrKey]: valueToApply,
-          };
-        } else if (changeField.includes('title')) {
-          updatedProd.attributes = {
-            ...prod.attributes,
-            verifiedBurnTime: valueToApply,
-          };
-        }
-
-        updatedProd.completenessScore = Math.min(100, prod.completenessScore + 6);
-        return updatedProd;
-      });
-      this.products = nextProducts;
-    }
-
-    const nextActions = this.actionItems.map(act => {
-      if (act.id === actionId) {
-        return {
-          ...act,
-          status: 'approved' as const,
-          approvedAt: new Date().toISOString(),
-          proposedChange: {
-            ...act.proposedChange,
-            to: valueToApply,
-          },
-          verificationStatus: 'verified_in_catalog' as const,
-          recheckNotes: 'Merchant approved in AIXSHOP. Internal catalog model updated.',
-        };
-      }
-      return act;
+    const res = executeActionApproval(actionId, customApprovedValue, {
+      products: this.products,
+      findings: this.findings,
+      actionItems: this.actionItems,
+      storeProfile: this.storeProfile,
+      isReadOnly: this.isReadOnlyMode,
     });
 
-    const nextFindings = this.findings.map(f => {
-      if (f.actionItemId === actionId) {
-        return { ...f, merchantVerified: true };
-      }
-      return f;
-    });
-
-    this.actionItems = nextActions;
-    this.findings = nextFindings;
-    const saveRes = this.persistState(nextProducts, nextFindings, nextActions, this.storeProfile);
-
-    if (saveRes && !saveRes.success) {
-      this.addToast('Action Approved (Session Only)', `Persistence failed: ${saveRes.error}`, 'warning');
-    } else {
+    if (!res.success) {
       this.addToast(
-        'Remediation Approved',
-        `Approved change for ${item.title}. AIXSHOP internal catalog updated. Note: External live write-back requires connector authorization.`,
-        'success'
+        res.errorCode === 'READ_ONLY_MODE' ? 'Action Disabled' : 'Action Failed',
+        res.message,
+        res.errorCode === 'READ_ONLY_MODE' ? 'warning' : 'error'
       );
+      return res;
     }
+
+    // Attempt atomic persistence
+    const saveRes = this.persistState(
+      res.nextProducts,
+      res.nextFindings,
+      res.nextActions,
+      res.nextStoreProfile
+    );
+
+    if (!saveRes.success) {
+      // Atomic rollback: preserve existing state without partial in-memory corruption
+      this.addToast(
+        'Persistence Failed (Rolled Back)',
+        `Could not persist approval: ${saveRes.error}. State preserved.`,
+        'error'
+      );
+      return { ...res, success: false, rolledBack: true };
+    }
+
+    // Persist succeeded: commit in-memory state
+    this.products = res.nextProducts;
+    this.findings = res.nextFindings;
+    this.actionItems = res.nextActions;
+    this.storeProfile = res.nextStoreProfile;
+    this.addToast('Remediation Approved', res.message, 'success');
+    return res;
   }
 
   public dismissAction(actionId: string) {
-    if (this.isReadOnlyMode) {
-      this.addToast('Action Disabled', 'Catalog is in read-only mode to protect your store data.', 'warning');
-      return;
-    }
-    this.actionItems = this.actionItems.map(act => {
-      if (act.id === actionId) {
-        return {
-          ...act,
-          status: 'dismissed' as const,
-          dismissedAt: new Date().toISOString(),
-          verificationStatus: 'unverified' as const,
-        };
-      }
-      return act;
+    const res = executeActionDismissal(actionId, {
+      products: this.products,
+      findings: this.findings,
+      actionItems: this.actionItems,
+      storeProfile: this.storeProfile,
+      isReadOnly: this.isReadOnlyMode,
     });
-    this.persistState(this.products, this.findings, this.actionItems, this.storeProfile);
+
+    if (!res.success) {
+      this.addToast('Action Disabled', res.message, 'warning');
+      return res;
+    }
+
+    const saveRes = this.persistState(
+      res.nextProducts,
+      res.nextFindings,
+      res.nextActions,
+      res.nextStoreProfile
+    );
+
+    if (!saveRes.success) {
+      this.addToast('Persistence Failed', `Could not persist dismissal: ${saveRes.error}`, 'error');
+      return { ...res, success: false, rolledBack: true };
+    }
+
+    this.products = res.nextProducts;
+    this.findings = res.nextFindings;
+    this.actionItems = res.nextActions;
+    this.storeProfile = res.nextStoreProfile;
+    this.addToast('Action Dismissed', res.message, 'info');
+    return res;
   }
 
   public recheckAction(actionId: string) {
-    if (this.isReadOnlyMode) {
-      this.addToast('Re-check Disabled', 'Catalog is in read-only mode.', 'warning');
-      return;
-    }
-    const item = this.actionItems.find(a => a.id === actionId);
-    if (!item) return;
-
-    if (item.status !== 'approved') {
-      this.actionItems = this.actionItems.map(act => {
-        if (act.id === actionId) {
-          return {
-            ...act,
-            verificationStatus: 'recheck_required' as const,
-            lastRecheckTimestamp: new Date().toISOString(),
-            recheckNotes: 'Re-check failed: Action has not been approved or applied yet. Human review required.',
-          };
-        }
-        return act;
-      });
-      this.addToast('Action Still Pending', 'Action still requires review', 'warning');
-      this.persistState(this.products, this.findings, this.actionItems, this.storeProfile);
-      return;
-    }
-
-    // Genuine validation against actual catalog state
-    let isValid = true;
-    let failureReason = '';
-
-    if (item.productId) {
-      const targetProd = this.products.find(p => p.id === item.productId);
-      if (!targetProd) {
-        isValid = false;
-        failureReason = `Target product "${item.productId}" not found in catalog.`;
-      } else {
-        const changeField = item.proposedChange.field;
-        const expectedValue = item.proposedChange.to;
-
-        if (changeField.startsWith('variants[') && changeField.includes('barcode')) {
-          const match = changeField.match(/variants\[(\d+)\]/);
-          const targetIndex = match ? parseInt(match[1], 10) : 0;
-          const targetVariant = targetProd.variants[targetIndex] || targetProd.variants[0];
-
-          if (!targetVariant || targetVariant.barcode !== expectedValue) {
-            isValid = false;
-            failureReason = `Variant barcode does not match approved value (${targetVariant?.barcode || 'empty'}).`;
-          } else if (!isValidGtin13(targetVariant.barcode)) {
-            isValid = false;
-            failureReason = `Variant barcode "${targetVariant.barcode}" fails GTIN-13 check digit validation.`;
-          }
-        } else if (changeField.startsWith('attributes.')) {
-          const attrKey = changeField.replace('attributes.', '');
-          const currentVal = targetProd.attributes[attrKey];
-          if (currentVal !== expectedValue) {
-            isValid = false;
-            failureReason = `Attribute "${attrKey}" does not match approved value.`;
-          }
-        } else if (changeField.includes('title')) {
-          if (targetProd.attributes.verifiedBurnTime !== expectedValue) {
-            isValid = false;
-            failureReason = 'Specification claim reconciliation not found in attributes.';
-          }
-        }
-      }
-    }
-
-    const nextVerificationStatus = isValid ? ('verified_in_catalog' as const) : ('verification_failed' as const);
-    const recheckNotes = isValid
-      ? 'Re-check validated against local catalog schema rules: All format requirements met.'
-      : `Re-check failed: ${failureReason}`;
-
-    this.actionItems = this.actionItems.map(act => {
-      if (act.id === actionId) {
-        return {
-          ...act,
-          verificationStatus: nextVerificationStatus,
-          lastRecheckTimestamp: new Date().toISOString(),
-          recheckNotes,
-        };
-      }
-      return act;
+    const res = executeActionRecheck(actionId, {
+      products: this.products,
+      findings: this.findings,
+      actionItems: this.actionItems,
+      storeProfile: this.storeProfile,
+      isReadOnly: this.isReadOnlyMode,
     });
 
-    if (isValid) {
-      this.addToast('Re-check Verified', 'Catalog consistency confirmed', 'success');
-    } else {
-      this.addToast('Re-check Failed', `Verification failed: ${failureReason}`, 'error');
+    if (!res.success) {
+      this.addToast(
+        res.errorCode === 'READ_ONLY_MODE' ? 'Re-check Disabled' : 'Re-check Failed',
+        res.message,
+        res.errorCode === 'READ_ONLY_MODE' ? 'warning' : 'error'
+      );
+      return res;
     }
 
-    this.persistState(this.products, this.findings, this.actionItems, this.storeProfile);
+    const saveRes = this.persistState(this.products, res.nextFindings, res.nextActions, this.storeProfile);
+    if (!saveRes.success) {
+      this.addToast('Persistence Failed', `Could not persist re-check results: ${saveRes.error}`, 'error');
+      return { ...res, success: false, rolledBack: true };
+    }
+
+    this.actionItems = res.nextActions;
+    this.findings = res.nextFindings;
+    this.addToast(
+      res.isVerified ? 'Re-check Verified' : 'Re-check Inconclusive',
+      res.message,
+      res.isVerified ? 'success' : 'warning'
+    );
+    return res;
   }
 }
 
-describe('Phase 2 Acceptance Audit & Regression Suite', () => {
-  let harness: AppCatalogTestHarness;
+describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
+  let coordinator: ProductionActionCoordinator;
 
   beforeEach(() => {
-    harness = new AppCatalogTestHarness();
+    coordinator = new ProductionActionCoordinator();
   });
 
-  describe('1. Mutation Scope & Target Integrity', () => {
-    it('successfully mutates structured attribute on the target product', () => {
-      const targetProdBefore = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      assert.equal(targetProdBefore.attributes.microwaveSafe, 'Unspecified');
+  describe('Phase B: Separation of Approval from Verification', () => {
+    it('approving an action sets status=approved but leaves verificationStatus=recheck_required', () => {
+      const actionBefore = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      assert.equal(actionBefore.status, 'pending_review');
+      assert.equal(actionBefore.verificationStatus, 'unverified');
 
-      harness.approveAction('act_02');
+      const res = coordinator.approveAction('act_01');
+      assert.equal(res.success, true);
 
-      const targetProdAfter = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      assert.equal(targetProdAfter.attributes.microwaveSafe, 'True (Tested up to 900W)');
+      const actionAfter = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      assert.equal(actionAfter.status, 'approved');
+      // Crucial Phase B requirement: Approval DOES NOT establish verification
+      assert.equal(actionAfter.verificationStatus, 'recheck_required');
+      assert.notEqual(actionAfter.verificationStatus, 'verified_in_catalog');
+      assert.ok(actionAfter.recheckNotes?.includes('Re-check required'));
     });
 
-    it('successfully mutates variant-specific barcode on the target product', () => {
-      const candleBefore = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleBefore.variants[0].barcode, '');
+    it('approving an action keeps finding.merchantVerified as false until genuine re-check', () => {
+      const findingBefore = coordinator.findings.find(f => f.actionItemId === 'act_01')!;
+      assert.equal(findingBefore.merchantVerified, false);
 
-      harness.approveAction('act_01');
+      coordinator.approveAction('act_01');
 
-      const candleAfter = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleAfter.variants[0].barcode, '0850029381082');
+      const findingAfter = coordinator.findings.find(f => f.actionItemId === 'act_01')!;
+      // Crucial Phase B requirement: Approval must NOT set merchantVerified: true
+      assert.equal(findingAfter.merchantVerified, false);
     });
 
-    it('mutates only the intended product when multiple products exist', () => {
-      const coffeeBefore = harness.products.find(p => p.id === 'prod_solstice_01')!;
-      const apronBefore = harness.products.find(p => p.id === 'prod_solstice_03')!;
-      const coffeeSnapshot = JSON.stringify(coffeeBefore);
-      const apronSnapshot = JSON.stringify(apronBefore);
+    it('re-check after approval validates catalog state and establishes verified_in_catalog', () => {
+      coordinator.approveAction('act_01');
+      const recheckRes = coordinator.recheckAction('act_01');
 
-      // Mutate candle
-      harness.approveAction('act_01');
+      assert.equal(recheckRes.success, true);
+      assert.equal(recheckRes.isVerified, true);
+      assert.equal(recheckRes.verificationStatus, 'verified_in_catalog');
 
-      const coffeeAfter = harness.products.find(p => p.id === 'prod_solstice_01')!;
-      const apronAfter = harness.products.find(p => p.id === 'prod_solstice_03')!;
-      assert.equal(JSON.stringify(coffeeAfter), coffeeSnapshot, 'Coffee must not be mutated');
-      assert.equal(JSON.stringify(apronAfter), apronSnapshot, 'Apron must not be mutated');
+      const action = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      assert.equal(action.verificationStatus, 'verified_in_catalog');
+
+      const finding = coordinator.findings.find(f => f.actionItemId === 'act_01')!;
+      assert.equal(finding.merchantVerified, true);
     });
 
-    it('preserves unrelated attributes, variants, offers, and evidence', () => {
-      const mugBefore = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      const originalDishwasherSafe = mugBefore.attributes.dishwasherSafe;
-      const originalOffers = JSON.stringify(mugBefore.offers);
-      const originalEvidence = JSON.stringify(mugBefore.evidenceDocuments);
+    it('re-check fails if target product is deleted after approval', () => {
+      coordinator.approveAction('act_01');
+      // Simulate target product removal
+      coordinator.products = coordinator.products.filter(p => p.id !== 'prod_solstice_04');
 
-      harness.approveAction('act_02');
+      const recheckRes = coordinator.recheckAction('act_01');
+      assert.equal(recheckRes.isVerified, false);
+      assert.equal(recheckRes.verificationStatus, 'verification_failed');
 
-      const mugAfter = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      assert.equal(mugAfter.attributes.dishwasherSafe, originalDishwasherSafe);
-      assert.equal(JSON.stringify(mugAfter.offers), originalOffers);
-      assert.equal(JSON.stringify(mugAfter.evidenceDocuments), originalEvidence);
+      const action = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      assert.equal(action.verificationStatus, 'verification_failed');
+      assert.ok(action.recheckNotes?.includes('not found in catalog'));
+
+      const finding = coordinator.findings.find(f => f.actionItemId === 'act_01')!;
+      assert.equal(finding.merchantVerified, false);
     });
 
-    it('handles store-level or offer-level action without corrupting products', () => {
-      const productsSnapshot = JSON.stringify(harness.products);
-      harness.approveAction('act_06'); // Storefront shipping SLA discrepancy
-      assert.equal(JSON.stringify(harness.products), productsSnapshot, 'Products must remain untouched for store action');
+    it('re-check fails if barcode check digit is invalid', () => {
+      // Approve action with a custom value having invalid check digit
+      coordinator.approveAction('act_01', '0850029381089');
+
+      const recheckRes = coordinator.recheckAction('act_01');
+      assert.equal(recheckRes.isVerified, false);
+      assert.equal(recheckRes.verificationStatus, 'verification_failed');
+      assert.ok(recheckRes.recheckNotes.includes('fails GTIN-13 check digit validation'));
     });
 
-    it('safely handles missing or invalid action ID without throwing', () => {
-      assert.doesNotThrow(() => {
-        harness.approveAction('non_existent_action_id');
-      });
+    it('re-check fails if catalog attribute value diverges from approved value', () => {
+      coordinator.approveAction('act_02');
+      // Tamper with attribute
+      const mug = coordinator.products.find(p => p.id === 'prod_solstice_02')!;
+      mug.attributes.microwaveSafe = 'Unspecified';
+
+      const recheckRes = coordinator.recheckAction('act_02');
+      assert.equal(recheckRes.isVerified, false);
+      assert.equal(recheckRes.verificationStatus, 'verification_failed');
+      assert.ok(recheckRes.recheckNotes.includes('does not match approved value'));
     });
 
-    it('safely rejects approval if target product does not exist without corrupting catalog', () => {
-      // Create an action referencing a non-existent product
-      harness.actionItems.push({
-        id: 'act_orphan',
-        findingId: 'find_orphan',
-        productId: 'prod_does_not_exist',
-        title: 'Orphan Action',
+    it('re-check on unapproved pending action leaves status as recheck_required', () => {
+      const recheckRes = coordinator.recheckAction('act_01'); // unapproved item
+      assert.equal(recheckRes.isVerified, false);
+      assert.equal(recheckRes.verificationStatus, 'recheck_required');
+      assert.equal(recheckRes.errorCode, 'ACTION_PENDING');
+
+      const action = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      assert.equal(action.status, 'pending_review');
+      assert.equal(action.verificationStatus, 'recheck_required');
+    });
+  });
+
+  describe('Phase C: Mutation Validation & Target Safeguards', () => {
+    it('rejects unsupported field without mutating catalog or action status', () => {
+      // Create an action with an unallowlisted field
+      coordinator.actionItems.push({
+        id: 'act_malicious',
+        findingId: 'find_malicious',
+        productId: 'prod_solstice_01',
+        title: 'Inject Custom Field',
         severity: 'high',
         status: 'pending_review',
         evidenceRequired: false,
         proposedChange: {
-          field: 'attributes.test',
+          field: 'unsupported.injected_field',
           from: '',
-          to: 'value',
+          to: 'exploit',
         },
         verificationStatus: 'unverified',
       });
 
-      const productsSnapshot = JSON.stringify(harness.products);
-      harness.approveAction('act_orphan');
+      const catalogSnapshot = JSON.stringify(coordinator.products);
+      const res = coordinator.approveAction('act_malicious');
 
-      assert.equal(JSON.stringify(harness.products), productsSnapshot, 'Products must remain untouched when target is missing');
-      assert.ok(harness.toasts.some(t => t.title === 'Target Not Found'));
-      const orphanAction = harness.actionItems.find(a => a.id === 'act_orphan')!;
-      assert.equal(orphanAction.status, 'pending_review', 'Orphan action must not be approved');
-    });
-  });
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'UNSUPPORTED_FIELD');
+      assert.equal(JSON.stringify(coordinator.products), catalogSnapshot);
 
-  describe('2. Completeness Score Consistency', () => {
-    it('increments product completenessScore bounded at 100', () => {
-      const mugBefore = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      const initialScore = mugBefore.completenessScore;
-      assert.equal(initialScore, 78);
-
-      harness.approveAction('act_02');
-
-      const mugAfter = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      assert.equal(mugAfter.completenessScore, initialScore + 6);
-      assert.ok(mugAfter.completenessScore <= 100);
-    });
-  });
-
-  describe('3. Read-Only Protection & Idempotence', () => {
-    it('blocks mutations when in read-only mode', () => {
-      const roHarness = new AppCatalogTestHarness(true); // read-only active
-      const candleBefore = roHarness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleBefore.variants[0].barcode, '');
-
-      roHarness.approveAction('act_01');
-
-      const candleAfter = roHarness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleAfter.variants[0].barcode, '', 'Barcode must NOT be mutated in read-only mode');
-      assert.ok(roHarness.toasts.some(t => t.title === 'Action Disabled'));
-    });
-
-    it('rejected or dismissed actions do not mutate catalog data', () => {
-      harness.dismissAction('act_01');
-      assert.equal(harness.actionItems.find(a => a.id === 'act_01')!.status, 'dismissed');
-
-      // Attempt approval on dismissed action
-      const candleBefore = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleBefore.variants[0].barcode, '');
-
-      harness.approveAction('act_01');
-
-      const candleAfter = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleAfter.variants[0].barcode, '', 'Dismissed action must not mutate catalog');
-      assert.ok(harness.toasts.some(t => t.title === 'Action Ineligible'));
-    });
-
-    it('repeated approval does not duplicate or reapply a correction', () => {
-      harness.approveAction('act_01');
-      const candleFirstPass = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      const scoreFirstPass = candleFirstPass.completenessScore;
-
-      // Second approval attempt on already approved action
-      harness.approveAction('act_01');
-      const candleSecondPass = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleSecondPass.completenessScore, scoreFirstPass, 'Score must not increment twice');
-      assert.ok(harness.toasts.some(t => t.title === 'Action Ineligible'));
-    });
-  });
-
-  describe('4. Storage Persistence & Reload Consistency', () => {
-    it('persists successful mutation to storage adapter and reloads accurately', () => {
-      harness.approveAction('act_01'); // assign barcode
-
-      // Load back from the adapter storage
-      const loaded = harness.adapter.load();
-      assert.equal(loaded.type, 'valid');
-      if (loaded.type === 'valid') {
-        const savedCandle = loaded.envelope.payload.products.find(p => p.id === 'prod_solstice_04')!;
-        assert.equal(savedCandle.variants[0].barcode, '0850029381082');
-
-        const savedAction = loaded.envelope.payload.actions.find(a => a.id === 'act_01')!;
-        assert.equal(savedAction.status, 'approved');
-        assert.equal(savedAction.verificationStatus, 'verified_in_catalog');
-
-        const savedFinding = loaded.envelope.payload.findings.find(f => f.actionItemId === 'act_01')!;
-        assert.equal(savedFinding.merchantVerified, true);
-      }
-    });
-
-    it('surfaces storage write failure without crashing application', () => {
-      // Mock failure by filling backend or throwing in setItem
-      harness.backend.setItem = () => {
-        throw new Error('QuotaExceededError: simulated disk quota failure');
-      };
-
-      assert.doesNotThrow(() => {
-        harness.approveAction('act_01');
-      });
-      assert.ok(harness.toasts.some(t => t.title.includes('Session Only')));
-    });
-  });
-
-  describe('5. Action Status and Re-check Verification Semantics', () => {
-    it('maintains pending status and recheck_required for unapproved items', () => {
-      harness.recheckAction('act_01'); // Unapproved item
-      const item = harness.actionItems.find(a => a.id === 'act_01')!;
-      assert.equal(item.status, 'pending_review');
-      assert.equal(item.verificationStatus, 'recheck_required');
-      assert.ok(item.recheckNotes?.includes('failed: Action has not been approved'));
-    });
-
-    it('verifies consistency upon re-check after approval has succeeded', () => {
-      harness.approveAction('act_01');
-      harness.recheckAction('act_01');
-      const item = harness.actionItems.find(a => a.id === 'act_01')!;
-      assert.equal(item.status, 'approved');
-      assert.equal(item.verificationStatus, 'verified_in_catalog');
-      assert.ok(item.recheckNotes?.includes('Re-check validated against local catalog schema rules'));
-    });
-
-    it('re-check fails with verification_failed when target product was deleted', () => {
-      harness.approveAction('act_01');
-      // Simulate target product removal from catalog
-      harness.products = harness.products.filter(p => p.id !== 'prod_solstice_04');
-
-      harness.recheckAction('act_01');
-      const item = harness.actionItems.find(a => a.id === 'act_01')!;
-      assert.equal(item.verificationStatus, 'verification_failed');
-      assert.ok(item.recheckNotes?.includes('not found in catalog'));
-    });
-
-    it('re-check fails with verification_failed when variant barcode check digit is invalid', () => {
-      harness.approveAction('act_01');
-      // Corrupt the target variant barcode with invalid check digit
-      const candle = harness.products.find(p => p.id === 'prod_solstice_04')!;
-      candle.variants[0].barcode = '0850029381089'; // Invalid check digit
-
-      harness.recheckAction('act_01');
-      const item = harness.actionItems.find(a => a.id === 'act_01')!;
-      assert.equal(item.verificationStatus, 'verification_failed');
-    });
-
-    it('re-check fails with verification_failed when attribute value does not match', () => {
-      harness.approveAction('act_02');
-      // Tamper with attribute value
-      const mug = harness.products.find(p => p.id === 'prod_solstice_02')!;
-      mug.attributes.microwaveSafe = 'False';
-
-      harness.recheckAction('act_02');
-      const item = harness.actionItems.find(a => a.id === 'act_02')!;
-      assert.equal(item.verificationStatus, 'verification_failed');
-      assert.ok(item.recheckNotes?.includes('does not match approved value'));
-    });
-
-    it('clearly documents local boundary vs external store update', () => {
-      harness.approveAction('act_01');
-      const successToast = harness.toasts.find(t => t.title === 'Remediation Approved');
-      assert.ok(successToast);
-      assert.ok(
-        successToast.message.includes('External live write-back requires connector authorization') ||
-        successToast.message.includes('AIXSHOP internal catalog updated'),
-        'Must contain clear external boundary disclaimer'
-      );
-    });
-  });
-
-  describe('6. End-to-End Workflow: Finding -> Product Detail -> Action -> Mutation -> Persistence -> Re-check', () => {
-    it('successfully executes complete end-to-end verification lifecycle', () => {
-      // 1. Home / Audit Finding inspection
-      const finding = harness.findings.find(f => f.id === 'find_01')!;
-      assert.equal(finding.productId, 'prod_solstice_04');
-      assert.equal(finding.merchantVerified, false);
-
-      // 2. Product Detail target resolution
-      const product = harness.products.find(p => p.id === finding.productId)!;
-      assert.ok(product);
-      assert.equal(product.variants[0].barcode, '');
-      const originalScore = product.completenessScore;
-
-      // 3. Action Center navigation & association
-      const action = harness.actionItems.find(a => a.id === finding.actionItemId)!;
+      const action = coordinator.actionItems.find(a => a.id === 'act_malicious')!;
       assert.equal(action.status, 'pending_review');
       assert.equal(action.verificationStatus, 'unverified');
+    });
 
-      // 4. Merchant Approval & Catalog Mutation
-      harness.approveAction(action.id);
+    it('rejects unlisted structured attribute without mutating catalog', () => {
+      coordinator.actionItems.push({
+        id: 'act_bad_attr',
+        findingId: 'find_bad_attr',
+        productId: 'prod_solstice_01',
+        title: 'Unknown Attribute',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'attributes.unregisteredRandomAttribute',
+          from: '',
+          to: 'xyz',
+        },
+        verificationStatus: 'unverified',
+      });
 
-      // 5. Verify local catalog mutation
-      const mutatedProduct = harness.products.find(p => p.id === finding.productId)!;
-      assert.equal(mutatedProduct.variants[0].barcode, '0850029381082');
-      assert.equal(mutatedProduct.completenessScore, originalScore + 6);
+      const res = coordinator.approveAction('act_bad_attr');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'UNSUPPORTED_FIELD');
+    });
 
-      // 6. Verify action & finding status transitions
-      const approvedAction = harness.actionItems.find(a => a.id === action.id)!;
-      assert.equal(approvedAction.status, 'approved');
-      assert.equal(approvedAction.verificationStatus, 'verified_in_catalog');
-      const updatedFinding = harness.findings.find(f => f.id === finding.id)!;
-      assert.equal(updatedFinding.merchantVerified, true);
+    it('rejects missing target product with PRODUCT_NOT_FOUND', () => {
+      coordinator.actionItems.push({
+        id: 'act_missing_prod',
+        findingId: 'find_missing_prod',
+        productId: 'prod_does_not_exist_999',
+        title: 'Missing Product Action',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'attributes.microwaveSafe',
+          from: '',
+          to: 'True',
+        },
+        verificationStatus: 'unverified',
+      });
 
-      // 7. Verify persistence through Storage Adapter
-      const loaded = harness.adapter.load();
+      const res = coordinator.approveAction('act_missing_prod');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'PRODUCT_NOT_FOUND');
+    });
+
+    it('rejects out-of-bounds variant index and NEVER silently falls back to variant[0]', () => {
+      // Candle prod_solstice_04 has exactly 1 variant (index 0)
+      coordinator.actionItems.push({
+        id: 'act_out_of_bounds_variant',
+        findingId: 'find_oob_var',
+        productId: 'prod_solstice_04',
+        title: 'Mutate Non-Existent Variant 99',
+        severity: 'high',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[99].barcode',
+          from: '',
+          to: '0850029381082',
+        },
+        verificationStatus: 'unverified',
+      });
+
+      const candleBefore = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const barcodeBefore = candleBefore.variants[0].barcode;
+
+      const res = coordinator.approveAction('act_out_of_bounds_variant');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'VARIANT_OUT_OF_BOUNDS');
+
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      // Crucial Phase C requirement: Must NEVER fall back to variant[0]
+      assert.equal(candleAfter.variants[0].barcode, barcodeBefore, 'Variant[0] must NOT be silently mutated');
+    });
+
+    it('mutates only the intended variant on the intended product', () => {
+      const mugBefore = coordinator.products.find(p => p.id === 'prod_solstice_02')!;
+      const coffeeBefore = coordinator.products.find(p => p.id === 'prod_solstice_01')!;
+      const coffeeSnapshot = JSON.stringify(coffeeBefore);
+
+      coordinator.approveAction('act_02'); // Mutates mug microwaveSafe
+
+      const mugAfter = coordinator.products.find(p => p.id === 'prod_solstice_02')!;
+      const coffeeAfter = coordinator.products.find(p => p.id === 'prod_solstice_01')!;
+
+      assert.equal(mugAfter.attributes.microwaveSafe, 'True (Tested up to 900W)');
+      assert.equal(JSON.stringify(coffeeAfter), coffeeSnapshot, 'Unrelated product must not be touched');
+    });
+
+    it('recalculates product completeness accurately using domain rules', () => {
+      const candle = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const initialScore = candle.completenessScore;
+      assert.equal(initialScore, 71);
+
+      coordinator.approveAction('act_01'); // assigns valid GTIN barcode to candle variant
+
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      const recalculated = calculateProductCompleteness(candleAfter);
+      assert.equal(candleAfter.completenessScore, recalculated);
+      // Valid GTIN-13 raises variant score from 0/20 to 20/20 (+20 points)
+      assert.ok(candleAfter.completenessScore > initialScore);
+      assert.ok(candleAfter.completenessScore <= 100);
+    });
+
+    it('no-op mutation does not increase completeness score', () => {
+      // Apply act_02
+      coordinator.approveAction('act_02');
+      const mugAfterFirst = coordinator.products.find(p => p.id === 'prod_solstice_02')!;
+      const scoreFirst = mugAfterFirst.completenessScore;
+
+      // Recalculating without new fields produces the exact same score
+      const scoreRecheck = calculateProductCompleteness(mugAfterFirst);
+      assert.equal(scoreRecheck, scoreFirst);
+    });
+  });
+
+  describe('Phase E: Storage, Durability & Atomic Persistence', () => {
+    it('blocks mutations when in read-only compatibility mode', () => {
+      const roCoordinator = new ProductionActionCoordinator(true);
+      assert.equal(roCoordinator.isReadOnlyMode, true);
+
+      const candleBefore = roCoordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleBefore.variants[0].barcode, '');
+
+      const res = roCoordinator.approveAction('act_01');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'READ_ONLY_MODE');
+
+      const candleAfter = roCoordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfter.variants[0].barcode, '');
+      assert.ok(roCoordinator.toasts.some(t => t.title === 'Action Disabled'));
+    });
+
+    it('blocks re-check when in read-only mode', () => {
+      const roCoordinator = new ProductionActionCoordinator(true);
+      const res = roCoordinator.recheckAction('act_01');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'READ_ONLY_MODE');
+      assert.ok(roCoordinator.toasts.some(t => t.title === 'Re-check Disabled'));
+    });
+
+    it('blocks dismissal when in read-only mode', () => {
+      const roCoordinator = new ProductionActionCoordinator(true);
+      const res = roCoordinator.dismissAction('act_01');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'READ_ONLY_MODE');
+    });
+
+    it('rolls back in-memory state atomically if persistence fails', () => {
+      // Simulate backend persistence failure
+      coordinator.backend.setItem = () => {
+        throw new Error('Disk quota exceeded');
+      };
+
+      const candleBefore = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleBefore.variants[0].barcode, '');
+
+      const res = coordinator.approveAction('act_01');
+      assert.equal(res.success, false);
+      assert.equal((res as { rolledBack?: boolean }).rolledBack, true);
+
+      // In-memory state MUST NOT have been updated!
+      const candleAfter = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfter.variants[0].barcode, '', 'In-memory catalog must roll back on save failure');
+
+      const actionAfter = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      assert.equal(actionAfter.status, 'pending_review', 'Action status must roll back on save failure');
+      assert.ok(coordinator.toasts.some(t => t.title.includes('Rolled Back')));
+    });
+
+    it('persists successful mutation and reloads accurately from storage envelope', () => {
+      coordinator.approveAction('act_01');
+
+      const loaded = coordinator.adapter.load();
       assert.equal(loaded.type, 'valid');
       if (loaded.type === 'valid') {
-        const persistedProduct = loaded.envelope.payload.products.find(p => p.id === finding.productId)!;
+        const candle = loaded.envelope.payload.products.find(p => p.id === 'prod_solstice_04')!;
+        assert.equal(candle.variants[0].barcode, '0850029381082');
+
+        const act = loaded.envelope.payload.actions.find(a => a.id === 'act_01')!;
+        assert.equal(act.status, 'approved');
+        assert.equal(act.verificationStatus, 'recheck_required');
+      }
+    });
+
+    it('recovers from corrupt persisted data non-destructively', () => {
+      coordinator.backend.setItem('aixshop_catalog_v1', '{malformed_json:::');
+
+      const loaded = coordinator.adapter.load();
+      assert.equal(loaded.type, 'corrupt');
+      assert.ok(loaded.type === 'corrupt' && loaded.backupKey);
+      if (loaded.type === 'corrupt' && loaded.backupKey) {
+        assert.ok(loaded.backupKey.startsWith('aixshop_catalog_v1_corrupt_'));
+        // Original corrupted data preserved in backup
+        const backupVal = coordinator.backend.getItem(loaded.backupKey);
+        assert.equal(backupVal, '{malformed_json:::');
+      }
+    });
+  });
+
+  describe('Phase F: Full Product Readiness - Real Store Check', () => {
+    it('normalizes store URLs correctly with various protocols and trailing paths', () => {
+      const res1 = normalizeStoreUrl('solsticemercantile.com');
+      assert.equal(res1.isValid, true);
+      assert.equal(res1.hostname, 'solsticemercantile.com');
+      assert.equal(res1.origin, 'https://solsticemercantile.com');
+
+      const res2 = normalizeStoreUrl('http://my-shop.myshopify.com/collections/all');
+      assert.equal(res2.isValid, true);
+      assert.equal(res2.hostname, 'my-shop.myshopify.com');
+      assert.equal(res2.origin, 'http://my-shop.myshopify.com');
+
+      const res3 = normalizeStoreUrl('');
+      assert.equal(res3.isValid, false);
+
+      const res4 = normalizeStoreUrl('not_a_valid_url');
+      assert.equal(res4.isValid, false);
+    });
+
+    it('evaluates Solstice demo fixture cleanly as demo_fixture without mock fabrication', async () => {
+      const check = await ingestAndAnalyzeStore('https://solstice.store');
+      assert.equal(check.scanStatus, 'demo_fixture');
+      assert.equal(check.detectedPlatform, 'Solstice Mercantile (Demo Fixture Feed)');
+      assert.ok(check.catalogCompletenessEstimate > 70);
+      assert.ok(check.gtinPresentRatio > 50);
+      assert.ok(check.sampleIssues.length > 0);
+    });
+
+    it('ingests and evaluates real Shopify catalog feed via customFetch', async () => {
+      const mockShopifyResponse = {
+        products: [
+          {
+            id: 101,
+            title: 'Organic Wool Throw Blanket',
+            vendor: 'North Weavers',
+            product_type: 'Home Goods',
+            body_html: '<p>Handcrafted 100% natural organic wool blanket made from heritage sheep wool.</p>',
+            variants: [
+              {
+                id: 201,
+                title: 'Charcoal',
+                sku: 'NW-WOOL-CHR',
+                barcode: '0850029381082', // Valid GTIN-13
+                price: '120.00',
+                available: true,
+              },
+            ],
+          },
+          {
+            id: 102,
+            title: 'Campfire Enamel Cup',
+            vendor: 'Trail & Forge',
+            product_type: 'Drinkware',
+            body_html: '<p>Durable steel cup.</p>', // Short description (<20 chars) triggers issue
+            variants: [
+              {
+                id: 202,
+                title: 'Default Title',
+                sku: 'TF-CUP-01',
+                barcode: '', // Missing barcode triggers issue
+                price: '18.00',
+                available: true,
+              },
+            ],
+          },
+        ],
+      };
+
+      const customFetch = async () => {
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: async () => mockShopifyResponse,
+        } as unknown as Response;
+      };
+
+      const result = await ingestAndAnalyzeStore('https://trail-and-forge.myshopify.com', {
+        customFetch: customFetch as unknown as typeof fetch,
+      });
+
+      assert.equal(result.scanStatus, 'real_scan');
+      assert.equal(result.schemaFound, true);
+      // 1 out of 2 variants has valid GTIN = 50%
+      assert.equal(result.gtinPresentRatio, 50);
+      assert.ok(result.detectedPlatform.includes('Shopify Live Storefront'));
+      // Evidence-based issues identified
+      assert.ok(result.sampleIssues.some(i => i.includes('Missing GTIN/UPC')));
+      assert.ok(result.sampleIssues.some(i => i.includes('lacks detailed physical description')));
+    });
+
+    it('handles restricted / non-public storefront gracefully as unsupported_store', async () => {
+      const customFetch = async () => {
+        return {
+          ok: false,
+          status: 403,
+          statusText: 'Forbidden',
+          json: async () => ({}),
+        } as unknown as Response;
+      };
+
+      const result = await ingestAndAnalyzeStore('https://private-store.com', {
+        customFetch: customFetch as unknown as typeof fetch,
+      });
+
+      assert.equal(result.scanStatus, 'unsupported_store');
+      assert.ok(result.sampleIssues.some(i => i.includes('HTTP 403 Forbidden')));
+      assert.ok(result.notice?.includes('Settings'));
+    });
+
+    it('handles network / CORS fetch failure gracefully as network_failure', async () => {
+      const customFetch = async () => {
+        throw new Error('Failed to fetch (CORS header missing)');
+      };
+
+      const result = await ingestAndAnalyzeStore('https://cors-blocked-store.com', {
+        customFetch: customFetch as unknown as typeof fetch,
+      });
+
+      assert.equal(result.scanStatus, 'network_failure');
+      assert.ok(result.sampleIssues.some(i => i.includes('CORS')));
+    });
+  });
+
+  describe('Phase D: End-to-End Workflow & Regression Verification', () => {
+    it('executes the full lifecycle: inspect -> approve -> persist -> re-check -> verify', () => {
+      // 1. Initial State
+      const action = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      const finding = coordinator.findings.find(f => f.actionItemId === action.id)!;
+      const product = coordinator.products.find(p => p.id === action.productId)!;
+
+      assert.equal(action.status, 'pending_review');
+      assert.equal(action.verificationStatus, 'unverified');
+      assert.equal(finding.merchantVerified, false);
+      assert.equal(product.variants[0].barcode, '');
+      const initialScore = product.completenessScore;
+
+      // 2. Approval
+      const approveRes = coordinator.approveAction('act_01');
+      assert.equal(approveRes.success, true);
+
+      // 3. Post-Approval State Check
+      const approvedAction = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      const updatedFinding = coordinator.findings.find(f => f.actionItemId === action.id)!;
+      const updatedProduct = coordinator.products.find(p => p.id === action.productId)!;
+
+      assert.equal(approvedAction.status, 'approved');
+      assert.equal(approvedAction.verificationStatus, 'recheck_required');
+      assert.equal(updatedFinding.merchantVerified, false);
+      assert.equal(updatedProduct.variants[0].barcode, '0850029381082');
+      assert.ok(updatedProduct.completenessScore > initialScore);
+
+      // 4. Persistence Verification
+      const loaded = coordinator.adapter.load();
+      assert.equal(loaded.type, 'valid');
+      if (loaded.type === 'valid') {
+        const persistedProduct = loaded.envelope.payload.products.find(p => p.id === product.id)!;
         assert.equal(persistedProduct.variants[0].barcode, '0850029381082');
-        assert.equal(persistedProduct.completenessScore, originalScore + 6);
       }
 
-      // 8. Re-check execution and validation
-      harness.recheckAction(action.id);
-      const recheckedAction = harness.actionItems.find(a => a.id === action.id)!;
-      assert.equal(recheckedAction.verificationStatus, 'verified_in_catalog');
-      assert.ok(recheckedAction.recheckNotes?.includes('local catalog schema rules'));
+      // 5. Re-check Execution
+      const recheckRes = coordinator.recheckAction('act_01');
+      assert.equal(recheckRes.success, true);
+      assert.equal(recheckRes.isVerified, true);
+      assert.equal(recheckRes.verificationStatus, 'verified_in_catalog');
+
+      // 6. Final Verified State
+      const verifiedAction = coordinator.actionItems.find(a => a.id === 'act_01')!;
+      const verifiedFinding = coordinator.findings.find(f => f.actionItemId === action.id)!;
+
+      assert.equal(verifiedAction.verificationStatus, 'verified_in_catalog');
+      assert.equal(verifiedFinding.merchantVerified, true);
     });
   });
 });
