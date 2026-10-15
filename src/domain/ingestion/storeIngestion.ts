@@ -48,17 +48,70 @@ export function normalizeStoreUrl(rawUrl: string): { hostname: string; origin: s
 
   try {
     const parsed = new URL(withProtocol);
-    if (!parsed.hostname || !parsed.hostname.includes('.')) {
+    const host = parsed.hostname.toLowerCase();
+    if (!host || (!host.includes('.') && host !== 'localhost')) {
       return { hostname: '', origin: '', isValid: false, error: 'Please enter a valid store domain (e.g., store.com).' };
     }
     return {
-      hostname: parsed.hostname.toLowerCase(),
+      hostname: host,
       origin: parsed.origin,
       isValid: true,
     };
   } catch {
     return { hostname: '', origin: '', isValid: false, error: 'Invalid URL format.' };
   }
+}
+
+/**
+ * Explicit, narrowly scoped allowlist of hostnames authorized for Solstice demo fixtures.
+ * Broad substring matching (e.g. hostname.includes('solstice')) is strictly forbidden
+ * to prevent unrelated real stores containing 'solstice' or 'demo' from being misclassified.
+ */
+export const DEMO_STORE_HOSTNAMES: ReadonlySet<string> = new Set([
+  'solsticecraftgoods.store',
+  'solstice.store',
+  'demo.store',
+  'localhost',
+  '127.0.0.1',
+]);
+
+/**
+ * Safely normalizes a hostname for exact allowlist comparison.
+ * - Trims whitespace
+ * - Converts to lowercase
+ * - Strips trailing dots (FQDN representation)
+ * - Strips port numbers if present
+ * - Strips leading 'www.' prefix
+ */
+export function normalizeHostname(rawHostname: string): string {
+  if (!rawHostname || typeof rawHostname !== 'string') return '';
+  let host = rawHostname.trim().toLowerCase();
+
+  // Strip trailing dot
+  if (host.endsWith('.')) {
+    host = host.slice(0, -1);
+  }
+
+  // Strip port
+  if (host.includes(':')) {
+    host = host.split(':')[0];
+  }
+
+  // Strip leading www.
+  if (host.startsWith('www.')) {
+    host = host.slice(4);
+  }
+
+  return host;
+}
+
+/**
+ * Evaluates whether a given hostname is an explicitly authorized demo fixture store.
+ * Only exact matches against the normalized allowlist are accepted.
+ */
+export function isDemoStoreHostname(rawHostname: string): boolean {
+  const normalized = normalizeHostname(rawHostname);
+  return DEMO_STORE_HOSTNAMES.has(normalized);
 }
 
 /**
@@ -319,12 +372,8 @@ export async function ingestAndAnalyzeStore(
   const timestamp = new Date().toISOString();
   const existingCatalog = options.existingCatalog || [];
 
-  // 1. Identify if this is the Solstice Demo Fixture environment
-  const isDemoStore = 
-    hostname.includes('solstice') || 
-    hostname.includes('example.com') || 
-    hostname === 'localhost' ||
-    hostname === 'demo.store';
+  // 1. Identify if this is the Solstice Demo Fixture environment via exact allowlist match
+  const isDemoStore = isDemoStoreHostname(hostname);
 
   if (isDemoStore) {
     return evaluateProductsCatalog(

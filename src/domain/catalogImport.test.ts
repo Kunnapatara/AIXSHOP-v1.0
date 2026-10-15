@@ -6,7 +6,10 @@ import {
   evaluateCandidateProducts,
   findMatchingCatalogProduct,
   detectProductConflict,
-  ShopifyPublicProduct
+  ShopifyPublicProduct,
+  DEMO_STORE_HOSTNAMES,
+  normalizeHostname,
+  isDemoStoreHostname
 } from './ingestion/storeIngestion';
 import { 
   executeCatalogImport, 
@@ -556,5 +559,121 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(recheckRes.success, true);
     assert.equal(recheckRes.isVerified, true);
     assert.equal(recheckRes.verificationStatus, 'verified_in_catalog');
+  });
+
+  // 14. Remediation A: Explicitly supported demo hostnames
+  it('14. correctly identifies explicitly supported demo hostnames without false negatives', async () => {
+    // Exact canonical demo store
+    assert.equal(isDemoStoreHostname('solsticecraftgoods.store'), true);
+    assert.equal(isDemoStoreHostname('solstice.store'), true);
+    assert.equal(isDemoStoreHostname('demo.store'), true);
+    assert.equal(isDemoStoreHostname('localhost'), true);
+    assert.equal(isDemoStoreHostname('127.0.0.1'), true);
+
+    // Safe normalization: case insensitivity, leading whitespace, trailing dots, and www prefix
+    assert.equal(isDemoStoreHostname('  SOLSTICEcraftgoods.STORE  '), true);
+    assert.equal(isDemoStoreHostname('www.solsticecraftgoods.store'), true);
+    assert.equal(isDemoStoreHostname('solsticecraftgoods.store.'), true);
+    assert.equal(isDemoStoreHostname('localhost:3000'), true);
+
+    // Ingestion returns demo_fixture for explicitly supported demo host
+    const res = await ingestAndAnalyzeStore('https://solsticecraftgoods.store', {
+      existingCatalog: products,
+    });
+    assert.equal(res.scanStatus, 'demo_fixture');
+    assert.equal(res.detectedPlatform, 'Solstice Mercantile (Demo Fixture Feed)');
+    assert.ok(res.ingestionResult);
+    assert.equal(res.ingestionResult.candidateProducts.length, initialProducts.length);
+  });
+
+  // 15. Remediation A: Real hostname containing demo-related substring
+  it('15. rejects broad substring matches: real stores containing "solstice" or "demo" are NOT classified as demo stores', async () => {
+    // Stores that contain 'solstice' but are separate real stores
+    assert.equal(isDemoStoreHostname('solstice-candles.com'), false);
+    assert.equal(isDemoStoreHostname('mysolsticeshop.com'), false);
+    assert.equal(isDemoStoreHostname('solsticedesign.org'), false);
+    assert.equal(isDemoStoreHostname('realsolstice.store'), false);
+    assert.equal(isDemoStoreHostname('the-solstice-store.com'), false);
+
+    // Stores that contain 'demo' or 'example'
+    assert.equal(isDemoStoreHostname('demostore-gear.com'), false);
+    assert.equal(isDemoStoreHostname('my-demo.shop'), false);
+    assert.equal(isDemoStoreHostname('example.com'), false);
+
+    // Mock response for real store containing 'solstice' in domain
+    const customFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({
+        products: [
+          createMockShopifyProduct(901, {
+            title: 'Real Solstice Artisan Pottery',
+            variants: [{ id: 'var_901', title: 'Default', sku: 'REAL-901', barcode: '0850029381082', price: '58.00', available: true }],
+          }),
+        ],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    const res = await ingestAndAnalyzeStore('https://solstice-candles.com', {
+      customFetch,
+      existingCatalog: products,
+    });
+
+    // Must be real_scan, NEVER demo_fixture
+    assert.equal(res.scanStatus, 'real_scan');
+    assert.notEqual(res.detectedPlatform, 'Solstice Mercantile (Demo Fixture Feed)');
+    assert.ok(res.ingestionResult);
+    assert.equal(res.ingestionResult.source.discoveredCount, 1);
+    assert.equal(res.ingestionResult.candidateProducts[0].title, 'Real Solstice Artisan Pottery');
+  });
+
+  // 16. Remediation A: Hostnames that resemble, but are not identical to, allowlist entries
+  it('16. prevents spoofing and rejects hostnames that resemble allowlist entries', async () => {
+    // Subdomain takeovers / spoof attempts
+    assert.equal(isDemoStoreHostname('realdemo.store'), false);
+    assert.equal(isDemoStoreHostname('demo.store.attacker.com'), false);
+    assert.equal(isDemoStoreHostname('solsticecraftgoods.store.phishing.io'), false);
+    assert.equal(isDemoStoreHostname('fake-solstice.store'), false);
+    assert.equal(isDemoStoreHostname('solstice.store.co'), false);
+    assert.equal(isDemoStoreHostname('notlocalhost'), false);
+  });
+
+  // 17. Honest failure reporting without silent demo fallback
+  it('17. never silently substitutes demo products when a real store scan fails or encounters CORS restrictions', async () => {
+    // Failing real store request (HTTP 404)
+    const failingFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ error: 'Not Found' }), {
+        status: 404,
+        statusText: 'Not Found',
+      });
+
+    const failRes = await ingestAndAnalyzeStore('https://solstice-candles.com', {
+      customFetch: failingFetch,
+      existingCatalog: products,
+    });
+
+    assert.equal(failRes.scanStatus, 'unsupported_store');
+    assert.notEqual(failRes.scanStatus, 'demo_fixture');
+    assert.equal(failRes.catalogCompletenessEstimate, 0);
+    assert.ok(failRes.ingestionResult);
+    assert.equal(failRes.ingestionResult.candidateProducts.length, 0, 'Must NOT substitute demo products on failure');
+    assert.ok(failRes.sampleIssues.some(i => i.includes('HTTP 404')));
+
+    // Network / CORS failure
+    const networkFailFetch: typeof fetch = async () => {
+      throw new Error('Failed to fetch (CORS header missing)');
+    };
+
+    const corsRes = await ingestAndAnalyzeStore('https://boutique-solstice.com', {
+      customFetch: networkFailFetch,
+      existingCatalog: products,
+    });
+
+    assert.equal(corsRes.scanStatus, 'network_failure');
+    assert.notEqual(corsRes.scanStatus, 'demo_fixture');
+    assert.equal(corsRes.catalogCompletenessEstimate, 0);
+    assert.ok(corsRes.ingestionResult);
+    assert.equal(corsRes.ingestionResult.candidateProducts.length, 0, 'Must NOT substitute demo products on network failure');
+    assert.ok(corsRes.sampleIssues.some(i => i.includes('Direct browser fetch was blocked')));
   });
 });
