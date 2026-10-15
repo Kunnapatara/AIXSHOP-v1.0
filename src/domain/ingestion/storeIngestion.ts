@@ -114,6 +114,94 @@ export function isDemoStoreHostname(rawHostname: string): boolean {
   return DEMO_STORE_HOSTNAMES.has(normalized);
 }
 
+export interface ParsedPriceResult {
+  isValid: boolean;
+  price: number | null;
+  rawString: string;
+  reason?: string;
+}
+
+/**
+ * Safely parses a source price value without inventing zero for missing or malformed inputs.
+ * Strictly rejects:
+ * - undefined or null
+ * - empty or whitespace-only strings
+ * - non-numeric strings or strings with trailing garbage (e.g. '12.50abc')
+ * - NaN, Infinity, -Infinity
+ * - negative prices (< 0)
+ * Valid zero (0, '0', '0.00') is accepted as legitimate non-negative price per domain rules.
+ */
+export function parseSourcePrice(rawPrice: unknown): ParsedPriceResult {
+  if (rawPrice === undefined || rawPrice === null) {
+    return {
+      isValid: false,
+      price: null,
+      rawString: String(rawPrice),
+      reason: 'Price is missing or null.',
+    };
+  }
+
+  if (typeof rawPrice === 'number') {
+    if (isNaN(rawPrice)) {
+      return { isValid: false, price: null, rawString: 'NaN', reason: 'Price is NaN.' };
+    }
+    if (!isFinite(rawPrice)) {
+      return { isValid: false, price: null, rawString: String(rawPrice), reason: `Price must be finite (received ${rawPrice}).` };
+    }
+    if (rawPrice < 0) {
+      return { isValid: false, price: null, rawString: String(rawPrice), reason: `Price cannot be negative (received ${rawPrice}).` };
+    }
+    return { isValid: true, price: rawPrice, rawString: String(rawPrice) };
+  }
+
+  if (typeof rawPrice === 'string') {
+    const trimmed = rawPrice.trim();
+    if (trimmed === '') {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: 'Price is empty or whitespace-only.',
+      };
+    }
+
+    const num = Number(trimmed);
+    if (isNaN(num)) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Malformed price string "${rawPrice}".`,
+      };
+    }
+    if (!isFinite(num)) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Price must be finite (received "${rawPrice}").`,
+      };
+    }
+    if (num < 0) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Price cannot be negative (received "${rawPrice}").`,
+      };
+    }
+
+    return { isValid: true, price: num, rawString: rawPrice };
+  }
+
+  return {
+    isValid: false,
+    price: null,
+    rawString: String(rawPrice),
+    reason: `Invalid price data type: ${typeof rawPrice}.`,
+  };
+}
+
 /**
  * Validates a single candidate product against catalog persistence & domain invariants.
  */
@@ -146,10 +234,12 @@ export function validateCandidateProduct(prod: Product): { isValid: boolean; rea
         reasons.push(`Variant [${idx}] title is missing.`);
       }
       if (typeof v.sku !== 'string' || v.sku.trim() === '') {
-        reasons.push(`Variant [${idx}] SKU is missing.`);
+        reasons.push(`Variant [${idx}] SKU is missing. Merchant SKU is required by catalog storage schema v1.2 for identity and inventory tracking.`);
       }
       if (typeof v.price !== 'number' || isNaN(v.price) || !isFinite(v.price) || v.price < 0) {
-        reasons.push(`Variant [${idx}] price (${v.price}) must be a valid non-negative number.`);
+        const rawInfo = v.attributes?.rawSourcePrice !== undefined ? ` (source value: "${v.attributes.rawSourcePrice}")` : '';
+        const specificError = v.attributes?.priceError ? `: ${v.attributes.priceError}` : '';
+        reasons.push(`Variant [${idx}] price is missing or invalid: must be a valid non-negative number${specificError}${rawInfo}.`);
       }
     });
   }
@@ -167,7 +257,10 @@ export function validateCandidateProduct(prod: Product): { isValid: boolean; rea
 export function findMatchingCatalogProduct(incoming: Product, catalog: Product[]): Product | undefined {
   if (!incoming || !Array.isArray(catalog)) return undefined;
 
-  const incomingSourceId = incoming.attributes?.sourceProductId || incoming.id;
+  const incomingSourceId = (incoming.attributes?.sourceProductId || '').trim();
+  const incomingVariantSourceIds = new Set(
+    (incoming.variants || []).map(v => (v.attributes?.sourceVariantId || '').trim()).filter(Boolean)
+  );
   const incomingBarcodes = new Set(
     (incoming.variants || []).map(v => (v.barcode || '').trim()).filter(Boolean)
   );
@@ -176,10 +269,10 @@ export function findMatchingCatalogProduct(incoming: Product, catalog: Product[]
   );
 
   return catalog.find(existing => {
-    // 1. Direct ID match
-    if (existing.id === incoming.id) return true;
+    // 1. Direct canonical ID match
+    if (incoming.id && existing.id === incoming.id) return true;
 
-    // 2. Stable Source ID match
+    // 2. Stable Source Product ID match
     if (
       incomingSourceId &&
       existing.attributes?.sourceProductId &&
@@ -188,11 +281,17 @@ export function findMatchingCatalogProduct(incoming: Product, catalog: Product[]
       return true;
     }
 
-    // 3. Variant Barcode match (GTIN / UPC)
+    // 3. Stable Source Variant ID match
+    if (incomingVariantSourceIds.size > 0) {
+      const existingVariantSourceIds = (existing.variants || []).map(v => (v.attributes?.sourceVariantId || '').trim()).filter(Boolean);
+      if (existingVariantSourceIds.some(sid => incomingVariantSourceIds.has(sid))) return true;
+    }
+
+    // 4. Variant Barcode match (GTIN / UPC)
     const existingBarcodes = (existing.variants || []).map(v => (v.barcode || '').trim()).filter(Boolean);
     if (existingBarcodes.some(b => incomingBarcodes.has(b))) return true;
 
-    // 4. Variant SKU match (stable identifier across platforms)
+    // 5. Variant SKU match (stable merchant identifier across channels)
     const existingSkus = (existing.variants || []).map(v => (v.sku || '').trim().toLowerCase()).filter(Boolean);
     if (existingSkus.some(s => incomingSkus.has(s))) return true;
 
@@ -223,7 +322,9 @@ export function detectProductConflict(incoming: Product, existing: Product): { i
     const ev = existingVariantMap.get(iv.sku.toLowerCase());
     if (ev) {
       if (iv.price !== ev.price) {
-        differences.push(`Variant SKU "${iv.sku}" price: incoming $${iv.price} vs catalog $${ev.price}`);
+        const incomingPriceStr = iv.price != null ? `$${iv.price.toFixed(2)}` : '(unpriced)';
+        const existingPriceStr = ev.price != null ? `$${ev.price.toFixed(2)}` : '(unpriced)';
+        differences.push(`Variant SKU "${iv.sku}" price: incoming ${incomingPriceStr} vs catalog ${existingPriceStr}`);
       }
       if ((iv.barcode || '').trim() !== (ev.barcode || '').trim()) {
         differences.push(`Variant SKU "${iv.sku}" barcode: incoming "${iv.barcode || ''}" vs catalog "${ev.barcode || ''}"`);
@@ -551,22 +652,40 @@ export async function ingestAndAnalyzeStore(
     // Convert raw public Shopify products into our domain model and evaluate
     // NOTE: Only observed source facts are recorded; zero inventory or evidence values are fabricated.
     const domainProducts: Product[] = rawProducts.map((p, pIdx) => {
-      const variants: Variant[] = (p.variants || []).map((v, vIdx) => ({
-        id: `v_${v.id || `${pIdx}_${vIdx}`}`,
-        sku: (v.sku || '').trim(),
-        title: (v.title || '').trim(),
-        barcode: (v.barcode || '').trim(),
-        price: typeof v.price === 'string' ? parseFloat(v.price) || 0 : (v.price || 0),
-        inventoryCount: 0, // Public storefront JSON does not provide warehouse inventory quantities
-        attributes: {},
-      }));
+      const sourceId = p.id != null ? String(p.id).trim() : '';
+      const prodId = sourceId ? `p_${sourceId}` : `p_idx_${pIdx}`;
+
+      const variants: Variant[] = (p.variants || []).map((v, vIdx) => {
+        const variantSourceId = v.id != null ? String(v.id).trim() : '';
+        const variantId = variantSourceId ? `v_${variantSourceId}` : `v_${prodId}_${vIdx}`;
+        const parsedPrice = parseSourcePrice(v.price);
+
+        const variantAttrs: Record<string, string> = {};
+        if (variantSourceId) {
+          variantAttrs.sourceVariantId = variantSourceId;
+        }
+        if (!parsedPrice.isValid) {
+          variantAttrs.rawSourcePrice = parsedPrice.rawString;
+          variantAttrs.priceError = parsedPrice.reason || 'Invalid price';
+        }
+
+        return {
+          id: variantId,
+          sku: (v.sku || '').trim(),
+          title: (v.title || '').trim(),
+          barcode: (v.barcode || '').trim(),
+          price: parsedPrice.price, // null when missing or invalid
+          inventoryCount: null, // Public storefront JSON does not provide warehouse inventory quantities (unknown)
+          attributes: variantAttrs,
+        };
+      });
 
       const observedVendor = (p.vendor || '').trim();
       const observedType = (p.product_type || '').trim();
       const observedTitle = (p.title || '').trim();
 
       const prod: Product = {
-        id: `p_${p.id || pIdx}`,
+        id: prodId,
         title: observedTitle,
         brand: observedVendor, // Do not inject 'Unknown Brand' placeholder
         category: observedType, // Do not inject 'General Merchandise' placeholder
@@ -578,7 +697,7 @@ export async function ingestAndAnalyzeStore(
         externalDiscoveryStatus: 'observed_in_sample',
         attributes: {
           sourcePlatform: 'shopify',
-          sourceProductId: String(p.id || ''),
+          sourceProductId: sourceId,
           sourceHandle: p.handle || '',
           provenance: 'observed_in_sample',
         },

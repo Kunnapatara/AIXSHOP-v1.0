@@ -22,8 +22,8 @@ export interface Variant {
   sku: string;
   title: string;
   barcode: string; // GTIN / EAN / UPC
-  price: number;
-  inventoryCount: number;
+  price: number | null;
+  inventoryCount?: number | null; // null or undefined indicates unknown/unavailable from source
   attributes: Record<string, string>;
 }
 

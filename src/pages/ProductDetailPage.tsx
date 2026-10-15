@@ -305,8 +305,16 @@ export const ProductDetailPage: React.FC = () => {
                     <td className="p-3.5 text-stone-600">
                       {Object.entries(v.attributes).map(([k, val]) => `${k}: ${val}`).join(' · ')}
                     </td>
-                    <td className="p-3.5 text-right font-mono font-medium">${v.price.toFixed(2)}</td>
-                    <td className="p-3.5 text-right font-mono text-stone-700">{v.inventoryCount} units</td>
+                    <td className="p-3.5 text-right font-mono font-medium">
+                      {v.price != null ? `$${v.price.toFixed(2)}` : <span className="text-stone-400 italic font-sans text-xs">Unpriced</span>}
+                    </td>
+                    <td className="p-3.5 text-right font-mono text-stone-700">
+                      {typeof v.inventoryCount === 'number'
+                        ? v.inventoryCount > 0
+                          ? `${v.inventoryCount} units`
+                          : <span className="text-rose-600 font-sans text-xs font-semibold">0 units (Out of stock)</span>
+                        : <span className="text-stone-400 font-sans text-xs italic">Unavailable (Public feed)</span>}
+                    </td>
                   </tr>
                 ))}
               </tbody>

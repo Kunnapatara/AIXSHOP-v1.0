@@ -417,7 +417,7 @@ export const LandingPage: React.FC = () => {
                           {ingestion.evaluationDetails.map((detail, idx) => {
                             const p = detail.product || ingestion.candidateProducts[idx];
                             const variantCount = p?.variants?.length || 0;
-                            const samplePrice = p?.variants?.[0]?.price ?? 0;
+                            const samplePrice = p?.variants?.[0]?.price;
 
                             return (
                               <div key={idx} className="p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-stone-50">
@@ -434,7 +434,7 @@ export const LandingPage: React.FC = () => {
                                     <span>Brand: {detail.brand || '(missing)'}</span>
                                     <span>Category: {detail.category || '(missing)'}</span>
                                     <span>{variantCount} variant{variantCount !== 1 ? 's' : ''}</span>
-                                    <span className="font-mono font-medium">${samplePrice.toFixed(2)}</span>
+                                    <span className="font-mono font-medium">{samplePrice != null ? `$${samplePrice.toFixed(2)}` : <span className="text-stone-400 italic font-sans">Unpriced</span>}</span>
                                   </div>
                                   {detail.reasons.length > 0 && (
                                     <p className="text-[11px] text-stone-500 mt-1 italic">

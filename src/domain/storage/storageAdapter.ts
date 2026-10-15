@@ -174,7 +174,14 @@ export function validateStoragePayload(payload: unknown): payload is StoragePayl
       typeof v.id !== 'string' || v.id.trim() === '' ||
       typeof v.title !== 'string' || v.title.trim() === '' ||
       typeof v.sku !== 'string' || v.sku.trim() === '' ||
-      typeof v.price !== 'number' || isNaN(v.price)
+      typeof v.price !== 'number' || isNaN(v.price) || !isFinite(v.price) || v.price < 0
+    ) {
+      return false;
+    }
+    if (
+      v.inventoryCount !== undefined &&
+      v.inventoryCount !== null &&
+      (typeof v.inventoryCount !== 'number' || isNaN(v.inventoryCount) || !isFinite(v.inventoryCount) || v.inventoryCount < 0)
     ) {
       return false;
     }

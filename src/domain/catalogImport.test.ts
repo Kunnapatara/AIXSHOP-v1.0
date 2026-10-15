@@ -9,16 +9,18 @@ import {
   ShopifyPublicProduct,
   DEMO_STORE_HOSTNAMES,
   normalizeHostname,
-  isDemoStoreHostname
+  isDemoStoreHostname,
+  parseSourcePrice
 } from './ingestion/storeIngestion';
 import { 
   executeCatalogImport, 
   CatalogImportContext,
   executeActionApproval,
-  executeActionRecheck
+  executeActionRecheck,
+  calculateProductCompleteness
 } from './catalog/catalogMutationService';
 import { CatalogStorageAdapter, MemoryStorageBackend } from './storage/storageAdapter';
-import { Product, StoreProfile, ActionItem, Finding } from '../types';
+import { Product, Variant, StoreProfile, ActionItem, Finding } from '../types';
 import { initialProducts, initialFindings, initialActionItems, initialStoreProfile } from '../data/mockData';
 
 describe('Store Check → Safe Product Catalog Import Suite', () => {
@@ -492,7 +494,7 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
 
     const candidate = result.ingestionResult?.candidateProducts[0]!;
     assert.ok(candidate);
-    assert.equal(candidate.variants[0].inventoryCount, 0, 'Inventory count must not be fabricated from public feed');
+    assert.equal(candidate.variants[0].inventoryCount, null, 'Inventory count must not be fabricated from public feed; unknown state must be null');
     assert.equal(candidate.evidenceCoverageScore, 0, 'Evidence coverage must be 0 without lab documents');
     assert.equal(candidate.evidenceDocuments.length, 0, 'No fake evidence documents');
     assert.equal(candidate.offers.length, 0, 'Product and Offer must remain distinct');
@@ -674,6 +676,408 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(corsRes.catalogCompletenessEstimate, 0);
     assert.ok(corsRes.ingestionResult);
     assert.equal(corsRes.ingestionResult.candidateProducts.length, 0, 'Must NOT substitute demo products on network failure');
+    assert.ok(corsRes.sampleIssues.some(i => i.includes('Direct browser fetch was blocked')));
+  });
+
+  // 18. Section 2: Price Data Integrity
+  it('18. price data integrity: distinguishes valid positive and legitimate zero from missing/malformed prices, prevents invalid prices from becoming free products, and protects catalog', async () => {
+    // 18a. Unit validation of parseSourcePrice
+    // Valid positive numeric
+    const p1 = parseSourcePrice(42.5);
+    assert.equal(p1.isValid, true);
+    assert.equal(p1.price, 42.5);
+
+    // Valid positive numeric string
+    const p2 = parseSourcePrice(' 89.99 ');
+    assert.equal(p2.isValid, true);
+    assert.equal(p2.price, 89.99);
+
+    // Legitimate zero price (promotional/free sample)
+    const p3 = parseSourcePrice(0);
+    assert.equal(p3.isValid, true);
+    assert.equal(p3.price, 0);
+
+    const p4 = parseSourcePrice('0');
+    assert.equal(p4.isValid, true);
+    assert.equal(p4.price, 0);
+
+    const p5 = parseSourcePrice('0.00');
+    assert.equal(p5.isValid, true);
+    assert.equal(p5.price, 0);
+
+    // Missing / null / undefined
+    const pMissing = parseSourcePrice(undefined);
+    assert.equal(pMissing.isValid, false);
+    assert.equal(pMissing.price, null);
+
+    const pNull = parseSourcePrice(null);
+    assert.equal(pNull.isValid, false);
+    assert.equal(pNull.price, null);
+
+    // Empty and whitespace-only strings
+    const pEmpty = parseSourcePrice('');
+    assert.equal(pEmpty.isValid, false);
+    assert.equal(pEmpty.price, null);
+
+    const pWhitespace = parseSourcePrice('   ');
+    assert.equal(pWhitespace.isValid, false);
+    assert.equal(pWhitespace.price, null);
+
+    // Malformed and garbage strings
+    const pAlpha = parseSourcePrice('free');
+    assert.equal(pAlpha.isValid, false);
+    assert.equal(pAlpha.price, null);
+
+    const pTrailing = parseSourcePrice('12.50usd');
+    assert.equal(pTrailing.isValid, false);
+    assert.equal(pTrailing.price, null);
+
+    // Negative prices
+    const pNegNum = parseSourcePrice(-10);
+    assert.equal(pNegNum.isValid, false);
+    assert.equal(pNegNum.price, null);
+
+    const pNegStr = parseSourcePrice('-10.50');
+    assert.equal(pNegStr.isValid, false);
+    assert.equal(pNegStr.price, null);
+
+    // Non-finite values: NaN, Infinity, -Infinity
+    const pNan = parseSourcePrice(NaN);
+    assert.equal(pNan.isValid, false);
+    assert.equal(pNan.price, null);
+
+    const pInf = parseSourcePrice(Infinity);
+    assert.equal(pInf.isValid, false);
+    assert.equal(pInf.price, null);
+
+    const pNegInf = parseSourcePrice(-Infinity);
+    assert.equal(pNegInf.isValid, false);
+    assert.equal(pNegInf.price, null);
+
+    const pInfStr = parseSourcePrice('Infinity');
+    assert.equal(pInfStr.isValid, false);
+    assert.equal(pInfStr.price, null);
+
+    // 18b. End-to-end ingestion test: feed containing valid and invalid prices
+    const testFeed = {
+      products: [
+        createMockShopifyProduct(801, {
+          title: 'Valid Zero Sample',
+          variants: [{ id: 'var_801', title: 'Sample', sku: 'FREE-SAMPLE', barcode: '0850029381082', price: '0.00', available: true }],
+        }),
+        createMockShopifyProduct(802, {
+          title: 'Missing Price Item',
+          variants: [{ id: 'var_802', title: 'Default', sku: 'NO-PRICE', barcode: '0850029389019', price: undefined, available: true }],
+        }),
+        createMockShopifyProduct(803, {
+          title: 'Empty Price Item',
+          variants: [{ id: 'var_803', title: 'Default', sku: 'EMPTY-PRICE', barcode: '0850029389026', price: '   ', available: true }],
+        }),
+        createMockShopifyProduct(804, {
+          title: 'Malformed Price Item',
+          variants: [{ id: 'var_804', title: 'Default', sku: 'BAD-PRICE', barcode: '0850029381082', price: 'Call for price', available: true }],
+        }),
+        createMockShopifyProduct(805, {
+          title: 'Negative Price Item',
+          variants: [{ id: 'var_805', title: 'Default', sku: 'NEG-PRICE', barcode: '0850029381082', price: '-25.00', available: true }],
+        }),
+      ],
+    };
+
+    const customFetch: typeof fetch = async () =>
+      new Response(JSON.stringify(testFeed), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    const scanRes = await ingestAndAnalyzeStore('https://price-integrity-test.com', {
+      customFetch,
+      existingCatalog: products,
+    });
+
+    assert.ok(scanRes.ingestionResult);
+    const candidates = scanRes.ingestionResult.candidateProducts;
+    const details = scanRes.ingestionResult.evaluationDetails;
+
+    // Check Candidate 801 (Legitimate zero): accepted
+    const d801 = details.find(d => d.productId === 'p_801')!;
+    assert.equal(d801.status, 'eligible');
+    assert.equal(candidates.find(p => p.id === 'p_801')!.variants[0].price, 0);
+
+    // Check Candidate 802 (Missing price): rejected, raw evidence preserved, price is null (NOT 0)
+    const c802 = candidates.find(p => p.id === 'p_802')!;
+    assert.equal(c802.variants[0].price, null, 'Must NOT convert missing price to 0');
+    assert.equal(c802.variants[0].attributes?.rawSourcePrice, 'undefined');
+    const d802 = details.find(d => d.productId === 'p_802')!;
+    assert.equal(d802.status, 'rejected');
+    assert.ok(d802.reasons.some(r => r.includes('price is missing or invalid')));
+
+    // Check Candidate 803 (Empty string price): rejected, price is null (NOT 0)
+    const c803 = candidates.find(p => p.id === 'p_803')!;
+    assert.equal(c803.variants[0].price, null, 'Must NOT convert whitespace price to 0');
+    const d803 = details.find(d => d.productId === 'p_803')!;
+    assert.equal(d803.status, 'rejected');
+
+    // Check Candidate 804 (Malformed string): rejected, price is null (NOT 0)
+    const c804 = candidates.find(p => p.id === 'p_804')!;
+    assert.equal(c804.variants[0].price, null, 'Must NOT convert malformed price to 0');
+    const d804 = details.find(d => d.productId === 'p_804')!;
+    assert.equal(d804.status, 'rejected');
+
+    // Check Candidate 805 (Negative price): rejected, price is null (NOT 0)
+    const c805 = candidates.find(p => p.id === 'p_805')!;
+    assert.equal(c805.variants[0].price, null);
+    const d805 = details.find(d => d.productId === 'p_805')!;
+    assert.equal(d805.status, 'rejected');
+
+    // 18c. Direct import execution: rejects all products with missing/invalid price; only eligible zero product imports
+    const initialCatalogCount = products.length;
+    const importRes = executeCatalogImport(candidates, getImportContext());
+    assert.equal(importRes.success, true);
+    assert.equal(importRes.importedCount, 1, 'Only legitimate zero product imports');
+    assert.equal(importRes.rejectedCount, 4, 'All 4 invalid price candidates must be rejected');
+    assert.equal(importRes.nextProducts.length, initialCatalogCount + 1);
+
+    // Existing catalog items strictly preserved
+    for (let i = 0; i < initialCatalogCount; i++) {
+      assert.deepEqual(importRes.nextProducts[i], products[i], 'Existing catalog data must remain completely intact');
+    }
+  });
+
+  // 19. Section 3: SKU Requirements and Stable Product Identity
+  it('19. SKU requirements and stable product identity: rejects SKU-less candidate with explicit schema technical reason, preserves multi-variants, deduplicates idempotently, and detects conflicts', async () => {
+    // 19a. Product with valid SKU is accepted
+    const validSkuProduct: Product = {
+      id: 'p_valid_sku',
+      title: 'Valid SKU Ceramic Pitcher',
+      brand: 'ClayWorks',
+      category: 'Tableware',
+      description: 'Handmade stoneware pitcher.',
+      image: '',
+      status: 'active',
+      completenessScore: 0,
+      evidenceCoverageScore: 0,
+      externalDiscoveryStatus: 'observed_in_sample',
+      attributes: { sourceProductId: '777' },
+      variants: [{ id: 'v_val_1', title: 'Standard', sku: 'PITCHER-1L', barcode: '0850029381082', price: 34.0, inventoryCount: null, attributes: {} }],
+      offers: [],
+      evidenceDocuments: [],
+      findingsCount: 0,
+      lastAudited: new Date().toISOString(),
+    };
+    const valRes = validateCandidateProduct(validSkuProduct);
+    assert.equal(valRes.isValid, true);
+
+    // 19b. Product without SKU: rejected with explicit technical reason documenting storage schema v1.2 requirement
+    const missingSkuProduct: Product = {
+      ...validSkuProduct,
+      id: 'p_missing_sku',
+      variants: [{ id: 'v_nosku_1', title: 'Standard', sku: '   ', barcode: '0850029381082', price: 34.0, inventoryCount: null, attributes: {} }],
+    };
+    const noSkuRes = validateCandidateProduct(missingSkuProduct);
+    assert.equal(noSkuRes.isValid, false);
+    assert.ok(noSkuRes.reasons.some(r => r.includes('Merchant SKU is required by catalog storage schema v1.2')));
+
+    // No dummy or fabricated SKUs are invented
+    assert.equal(missingSkuProduct.variants[0].sku.trim(), '');
+
+    // 19c. Product with multiple distinct variants belonging to one source product: all preserved without collapsing
+    const multiVariantProduct: Product = {
+      id: 'p_multi_var',
+      title: 'Hand-Poured Soy Candle',
+      brand: 'Studio Crafts',
+      category: 'Home Fragrance',
+      description: 'Natural soy wax candle in multiple sizes.',
+      image: '',
+      status: 'active',
+      completenessScore: 0,
+      evidenceCoverageScore: 0,
+      externalDiscoveryStatus: 'observed_in_sample',
+      attributes: { sourceProductId: '888' },
+      variants: [
+        { id: 'v_mv_small', title: 'Small 4oz', sku: 'CANDLE-4OZ', barcode: '0850029381082', price: 18.0, inventoryCount: 50, attributes: { sourceVariantId: 'sv_1' } },
+        { id: 'v_mv_medium', title: 'Medium 8oz', sku: 'CANDLE-8OZ', barcode: '0850029389019', price: 28.0, inventoryCount: 35, attributes: { sourceVariantId: 'sv_2' } },
+        { id: 'v_mv_large', title: 'Large 16oz', sku: 'CANDLE-16OZ', barcode: '0850029389026', price: 42.0, inventoryCount: 20, attributes: { sourceVariantId: 'sv_3' } },
+      ],
+      offers: [],
+      evidenceDocuments: [],
+      findingsCount: 0,
+      lastAudited: new Date().toISOString(),
+    };
+
+    const mvImport = executeCatalogImport([multiVariantProduct], getImportContext());
+    assert.equal(mvImport.success, true);
+    assert.equal(mvImport.importedCount, 1);
+    const importedMv = mvImport.nextProducts.find(p => p.id === 'p_multi_var')!;
+    assert.equal(importedMv.variants.length, 3, 'All 3 variants must be preserved without collapsing');
+    assert.equal(importedMv.variants[0].sku, 'CANDLE-4OZ');
+    assert.equal(importedMv.variants[1].sku, 'CANDLE-8OZ');
+    assert.equal(importedMv.variants[2].sku, 'CANDLE-16OZ');
+
+    // 19d. Repeated imports of the same source product and variants: idempotent, skipped as duplicate
+    const reImportMv = executeCatalogImport([multiVariantProduct], {
+      ...getImportContext(),
+      products: mvImport.nextProducts,
+      storeProfile: mvImport.nextStoreProfile,
+    });
+    assert.equal(reImportMv.importedCount, 0, 'Re-import must not create duplicate records');
+    assert.equal(reImportMv.skippedCount, 1);
+    assert.equal(reImportMv.nextProducts.length, mvImport.nextProducts.length);
+
+    // 19e. Conflict with existing catalog product: detected and merchant data preserved
+    const conflictingProduct: Product = {
+      ...multiVariantProduct,
+      title: 'Altered Candle Title From Source',
+      brand: 'Different Brand',
+    };
+    const conflictRes = executeCatalogImport([conflictingProduct], {
+      ...getImportContext(),
+      products: mvImport.nextProducts,
+      storeProfile: mvImport.nextStoreProfile,
+    });
+    assert.equal(conflictRes.conflictCount, 1);
+    assert.equal(conflictRes.importedCount, 0);
+    // Preserved merchant data:
+    const catalogItem = conflictRes.nextProducts.find(p => p.id === 'p_multi_var')!;
+    assert.equal(catalogItem.title, 'Hand-Poured Soy Candle', 'Merchant title must not be overwritten');
+    assert.equal(catalogItem.brand, 'Studio Crafts', 'Merchant brand must not be overwritten');
+  });
+
+  // 20. Section 4: Three Distinct Inventory States & Storage Round-Trip
+  it('20. inventory states: correctly distinguishes known > 0, confirmed zero, and unknown (null) across ingestion, completeness, and storage round-trip', () => {
+    // 20a. Three distinct variants representing the 3 states
+    const variantKnownPositive: Variant = {
+      id: 'v_inv_pos',
+      sku: 'INV-POS-100',
+      title: 'In Stock 100',
+      barcode: '0850029381082',
+      price: 25.0,
+      inventoryCount: 100, // State 1: Known > 0
+      attributes: {},
+    };
+
+    const variantConfirmedZero: Variant = {
+      id: 'v_inv_zero',
+      sku: 'INV-ZERO-000',
+      title: 'Confirmed Out of Stock',
+      barcode: '0850029389019',
+      price: 25.0,
+      inventoryCount: 0, // State 2: Confirmed zero
+      attributes: {},
+    };
+
+    const variantUnknown: Variant = {
+      id: 'v_inv_null',
+      sku: 'INV-NULL-XXX',
+      title: 'Public Feed Sample (Unknown Stock)',
+      barcode: '0850029389026',
+      price: 25.0,
+      inventoryCount: null, // State 3: Unknown / unavailable from source
+      attributes: {},
+    };
+
+    const testProduct: Product = {
+      id: 'p_inv_states',
+      title: 'Inventory States Demonstration Product',
+      brand: 'Warehouse Brand',
+      category: 'Supplies',
+      description: 'Demonstrates 3 distinct inventory states without false claims.',
+      image: '',
+      status: 'active',
+      completenessScore: 0,
+      evidenceCoverageScore: 0,
+      externalDiscoveryStatus: 'observed_in_sample',
+      attributes: {},
+      variants: [variantKnownPositive, variantConfirmedZero, variantUnknown],
+      offers: [],
+      evidenceDocuments: [],
+      findingsCount: 0,
+      lastAudited: new Date().toISOString(),
+    };
+
+    // 20b. Completeness calculation works identically and safely across all inventory states
+    const score = calculateProductCompleteness(testProduct);
+    assert.ok(score > 0, 'Completeness calculates without throwing on null inventory');
+
+    // 20c. Persistence through storageAdapter: validates and saves clean envelope
+    const allProducts = [...products, testProduct];
+    const saveRes = adapter.save({
+      products: allProducts,
+      variants: allProducts.flatMap(p => p.variants || []),
+      offers: allProducts.flatMap(p => p.offers || []),
+      findings,
+      evidence: [],
+      actions: actionItems,
+      storeProfile,
+    });
+    assert.equal(saveRes.success, true, 'Storage adapter must accept variants with null inventoryCount');
+
+    // 20d. Load round-trip: restores exact states faithfully
+    const loadRes = adapter.load();
+    assert.equal(loadRes.type, 'valid');
+    if (loadRes.type === 'valid') {
+      const loadedProd = loadRes.envelope.payload.products.find(p => p.id === 'p_inv_states')!;
+      assert.ok(loadedProd);
+      assert.equal(loadedProd.variants[0].inventoryCount, 100, 'State 1 (known > 0) preserved');
+      assert.equal(loadedProd.variants[1].inventoryCount, 0, 'State 2 (confirmed 0) preserved');
+      assert.equal(loadedProd.variants[2].inventoryCount, null, 'State 3 (null/unknown) preserved');
+    }
+  });
+
+  // 21. Section 5: Scan Status and Completeness Semantics
+  it('21. scan status & completeness semantics: accurately separates demo fixture, partial real sample, HTTP failure, and CORS network failure', async () => {
+    // 21a. Explicit Demo Fixture: scanStatus is demo_fixture, isPartialSample is false
+    const demoRes = await ingestAndAnalyzeStore('https://solsticecraftgoods.store', {
+      existingCatalog: products,
+    });
+    assert.equal(demoRes.scanStatus, 'demo_fixture');
+    assert.equal(demoRes.detectedPlatform, 'Solstice Mercantile (Demo Fixture Feed)');
+    assert.ok(demoRes.ingestionResult);
+    assert.equal(demoRes.ingestionResult.source.isPartialSample, false);
+    assert.equal(demoRes.ingestionResult.warnings.length, 0);
+
+    // 21b. Real Live Sample: scanStatus is real_scan, isPartialSample is true (25 limit), clear warning
+    const sampleFeed = {
+      products: [
+        createMockShopifyProduct(1, { title: 'Item 1' }),
+        createMockShopifyProduct(2, { title: 'Item 2' }),
+      ],
+    };
+    const sampleFetch: typeof fetch = async () =>
+      new Response(JSON.stringify(sampleFeed), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    const sampleRes = await ingestAndAnalyzeStore('https://real-boutique-goods.com', {
+      customFetch: sampleFetch,
+      existingCatalog: products,
+    });
+    assert.equal(sampleRes.scanStatus, 'real_scan');
+    assert.ok(sampleRes.ingestionResult);
+    assert.equal(sampleRes.ingestionResult.source.isPartialSample, true);
+    assert.equal(sampleRes.ingestionResult.source.sampleLimit, 25);
+    assert.ok(sampleRes.ingestionResult.warnings.some(w => w.includes('25-product sample')));
+    assert.ok(sampleRes.notice?.includes('Sample evaluation scanned'));
+
+    // 21c. HTTP 403 / Restricted: scanStatus is unsupported_store, candidateProducts is empty
+    const forbiddenFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ error: 'Access denied' }), { status: 403, statusText: 'Forbidden' });
+
+    const forbiddenRes = await ingestAndAnalyzeStore('https://private-store.com', {
+      customFetch: forbiddenFetch,
+      existingCatalog: products,
+    });
+    assert.equal(forbiddenRes.scanStatus, 'unsupported_store');
+    assert.ok(forbiddenRes.ingestionResult);
+    assert.equal(forbiddenRes.ingestionResult.candidateProducts.length, 0);
+    assert.ok(forbiddenRes.sampleIssues.some(i => i.includes('HTTP 403')));
+
+    // 21d. Network / CORS Failure: scanStatus is network_failure, candidateProducts is empty
+    const corsFetch: typeof fetch = async () => {
+      throw new Error('Failed to fetch due to CORS preflight');
+    };
+    const corsRes = await ingestAndAnalyzeStore('https://cors-blocked-store.com', {
+      customFetch: corsFetch,
+      existingCatalog: products,
+    });
+    assert.equal(corsRes.scanStatus, 'network_failure');
+    assert.ok(corsRes.ingestionResult);
+    assert.equal(corsRes.ingestionResult.candidateProducts.length, 0);
     assert.ok(corsRes.sampleIssues.some(i => i.includes('Direct browser fetch was blocked')));
   });
 });
