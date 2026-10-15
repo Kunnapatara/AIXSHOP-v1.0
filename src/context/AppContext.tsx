@@ -5,7 +5,9 @@ import {
   Finding, 
   ActionItem, 
   StoreProfile, 
-  QuickHealthCheckResult 
+  QuickHealthCheckResult,
+  StoreIngestionResult,
+  CatalogImportResult
 } from '../types';
 import { 
   initialStoreProfile, 
@@ -22,6 +24,7 @@ import {
   executeActionRecheck,
   executeProductRecheck,
   calculateStoreCompletenessAvg,
+  executeCatalogImport,
 } from '../domain/catalog/catalogMutationService';
 import { ingestAndAnalyzeStore } from '../domain/ingestion/storeIngestion';
 
@@ -43,6 +46,7 @@ interface AppContextType {
   actionItems: ActionItem[];
   toasts: ToastMessage[];
   quickCheckResult: QuickHealthCheckResult | null;
+  lastIngestionResult: StoreIngestionResult | null;
   isCheckingStore: boolean;
   selectedProduct: Product | null;
   mobileMenuOpen: boolean;
@@ -56,6 +60,7 @@ interface AppContextType {
   viewProductDetail: (productId: string, fromPage?: NavigationPage) => void;
   returnFromProductDetail: () => void;
   runStoreCheck: (url: string) => Promise<void>;
+  importDiscoveredProducts: () => Promise<CatalogImportResult | null>;
   approveAction: (actionId: string, customApprovedValue?: string) => void;
   dismissAction: (actionId: string) => void;
   recheckAction: (actionId: string) => void;
@@ -86,6 +91,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [actionItems, setActionItems] = useState<ActionItem[]>(initialActionItems);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [quickCheckResult, setQuickCheckResult] = useState<QuickHealthCheckResult | null>(null);
+  const [lastIngestionResult, setLastIngestionResult] = useState<StoreIngestionResult | null>(null);
   const [isCheckingStore, setIsCheckingStore] = useState<boolean>(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const [isReadOnlyMode, setIsReadOnlyMode] = useState<boolean>(false);
@@ -224,8 +230,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const runStoreCheck = async (url: string) => {
     setIsCheckingStore(true);
     try {
-      const result = await ingestAndAnalyzeStore(url);
+      const result = await ingestAndAnalyzeStore(url, { existingCatalog: products });
       setQuickCheckResult(result);
+      if (result.ingestionResult) {
+        setLastIngestionResult(result.ingestionResult);
+      }
 
       if (result.scanStatus === 'demo_fixture') {
         addToast(
@@ -257,6 +266,69 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     } finally {
       setIsCheckingStore(false);
     }
+  };
+
+  const importDiscoveredProducts = async (): Promise<CatalogImportResult | null> => {
+    if (!lastIngestionResult || !lastIngestionResult.candidateProducts.length) {
+      addToast('No Products Discovered', 'Run a store check first to discover products for import.', 'warning');
+      return null;
+    }
+
+    if (isReadOnlyMode) {
+      addToast('Import Disabled', 'Storage is in read-only compatibility mode.', 'warning');
+      return null;
+    }
+
+    const res = executeCatalogImport(lastIngestionResult.candidateProducts, {
+      products,
+      findings,
+      actionItems,
+      storeProfile,
+      isReadOnly: isReadOnlyMode,
+    });
+
+    if (!res.success) {
+      addToast('Import Failed', res.message, 'error');
+      return res;
+    }
+
+    if (res.importedCount === 0) {
+      addToast('Import Information', res.message, 'info');
+      return res;
+    }
+
+    // Atomic persistence through storage adapter
+    const saveRes = persistState(
+      res.nextProducts,
+      findings,
+      actionItems,
+      res.nextStoreProfile
+    );
+
+    if (!saveRes.success) {
+      addToast(
+        'Persistence Failed (Rolled Back)',
+        `Could not persist imported products: ${saveRes.error}. Catalog preserved.`,
+        'error'
+      );
+      return { ...res, success: false };
+    }
+
+    // Persist succeeded: commit in-memory state
+    setProducts(res.nextProducts);
+    setStoreProfile(res.nextStoreProfile);
+
+    // Update lastIngestionResult details
+    setLastIngestionResult(prev => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        evaluationDetails: res.details,
+      };
+    });
+
+    addToast('Catalog Import Complete', res.message, 'success');
+    return res;
   };
 
   const approveAction = (actionId: string, customApprovedValue?: string) => {
@@ -469,6 +541,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         actionItems,
         toasts,
         quickCheckResult,
+        lastIngestionResult,
         isCheckingStore,
         selectedProduct,
         mobileMenuOpen,
@@ -482,6 +555,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         viewProductDetail,
         returnFromProductDetail,
         runStoreCheck,
+        importDiscoveredProducts,
         approveAction,
         dismissAction,
         recheckAction,

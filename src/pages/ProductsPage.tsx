@@ -14,11 +14,19 @@ import {
   ChevronRight,
   LayoutGrid,
   List,
-  CheckSquare
+  CheckSquare,
+  Download
 } from 'lucide-react';
 
 export const ProductsPage: React.FC = () => {
-  const { products, viewProductDetail, addToast } = useApp();
+  const { 
+    products, 
+    viewProductDetail, 
+    addToast, 
+    lastIngestionResult, 
+    importDiscoveredProducts, 
+    isReadOnlyMode 
+  } = useApp();
 
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
@@ -108,6 +116,36 @@ export const ProductsPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Discovered Products Import Banner */}
+      {lastIngestionResult && (lastIngestionResult.evaluationDetails.filter(d => d.status === 'eligible').length > 0) && (
+        <div className="bg-emerald-50 border border-emerald-200/90 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-start gap-3">
+            <Download className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+            <div className="text-xs">
+              <p className="font-semibold text-emerald-950">
+                Recent Store Check discovered {lastIngestionResult.evaluationDetails.filter(d => d.status === 'eligible').length} eligible products from {lastIngestionResult.source.platform}
+              </p>
+              <p className="text-emerald-800 mt-0.5">
+                Ready to import into your internal catalog. Duplicates and merchant-edited fields are preserved.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              await importDiscoveredProducts();
+            }}
+            disabled={isReadOnlyMode}
+            className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg shrink-0 transition-colors ${
+              isReadOnlyMode
+                ? 'bg-stone-300 text-stone-500 cursor-not-allowed'
+                : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs'
+            }`}
+          >
+            Import {lastIngestionResult.evaluationDetails.filter(d => d.status === 'eligible').length} Products
+          </button>
+        </div>
+      )}
 
       {/* Distinction Callout */}
       <div className="p-3.5 bg-stone-50 border border-stone-200/90 rounded-xl text-xs text-stone-600 flex flex-col sm:flex-row sm:items-center justify-between gap-2">

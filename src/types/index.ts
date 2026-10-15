@@ -155,4 +155,49 @@ export interface QuickHealthCheckResult {
   sampleIssues: string[];
   scanStatus?: 'real_scan' | 'partial_scan' | 'unsupported_store' | 'network_failure' | 'demo_fixture';
   notice?: string;
+  ingestionResult?: StoreIngestionResult;
 }
+
+export type CandidateEligibilityStatus = 'eligible' | 'duplicate' | 'conflict' | 'rejected';
+
+export interface CandidateProductStatus {
+  productId: string;
+  sourceId: string;
+  title: string;
+  brand: string;
+  category: string;
+  status: CandidateEligibilityStatus;
+  reasons: string[];
+  product?: Product;
+}
+
+export interface StoreIngestionResult {
+  healthCheck: QuickHealthCheckResult;
+  candidateProducts: Product[];
+  evaluationDetails: CandidateProductStatus[];
+  source: {
+    platform: string;
+    origin: string;
+    endpoint: string;
+    timestamp: string;
+    isPartialSample: boolean;
+    sampleLimit: number;
+    discoveredCount: number;
+    parsedCount: number;
+  };
+  warnings: string[];
+}
+
+export interface CatalogImportResult {
+  success: boolean;
+  importedCount: number;
+  skippedCount: number;
+  rejectedCount: number;
+  conflictCount: number;
+  message: string;
+  importedProducts: Product[];
+  nextProducts: Product[];
+  nextStoreProfile: StoreProfile;
+  details: CandidateProductStatus[];
+}
+

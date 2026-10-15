@@ -15,7 +15,11 @@ import {
   Lock,
   FileCheck,
   Building2,
-  RefreshCw
+  RefreshCw,
+  Download,
+  ChevronDown,
+  ChevronUp,
+  Check
 } from 'lucide-react';
 
 export const LandingPage: React.FC = () => {
@@ -23,9 +27,15 @@ export const LandingPage: React.FC = () => {
     navigateTo, 
     runStoreCheck, 
     quickCheckResult, 
+    lastIngestionResult,
+    importDiscoveredProducts,
+    isReadOnlyMode,
     isCheckingStore, 
     storeProfile 
   } = useApp();
+
+  const [isReviewOpen, setIsReviewOpen] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
 
   const [urlInput, setUrlInput] = useState('https://solsticecraftgoods.store');
   const [urlError, setUrlError] = useState<string | null>(null);
@@ -283,6 +293,187 @@ export const LandingPage: React.FC = () => {
                   ))}
                 </div>
               </div>
+
+              {/* Safe Catalog Import Section */}
+              {(() => {
+                const ingestion = lastIngestionResult || quickCheckResult.ingestionResult;
+                if (!ingestion || !ingestion.candidateProducts || ingestion.candidateProducts.length === 0) {
+                  return null;
+                }
+
+                const eligibleList = ingestion.evaluationDetails.filter(d => d.status === 'eligible');
+                const duplicateList = ingestion.evaluationDetails.filter(d => d.status === 'duplicate');
+                const conflictList = ingestion.evaluationDetails.filter(d => d.status === 'conflict');
+                const rejectedList = ingestion.evaluationDetails.filter(d => d.status === 'rejected');
+
+                const eligibleCount = eligibleList.length;
+                const duplicateCount = duplicateList.length;
+                const conflictCount = conflictList.length;
+                const rejectedCount = rejectedList.length;
+
+                const handleImportClick = async () => {
+                  setIsImporting(true);
+                  try {
+                    await importDiscoveredProducts();
+                  } finally {
+                    setIsImporting(false);
+                  }
+                };
+
+                return (
+                  <div className="bg-stone-50 border border-stone-200/90 rounded-xl p-5 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <Download className="w-4 h-4 text-emerald-600" />
+                          <h4 className="text-sm font-bold text-stone-900">
+                            Discovered Product Feed ({ingestion.candidateProducts.length} Items)
+                          </h4>
+                          {ingestion.source.isPartialSample && (
+                            <span className="text-[11px] font-medium px-2 py-0.5 rounded bg-amber-100 text-amber-800">
+                              25-Product Sample
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-stone-600 mt-1">
+                          Review discovered products before safe catalog import. Duplicates and merchant-edited fields are protected from overwrite.
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setIsReviewOpen(!isReviewOpen)}
+                          className="px-3 py-1.5 text-xs font-medium text-stone-700 bg-white border border-stone-200 hover:bg-stone-100 rounded-lg flex items-center gap-1.5 transition-colors"
+                        >
+                          <span>{isReviewOpen ? 'Hide Records' : 'Review Records'}</span>
+                          {isReviewOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleImportClick}
+                          disabled={isImporting || isReadOnlyMode || eligibleCount === 0}
+                          className={`px-4 py-2 text-xs font-semibold rounded-lg flex items-center gap-2 transition-colors shadow-xs ${
+                            isReadOnlyMode
+                              ? 'bg-stone-300 text-stone-500 cursor-not-allowed'
+                              : eligibleCount > 0
+                              ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                              : 'bg-stone-200 text-stone-600 cursor-default'
+                          }`}
+                        >
+                          {isImporting ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>Importing...</span>
+                            </>
+                          ) : eligibleCount > 0 ? (
+                            <>
+                              <Download className="w-3.5 h-3.5" />
+                              <span>Import {eligibleCount} Eligible Products</span>
+                            </>
+                          ) : (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>All Records In Catalog</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Eligibility Metric Pill Breakdown */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1">
+                      <div className="bg-white px-3 py-2 rounded-lg border border-stone-200/80 flex items-center justify-between">
+                        <span className="text-xs text-stone-600 font-medium">Eligible for Import</span>
+                        <span className="text-xs font-bold font-mono text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                          {eligibleCount}
+                        </span>
+                      </div>
+                      <div className="bg-white px-3 py-2 rounded-lg border border-stone-200/80 flex items-center justify-between">
+                        <span className="text-xs text-stone-600 font-medium">Already in Catalog</span>
+                        <span className="text-xs font-bold font-mono text-stone-700 bg-stone-100 px-2 py-0.5 rounded">
+                          {duplicateCount}
+                        </span>
+                      </div>
+                      <div className="bg-white px-3 py-2 rounded-lg border border-stone-200/80 flex items-center justify-between">
+                        <span className="text-xs text-stone-600 font-medium">Merchant Conflicts</span>
+                        <span className="text-xs font-bold font-mono text-amber-700 bg-amber-50 px-2 py-0.5 rounded">
+                          {conflictCount}
+                        </span>
+                      </div>
+                      <div className="bg-white px-3 py-2 rounded-lg border border-stone-200/80 flex items-center justify-between">
+                        <span className="text-xs text-stone-600 font-medium">Incomplete / Rejected</span>
+                        <span className="text-xs font-bold font-mono text-rose-700 bg-rose-50 px-2 py-0.5 rounded">
+                          {rejectedCount}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Collapsible Candidate Records List */}
+                    {isReviewOpen && (
+                      <div className="mt-3 bg-white border border-stone-200 rounded-xl overflow-hidden shadow-xs">
+                        <div className="max-h-72 overflow-y-auto divide-y divide-stone-100">
+                          {ingestion.evaluationDetails.map((detail, idx) => {
+                            const p = detail.product || ingestion.candidateProducts[idx];
+                            const variantCount = p?.variants?.length || 0;
+                            const samplePrice = p?.variants?.[0]?.price ?? 0;
+
+                            return (
+                              <div key={idx} className="p-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-stone-50">
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="font-semibold text-stone-900 truncate">
+                                      {detail.title}
+                                    </span>
+                                    <span className="text-stone-400 font-mono text-[11px]">
+                                      ID: {detail.sourceId || detail.productId}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-3 text-stone-500 text-[11px] mt-0.5 flex-wrap">
+                                    <span>Brand: {detail.brand || '(missing)'}</span>
+                                    <span>Category: {detail.category || '(missing)'}</span>
+                                    <span>{variantCount} variant{variantCount !== 1 ? 's' : ''}</span>
+                                    <span className="font-mono font-medium">${samplePrice.toFixed(2)}</span>
+                                  </div>
+                                  {detail.reasons.length > 0 && (
+                                    <p className="text-[11px] text-stone-500 mt-1 italic">
+                                      {detail.reasons.join(' · ')}
+                                    </p>
+                                  )}
+                                </div>
+
+                                <div className="shrink-0 flex items-center gap-2">
+                                  {detail.status === 'eligible' && (
+                                    <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-100 text-emerald-800">
+                                      Eligible for Import
+                                    </span>
+                                  )}
+                                  {detail.status === 'duplicate' && (
+                                    <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-stone-100 text-stone-600">
+                                      In Catalog (Skipped)
+                                    </span>
+                                  )}
+                                  {detail.status === 'conflict' && (
+                                    <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-100 text-amber-800">
+                                      Merchant Value Preserved
+                                    </span>
+                                  )}
+                                  {detail.status === 'rejected' && (
+                                    <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-rose-100 text-rose-800">
+                                      Ineligible (Missing Fields)
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Clear Transition to Full Merchant App */}
               <div className="p-4 bg-orange-50/70 border border-orange-200 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">

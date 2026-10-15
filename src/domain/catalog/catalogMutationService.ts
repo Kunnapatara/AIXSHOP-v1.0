@@ -1,5 +1,6 @@
-import { Product, Finding, ActionItem, StoreProfile } from '../../types';
+import { Product, Finding, ActionItem, StoreProfile, CatalogImportResult } from '../../types';
 import { isValidGtin13 } from '../validation/gtin';
+import { evaluateCandidateProducts } from '../ingestion/storeIngestion';
 
 /**
  * Explicit allowlist of fields that may be mutated by an Action Item.
@@ -771,3 +772,110 @@ export function executeProductRecheck(
     nextProducts,
   };
 }
+
+export interface CatalogImportContext {
+  products: Product[];
+  findings: Finding[];
+  actionItems: ActionItem[];
+  storeProfile: StoreProfile;
+  isReadOnly: boolean;
+}
+
+/**
+ * Safely imports validated candidate products into the merchant catalog.
+ * - Idempotent: Skips duplicates based on stable source identifiers.
+ * - Non-destructive: Never overwrites merchant-edited fields (conflicts are preserved).
+ * - Enforces read-only mode and domain validation rules.
+ * - Recalculates catalog completeness and SKU metrics accurately.
+ * - Explicitly notes that internal import does not modify the external merchant store.
+ */
+export function executeCatalogImport(
+  candidates: Product[],
+  ctx: CatalogImportContext
+): CatalogImportResult {
+  if (ctx.isReadOnly) {
+    return {
+      success: false,
+      importedCount: 0,
+      skippedCount: 0,
+      rejectedCount: 0,
+      conflictCount: 0,
+      message: 'Catalog is in read-only mode. Import aborted.',
+      importedProducts: [],
+      nextProducts: ctx.products,
+      nextStoreProfile: ctx.storeProfile,
+      details: [],
+    };
+  }
+
+  if (!candidates || candidates.length === 0) {
+    return {
+      success: true,
+      importedCount: 0,
+      skippedCount: 0,
+      rejectedCount: 0,
+      conflictCount: 0,
+      message: 'No candidate products provided for import.',
+      importedProducts: [],
+      nextProducts: ctx.products,
+      nextStoreProfile: ctx.storeProfile,
+      details: [],
+    };
+  }
+
+  const { candidateDetails, eligibleProducts } = evaluateCandidateProducts(candidates, ctx.products);
+
+  let skippedCount = 0;
+  let rejectedCount = 0;
+  let conflictCount = 0;
+
+  candidateDetails.forEach(d => {
+    if (d.status === 'duplicate') skippedCount++;
+    else if (d.status === 'rejected') rejectedCount++;
+    else if (d.status === 'conflict') conflictCount++;
+  });
+
+  if (eligibleProducts.length === 0) {
+    return {
+      success: true,
+      importedCount: 0,
+      skippedCount,
+      rejectedCount,
+      conflictCount,
+      message: `0 products imported (${skippedCount} duplicates skipped, ${rejectedCount} rejected, ${conflictCount} conflicts preserved).`,
+      importedProducts: [],
+      nextProducts: ctx.products,
+      nextStoreProfile: ctx.storeProfile,
+      details: candidateDetails,
+    };
+  }
+
+  // Ensure each newly imported product has valid completeness score calculated
+  const newProductsWithScores = eligibleProducts.map(p => ({
+    ...p,
+    completenessScore: calculateProductCompleteness(p),
+  }));
+
+  const nextProducts = [...ctx.products, ...newProductsWithScores];
+  const addedVariantCount = newProductsWithScores.reduce((sum, p) => sum + (p.variants?.length || 0), 0);
+  const nextStoreProfile: StoreProfile = {
+    ...ctx.storeProfile,
+    skuCount: ctx.storeProfile.skuCount + addedVariantCount,
+    catalogCompletenessAvg: calculateStoreCompletenessAvg(nextProducts),
+    lastAuditDate: new Date().toISOString(),
+  };
+
+  return {
+    success: true,
+    importedCount: newProductsWithScores.length,
+    skippedCount,
+    rejectedCount,
+    conflictCount,
+    message: `Successfully imported ${newProductsWithScores.length} products into catalog (${skippedCount} duplicates skipped, ${rejectedCount} rejected, ${conflictCount} conflicts preserved). Note: No external store write-back was performed.`,
+    importedProducts: newProductsWithScores,
+    nextProducts,
+    nextStoreProfile,
+    details: candidateDetails,
+  };
+}
+
