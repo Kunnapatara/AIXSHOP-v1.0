@@ -8,8 +8,23 @@ import {
 } from '../../types';
 import { initialProducts, initialFindings } from '../../data/mockData';
 import { isValidGtin13 } from '../validation/gtin';
-import { calculateProductCompleteness } from '../catalog/catalogMutationService';
+import { calculateProductCompleteness } from '../catalog/completeness';
 import { CURRENT_SCHEMA_VERSION } from '../storage/storageAdapter';
+import { 
+  DECIMAL_PRICE_REGEX, 
+  parseDecimalPrice, 
+  parseSourcePrice, 
+  isValidDecimalPriceString 
+} from '../validation/price';
+import type { ParsedPriceResult } from '../validation/price';
+
+export { 
+  DECIMAL_PRICE_REGEX, 
+  parseDecimalPrice, 
+  parseSourcePrice, 
+  isValidDecimalPriceString 
+};
+export type { ParsedPriceResult };
 
 export interface ShopifyPublicProduct {
   id: number | string;
@@ -115,110 +130,7 @@ export function isDemoStoreHostname(rawHostname: string): boolean {
   return DEMO_STORE_HOSTNAMES.has(normalized);
 }
 
-export const DECIMAL_PRICE_REGEX = /^\d+(\.\d+)?$/;
 
-export interface ParsedPriceResult {
-  isValid: boolean;
-  price: number | null;
-  rawString: string;
-  reason?: string;
-}
-
-/**
- * Safely parses a source price value without inventing zero for missing or malformed inputs.
- * Strictly rejects:
- * - undefined or null
- * - empty or whitespace-only strings
- * - non-numeric strings or strings with trailing garbage (e.g. '12.50abc')
- * - hexadecimal ('0x10'), binary ('0b101'), octal ('0o77'), scientific/exponential notation ('1e3')
- * - NaN, Infinity, -Infinity
- * - negative prices (< 0) or strings with negative signs
- * Valid zero (0, '0', '0.00') is accepted as legitimate non-negative price per domain rules.
- */
-export function parseSourcePrice(rawPrice: unknown): ParsedPriceResult {
-  if (rawPrice === undefined || rawPrice === null) {
-    return {
-      isValid: false,
-      price: null,
-      rawString: String(rawPrice),
-      reason: 'Price is missing or null.',
-    };
-  }
-
-  if (typeof rawPrice === 'number') {
-    if (isNaN(rawPrice)) {
-      return { isValid: false, price: null, rawString: 'NaN', reason: 'Price is NaN.' };
-    }
-    if (!isFinite(rawPrice)) {
-      return { isValid: false, price: null, rawString: String(rawPrice), reason: `Price must be finite (received ${rawPrice}).` };
-    }
-    if (rawPrice < 0) {
-      return { isValid: false, price: null, rawString: String(rawPrice), reason: `Price cannot be negative (received ${rawPrice}).` };
-    }
-    const normalizedPrice = rawPrice === 0 ? 0 : rawPrice;
-    return { isValid: true, price: normalizedPrice, rawString: String(rawPrice) };
-  }
-
-  if (typeof rawPrice === 'string') {
-    const trimmed = rawPrice.trim();
-    if (trimmed === '') {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: 'Price is empty or whitespace-only.',
-      };
-    }
-
-    // Explicit price parsing policy: must match standard non-negative decimal merchant price format.
-    // Rejects hexadecimal (0x..), binary (0b..), octal (0o..), scientific/exponential notation (1e3),
-    // signs (+/-), currency symbols, multiple decimal dots, and non-numeric characters.
-    if (!DECIMAL_PRICE_REGEX.test(trimmed)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Malformed price string "${rawPrice}": must be a valid non-negative decimal merchant price without currency symbols, letters, signs, exponential notation, or non-decimal bases.`,
-      };
-    }
-
-    const num = Number(trimmed);
-    if (isNaN(num)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Malformed price string "${rawPrice}".`,
-      };
-    }
-    if (!isFinite(num)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price must be finite (received "${rawPrice}").`,
-      };
-    }
-    if (num < 0) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price cannot be negative (received "${rawPrice}").`,
-      };
-    }
-
-    const normalizedPrice = num === 0 ? 0 : num;
-    return { isValid: true, price: normalizedPrice, rawString: rawPrice };
-  }
-
-  return {
-    isValid: false,
-    price: null,
-    rawString: String(rawPrice),
-    reason: `Invalid price data type: ${typeof rawPrice}.`,
-  };
-}
 
 /**
  * Validates a single candidate product against catalog persistence & domain invariants.

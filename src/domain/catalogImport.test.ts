@@ -9,10 +9,15 @@ import {
   ShopifyPublicProduct,
   DEMO_STORE_HOSTNAMES,
   normalizeHostname,
-  isDemoStoreHostname,
-  parseSourcePrice,
-  DECIMAL_PRICE_REGEX
+  isDemoStoreHostname
 } from './ingestion/storeIngestion';
+import {
+  parseSourcePrice,
+  DECIMAL_PRICE_REGEX,
+  parseDecimalPrice,
+  isValidDecimalPriceString
+} from './validation/price';
+import type { ParsedPriceResult } from './validation/price';
 import { 
   executeCatalogImport, 
   CatalogImportContext,
@@ -815,16 +820,71 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(parseSourcePrice('19').price, 19);
     assert.equal(parseSourcePrice('0.5').isValid, true);
     assert.equal(parseSourcePrice('0.5').price, 0.5);
+    assert.equal(parseSourcePrice('1').isValid, true);
+    assert.equal(parseSourcePrice('1').price, 1);
+    assert.equal(parseSourcePrice('12.34').isValid, true);
+    assert.equal(parseSourcePrice('12.34').price, 12.34);
     assert.equal(parseSourcePrice('1299.99').isValid, true);
     assert.equal(parseSourcePrice('1299.99').price, 1299.99);
 
-    // Direct verification of DECIMAL_PRICE_REGEX
+    // Incomplete decimals: leading dot and trailing dot must be rejected
+    const pLeadDot = parseDecimalPrice('.5');
+    assert.equal(pLeadDot.isValid, false, 'Leading dot ".5" must be rejected without leading integer');
+    assert.equal(pLeadDot.price, null);
+
+    const pTrailDot = parseDecimalPrice('1.');
+    assert.equal(pTrailDot.isValid, false, 'Trailing dot "1." must be rejected without fractional digits');
+    assert.equal(pTrailDot.price, null);
+
+    // Explicit signs: "+1", "-1"
+    const pPlusOne = parseDecimalPrice('+1');
+    assert.equal(pPlusOne.isValid, false, 'Leading plus "+1" must be rejected');
+    assert.equal(pPlusOne.price, null);
+
+    const pMinusOne = parseDecimalPrice('-1');
+    assert.equal(pMinusOne.isValid, false, 'Leading minus "-1" must be rejected');
+    assert.equal(pMinusOne.price, null);
+
+    // Negative zero numeric normalization: -0 normalized to 0
+    const pNegZeroNum = parseDecimalPrice(-0);
+    assert.equal(pNegZeroNum.isValid, true);
+    assert.equal(pNegZeroNum.price, 0);
+    assert.equal(Object.is(pNegZeroNum.price, -0), false, '-0 must be normalized to standard 0');
+
+    // Values exceeding JavaScript IEEE-754 safe integer limits (Number.MAX_SAFE_INTEGER: 9007199254740991)
+    const pExceedingStr = parseDecimalPrice('9007199254740992');
+    assert.equal(pExceedingStr.isValid, false, 'Price string exceeding MAX_SAFE_INTEGER must be rejected');
+    assert.equal(pExceedingStr.price, null);
+    assert.ok(pExceedingStr.reason?.includes('MAX_SAFE_INTEGER'));
+
+    const pExceedingNum = parseDecimalPrice(9007199254740992);
+    assert.equal(pExceedingNum.isValid, false, 'Numeric price exceeding MAX_SAFE_INTEGER must be rejected');
+    assert.equal(pExceedingNum.price, null);
+    assert.ok(pExceedingNum.reason?.includes('MAX_SAFE_INTEGER'));
+
+    // Safe maximum integer boundary is accepted
+    const pMaxSafe = parseDecimalPrice(Number.MAX_SAFE_INTEGER);
+    assert.equal(pMaxSafe.isValid, true);
+    assert.equal(pMaxSafe.price, Number.MAX_SAFE_INTEGER);
+
+    // Direct verification of DECIMAL_PRICE_REGEX and isValidDecimalPriceString
     assert.equal(DECIMAL_PRICE_REGEX.test('0'), true);
     assert.equal(DECIMAL_PRICE_REGEX.test('0.00'), true);
+    assert.equal(DECIMAL_PRICE_REGEX.test('1'), true);
+    assert.equal(DECIMAL_PRICE_REGEX.test('12.34'), true);
     assert.equal(DECIMAL_PRICE_REGEX.test('49.95'), true);
+    assert.equal(DECIMAL_PRICE_REGEX.test('.5'), false);
+    assert.equal(DECIMAL_PRICE_REGEX.test('1.'), false);
+    assert.equal(DECIMAL_PRICE_REGEX.test('+1'), false);
+    assert.equal(DECIMAL_PRICE_REGEX.test('-1'), false);
     assert.equal(DECIMAL_PRICE_REGEX.test('0x10'), false);
     assert.equal(DECIMAL_PRICE_REGEX.test('1e3'), false);
     assert.equal(DECIMAL_PRICE_REGEX.test('$10'), false);
+
+    assert.equal(isValidDecimalPriceString('12.34'), true);
+    assert.equal(isValidDecimalPriceString('0.00'), true);
+    assert.equal(isValidDecimalPriceString('0x10'), false);
+    assert.equal(isValidDecimalPriceString('9007199254740992'), false);
 
     // 18b. End-to-end ingestion test: feed containing valid and invalid prices
     const testFeed = {

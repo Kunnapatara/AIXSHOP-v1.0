@@ -431,8 +431,30 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(candle.variants[0].price, originalPrice, 'Stored price must not be modified by whitespace-only string');
       assert.equal(coordinator.actionItems.find(a => a.id === 'act_whitespace_price')?.status, 'pending_review');
 
-      // 3. Rejects negative values, non-numeric values, NaN, and positive/negative infinity
-      const invalidPriceValues = ['-10.50', '-0.01', 'invalid_price_abc', 'NaN', 'Infinity', '-Infinity'];
+      // 3. Rejects negative values, non-numeric values, signs, non-decimal bases, scientific notation, and values exceeding MAX_SAFE_INTEGER
+      const invalidPriceValues = [
+        '-10.50',
+        '-0.01',
+        '-1',
+        '+1',
+        '+12.50',
+        '-0',
+        '.5',
+        '1.',
+        '1e3',
+        '2.5E2',
+        '0x10',
+        '0X1A',
+        '0b101',
+        '0o77',
+        '$12.50',
+        '12..50',
+        'invalid_price_abc',
+        'NaN',
+        'Infinity',
+        '-Infinity',
+        '9007199254740992', // Exceeds Number.MAX_SAFE_INTEGER (9007199254740991)
+      ];
       for (const [idx, badVal] of invalidPriceValues.entries()) {
         const badId = `act_bad_val_${idx}`;
         coordinator.actionItems.push({
@@ -457,6 +479,27 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         assert.equal(candle.variants[0].price, originalPrice, `Stored price must not be modified by "${badVal}"`);
         assert.equal(coordinator.actionItems.find(a => a.id === badId)?.status, 'pending_review');
       }
+
+      // 3b. Re-check rejects invalid expected prices without treating them as valid numbers
+      coordinator.actionItems.push({
+        id: 'act_recheck_bad_expected',
+        findingId: 'find_recheck_bad_expected',
+        productId: 'prod_solstice_04',
+        title: 'Recheck Action with Invalid Expected Price',
+        severity: 'medium',
+        status: 'approved',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '0x10',
+        },
+        verificationStatus: 'recheck_required',
+      });
+      const recheckBadExpected = coordinator.recheckAction('act_recheck_bad_expected');
+      assert.equal(recheckBadExpected.success, true);
+      assert.equal(recheckBadExpected.isVerified, false, 'Recheck must not verify invalid expected price "0x10"');
+      assert.equal(recheckBadExpected.verificationStatus, 'verification_failed');
 
       // 4. Accepts valid numeric zero and updates variant.price as number 0
       coordinator.actionItems.push({
