@@ -454,11 +454,6 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         'Infinity',
         '-Infinity',
         '9007199254740992', // Exceeds Number.MAX_SAFE_INTEGER (9007199254740991)
-        '0.10000000000000001', // Precision loss: cannot be represented without floating-point distortion
-        '1.234567890123456789', // Precision loss: truncated by IEEE-754 binary64
-        '0.30000000000000004', // Binary floating-point calculation artifact: 0.1 + 0.2
-        '0.6000000000000001', // Binary floating-point calculation artifact: 0.2 + 0.4
-        '0.9999999999999999', // Binary floating-point calculation artifact: 0.7 + 0.1 + 0.1 + 0.1
       ];
       for (const [idx, badVal] of invalidPriceValues.entries()) {
         const badId = `act_bad_val_${idx}`;
@@ -506,47 +501,26 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(recheckBadExpected.isVerified, false, 'Recheck must not verify invalid expected price "0x10"');
       assert.equal(recheckBadExpected.verificationStatus, 'verification_failed');
 
-      // 3c. Re-check rejects expected price suffering floating-point precision loss
+      // 3c. Re-check rejects expected price that does not match stored catalog price
       coordinator.actionItems.push({
-        id: 'act_recheck_precision_loss',
-        findingId: 'find_recheck_precision_loss',
+        id: 'act_recheck_mismatch',
+        findingId: 'find_recheck_mismatch',
         productId: 'prod_solstice_04',
-        title: 'Recheck Action with Precision Loss Expected Price',
+        title: 'Recheck Action with Mismatched Expected Price',
         severity: 'medium',
         status: 'approved',
         evidenceRequired: false,
         proposedChange: {
           field: 'variants[0].price',
           from: '34',
-          to: '0.10000000000000001',
+          to: '99.99',
         },
         verificationStatus: 'recheck_required',
       });
-      const recheckPrecLoss = coordinator.recheckAction('act_recheck_precision_loss');
-      assert.equal(recheckPrecLoss.success, true);
-      assert.equal(recheckPrecLoss.isVerified, false, 'Recheck must not verify precision loss expected price');
-      assert.equal(recheckPrecLoss.verificationStatus, 'verification_failed');
-
-      // 3d. Re-check rejects expected price containing floating-point calculation artifact
-      coordinator.actionItems.push({
-        id: 'act_recheck_artifact',
-        findingId: 'find_recheck_artifact',
-        productId: 'prod_solstice_04',
-        title: 'Recheck Action with Calculation Artifact Expected Price',
-        severity: 'medium',
-        status: 'approved',
-        evidenceRequired: false,
-        proposedChange: {
-          field: 'variants[0].price',
-          from: '34',
-          to: '0.30000000000000004',
-        },
-        verificationStatus: 'recheck_required',
-      });
-      const recheckArtifact = coordinator.recheckAction('act_recheck_artifact');
-      assert.equal(recheckArtifact.success, true);
-      assert.equal(recheckArtifact.isVerified, false, 'Recheck must not verify floating-point calculation artifact expected price');
-      assert.equal(recheckArtifact.verificationStatus, 'verification_failed');
+      const recheckMismatch = coordinator.recheckAction('act_recheck_mismatch');
+      assert.equal(recheckMismatch.success, true);
+      assert.equal(recheckMismatch.isVerified, false, 'Recheck must not verify mismatched expected price');
+      assert.equal(recheckMismatch.verificationStatus, 'verification_failed');
 
       // 4. Accepts valid numeric zero and updates variant.price as number 0
       coordinator.actionItems.push({
@@ -608,7 +582,32 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(recheck.isVerified, true);
       assert.equal(recheck.verificationStatus, 'verified_in_catalog');
 
-      // 6. Accepts small valid fractional price 0.0000001 without scientific notation false rejection
+      // 6. Two-decimal half-up rounding policy on action approval and recheck
+      // Example: 1.235 -> 1.24
+      coordinator.actionItems.push({
+        id: 'act_round_half_up',
+        findingId: 'find_round_half_up',
+        productId: 'prod_solstice_04',
+        title: 'Update Variant Price to 1.235',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '38.50',
+          to: '1.235',
+        },
+        verificationStatus: 'unverified',
+      });
+      const resRound = coordinator.approveAction('act_round_half_up');
+      assert.equal(resRound.success, true);
+      const candleRounded = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleRounded.variants[0].price, 1.24, '1.235 must round half-up to 1.24');
+      const recheckRound = coordinator.recheckAction('act_round_half_up');
+      assert.equal(recheckRound.success, true);
+      assert.equal(recheckRound.isVerified, true, 'Recheck of 1.235 must match normalized catalog price 1.24');
+
+      // Accepts small fractional price 0.0000001 and normalizes under two-decimal policy to 0
       coordinator.actionItems.push({
         id: 'act_small_frac_price',
         findingId: 'find_small_frac_price',
@@ -619,7 +618,7 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         evidenceRequired: false,
         proposedChange: {
           field: 'variants[0].price',
-          from: '38.50',
+          from: '1.24',
           to: '0.0000001',
         },
         verificationStatus: 'unverified',
@@ -627,7 +626,7 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       const resSmallFrac = coordinator.approveAction('act_small_frac_price');
       assert.equal(resSmallFrac.success, true, 'Small fraction 0.0000001 must be accepted');
       const candleSmallFrac = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
-      assert.equal(candleSmallFrac.variants[0].price, 0.0000001);
+      assert.equal(candleSmallFrac.variants[0].price, 0, '0.0000001 normalizes to 0 under two-decimal policy');
 
       const recheckSmallFrac = coordinator.recheckAction('act_small_frac_price');
       assert.equal(recheckSmallFrac.success, true);

@@ -16,8 +16,7 @@ import {
   parseSourcePrice, 
   isValidDecimalPriceString,
   toCanonicalDecimal,
-  numberToPlainDecimal,
-  isFloatingPointArtifact 
+  numberToPlainDecimal 
 } from '../validation/price';
 import type { ParsedPriceResult } from '../validation/price';
 
@@ -27,8 +26,7 @@ export {
   parseSourcePrice, 
   isValidDecimalPriceString,
   toCanonicalDecimal,
-  numberToPlainDecimal,
-  isFloatingPointArtifact 
+  numberToPlainDecimal 
 };
 export type { ParsedPriceResult };
 

@@ -16,8 +16,7 @@ import {
   DECIMAL_PRICE_REGEX,
   parseDecimalPrice,
   isValidDecimalPriceString,
-  numberToPlainDecimal,
-  isFloatingPointArtifact
+  numberToPlainDecimal
 } from './validation/price';
 import type { ParsedPriceResult } from './validation/price';
 import { 
@@ -883,16 +882,81 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(DECIMAL_PRICE_REGEX.test('1e3'), false);
     assert.equal(DECIMAL_PRICE_REGEX.test('$10'), false);
 
-    // Decimal Precision Invariants: inputs that suffer binary floating-point precision loss
-    const pPrecisionLoss1 = parseDecimalPrice('0.10000000000000001');
-    assert.equal(pPrecisionLoss1.isValid, false, '0.10000000000000001 must be rejected for precision loss');
-    assert.equal(pPrecisionLoss1.price, null);
-    assert.ok(pPrecisionLoss1.reason?.includes('precision loss'));
+    // Two-Decimal-Place Monetary Rounding Policy Verification
+    // Deterministic half-up rounding to two decimal places:
+    // 1.234 -> 1.23, 1.235 -> 1.24, 1.236 -> 1.24
+    const pRoundDown = parseDecimalPrice('1.234');
+    assert.equal(pRoundDown.isValid, true);
+    assert.equal(pRoundDown.price, 1.23);
+    assert.equal(pRoundDown.formattedPrice, '1.23');
 
-    const pPrecisionLoss2 = parseDecimalPrice('1.234567890123456789');
-    assert.equal(pPrecisionLoss2.isValid, false, '1.234567890123456789 must be rejected for precision loss');
-    assert.equal(pPrecisionLoss2.price, null);
-    assert.ok(pPrecisionLoss2.reason?.includes('precision loss'));
+    const pRoundHalfUp = parseDecimalPrice('1.235');
+    assert.equal(pRoundHalfUp.isValid, true);
+    assert.equal(pRoundHalfUp.price, 1.24);
+    assert.equal(pRoundHalfUp.formattedPrice, '1.24');
+
+    const pRoundUp = parseDecimalPrice('1.236');
+    assert.equal(pRoundUp.isValid, true);
+    assert.equal(pRoundUp.price, 1.24);
+    assert.equal(pRoundUp.formattedPrice, '1.24');
+
+    // Floating-Point calculation results (e.g. 0.1 + 0.2 = 0.30000000000000004)
+    // are safely normalized to two decimal places (0.30) without heuristic rejection
+    const pArtifactNum = parseDecimalPrice(0.1 + 0.2);
+    assert.equal(pArtifactNum.isValid, true);
+    assert.equal(pArtifactNum.price, 0.3);
+    assert.equal(pArtifactNum.formattedPrice, '0.30');
+
+    const pArtifactStr = parseDecimalPrice('0.30000000000000004');
+    assert.equal(pArtifactStr.isValid, true);
+    assert.equal(pArtifactStr.price, 0.3);
+    assert.equal(pArtifactStr.formattedPrice, '0.30');
+
+    const pSum2 = parseDecimalPrice(0.2 + 0.4);
+    assert.equal(pSum2.isValid, true);
+    assert.equal(pSum2.price, 0.6);
+    assert.equal(pSum2.formattedPrice, '0.60');
+
+    const pSum3 = parseDecimalPrice(0.7 + 0.1 + 0.1 + 0.1);
+    assert.equal(pSum3.isValid, true);
+    assert.equal(pSum3.price, 1);
+    assert.equal(pSum3.formattedPrice, '1.00');
+
+    const pSub = parseDecimalPrice(1.0 - 0.9);
+    assert.equal(pSub.isValid, true);
+    assert.equal(pSub.price, 0.1);
+    assert.equal(pSub.formattedPrice, '0.10');
+
+    const pMult = parseDecimalPrice(35.55 * 100);
+    assert.equal(pMult.isValid, true);
+    assert.equal(pMult.price, 3555);
+
+    // Decimal strings with extended precision normalize to two decimal places
+    const pExtended1 = parseDecimalPrice('0.10000000000000001');
+    assert.equal(pExtended1.isValid, true);
+    assert.equal(pExtended1.price, 0.1);
+    assert.equal(pExtended1.formattedPrice, '0.10');
+
+    const pExtended2 = parseDecimalPrice('1.234567890123456789');
+    assert.equal(pExtended2.isValid, true);
+    assert.equal(pExtended2.price, 1.23);
+    assert.equal(pExtended2.formattedPrice, '1.23');
+
+    // Small fractional prices round half-up to two decimal places (0.00 / 0)
+    const pSmallFrac1 = parseDecimalPrice('0.0000001');
+    assert.equal(pSmallFrac1.isValid, true);
+    assert.equal(pSmallFrac1.price, 0);
+    assert.equal(pSmallFrac1.formattedPrice, '0.00');
+
+    const pSmallFrac2 = parseDecimalPrice('0.00000001');
+    assert.equal(pSmallFrac2.isValid, true);
+    assert.equal(pSmallFrac2.price, 0);
+    assert.equal(pSmallFrac2.formattedPrice, '0.00');
+
+    const pSmallFrac3 = parseDecimalPrice('0.00000015');
+    assert.equal(pSmallFrac3.isValid, true);
+    assert.equal(pSmallFrac3.price, 0);
+    assert.equal(pSmallFrac3.formattedPrice, '0.00');
 
     // Formatting vs monetary-value equivalence:
     // '0.10' and '0.1' both represent 10 cents and parse to identical numeric value 0.1
@@ -902,24 +966,12 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(pTenCents2.isValid, true);
     assert.equal(pTenCents1.price, 0.1);
     assert.equal(pTenCents2.price, 0.1);
+    assert.equal(pTenCents1.formattedPrice, '0.10');
+    assert.equal(pTenCents2.formattedPrice, '0.10');
 
     // '0.50' and '0.5' both represent 50 cents
     assert.equal(parseDecimalPrice('0.50').price, 0.5);
     assert.equal(parseDecimalPrice('0.5').price, 0.5);
-
-    // Small valid fractional prices: must NOT be falsely rejected solely because JavaScript renders them in scientific notation (1e-7)
-    const pSmallFrac1 = parseDecimalPrice('0.0000001');
-    assert.equal(pSmallFrac1.isValid, true, 'Small decimal fraction "0.0000001" must be accepted');
-    assert.equal(pSmallFrac1.price, 0.0000001);
-    assert.equal(numberToPlainDecimal(pSmallFrac1.price!), '0.0000001');
-
-    const pSmallFrac2 = parseDecimalPrice('0.00000001');
-    assert.equal(pSmallFrac2.isValid, true, 'Small decimal fraction "0.00000001" must be accepted');
-    assert.equal(pSmallFrac2.price, 0.00000001);
-
-    const pSmallFrac3 = parseDecimalPrice('0.00000015');
-    assert.equal(pSmallFrac3.isValid, true, 'Small decimal fraction "0.00000015" must be accepted');
-    assert.equal(pSmallFrac3.price, 0.00000015);
 
     // Scientific notation string input: must be strictly rejected
     const pSciSmall = parseDecimalPrice('1e-7');
@@ -930,6 +982,7 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const pLeadingZeros1 = parseDecimalPrice('007.50');
     assert.equal(pLeadingZeros1.isValid, true);
     assert.equal(pLeadingZeros1.price, 7.5);
+    assert.equal(pLeadingZeros1.formattedPrice, '7.50');
 
     const pLeadingZeros2 = parseDecimalPrice('012.34');
     assert.equal(pLeadingZeros2.isValid, true);
@@ -942,33 +995,7 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const pZeroPadded = parseDecimalPrice('00.00');
     assert.equal(pZeroPadded.isValid, true);
     assert.equal(pZeroPadded.price, 0);
-
-    // Floating-Point Calculation Artifacts (e.g. 0.1 + 0.2 = 0.30000000000000004)
-    // Must be strictly rejected in both numeric and string forms without silent rounding
-    const pArtifactNum = parseDecimalPrice(0.1 + 0.2);
-    assert.equal(pArtifactNum.isValid, false, 'Numeric 0.1 + 0.2 (0.30000000000000004) must be rejected as floating-point calculation artifact');
-    assert.equal(pArtifactNum.price, null);
-    assert.ok(pArtifactNum.reason?.includes('binary floating-point calculation artifact'));
-
-    const pArtifactStr = parseDecimalPrice('0.30000000000000004');
-    assert.equal(pArtifactStr.isValid, false, 'String "0.30000000000000004" must be rejected as floating-point calculation artifact');
-    assert.equal(pArtifactStr.price, null);
-    assert.ok(pArtifactStr.reason?.includes('binary floating-point calculation artifact'));
-
-    assert.equal(parseDecimalPrice(0.2 + 0.4).isValid, false, '0.2 + 0.4 must be rejected');
-    assert.equal(parseDecimalPrice(0.7 + 0.1 + 0.1 + 0.1).isValid, false, '0.7 + 0.1 + 0.1 + 0.1 must be rejected');
-    assert.equal(parseDecimalPrice(1.0 - 0.9).isValid, false, '1.0 - 0.9 must be rejected');
-    assert.equal(parseDecimalPrice(35.55 * 100).isValid, false, '35.55 * 100 must be rejected');
-
-    // Strict distinction: isFloatingPointArtifact detects calculation artifacts while preserving legitimate small fractions
-    assert.equal(isFloatingPointArtifact(0.1 + 0.2), true);
-    assert.equal(isFloatingPointArtifact('0.30000000000000004'), true);
-    assert.equal(isFloatingPointArtifact(0.0000001), false, 'Legitimate small fraction 0.0000001 is NOT an artifact');
-    assert.equal(isFloatingPointArtifact('0.0000001'), false);
-    assert.equal(isFloatingPointArtifact(0.00000001), false);
-    assert.equal(isFloatingPointArtifact('0.00000015'), false);
-    assert.equal(isFloatingPointArtifact(0.1), false);
-    assert.equal(isFloatingPointArtifact('0.10'), false);
+    assert.equal(pZeroPadded.formattedPrice, '0.00');
 
     // 18b. End-to-end ingestion test: feed containing valid and invalid prices
     const testFeed = {
@@ -994,12 +1021,12 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
           variants: [{ id: 'var_805', title: 'Default', sku: 'NEG-PRICE', barcode: '0850029381082', price: '-25.00', available: true }],
         }),
         createMockShopifyProduct(806, {
-          title: 'Precision Loss Item 1',
+          title: 'Extended Precision Item 1',
           variants: [{ id: 'var_806', title: 'Default', sku: 'PREC-LOSS-1', barcode: '0850029389019', price: '0.10000000000000001', available: true }],
         }),
         createMockShopifyProduct(807, {
-          title: 'Precision Loss Item 2',
-          variants: [{ id: 'var_807', title: 'Default', sku: 'PREC-LOSS-2', barcode: '0850029389026', price: '1.234567890123456789', available: true }],
+          title: 'Half-Up Rounding Item',
+          variants: [{ id: 'var_807', title: 'Default', sku: 'ROUND-ITEM', barcode: '0850029389026', price: '1.235', available: true }],
         }),
         createMockShopifyProduct(808, {
           title: 'Valid Ten Cents Item',
@@ -1010,8 +1037,8 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
           variants: [{ id: 'var_809', title: 'Default', sku: 'SMALL-FRAC', barcode: '0850029389040', price: '0.0000001', available: true }],
         }),
         createMockShopifyProduct(810, {
-          title: 'Floating Point Artifact Item',
-          variants: [{ id: 'var_810', title: 'Default', sku: 'FP-ARTIFACT', barcode: '0850029389057', price: 0.1 + 0.2, available: true }],
+          title: 'Floating Point Sum Item',
+          variants: [{ id: 'var_810', title: 'Default', sku: 'FP-SUM', barcode: '0850029389057', price: 0.1 + 0.2, available: true }],
         }),
       ],
     };
@@ -1038,18 +1065,25 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(d808.status, 'eligible');
     assert.equal(candidates.find(p => p.id === 'p_808')!.variants[0].price, 0.1);
 
-    // Check Candidate 809 (Valid small fraction 0.0000001): accepted, monetary value 0.0000001
+    // Check Candidate 806 (Extended precision 0.10000000000000001): normalized to 0.10 / 0.1
+    const d806 = details.find(d => d.productId === 'p_806')!;
+    assert.equal(d806.status, 'eligible');
+    assert.equal(candidates.find(p => p.id === 'p_806')!.variants[0].price, 0.1);
+
+    // Check Candidate 807 (Half-up rounding 1.235): normalized to 1.24
+    const d807 = details.find(d => d.productId === 'p_807')!;
+    assert.equal(d807.status, 'eligible');
+    assert.equal(candidates.find(p => p.id === 'p_807')!.variants[0].price, 1.24);
+
+    // Check Candidate 809 (Valid small fraction 0.0000001): rounded half-up to 0
     const d809 = details.find(d => d.productId === 'p_809')!;
     assert.equal(d809.status, 'eligible');
-    assert.equal(candidates.find(p => p.id === 'p_809')!.variants[0].price, 0.0000001);
+    assert.equal(candidates.find(p => p.id === 'p_809')!.variants[0].price, 0);
 
-    // Check Candidate 810 (Floating-point calculation artifact 0.1 + 0.2): rejected, raw evidence preserved, price null
-    const c810 = candidates.find(p => p.id === 'p_810')!;
-    assert.equal(c810.variants[0].price, null, 'Must NOT convert artifact price to rounded value');
-    assert.equal(c810.variants[0].attributes?.rawSourcePrice, '0.30000000000000004');
-    assert.ok(c810.variants[0].attributes?.priceError?.includes('binary floating-point calculation artifact'));
+    // Check Candidate 810 (Floating-point sum 0.1 + 0.2): rounded to 0.30 / 0.3
     const d810 = details.find(d => d.productId === 'p_810')!;
-    assert.equal(d810.status, 'rejected');
+    assert.equal(d810.status, 'eligible');
+    assert.equal(candidates.find(p => p.id === 'p_810')!.variants[0].price, 0.3);
 
     // Check Candidate 802 (Missing price): rejected, raw evidence preserved, price is null (NOT 0)
     const c802 = candidates.find(p => p.id === 'p_802')!;
@@ -1077,28 +1111,13 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const d805 = details.find(d => d.productId === 'p_805')!;
     assert.equal(d805.status, 'rejected');
 
-    // Check Candidate 806 (Precision loss 0.10000000000000001): rejected, price is null
-    const c806 = candidates.find(p => p.id === 'p_806')!;
-    assert.equal(c806.variants[0].price, null);
-    assert.equal(c806.variants[0].attributes?.rawSourcePrice, '0.10000000000000001');
-    assert.ok(c806.variants[0].attributes?.priceError?.includes('precision loss'));
-    const d806 = details.find(d => d.productId === 'p_806')!;
-    assert.equal(d806.status, 'rejected');
-
-    // Check Candidate 807 (Precision loss 1.234567890123456789): rejected, price is null
-    const c807 = candidates.find(p => p.id === 'p_807')!;
-    assert.equal(c807.variants[0].price, null);
-    assert.equal(c807.variants[0].attributes?.rawSourcePrice, '1.234567890123456789');
-    const d807 = details.find(d => d.productId === 'p_807')!;
-    assert.equal(d807.status, 'rejected');
-
     // 18c. Direct import execution: rejects all products with missing/invalid price; only eligible products import
     const initialCatalogCount = products.length;
     const importRes = executeCatalogImport(candidates, getImportContext());
     assert.equal(importRes.success, true);
-    assert.equal(importRes.importedCount, 3, 'Candidate 801 (price 0), 808 (price 0.1), and 809 (price 0.0000001) import cleanly');
-    assert.equal(importRes.rejectedCount, 7, 'All 7 invalid/artifact price candidates must be rejected');
-    assert.equal(importRes.nextProducts.length, initialCatalogCount + 3);
+    assert.equal(importRes.importedCount, 6, 'Candidates 801, 806, 807, 808, 809, and 810 import cleanly');
+    assert.equal(importRes.rejectedCount, 4, 'All 4 invalid price candidates (missing, empty, malformed, negative) must be rejected');
+    assert.equal(importRes.nextProducts.length, initialCatalogCount + 6);
 
     // Existing catalog items strictly preserved
     for (let i = 0; i < initialCatalogCount; i++) {
@@ -1106,11 +1125,11 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     }
 
     // 18d. Persistence, re-check, and mutation consistency for decimal prices
-    const smallFracProduct = importRes.nextProducts.find(p => p.id === 'p_809')!;
-    assert.ok(smallFracProduct);
-    assert.equal(smallFracProduct.variants[0].price, 0.0000001);
+    const roundedProduct = importRes.nextProducts.find(p => p.id === 'p_807')!;
+    assert.ok(roundedProduct);
+    assert.equal(roundedProduct.variants[0].price, 1.24);
 
-    // Persistence round-trip verifies small fractional price and 0 price without corruption
+    // Persistence round-trip verifies two-decimal normalized prices and zero prices without corruption
     const saveRes = adapter.save({
       products: importRes.nextProducts,
       variants: importRes.nextProducts.flatMap(p => p.variants || []),
@@ -1124,13 +1143,13 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const loadRes = adapter.load();
     assert.equal(loadRes.type, 'valid');
     if (loadRes.type === 'valid') {
-      const persisted809 = loadRes.envelope.payload.products.find(p => p.id === 'p_809')!;
-      assert.equal(persisted809.variants[0].price, 0.0000001);
+      const persisted807 = loadRes.envelope.payload.products.find(p => p.id === 'p_807')!;
+      assert.equal(persisted807.variants[0].price, 1.24);
       const persisted801 = loadRes.envelope.payload.products.find(p => p.id === 'p_801')!;
       assert.equal(persisted801.variants[0].price, 0);
     }
 
-    // Mutation rejection for invalid price leaves catalog completely unchanged
+    // Mutation rejection for invalid price (e.g. non-numeric 'invalid_abc') leaves catalog completely unchanged
     const originalCandlePrice = products[0].variants[0].price;
     const badPriceAction: ActionItem = {
       id: 'act_bad_price_test',
@@ -1140,7 +1159,7 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
       severity: 'medium',
       status: 'pending_review',
       evidenceRequired: false,
-      proposedChange: { field: 'variants[0].price', from: String(originalCandlePrice), to: '0.10000000000000001' },
+      proposedChange: { field: 'variants[0].price', from: String(originalCandlePrice), to: 'invalid_price_abc' },
       verificationStatus: 'unverified',
     };
     const mutRejectRes = executeActionApproval('act_bad_price_test', undefined, {
@@ -1154,40 +1173,40 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(mutRejectRes.errorCode, 'UNSUPPORTED_FIELD');
     assert.equal(products[0].variants[0].price, originalCandlePrice, 'Catalog price must not change on mutation failure');
 
-    // Mutation approval with small valid fraction 0.0000001 updates price and verifies in recheck
-    const smallFracAction: ActionItem = {
-      id: 'act_small_frac_test',
-      findingId: 'find_small_frac',
+    // Mutation approval with two-decimal rounding (1.235 -> 1.24) updates price and verifies in recheck
+    const roundAction: ActionItem = {
+      id: 'act_round_test',
+      findingId: 'find_round_test',
       productId: products[0].id,
-      title: 'Set Micro-Transaction Price',
+      title: 'Set Rounded Price',
       severity: 'low',
       status: 'pending_review',
       evidenceRequired: false,
-      proposedChange: { field: 'variants[0].price', from: String(originalCandlePrice), to: '0.0000001' },
+      proposedChange: { field: 'variants[0].price', from: String(originalCandlePrice), to: '1.235' },
       verificationStatus: 'unverified',
     };
-    const mutApproveRes = executeActionApproval('act_small_frac_test', undefined, {
+    const mutApproveRes = executeActionApproval('act_round_test', undefined, {
       products,
       findings,
-      actionItems: [smallFracAction],
+      actionItems: [roundAction],
       storeProfile,
       isReadOnly: false,
     });
     assert.equal(mutApproveRes.success, true);
     const updatedProd = mutApproveRes.nextProducts.find(p => p.id === products[0].id)!;
-    assert.equal(updatedProd.variants[0].price, 0.0000001);
+    assert.equal(updatedProd.variants[0].price, 1.24);
 
-    // Recheck verifies the small fractional price
-    const recheckSmallFrac = executeActionRecheck('act_small_frac_test', {
+    // Recheck verifies the rounded price (1.235 matches normalized 1.24)
+    const recheckRound = executeActionRecheck('act_round_test', {
       products: mutApproveRes.nextProducts,
       findings: mutApproveRes.nextFindings,
       actionItems: mutApproveRes.nextActions,
       storeProfile: mutApproveRes.nextStoreProfile,
       isReadOnly: false,
     });
-    assert.equal(recheckSmallFrac.success, true);
-    assert.equal(recheckSmallFrac.isVerified, true);
-    assert.equal(recheckSmallFrac.verificationStatus, 'verified_in_catalog');
+    assert.equal(recheckRound.success, true);
+    assert.equal(recheckRound.isVerified, true);
+    assert.equal(recheckRound.verificationStatus, 'verified_in_catalog');
 
     // Recheck verifies monetary equivalence between '0.10' and stored 0.1
     const tenCentsAction: ActionItem = {

@@ -1,18 +1,23 @@
 /**
- * Canonical Decimal Price Validation Primitive for AIXSHOP v1.0.
+ * Shared Canonical Two-Decimal Price Validation & Normalization Module for AIXSHOP v1.0.
  * 
- * Shared neutral domain module used across:
+ * Enforces a consistent two-decimal-place monetary precision policy across:
  * - Public Store Ingestion (storeIngestion.ts)
  * - Merchant Action Mutation & Approval (catalogMutationService.ts)
  * - Action Verification & Re-check (catalogMutationService.ts)
+ * - Catalog Storage & Persistence (storageAdapter.ts)
  * 
- * Eliminates circular dependencies and enforces monetary decimal precision invariants.
+ * Rounding Policy:
+ * - Deterministic decimal half-up rounding to exactly two decimal places (e.g. 1.234 -> 1.23, 1.235 -> 1.24).
+ * - Avoids binary floating-point multiplication errors by operating directly on decimal digits.
+ * - Valid prices with more than two decimal digits are normalized, not rejected.
+ * - Missing, negative, non-finite, out-of-range, and malformed inputs are strictly rejected.
  */
 
 /**
  * Strict regex for valid merchant decimal prices:
  * - One or more decimal digits optionally followed by a single decimal dot and one or more decimal digits.
- * - Accepts: '0', '0.00', '1', '12.34', '199.99'
+ * - Accepts: '0', '0.00', '1', '1.2', '1.23', '1.235', '199.99'
  * - Rejects:
  *   - Empty and whitespace-only strings
  *   - Leading dot without digits: '.5'
@@ -31,34 +36,14 @@ export const DECIMAL_PRICE_REGEX = /^\d+(\.\d+)?$/;
 export interface ParsedPriceResult {
   isValid: boolean;
   price: number | null;
+  formattedPrice?: string;
   rawString: string;
   reason?: string;
 }
 
 /**
- * Normalizes a valid decimal string to its canonical mathematical decimal representation:
- * - Strips redundant leading zeros from integer part (preserving single '0')
- * - Strips redundant trailing zeros from fractional part
- * - Strips lone decimal point if all fractional digits were zeros
- * 
- * Examples:
- * - '007.50' -> '7.5'
- * - '0.10' -> '0.1'
- * - '0.00' -> '0'
- * - '12.3400' -> '12.34'
- */
-export function toCanonicalDecimal(decimalStr: string): string {
-  const parts = decimalStr.split('.');
-  let intPart = parts[0].replace(/^0+(?=\d)/, '');
-  if (parts.length === 1) return intPart;
-  const fracPart = parts[1].replace(/0+$/, '');
-  return fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
-}
-
-/**
  * Formats a JavaScript IEEE-754 finite number into a canonical plain decimal string
  * without scientific/exponential notation (e.g. converting 1e-7 to '0.0000001').
- * Prevents false rejection of small valid fractions whose default String(num) uses scientific notation.
  */
 export function numberToPlainDecimal(num: number): string {
   const str = String(num);
@@ -80,45 +65,80 @@ export function numberToPlainDecimal(num: number): string {
 }
 
 /**
- * Detects whether a numeric value or decimal string contains binary floating-point
- * calculation artifacts (such as 0.1 + 0.2 = 0.30000000000000004 or 0.7 + 0.3 = 0.9999999999999999).
- * 
- * In IEEE-754 binary64 arithmetic, imprecise binary representations of decimal fractions
- * manifest at machine precision boundaries (~15-17 significant decimal digits) with long
- * sequences of repeating 0s followed by a stray digit, or long sequences of repeating 9s.
- * 
- * In contrast, legitimate small fractional prices (e.g. 0.0000001 or 0.00000015) have leading
- * fractional zeros immediately following the decimal point with few significant digits, which
- * this detector explicitly preserves.
+ * Normalizes a valid decimal string to its canonical mathematical decimal representation:
+ * - Strips redundant leading zeros from integer part (preserving single '0')
+ * - Strips redundant trailing zeros from fractional part
+ * - Strips lone decimal point if all fractional digits were zeros
  */
-export function isFloatingPointArtifact(val: unknown): boolean {
-  if (typeof val !== 'number' && typeof val !== 'string') return false;
-  const str = String(val).trim();
-  if (str === '' || str === 'NaN' || str === 'Infinity' || str === '-Infinity') return false;
-
-  // Significant digit followed by 7+ zeros and a trailing non-zero digit: e.g. 0.30000000000000004
-  if (/\.[0-9]*?[1-9]0{7,}[1-9]$/.test(str)) {
-    return true;
-  }
-  // 7+ consecutive nines in fractional part: e.g. 0.9999999999999999, 3554.9999999999995
-  if (/\.[0-9]*?9{7,}[0-9]*$/.test(str)) {
-    return true;
-  }
-  return false;
+export function toCanonicalDecimal(decimalStr: string): string {
+  const parts = decimalStr.split('.');
+  let intPart = parts[0].replace(/^0+(?=\d)/, '');
+  if (parts.length === 1) return intPart;
+  const fracPart = parts[1].replace(/0+$/, '');
+  return fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
 }
 
 /**
- * Parses and validates an unknown raw price value against canonical decimal price constraints.
+ * Normalizes a decimal string to two decimal places using deterministic half-up rounding.
+ * Operates directly on decimal digits to avoid binary floating-point multiplication distortion.
  * 
- * Monetary Precision Invariants:
- * 1. Legitimate zero prices (0, '0', '0.00') are accepted and preserved as numeric 0.
- * 2. Negative zero (-0) is safely normalized to ordinary 0.
+ * Examples:
+ * - '1' -> formatted: '1.00', numeric: 1
+ * - '1.2' -> formatted: '1.20', numeric: 1.2
+ * - '1.23' -> formatted: '1.23', numeric: 1.23
+ * - '1.234' -> formatted: '1.23', numeric: 1.23
+ * - '1.235' -> formatted: '1.24', numeric: 1.24
+ * - '1.236' -> formatted: '1.24', numeric: 1.24
+ * - '0.1' -> formatted: '0.10', numeric: 0.1
+ * - '0.0000001' -> formatted: '0.00', numeric: 0
+ * - '0' -> formatted: '0.00', numeric: 0
+ * - '0.9999999999999999' -> formatted: '1.00', numeric: 1
+ */
+export function roundHalfUpToTwoDecimals(decimalStr: string): { formatted: string; numeric: number } {
+  const parts = decimalStr.split('.');
+  const intPart = parts[0].replace(/^0+(?=\d)/, '') || '0';
+  const fracPart = parts[1] || '';
+
+  if (fracPart.length <= 2) {
+    const paddedFrac = (fracPart + '00').slice(0, 2);
+    const formatted = `${intPart}.${paddedFrac}`;
+    return { formatted, numeric: Number(formatted) };
+  }
+
+  // Decimal half-up rounding on the 3rd decimal digit
+  const d1 = parseInt(fracPart[0], 10);
+  const d2 = parseInt(fracPart[1], 10);
+  const d3 = parseInt(fracPart[2], 10);
+
+  let fracNum = d1 * 10 + d2;
+  let carry = 0;
+
+  if (d3 >= 5) {
+    fracNum += 1;
+    if (fracNum === 100) {
+      fracNum = 0;
+      carry = 1;
+    }
+  }
+
+  const finalInt = BigInt(intPart) + BigInt(carry);
+  const finalFracStr = String(fracNum).padStart(2, '0');
+  const formatted = `${finalInt}.${finalFracStr}`;
+  return { formatted, numeric: Number(formatted) };
+}
+
+/**
+ * Parses, validates, and normalizes an unknown raw price value according to the
+ * shared two-decimal-place monetary precision policy.
+ * 
+ * Rules:
+ * 1. Legitimate zero prices (0, '0', '0.00', etc.) are accepted and normalized to 0 (formatted '0.00').
+ * 2. Negative zero (-0) is safely normalized to 0.
  * 3. Never invents zero for missing, null, empty, or malformed inputs.
  * 4. Rejects values exceeding JavaScript's IEEE-754 safe numeric limit (Number.MAX_SAFE_INTEGER: 9007199254740991).
- * 5. Rejects decimal values that suffer floating-point precision loss (e.g. '0.10000000000000001' or '1.234567890123456789')
- *    where JavaScript binary64 cannot represent the exact mathematical decimal value.
- * 6. Rejects binary floating-point calculation artifacts (e.g. 0.1 + 0.2 = 0.30000000000000004).
- * 7. Rejects all non-decimal bases, scientific notation, signs, currency symbols, and non-numeric characters.
+ * 5. Rejects all negative values, non-finite values (NaN, Infinity, -Infinity).
+ * 6. Rejects all non-decimal bases, scientific notation strings, currency symbols, and non-numeric characters.
+ * 7. Applies deterministic decimal half-up rounding to two decimal places for valid prices.
  */
 export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
   if (rawPrice === undefined || rawPrice === null) {
@@ -148,17 +168,21 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
         reason: `Price exceeds maximum safe numeric value (Number.MAX_SAFE_INTEGER: ${Number.MAX_SAFE_INTEGER}).`,
       };
     }
-    if (isFloatingPointArtifact(rawPrice)) {
+    if (rawPrice === 0 || Object.is(rawPrice, -0)) {
+      return { isValid: true, price: 0, formattedPrice: '0.00', rawString: String(rawPrice) };
+    }
+
+    const plain = numberToPlainDecimal(rawPrice);
+    const rounded = roundHalfUpToTwoDecimals(plain);
+    if (rounded.numeric > Number.MAX_SAFE_INTEGER) {
       return {
         isValid: false,
         price: null,
         rawString: String(rawPrice),
-        reason: `Price contains a binary floating-point calculation artifact or floating-point precision loss (received ${rawPrice}).`,
+        reason: `Price exceeds maximum safe numeric value (Number.MAX_SAFE_INTEGER: ${Number.MAX_SAFE_INTEGER}).`,
       };
     }
-    // Normalize -0 to 0
-    const normalizedPrice = (rawPrice === 0 || Object.is(rawPrice, -0)) ? 0 : rawPrice;
-    return { isValid: true, price: normalizedPrice, rawString: String(rawPrice) };
+    return { isValid: true, price: rounded.numeric, formattedPrice: rounded.formatted, rawString: String(rawPrice) };
   }
 
   if (typeof rawPrice === 'string') {
@@ -181,52 +205,8 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
       };
     }
 
-    if (isFloatingPointArtifact(trimmed)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price string "${rawPrice}" contains a binary floating-point calculation artifact or floating-point precision loss.`,
-      };
-    }
-
-    const canonicalStr = toCanonicalDecimal(trimmed);
-    const num = Number(canonicalStr);
-
-    if (isFloatingPointArtifact(num)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price string "${rawPrice}" contains a binary floating-point calculation artifact or floating-point precision loss.`,
-      };
-    }
-
-    if (isNaN(num)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Malformed price string "${rawPrice}".`,
-      };
-    }
-    if (!isFinite(num)) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price must be finite (received "${rawPrice}").`,
-      };
-    }
-    if (num < 0) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price cannot be negative (received "${rawPrice}").`,
-      };
-    }
-    if (num > Number.MAX_SAFE_INTEGER || Math.floor(num) > Number.MAX_SAFE_INTEGER) {
+    const rounded = roundHalfUpToTwoDecimals(trimmed);
+    if (rounded.numeric > Number.MAX_SAFE_INTEGER) {
       return {
         isValid: false,
         price: null,
@@ -235,21 +215,7 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
       };
     }
 
-    // Precision Invariant: Verify that binary floating-point representation does not silently alter
-    // or truncate the decimal precision of the intended monetary value.
-    // Convert to plain decimal string to prevent false rejection of small valid fractions (e.g. 0.0000001 / 1e-7).
-    const plainDecimal = numberToPlainDecimal(num);
-    if (plainDecimal !== canonicalStr) {
-      return {
-        isValid: false,
-        price: null,
-        rawString: rawPrice,
-        reason: `Price string "${rawPrice}" cannot be represented safely without floating-point precision loss.`,
-      };
-    }
-
-    const normalizedPrice = (num === 0 || Object.is(num, -0)) ? 0 : num;
-    return { isValid: true, price: normalizedPrice, rawString: rawPrice };
+    return { isValid: true, price: rounded.numeric, formattedPrice: rounded.formatted, rawString: rawPrice };
   }
 
   return {
@@ -266,8 +232,7 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
 export const parseSourcePrice = parseDecimalPrice;
 
 /**
- * Returns true if the string represents a strictly valid, non-negative decimal price within safe numeric bounds
- * without floating-point precision loss.
+ * Returns true if the string represents a strictly valid, non-negative decimal price within safe numeric bounds.
  */
 export function isValidDecimalPriceString(value: string): boolean {
   if (typeof value !== 'string') return false;
