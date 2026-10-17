@@ -23,7 +23,10 @@ export const SettingsPage: React.FC = () => {
     storeProfile, 
     updateStoreProfile, 
     toggleConnectorSync, 
-    addToast 
+    addToast,
+    isReadOnlyMode,
+    isDurableStorage,
+    products
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<'profile' | 'connectors' | 'subscription' | 'policies' | 'diagnostics'>('profile');
@@ -33,11 +36,26 @@ export const SettingsPage: React.FC = () => {
   const [strictness, setStrictness] = useState(storeProfile.truthBoundaryStrictness);
   const [isDiagnosticsUnlocked, setIsDiagnosticsUnlocked] = useState(false);
 
+  React.useEffect(() => {
+    setStoreName(storeProfile.name);
+    setStoreDomain(storeProfile.domain);
+    setCurrency(storeProfile.currency);
+    setStrictness(storeProfile.truthBoundaryStrictness);
+  }, [storeProfile]);
+
   const handleSaveProfile = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!storeName.trim()) {
+      addToast('Validation Error', 'Store name cannot be empty.', 'warning');
+      return;
+    }
+    if (!storeDomain.trim()) {
+      addToast('Validation Error', 'Store domain cannot be empty.', 'warning');
+      return;
+    }
     updateStoreProfile({
-      name: storeName,
-      domain: storeDomain,
+      name: storeName.trim(),
+      domain: storeDomain.trim(),
       currency: currency,
       truthBoundaryStrictness: strictness,
     });
@@ -175,14 +193,19 @@ export const SettingsPage: React.FC = () => {
 
           <div className="pt-4 border-t border-stone-100 flex items-center justify-between">
             <span className="text-xs text-stone-500 font-mono">
-              Last saved: Active in session
+              Storage: {isDurableStorage ? 'Persistent Local Storage' : 'Session Memory (Non-durable)'}
             </span>
             <button
               type="submit"
-              className="px-5 py-2.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-xl shadow-xs flex items-center gap-1.5 transition-colors"
+              disabled={isReadOnlyMode}
+              className={`px-5 py-2.5 text-white text-xs font-semibold rounded-xl shadow-xs flex items-center gap-1.5 transition-colors ${
+                isReadOnlyMode 
+                  ? 'bg-stone-400 cursor-not-allowed' 
+                  : 'bg-orange-600 hover:bg-orange-700'
+              }`}
             >
               <Save className="w-3.5 h-3.5" />
-              <span>Save Store Profile</span>
+              <span>{isReadOnlyMode ? 'Locked (Read-Only Mode)' : 'Save Store Profile'}</span>
             </button>
           </div>
         </form>
@@ -193,9 +216,9 @@ export const SettingsPage: React.FC = () => {
           <div className="flex items-center justify-between pb-3 border-b border-stone-100">
             <div>
               <h3 className="text-sm font-bold text-stone-900">Integration Connectors & Channel Feeds</h3>
-              <p className="text-xs text-stone-500">Live integration state and catalog sync feeds</p>
+              <p className="text-xs text-stone-500">Integration status and catalog synchronization feeds</p>
             </div>
-            <span className="text-xs font-mono text-stone-400">Strict Connection Status</span>
+            <span className="text-xs font-mono text-stone-400">Connection Verification</span>
           </div>
 
           <div className="space-y-4">
@@ -226,12 +249,18 @@ export const SettingsPage: React.FC = () => {
                       Write-Back: {connector.writeBackAuthorized ? 'Authorized' : 'Read-Only (Protected)'}
                     </span>
                   </div>
+                  {connector.status === 'disconnected' && (
+                    <p className="text-[11px] text-stone-500 mt-1.5 flex items-center gap-1">
+                      <AlertTriangle className="w-3 h-3 text-amber-500 shrink-0" />
+                      <span>Live integration not configured. External OAuth and synchronization are unavailable.</span>
+                    </p>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => toggleConnectorSync(connector.id)}
-                    className="px-3 py-1.5 bg-white border border-stone-300 hover:border-stone-400 text-xs font-medium text-stone-700 rounded-lg transition-colors"
+                    className="px-3 py-1.5 bg-white border border-stone-300 hover:border-stone-400 text-xs font-medium text-stone-700 rounded-lg transition-colors cursor-pointer"
                   >
                     {connector.status === 'connected' ? 'Disconnect' : 'Connect & Sync'}
                   </button>
@@ -241,8 +270,8 @@ export const SettingsPage: React.FC = () => {
           </div>
 
           <div className="p-3.5 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-800">
-            <strong className="block mb-0.5">Write-Back Security Policy:</strong>
-            Write-back permissions require explicit OAuth token authorization with catalog write scopes. In read-only mode, AIXSHOP audits and suggests corrections without mutating live storefront data.
+            <strong className="block mb-0.5">Write-Back & Integration Security Policy:</strong>
+            Write-back permissions require explicit OAuth token authorization with catalog write scopes. In this preview environment, live storefront mutation is unavailable and connectors default to safe read-only auditing.
           </div>
         </div>
       )}
@@ -252,18 +281,18 @@ export const SettingsPage: React.FC = () => {
           <div className="flex items-center justify-between pb-3 border-b border-stone-100">
             <div>
               <h3 className="text-sm font-bold text-stone-900">Subscription & SKU Capacity</h3>
-              <p className="text-xs text-stone-500">Active plan capacity and catalog scale limits</p>
+              <p className="text-xs text-stone-500">Workspace scale limits and demo plan parameters (unverified entitlement)</p>
             </div>
             <span className="text-xs font-mono font-bold text-orange-700 bg-orange-50 px-2 py-0.5 rounded border border-orange-200">
-              {storeProfile.tier}
+              {storeProfile.tier} (Demo Fixture)
             </span>
           </div>
 
           <div className="p-5 bg-stone-50 rounded-xl border border-stone-200 space-y-3">
             <div className="flex items-center justify-between text-xs">
-              <span className="font-semibold text-stone-900">SKU Utilization</span>
+              <span className="font-semibold text-stone-900">Catalog SKU Utilization</span>
               <span className="font-mono text-stone-600">
-                {storeProfile.skuCount} / {storeProfile.skuLimit} SKUs ({((storeProfile.skuCount / storeProfile.skuLimit) * 100).toFixed(1)}%)
+                {products.length} catalog products / {storeProfile.skuLimit} SKU Limit ({((products.length / storeProfile.skuLimit) * 100).toFixed(1)}%)
               </span>
             </div>
 
@@ -271,31 +300,53 @@ export const SettingsPage: React.FC = () => {
             <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden">
               <div 
                 className="bg-orange-600 h-2.5 rounded-full" 
-                style={{ width: `${(storeProfile.skuCount / storeProfile.skuLimit) * 100}%` }}
+                style={{ width: `${Math.min(100, (products.length / storeProfile.skuLimit) * 100)}%` }}
               ></div>
             </div>
 
             <p className="text-xs text-stone-500">
-              You have {storeProfile.skuLimit - storeProfile.skuCount} remaining SKUs in your current tier allowance.
+              Capacity baseline: {storeProfile.skuLimit} SKUs. Plan tier and limits reflect local workspace configuration without verified third-party billing enforcement.
             </p>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1">
-              <span className="text-stone-500">Billing Cadence</span>
+            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-stone-500">Billing Cadence</span>
+                <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                  Not Configured
+                </span>
+              </div>
               <p className="text-base font-bold text-stone-900 font-mono">$179 / mo</p>
-              <p className="text-stone-500">Annual billing active</p>
+              <p className="text-stone-500">Target tier reference · No active billing provider</p>
             </div>
-            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1">
-              <span className="text-stone-500">Next Audit Run</span>
-              <p className="text-base font-bold text-stone-900 font-mono">Continuous</p>
-              <p className="text-stone-500">Webhooks enabled</p>
+
+            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-stone-500">Audit & Sync</span>
+                <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-600 border border-stone-200">
+                  Manual Only
+                </span>
+              </div>
+              <p className="text-base font-bold text-stone-900 font-mono">On-Demand</p>
+              <p className="text-stone-500">Live webhook synchronization not configured</p>
             </div>
-            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1">
-              <span className="text-stone-500">Support Level</span>
-              <p className="text-base font-bold text-stone-900 font-mono">Priority SaaS</p>
-              <p className="text-stone-500">Catalog specialist access</p>
+
+            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-stone-500">Support Entitlement</span>
+                <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                  Self-Serve
+                </span>
+              </div>
+              <p className="text-base font-bold text-stone-900 font-mono">Standard Workspace</p>
+              <p className="text-stone-500">Priority SaaS requires verified enterprise contract</p>
             </div>
+          </div>
+
+          <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200 text-xs text-stone-600">
+            <strong className="block mb-0.5 text-stone-800">Integration Notice:</strong>
+            Recurring billing, payment gateways, live webhook listeners, and paid SaaS entitlements are not implemented in this workspace. Displayed metrics and capacity allowances serve as local application constraints.
           </div>
         </div>
       )}
@@ -351,7 +402,7 @@ export const SettingsPage: React.FC = () => {
               <Lock className="w-8 h-8 text-stone-400 mx-auto" />
               <p className="text-xs font-bold text-stone-900">Protected Diagnostic Console</p>
               <p className="text-xs text-stone-500 max-w-sm mx-auto">
-                Contains technical schema payloads, webhook logs, and raw crawl trace headers.
+                Contains technical schema payloads, sample crawl trace headers, and simulated demo diagnostic records.
               </p>
               <button
                 onClick={() => setIsDiagnosticsUnlocked(true)}
@@ -363,8 +414,8 @@ export const SettingsPage: React.FC = () => {
           ) : (
             <div className="space-y-3">
               <div className="p-4 bg-stone-900 text-stone-100 rounded-xl font-mono text-xs space-y-2 overflow-x-auto">
-                <p className="text-stone-400"># AIXSHOP Internal Schema & Sync Log</p>
-                <p className="text-emerald-400">✓ [2026-10-11T04:30:12Z] Feed Ingest: 184 products parsed from Shopify GraphQL</p>
+                <p className="text-stone-400"># AIXSHOP Internal Schema & Sync Log (Simulated Demo Fixture)</p>
+                <p className="text-emerald-400">✓ [2026-10-11T04:30:12Z] Feed Ingest: 184 products parsed from Shopify GraphQL (Demo)</p>
                 <p className="text-emerald-400">✓ [2026-10-11T04:30:14Z] Schema.org Validator: 184/184 Product entities verified</p>
                 <p className="text-amber-400">⚠ [2026-10-11T04:30:15Z] GTIN Validator: 1/184 variants missing EAN/UPC (var_candle_8oz)</p>
                 <p className="text-rose-400">✖ [2026-10-11T04:30:16Z] Claim Conflict: SLA mismatch detected between Storefront (2d) and GMC (3-5d)</p>

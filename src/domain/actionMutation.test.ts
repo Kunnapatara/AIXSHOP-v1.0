@@ -19,6 +19,11 @@ import {
   evaluateProductsCatalog,
   ingestAndAnalyzeStore,
 } from './ingestion/storeIngestion';
+import {
+  validateAndApplyProfileUpdate,
+  applyConnectorToggle,
+  ConnectorSyncExecutionOptions,
+} from './settings/settingsService';
 
 /**
  * Production-identical orchestrator that directly invokes the shared domain
@@ -200,6 +205,52 @@ class ProductionActionCoordinator {
       res.isVerified ? 'success' : 'warning'
     );
     return res;
+  }
+
+  public updateStoreProfile(updates: Partial<StoreProfile>) {
+    const valRes = validateAndApplyProfileUpdate(this.storeProfile, updates, this.isReadOnlyMode);
+    if (!valRes.success || !valRes.nextProfile) {
+      this.addToast(
+        valRes.errorCode === 'READ_ONLY_MODE' ? 'Settings Locked' : 'Validation Error',
+        valRes.message,
+        'warning'
+      );
+      return { success: false, error: valRes.message, rolledBack: true };
+    }
+
+    const proposedProfile = valRes.nextProfile;
+    const saveRes = this.persistState(this.products, this.findings, this.actionItems, proposedProfile);
+    if (!saveRes.success) {
+      this.addToast('Settings Save Failed', `Could not persist store settings: ${saveRes.error}`, 'error');
+      return { success: false, error: saveRes.error, rolledBack: true };
+    }
+
+    this.storeProfile = proposedProfile;
+    this.addToast('Store Settings Saved', 'Store configuration updated and persisted.', 'success');
+    return { success: true, nextProfile: proposedProfile };
+  }
+
+  public toggleConnectorSync(connectorId: string, syncOptions?: ConnectorSyncExecutionOptions) {
+    const toggleRes = applyConnectorToggle(this.storeProfile, connectorId, this.isReadOnlyMode, syncOptions);
+    if (!toggleRes.success || !toggleRes.nextProfile) {
+      this.addToast(
+        toggleRes.errorCode === 'READ_ONLY_MODE' ? 'Connector Locked' : 'Integration Unavailable',
+        toggleRes.message,
+        'warning'
+      );
+      return { success: false, error: toggleRes.message, errorCode: toggleRes.errorCode, rolledBack: true };
+    }
+
+    const proposedProfile = toggleRes.nextProfile;
+    const saveRes = this.persistState(this.products, this.findings, this.actionItems, proposedProfile);
+    if (!saveRes.success) {
+      this.addToast('Connector Update Failed', `Could not persist connector status: ${saveRes.error}`, 'error');
+      return { success: false, error: saveRes.error, rolledBack: true };
+    }
+
+    this.storeProfile = proposedProfile;
+    this.addToast('Connector Updated', toggleRes.message, 'info');
+    return { success: true, nextProfile: proposedProfile };
   }
 }
 
@@ -1237,6 +1288,203 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
 
       assert.equal(verifiedAction.verificationStatus, 'verified_in_catalog');
       assert.equal(verifiedFinding.merchantVerified, true);
+    });
+  });
+
+  describe('Phase F: Settings Integrity, Honest Integration State & Persistence Safety (Domain Contract Remediation)', () => {
+    it('clicking Connect does not create a false connected state when no real connector operation exists', () => {
+      const metaBefore = coordinator.storeProfile.connectors.find(c => c.id === 'conn_meta_01')!;
+      assert.equal(metaBefore.status, 'disconnected');
+      assert.equal(metaBefore.lastSync, 'Never');
+      assert.equal(metaBefore.productCountSynced, 0);
+      assert.equal(metaBefore.writeBackAuthorized, false);
+
+      // Attempt to toggle/connect without real integration
+      const res = coordinator.toggleConnectorSync('conn_meta_01');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'INTEGRATION_UNAVAILABLE');
+
+      // Verify that status, lastSync, synced count, and write-back authorization are strictly preserved
+      const metaAfter = coordinator.storeProfile.connectors.find(c => c.id === 'conn_meta_01')!;
+      assert.equal(metaAfter.status, 'disconnected', 'Connector status must NOT transition to connected without real integration');
+      assert.equal(metaAfter.lastSync, 'Never', 'lastSync must not update to "Just now" without real sync');
+      assert.equal(metaAfter.productCountSynced, 0);
+      assert.equal(metaAfter.writeBackAuthorized, false);
+
+      assert.ok(coordinator.toasts.some(t => t.title === 'Integration Unavailable'));
+    });
+
+    it('a failed connector operation cannot update lastSync, SKU counts, or authorization', () => {
+      const gmcBefore = coordinator.storeProfile.connectors.find(c => c.id === 'conn_gmc_01')!;
+      const originalLastSync = gmcBefore.lastSync;
+      const originalCount = gmcBefore.productCountSynced;
+      const originalWriteBack = gmcBefore.writeBackAuthorized;
+
+      // Attempting invalid connector or unsupported operation
+      const res = coordinator.toggleConnectorSync('conn_non_existent');
+      assert.equal(res.success, false);
+      assert.equal(res.errorCode, 'CONNECTOR_NOT_FOUND');
+
+      const gmcAfter = coordinator.storeProfile.connectors.find(c => c.id === 'conn_gmc_01')!;
+      assert.equal(gmcAfter.lastSync, originalLastSync);
+      assert.equal(gmcAfter.productCountSynced, originalCount);
+      assert.equal(gmcAfter.writeBackAuthorized, originalWriteBack);
+    });
+
+    it('a genuine connector success, if supported by the existing implementation, updates status only after success', () => {
+      const metaBefore = coordinator.storeProfile.connectors.find(c => c.id === 'conn_meta_01')!;
+      assert.equal(metaBefore.status, 'disconnected');
+
+      // Execute genuine verified sync
+      const verifiedTimestamp = '2026-10-17T12:00:00Z';
+      const res = coordinator.toggleConnectorSync('conn_meta_01', {
+        verifiedResult: {
+          syncedCount: 42,
+          timestamp: verifiedTimestamp,
+          writeBackAuthorized: true,
+        },
+      });
+
+      assert.equal(res.success, true);
+      const metaAfter = coordinator.storeProfile.connectors.find(c => c.id === 'conn_meta_01')!;
+      assert.equal(metaAfter.status, 'connected');
+      assert.equal(metaAfter.lastSync, verifiedTimestamp);
+      assert.equal(metaAfter.productCountSynced, 42);
+      assert.equal(metaAfter.writeBackAuthorized, true);
+
+      // Verify persistence in storage adapter
+      const loadRes = coordinator.adapter.load();
+      assert.equal(loadRes.type, 'valid');
+      if (loadRes.type === 'valid') {
+        const persistedMeta = loadRes.envelope.payload.storeProfile.connectors.find(c => c.id === 'conn_meta_01')!;
+        assert.equal(persistedMeta.status, 'connected');
+        assert.equal(persistedMeta.lastSync, verifiedTimestamp);
+        assert.equal(persistedMeta.productCountSynced, 42);
+        assert.equal(persistedMeta.writeBackAuthorized, true);
+      }
+    });
+
+    it('disconnecting an active connector safely transitions to disconnected and revokes write-back authorization', () => {
+      const shopifyBefore = coordinator.storeProfile.connectors.find(c => c.id === 'conn_shopify_01')!;
+      assert.equal(shopifyBefore.status, 'connected');
+
+      const res = coordinator.toggleConnectorSync('conn_shopify_01');
+      assert.equal(res.success, true);
+
+      const shopifyAfter = coordinator.storeProfile.connectors.find(c => c.id === 'conn_shopify_01')!;
+      assert.equal(shopifyAfter.status, 'disconnected');
+      assert.equal(shopifyAfter.writeBackAuthorized, false);
+
+      const loadRes = coordinator.adapter.load();
+      assert.equal(loadRes.type, 'valid');
+      if (loadRes.type === 'valid') {
+        const persistedShopify = loadRes.envelope.payload.storeProfile.connectors.find(c => c.id === 'conn_shopify_01')!;
+        assert.equal(persistedShopify.status, 'disconnected');
+        assert.equal(persistedShopify.writeBackAuthorized, false);
+      }
+    });
+
+    it('profile persistence success updates both stored and in-memory state', () => {
+      const updateRes = coordinator.updateStoreProfile({
+        name: 'Solstice Verified Artisans',
+        currency: 'EUR',
+        truthBoundaryStrictness: 'strict',
+      });
+
+      assert.equal(updateRes.success, true);
+      assert.equal(coordinator.storeProfile.name, 'Solstice Verified Artisans');
+      assert.equal(coordinator.storeProfile.currency, 'EUR');
+
+      const loadRes = coordinator.adapter.load();
+      assert.equal(loadRes.type, 'valid');
+      if (loadRes.type === 'valid') {
+        assert.equal(loadRes.envelope.payload.storeProfile.name, 'Solstice Verified Artisans');
+        assert.equal(loadRes.envelope.payload.storeProfile.currency, 'EUR');
+      }
+    });
+
+    it('profile persistence failure preserves the previous in-memory state and reports failure', () => {
+      const profileBefore = coordinator.storeProfile.name;
+
+      // Simulate persistence failure (e.g. quota exceeded or storage failure)
+      coordinator.backend.setItem = () => {
+        throw new Error('QuotaExceededError: storage full');
+      };
+
+      const updateRes = coordinator.updateStoreProfile({
+        name: 'Failing Store Profile Name That Must Not Persist',
+      });
+
+      assert.equal(updateRes.success, false);
+      assert.equal(updateRes.rolledBack, true);
+      assert.equal(coordinator.storeProfile.name, profileBefore, 'In-memory profile must NOT update when persistence fails');
+      assert.ok(coordinator.toasts.some(t => t.title === 'Settings Save Failed'));
+
+      // Restore storage backend
+      coordinator.backend.setItem = (k: string, v: string) => {
+        (coordinator.backend as unknown as { store: Map<string, string> }).store.set(k, v);
+      };
+    });
+
+    it('connector-setting persistence failure preserves the previous state and reports failure', () => {
+      const erpBefore = coordinator.storeProfile.connectors.find(c => c.id === 'conn_erp_01')!;
+      assert.equal(erpBefore.status, 'connected');
+      assert.equal(erpBefore.writeBackAuthorized, true);
+
+      // Simulate storage failure
+      coordinator.backend.setItem = () => {
+        throw new Error('Storage write failed');
+      };
+
+      const res = coordinator.toggleConnectorSync('conn_erp_01');
+      assert.equal(res.success, false);
+      assert.equal(res.rolledBack, true);
+
+      const erpAfter = coordinator.storeProfile.connectors.find(c => c.id === 'conn_erp_01')!;
+      assert.equal(erpAfter.status, 'connected', 'In-memory connector status must NOT change if persistence fails');
+      assert.equal(erpAfter.writeBackAuthorized, true);
+      assert.ok(coordinator.toasts.some(t => t.title === 'Connector Update Failed'));
+
+      // Restore storage backend
+      coordinator.backend.setItem = (k: string, v: string) => {
+        (coordinator.backend as unknown as { store: Map<string, string> }).store.set(k, v);
+      };
+    });
+
+    it('read-only mode blocks affected profile and connector writes without mutating state', () => {
+      const readOnlyCoord = new ProductionActionCoordinator(true);
+      assert.equal(readOnlyCoord.isReadOnlyMode, true);
+
+      const profileNameBefore = readOnlyCoord.storeProfile.name;
+      const resProfile = readOnlyCoord.updateStoreProfile({ name: 'Blocked Read Only Name' });
+      assert.equal(resProfile.success, false);
+      assert.equal(readOnlyCoord.storeProfile.name, profileNameBefore);
+
+      const shopifyBefore = readOnlyCoord.storeProfile.connectors.find(c => c.id === 'conn_shopify_01')!.status;
+      const resConn = readOnlyCoord.toggleConnectorSync('conn_shopify_01');
+      assert.equal(resConn.success, false);
+      assert.equal(readOnlyCoord.storeProfile.connectors.find(c => c.id === 'conn_shopify_01')!.status, shopifyBefore);
+    });
+
+    it('subscription and webhook states do not assert active billing or live webhooks without verified backing data', () => {
+      // Verifies that tier and limits are seeded workspace fixtures
+      assert.equal(coordinator.storeProfile.tier, 'Growth Tier');
+      assert.equal(coordinator.storeProfile.skuLimit, 2500);
+      assert.equal(typeof coordinator.storeProfile.skuCount, 'number');
+
+      // Persist state to verify envelope payload integrity
+      const saveRes = coordinator.persistState(coordinator.products, coordinator.findings, coordinator.actionItems, coordinator.storeProfile);
+      assert.equal(saveRes.success, true);
+
+      // Storage payload never contains unverified credentials or billing secrets
+      const loadRes = coordinator.adapter.load();
+      assert.equal(loadRes.type, 'valid');
+      if (loadRes.type === 'valid') {
+        const payload = loadRes.envelope.payload;
+        assert.equal((payload as unknown as Record<string, unknown>).billingWebhookSecret, undefined);
+        assert.equal((payload as unknown as Record<string, unknown>).stripeCustomerId, undefined);
+        assert.equal((payload as unknown as Record<string, unknown>).activeSubscriptionId, undefined);
+      }
     });
   });
 });

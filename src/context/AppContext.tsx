@@ -27,6 +27,10 @@ import {
   executeCatalogImport,
 } from '../domain/catalog/catalogMutationService';
 import { ingestAndAnalyzeStore } from '../domain/ingestion/storeIngestion';
+import { 
+  validateAndApplyProfileUpdate, 
+  applyConnectorToggle 
+} from '../domain/settings/settingsService';
 
 export interface ToastMessage {
   id: string;
@@ -65,8 +69,8 @@ interface AppContextType {
   dismissAction: (actionId: string) => void;
   recheckAction: (actionId: string) => void;
   recheckProduct: (productId: string) => void;
-  updateStoreProfile: (updates: Partial<StoreProfile>) => void;
-  toggleConnectorSync: (connectorId: string) => void;
+  updateStoreProfile: (updates: Partial<StoreProfile>) => { success: boolean; error?: string };
+  toggleConnectorSync: (connectorId: string) => { success: boolean; error?: string };
   addToast: (title: string, message: string, type?: ToastMessage['type']) => void;
   removeToast: (id: string) => void;
   resetToSeedData: () => void;
@@ -479,39 +483,77 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   };
 
-  const updateStoreProfile = (updates: Partial<StoreProfile>) => {
-    if (isReadOnlyMode) {
-      addToast('Settings Locked', 'Store settings cannot be changed while read-only mode is active.', 'warning');
-      return;
+  const updateStoreProfile = (updates: Partial<StoreProfile>): { success: boolean; error?: string } => {
+    const valRes = validateAndApplyProfileUpdate(storeProfile, updates, isReadOnlyMode);
+    if (!valRes.success || !valRes.nextProfile) {
+      addToast(
+        valRes.errorCode === 'READ_ONLY_MODE' ? 'Settings Locked' : 'Validation Error',
+        valRes.message,
+        'warning'
+      );
+      return { success: false, error: valRes.message };
     }
-    const nextProfile = { ...storeProfile, ...updates };
-    setStoreProfile(nextProfile);
-    persistState(products, findings, actionItems, nextProfile);
-    addToast('Store Settings Saved', 'Store configuration updated and persisted.', 'success');
+
+    const proposedProfile = valRes.nextProfile;
+
+    // Failure-safe persistence: attempt to persist before updating in-memory React state
+    const saveRes = persistState(products, findings, actionItems, proposedProfile);
+    if (!saveRes.success) {
+      addToast(
+        'Settings Save Failed',
+        `Could not persist store settings: ${saveRes.error}`,
+        'error'
+      );
+      return { success: false, error: saveRes.error };
+    }
+
+    // Commit new in-memory state ONLY after persistence succeeds
+    setStoreProfile(proposedProfile);
+
+    // Truthful durability messaging
+    if (saveRes.isDurable) {
+      addToast('Store Settings Saved', 'Store configuration updated and durably persisted.', 'success');
+    } else {
+      addToast('Store Settings Updated (Session Only)', 'Store configuration updated in memory. Persistent local storage is restricted.', 'info');
+    }
+
+    return { success: true };
   };
 
-  const toggleConnectorSync = (connectorId: string) => {
-    if (isReadOnlyMode) {
-      addToast('Connector Locked', 'Connectors cannot be modified while read-only mode is active.', 'warning');
-      return;
+  const toggleConnectorSync = (connectorId: string): { success: boolean; error?: string } => {
+    const toggleRes = applyConnectorToggle(storeProfile, connectorId, isReadOnlyMode);
+    if (!toggleRes.success || !toggleRes.nextProfile) {
+      addToast(
+        toggleRes.errorCode === 'READ_ONLY_MODE' ? 'Connector Locked' : 'Integration Unavailable',
+        toggleRes.message,
+        'warning'
+      );
+      return { success: false, error: toggleRes.message };
     }
 
-    const nextConnectors = storeProfile.connectors.map(c => {
-      if (c.id === connectorId) {
-        const newStatus = c.status === 'connected' ? 'disconnected' as const : 'connected' as const;
-        return {
-          ...c,
-          status: newStatus,
-          lastSync: newStatus === 'connected' ? 'Just now' : c.lastSync,
-        };
-      }
-      return c;
-    });
+    const proposedProfile = toggleRes.nextProfile;
 
-    const nextProfile = { ...storeProfile, connectors: nextConnectors };
-    setStoreProfile(nextProfile);
-    persistState(products, findings, actionItems, nextProfile);
-    addToast('Connector Updated', 'Connector status was modified.', 'info');
+    // Failure-safe persistence: attempt to persist before updating in-memory React state
+    const saveRes = persistState(products, findings, actionItems, proposedProfile);
+    if (!saveRes.success) {
+      addToast(
+        'Connector Update Failed',
+        `Could not persist connector status: ${saveRes.error}`,
+        'error'
+      );
+      return { success: false, error: saveRes.error };
+    }
+
+    // Commit new in-memory state ONLY after persistence succeeds
+    setStoreProfile(proposedProfile);
+
+    if (saveRes.isDurable) {
+      addToast('Connector Disconnected', `${toggleRes.message} State durably persisted.`, 'info');
+    } else {
+      addToast('Connector Disconnected (Session Only)', `${toggleRes.message} Persistent local storage is restricted.`, 'info');
+    }
+
+    return { success: true };
   };
 
   const resetToSeedData = () => {
