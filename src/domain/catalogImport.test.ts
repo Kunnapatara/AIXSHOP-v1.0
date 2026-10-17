@@ -16,7 +16,8 @@ import {
   DECIMAL_PRICE_REGEX,
   parseDecimalPrice,
   isValidDecimalPriceString,
-  numberToPlainDecimal
+  numberToPlainDecimal,
+  isFloatingPointArtifact
 } from './validation/price';
 import type { ParsedPriceResult } from './validation/price';
 import { 
@@ -942,6 +943,33 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(pZeroPadded.isValid, true);
     assert.equal(pZeroPadded.price, 0);
 
+    // Floating-Point Calculation Artifacts (e.g. 0.1 + 0.2 = 0.30000000000000004)
+    // Must be strictly rejected in both numeric and string forms without silent rounding
+    const pArtifactNum = parseDecimalPrice(0.1 + 0.2);
+    assert.equal(pArtifactNum.isValid, false, 'Numeric 0.1 + 0.2 (0.30000000000000004) must be rejected as floating-point calculation artifact');
+    assert.equal(pArtifactNum.price, null);
+    assert.ok(pArtifactNum.reason?.includes('binary floating-point calculation artifact'));
+
+    const pArtifactStr = parseDecimalPrice('0.30000000000000004');
+    assert.equal(pArtifactStr.isValid, false, 'String "0.30000000000000004" must be rejected as floating-point calculation artifact');
+    assert.equal(pArtifactStr.price, null);
+    assert.ok(pArtifactStr.reason?.includes('binary floating-point calculation artifact'));
+
+    assert.equal(parseDecimalPrice(0.2 + 0.4).isValid, false, '0.2 + 0.4 must be rejected');
+    assert.equal(parseDecimalPrice(0.7 + 0.1 + 0.1 + 0.1).isValid, false, '0.7 + 0.1 + 0.1 + 0.1 must be rejected');
+    assert.equal(parseDecimalPrice(1.0 - 0.9).isValid, false, '1.0 - 0.9 must be rejected');
+    assert.equal(parseDecimalPrice(35.55 * 100).isValid, false, '35.55 * 100 must be rejected');
+
+    // Strict distinction: isFloatingPointArtifact detects calculation artifacts while preserving legitimate small fractions
+    assert.equal(isFloatingPointArtifact(0.1 + 0.2), true);
+    assert.equal(isFloatingPointArtifact('0.30000000000000004'), true);
+    assert.equal(isFloatingPointArtifact(0.0000001), false, 'Legitimate small fraction 0.0000001 is NOT an artifact');
+    assert.equal(isFloatingPointArtifact('0.0000001'), false);
+    assert.equal(isFloatingPointArtifact(0.00000001), false);
+    assert.equal(isFloatingPointArtifact('0.00000015'), false);
+    assert.equal(isFloatingPointArtifact(0.1), false);
+    assert.equal(isFloatingPointArtifact('0.10'), false);
+
     // 18b. End-to-end ingestion test: feed containing valid and invalid prices
     const testFeed = {
       products: [
@@ -981,6 +1009,10 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
           title: 'Valid Small Fractional Price Item',
           variants: [{ id: 'var_809', title: 'Default', sku: 'SMALL-FRAC', barcode: '0850029389040', price: '0.0000001', available: true }],
         }),
+        createMockShopifyProduct(810, {
+          title: 'Floating Point Artifact Item',
+          variants: [{ id: 'var_810', title: 'Default', sku: 'FP-ARTIFACT', barcode: '0850029389057', price: 0.1 + 0.2, available: true }],
+        }),
       ],
     };
 
@@ -1010,6 +1042,14 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const d809 = details.find(d => d.productId === 'p_809')!;
     assert.equal(d809.status, 'eligible');
     assert.equal(candidates.find(p => p.id === 'p_809')!.variants[0].price, 0.0000001);
+
+    // Check Candidate 810 (Floating-point calculation artifact 0.1 + 0.2): rejected, raw evidence preserved, price null
+    const c810 = candidates.find(p => p.id === 'p_810')!;
+    assert.equal(c810.variants[0].price, null, 'Must NOT convert artifact price to rounded value');
+    assert.equal(c810.variants[0].attributes?.rawSourcePrice, '0.30000000000000004');
+    assert.ok(c810.variants[0].attributes?.priceError?.includes('binary floating-point calculation artifact'));
+    const d810 = details.find(d => d.productId === 'p_810')!;
+    assert.equal(d810.status, 'rejected');
 
     // Check Candidate 802 (Missing price): rejected, raw evidence preserved, price is null (NOT 0)
     const c802 = candidates.find(p => p.id === 'p_802')!;
@@ -1057,7 +1097,7 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const importRes = executeCatalogImport(candidates, getImportContext());
     assert.equal(importRes.success, true);
     assert.equal(importRes.importedCount, 3, 'Candidate 801 (price 0), 808 (price 0.1), and 809 (price 0.0000001) import cleanly');
-    assert.equal(importRes.rejectedCount, 6, 'All 6 invalid price candidates must be rejected');
+    assert.equal(importRes.rejectedCount, 7, 'All 7 invalid/artifact price candidates must be rejected');
     assert.equal(importRes.nextProducts.length, initialCatalogCount + 3);
 
     // Existing catalog items strictly preserved

@@ -456,6 +456,9 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         '9007199254740992', // Exceeds Number.MAX_SAFE_INTEGER (9007199254740991)
         '0.10000000000000001', // Precision loss: cannot be represented without floating-point distortion
         '1.234567890123456789', // Precision loss: truncated by IEEE-754 binary64
+        '0.30000000000000004', // Binary floating-point calculation artifact: 0.1 + 0.2
+        '0.6000000000000001', // Binary floating-point calculation artifact: 0.2 + 0.4
+        '0.9999999999999999', // Binary floating-point calculation artifact: 0.7 + 0.1 + 0.1 + 0.1
       ];
       for (const [idx, badVal] of invalidPriceValues.entries()) {
         const badId = `act_bad_val_${idx}`;
@@ -523,6 +526,27 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(recheckPrecLoss.success, true);
       assert.equal(recheckPrecLoss.isVerified, false, 'Recheck must not verify precision loss expected price');
       assert.equal(recheckPrecLoss.verificationStatus, 'verification_failed');
+
+      // 3d. Re-check rejects expected price containing floating-point calculation artifact
+      coordinator.actionItems.push({
+        id: 'act_recheck_artifact',
+        findingId: 'find_recheck_artifact',
+        productId: 'prod_solstice_04',
+        title: 'Recheck Action with Calculation Artifact Expected Price',
+        severity: 'medium',
+        status: 'approved',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '0.30000000000000004',
+        },
+        verificationStatus: 'recheck_required',
+      });
+      const recheckArtifact = coordinator.recheckAction('act_recheck_artifact');
+      assert.equal(recheckArtifact.success, true);
+      assert.equal(recheckArtifact.isVerified, false, 'Recheck must not verify floating-point calculation artifact expected price');
+      assert.equal(recheckArtifact.verificationStatus, 'verification_failed');
 
       // 4. Accepts valid numeric zero and updates variant.price as number 0
       coordinator.actionItems.push({

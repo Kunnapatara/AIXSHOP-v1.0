@@ -80,6 +80,34 @@ export function numberToPlainDecimal(num: number): string {
 }
 
 /**
+ * Detects whether a numeric value or decimal string contains binary floating-point
+ * calculation artifacts (such as 0.1 + 0.2 = 0.30000000000000004 or 0.7 + 0.3 = 0.9999999999999999).
+ * 
+ * In IEEE-754 binary64 arithmetic, imprecise binary representations of decimal fractions
+ * manifest at machine precision boundaries (~15-17 significant decimal digits) with long
+ * sequences of repeating 0s followed by a stray digit, or long sequences of repeating 9s.
+ * 
+ * In contrast, legitimate small fractional prices (e.g. 0.0000001 or 0.00000015) have leading
+ * fractional zeros immediately following the decimal point with few significant digits, which
+ * this detector explicitly preserves.
+ */
+export function isFloatingPointArtifact(val: unknown): boolean {
+  if (typeof val !== 'number' && typeof val !== 'string') return false;
+  const str = String(val).trim();
+  if (str === '' || str === 'NaN' || str === 'Infinity' || str === '-Infinity') return false;
+
+  // Significant digit followed by 7+ zeros and a trailing non-zero digit: e.g. 0.30000000000000004
+  if (/\.[0-9]*?[1-9]0{7,}[1-9]$/.test(str)) {
+    return true;
+  }
+  // 7+ consecutive nines in fractional part: e.g. 0.9999999999999999, 3554.9999999999995
+  if (/\.[0-9]*?9{7,}[0-9]*$/.test(str)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Parses and validates an unknown raw price value against canonical decimal price constraints.
  * 
  * Monetary Precision Invariants:
@@ -89,7 +117,8 @@ export function numberToPlainDecimal(num: number): string {
  * 4. Rejects values exceeding JavaScript's IEEE-754 safe numeric limit (Number.MAX_SAFE_INTEGER: 9007199254740991).
  * 5. Rejects decimal values that suffer floating-point precision loss (e.g. '0.10000000000000001' or '1.234567890123456789')
  *    where JavaScript binary64 cannot represent the exact mathematical decimal value.
- * 6. Rejects all non-decimal bases, scientific notation, signs, currency symbols, and non-numeric characters.
+ * 6. Rejects binary floating-point calculation artifacts (e.g. 0.1 + 0.2 = 0.30000000000000004).
+ * 7. Rejects all non-decimal bases, scientific notation, signs, currency symbols, and non-numeric characters.
  */
 export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
   if (rawPrice === undefined || rawPrice === null) {
@@ -119,6 +148,14 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
         reason: `Price exceeds maximum safe numeric value (Number.MAX_SAFE_INTEGER: ${Number.MAX_SAFE_INTEGER}).`,
       };
     }
+    if (isFloatingPointArtifact(rawPrice)) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: String(rawPrice),
+        reason: `Price contains a binary floating-point calculation artifact or floating-point precision loss (received ${rawPrice}).`,
+      };
+    }
     // Normalize -0 to 0
     const normalizedPrice = (rawPrice === 0 || Object.is(rawPrice, -0)) ? 0 : rawPrice;
     return { isValid: true, price: normalizedPrice, rawString: String(rawPrice) };
@@ -144,8 +181,26 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
       };
     }
 
+    if (isFloatingPointArtifact(trimmed)) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Price string "${rawPrice}" contains a binary floating-point calculation artifact or floating-point precision loss.`,
+      };
+    }
+
     const canonicalStr = toCanonicalDecimal(trimmed);
     const num = Number(canonicalStr);
+
+    if (isFloatingPointArtifact(num)) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Price string "${rawPrice}" contains a binary floating-point calculation artifact or floating-point precision loss.`,
+      };
+    }
 
     if (isNaN(num)) {
       return {
