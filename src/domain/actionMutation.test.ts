@@ -454,6 +454,8 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
         'Infinity',
         '-Infinity',
         '9007199254740992', // Exceeds Number.MAX_SAFE_INTEGER (9007199254740991)
+        '0.10000000000000001', // Precision loss: cannot be represented without floating-point distortion
+        '1.234567890123456789', // Precision loss: truncated by IEEE-754 binary64
       ];
       for (const [idx, badVal] of invalidPriceValues.entries()) {
         const badId = `act_bad_val_${idx}`;
@@ -500,6 +502,27 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(recheckBadExpected.success, true);
       assert.equal(recheckBadExpected.isVerified, false, 'Recheck must not verify invalid expected price "0x10"');
       assert.equal(recheckBadExpected.verificationStatus, 'verification_failed');
+
+      // 3c. Re-check rejects expected price suffering floating-point precision loss
+      coordinator.actionItems.push({
+        id: 'act_recheck_precision_loss',
+        findingId: 'find_recheck_precision_loss',
+        productId: 'prod_solstice_04',
+        title: 'Recheck Action with Precision Loss Expected Price',
+        severity: 'medium',
+        status: 'approved',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '34',
+          to: '0.10000000000000001',
+        },
+        verificationStatus: 'recheck_required',
+      });
+      const recheckPrecLoss = coordinator.recheckAction('act_recheck_precision_loss');
+      assert.equal(recheckPrecLoss.success, true);
+      assert.equal(recheckPrecLoss.isVerified, false, 'Recheck must not verify precision loss expected price');
+      assert.equal(recheckPrecLoss.verificationStatus, 'verification_failed');
 
       // 4. Accepts valid numeric zero and updates variant.price as number 0
       coordinator.actionItems.push({

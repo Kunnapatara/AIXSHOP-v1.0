@@ -881,10 +881,29 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(DECIMAL_PRICE_REGEX.test('1e3'), false);
     assert.equal(DECIMAL_PRICE_REGEX.test('$10'), false);
 
-    assert.equal(isValidDecimalPriceString('12.34'), true);
-    assert.equal(isValidDecimalPriceString('0.00'), true);
-    assert.equal(isValidDecimalPriceString('0x10'), false);
-    assert.equal(isValidDecimalPriceString('9007199254740992'), false);
+    // Decimal Precision Invariants: inputs that suffer binary floating-point precision loss
+    const pPrecisionLoss1 = parseDecimalPrice('0.10000000000000001');
+    assert.equal(pPrecisionLoss1.isValid, false, '0.10000000000000001 must be rejected for precision loss');
+    assert.equal(pPrecisionLoss1.price, null);
+    assert.ok(pPrecisionLoss1.reason?.includes('precision loss'));
+
+    const pPrecisionLoss2 = parseDecimalPrice('1.234567890123456789');
+    assert.equal(pPrecisionLoss2.isValid, false, '1.234567890123456789 must be rejected for precision loss');
+    assert.equal(pPrecisionLoss2.price, null);
+    assert.ok(pPrecisionLoss2.reason?.includes('precision loss'));
+
+    // Formatting vs monetary-value equivalence:
+    // '0.10' and '0.1' both represent 10 cents and parse to identical numeric value 0.1
+    const pTenCents1 = parseDecimalPrice('0.1');
+    const pTenCents2 = parseDecimalPrice('0.10');
+    assert.equal(pTenCents1.isValid, true);
+    assert.equal(pTenCents2.isValid, true);
+    assert.equal(pTenCents1.price, 0.1);
+    assert.equal(pTenCents2.price, 0.1);
+
+    // '0.50' and '0.5' both represent 50 cents
+    assert.equal(parseDecimalPrice('0.50').price, 0.5);
+    assert.equal(parseDecimalPrice('0.5').price, 0.5);
 
     // 18b. End-to-end ingestion test: feed containing valid and invalid prices
     const testFeed = {
@@ -909,6 +928,18 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
           title: 'Negative Price Item',
           variants: [{ id: 'var_805', title: 'Default', sku: 'NEG-PRICE', barcode: '0850029381082', price: '-25.00', available: true }],
         }),
+        createMockShopifyProduct(806, {
+          title: 'Precision Loss Item 1',
+          variants: [{ id: 'var_806', title: 'Default', sku: 'PREC-LOSS-1', barcode: '0850029389019', price: '0.10000000000000001', available: true }],
+        }),
+        createMockShopifyProduct(807, {
+          title: 'Precision Loss Item 2',
+          variants: [{ id: 'var_807', title: 'Default', sku: 'PREC-LOSS-2', barcode: '0850029389026', price: '1.234567890123456789', available: true }],
+        }),
+        createMockShopifyProduct(808, {
+          title: 'Valid Ten Cents Item',
+          variants: [{ id: 'var_808', title: 'Default', sku: 'TEN-CENTS', barcode: '0850029389033', price: '0.10', available: true }],
+        }),
       ],
     };
 
@@ -928,6 +959,11 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const d801 = details.find(d => d.productId === 'p_801')!;
     assert.equal(d801.status, 'eligible');
     assert.equal(candidates.find(p => p.id === 'p_801')!.variants[0].price, 0);
+
+    // Check Candidate 808 (Valid ten cents): accepted, monetary value 0.1
+    const d808 = details.find(d => d.productId === 'p_808')!;
+    assert.equal(d808.status, 'eligible');
+    assert.equal(candidates.find(p => p.id === 'p_808')!.variants[0].price, 0.1);
 
     // Check Candidate 802 (Missing price): rejected, raw evidence preserved, price is null (NOT 0)
     const c802 = candidates.find(p => p.id === 'p_802')!;
@@ -955,13 +991,28 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const d805 = details.find(d => d.productId === 'p_805')!;
     assert.equal(d805.status, 'rejected');
 
-    // 18c. Direct import execution: rejects all products with missing/invalid price; only eligible zero product imports
+    // Check Candidate 806 (Precision loss 0.10000000000000001): rejected, price is null
+    const c806 = candidates.find(p => p.id === 'p_806')!;
+    assert.equal(c806.variants[0].price, null);
+    assert.equal(c806.variants[0].attributes?.rawSourcePrice, '0.10000000000000001');
+    assert.ok(c806.variants[0].attributes?.priceError?.includes('precision loss'));
+    const d806 = details.find(d => d.productId === 'p_806')!;
+    assert.equal(d806.status, 'rejected');
+
+    // Check Candidate 807 (Precision loss 1.234567890123456789): rejected, price is null
+    const c807 = candidates.find(p => p.id === 'p_807')!;
+    assert.equal(c807.variants[0].price, null);
+    assert.equal(c807.variants[0].attributes?.rawSourcePrice, '1.234567890123456789');
+    const d807 = details.find(d => d.productId === 'p_807')!;
+    assert.equal(d807.status, 'rejected');
+
+    // 18c. Direct import execution: rejects all products with missing/invalid price; only eligible products import
     const initialCatalogCount = products.length;
     const importRes = executeCatalogImport(candidates, getImportContext());
     assert.equal(importRes.success, true);
-    assert.equal(importRes.importedCount, 1, 'Only legitimate zero product imports');
-    assert.equal(importRes.rejectedCount, 4, 'All 4 invalid price candidates must be rejected');
-    assert.equal(importRes.nextProducts.length, initialCatalogCount + 1);
+    assert.equal(importRes.importedCount, 2, 'Candidate 801 (price 0) and 808 (price 0.1) import cleanly');
+    assert.equal(importRes.rejectedCount, 6, 'All 6 invalid price candidates must be rejected');
+    assert.equal(importRes.nextProducts.length, initialCatalogCount + 2);
 
     // Existing catalog items strictly preserved
     for (let i = 0; i < initialCatalogCount; i++) {

@@ -14,7 +14,8 @@ import {
   DECIMAL_PRICE_REGEX, 
   parseDecimalPrice, 
   parseSourcePrice, 
-  isValidDecimalPriceString 
+  isValidDecimalPriceString,
+  toCanonicalDecimal 
 } from '../validation/price';
 import type { ParsedPriceResult } from '../validation/price';
 
@@ -22,7 +23,8 @@ export {
   DECIMAL_PRICE_REGEX, 
   parseDecimalPrice, 
   parseSourcePrice, 
-  isValidDecimalPriceString 
+  isValidDecimalPriceString,
+  toCanonicalDecimal 
 };
 export type { ParsedPriceResult };
 

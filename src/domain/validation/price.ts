@@ -6,7 +6,7 @@
  * - Merchant Action Mutation & Approval (catalogMutationService.ts)
  * - Action Verification & Re-check (catalogMutationService.ts)
  * 
- * Eliminates circular dependencies between ingestion and catalog mutation.
+ * Eliminates circular dependencies and enforces monetary decimal precision invariants.
  */
 
 /**
@@ -36,14 +36,36 @@ export interface ParsedPriceResult {
 }
 
 /**
+ * Normalizes a valid decimal string to its canonical mathematical decimal representation:
+ * - Strips redundant leading zeros from integer part (preserving single '0')
+ * - Strips redundant trailing zeros from fractional part
+ * - Strips lone decimal point if all fractional digits were zeros
+ * 
+ * Examples:
+ * - '007.50' -> '7.5'
+ * - '0.10' -> '0.1'
+ * - '0.00' -> '0'
+ * - '12.3400' -> '12.34'
+ */
+export function toCanonicalDecimal(decimalStr: string): string {
+  const parts = decimalStr.split('.');
+  let intPart = parts[0].replace(/^0+(?=\d)/, '');
+  if (parts.length === 1) return intPart;
+  const fracPart = parts[1].replace(/0+$/, '');
+  return fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
+}
+
+/**
  * Parses and validates an unknown raw price value against canonical decimal price constraints.
  * 
- * Guarantees:
+ * Monetary Precision Invariants:
  * 1. Legitimate zero prices (0, '0', '0.00') are accepted and preserved as numeric 0.
  * 2. Negative zero (-0) is safely normalized to ordinary 0.
  * 3. Never invents zero for missing, null, empty, or malformed inputs.
- * 4. Rejects values exceeding JavaScript's IEEE-754 safe numeric limit (Number.MAX_SAFE_INTEGER).
- * 5. Rejects all non-decimal bases, scientific notation, signs, currency symbols, and non-numeric characters.
+ * 4. Rejects values exceeding JavaScript's IEEE-754 safe numeric limit (Number.MAX_SAFE_INTEGER: 9007199254740991).
+ * 5. Rejects decimal values that suffer floating-point precision loss (e.g. '0.10000000000000001' or '1.234567890123456789')
+ *    where JavaScript binary64 cannot represent the exact mathematical decimal value.
+ * 6. Rejects all non-decimal bases, scientific notation, signs, currency symbols, and non-numeric characters.
  */
 export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
   if (rawPrice === undefined || rawPrice === null) {
@@ -65,7 +87,7 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
     if (rawPrice < 0) {
       return { isValid: false, price: null, rawString: String(rawPrice), reason: `Price cannot be negative (received ${rawPrice}).` };
     }
-    if (rawPrice > Number.MAX_SAFE_INTEGER) {
+    if (rawPrice > Number.MAX_SAFE_INTEGER || Math.floor(rawPrice) > Number.MAX_SAFE_INTEGER) {
       return {
         isValid: false,
         price: null,
@@ -98,7 +120,9 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
       };
     }
 
-    const num = Number(trimmed);
+    const canonicalStr = toCanonicalDecimal(trimmed);
+    const num = Number(canonicalStr);
+
     if (isNaN(num)) {
       return {
         isValid: false,
@@ -123,12 +147,23 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
         reason: `Price cannot be negative (received "${rawPrice}").`,
       };
     }
-    if (num > Number.MAX_SAFE_INTEGER) {
+    if (num > Number.MAX_SAFE_INTEGER || Math.floor(num) > Number.MAX_SAFE_INTEGER) {
       return {
         isValid: false,
         price: null,
         rawString: rawPrice,
         reason: `Price exceeds maximum safe numeric value (Number.MAX_SAFE_INTEGER: ${Number.MAX_SAFE_INTEGER}).`,
+      };
+    }
+
+    // Precision Invariant: Verify that binary floating-point representation does not silently alter
+    // or truncate the decimal precision of the intended monetary value.
+    if (String(num) !== canonicalStr) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Price string "${rawPrice}" cannot be represented safely without floating-point precision loss.`,
       };
     }
 
@@ -150,12 +185,11 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
 export const parseSourcePrice = parseDecimalPrice;
 
 /**
- * Returns true if the string represents a strictly valid, non-negative decimal price within safe numeric bounds.
+ * Returns true if the string represents a strictly valid, non-negative decimal price within safe numeric bounds
+ * without floating-point precision loss.
  */
 export function isValidDecimalPriceString(value: string): boolean {
   if (typeof value !== 'string') return false;
-  const trimmed = value.trim();
-  if (!DECIMAL_PRICE_REGEX.test(trimmed)) return false;
-  const num = Number(trimmed);
-  return !isNaN(num) && isFinite(num) && num >= 0 && num <= Number.MAX_SAFE_INTEGER;
+  const parsed = parseDecimalPrice(value);
+  return parsed.isValid && parsed.price !== null;
 }
