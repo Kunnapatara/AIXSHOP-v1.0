@@ -9,6 +9,7 @@ import {
 import { initialProducts, initialFindings } from '../../data/mockData';
 import { isValidGtin13 } from '../validation/gtin';
 import { calculateProductCompleteness } from '../catalog/catalogMutationService';
+import { CURRENT_SCHEMA_VERSION } from '../storage/storageAdapter';
 
 export interface ShopifyPublicProduct {
   id: number | string;
@@ -114,6 +115,8 @@ export function isDemoStoreHostname(rawHostname: string): boolean {
   return DEMO_STORE_HOSTNAMES.has(normalized);
 }
 
+export const DECIMAL_PRICE_REGEX = /^\d+(\.\d+)?$/;
+
 export interface ParsedPriceResult {
   isValid: boolean;
   price: number | null;
@@ -127,8 +130,9 @@ export interface ParsedPriceResult {
  * - undefined or null
  * - empty or whitespace-only strings
  * - non-numeric strings or strings with trailing garbage (e.g. '12.50abc')
+ * - hexadecimal ('0x10'), binary ('0b101'), octal ('0o77'), scientific/exponential notation ('1e3')
  * - NaN, Infinity, -Infinity
- * - negative prices (< 0)
+ * - negative prices (< 0) or strings with negative signs
  * Valid zero (0, '0', '0.00') is accepted as legitimate non-negative price per domain rules.
  */
 export function parseSourcePrice(rawPrice: unknown): ParsedPriceResult {
@@ -151,7 +155,8 @@ export function parseSourcePrice(rawPrice: unknown): ParsedPriceResult {
     if (rawPrice < 0) {
       return { isValid: false, price: null, rawString: String(rawPrice), reason: `Price cannot be negative (received ${rawPrice}).` };
     }
-    return { isValid: true, price: rawPrice, rawString: String(rawPrice) };
+    const normalizedPrice = rawPrice === 0 ? 0 : rawPrice;
+    return { isValid: true, price: normalizedPrice, rawString: String(rawPrice) };
   }
 
   if (typeof rawPrice === 'string') {
@@ -162,6 +167,18 @@ export function parseSourcePrice(rawPrice: unknown): ParsedPriceResult {
         price: null,
         rawString: rawPrice,
         reason: 'Price is empty or whitespace-only.',
+      };
+    }
+
+    // Explicit price parsing policy: must match standard non-negative decimal merchant price format.
+    // Rejects hexadecimal (0x..), binary (0b..), octal (0o..), scientific/exponential notation (1e3),
+    // signs (+/-), currency symbols, multiple decimal dots, and non-numeric characters.
+    if (!DECIMAL_PRICE_REGEX.test(trimmed)) {
+      return {
+        isValid: false,
+        price: null,
+        rawString: rawPrice,
+        reason: `Malformed price string "${rawPrice}": must be a valid non-negative decimal merchant price without currency symbols, letters, signs, exponential notation, or non-decimal bases.`,
       };
     }
 
@@ -191,7 +208,8 @@ export function parseSourcePrice(rawPrice: unknown): ParsedPriceResult {
       };
     }
 
-    return { isValid: true, price: num, rawString: rawPrice };
+    const normalizedPrice = num === 0 ? 0 : num;
+    return { isValid: true, price: normalizedPrice, rawString: rawPrice };
   }
 
   return {
@@ -234,7 +252,7 @@ export function validateCandidateProduct(prod: Product): { isValid: boolean; rea
         reasons.push(`Variant [${idx}] title is missing.`);
       }
       if (typeof v.sku !== 'string' || v.sku.trim() === '') {
-        reasons.push(`Variant [${idx}] SKU is missing. Merchant SKU is required by catalog storage schema v1.2 for identity and inventory tracking.`);
+        reasons.push(`Variant [${idx}] SKU is missing. Merchant SKU is required by catalog storage schema v${CURRENT_SCHEMA_VERSION} for identity and inventory tracking.`);
       }
       if (typeof v.price !== 'number' || isNaN(v.price) || !isFinite(v.price) || v.price < 0) {
         const rawInfo = v.attributes?.rawSourcePrice !== undefined ? ` (source value: "${v.attributes.rawSourcePrice}")` : '';

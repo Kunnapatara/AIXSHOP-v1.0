@@ -10,7 +10,8 @@ import {
   DEMO_STORE_HOSTNAMES,
   normalizeHostname,
   isDemoStoreHostname,
-  parseSourcePrice
+  parseSourcePrice,
+  DECIMAL_PRICE_REGEX
 } from './ingestion/storeIngestion';
 import { 
   executeCatalogImport, 
@@ -19,7 +20,7 @@ import {
   executeActionRecheck,
   calculateProductCompleteness
 } from './catalog/catalogMutationService';
-import { CatalogStorageAdapter, MemoryStorageBackend } from './storage/storageAdapter';
+import { CatalogStorageAdapter, MemoryStorageBackend, CURRENT_SCHEMA_VERSION } from './storage/storageAdapter';
 import { Product, Variant, StoreProfile, ActionItem, Finding } from '../types';
 import { initialProducts, initialFindings, initialActionItems, initialStoreProfile } from '../data/mockData';
 
@@ -758,6 +759,73 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(pInfStr.isValid, false);
     assert.equal(pInfStr.price, null);
 
+    // Hexadecimal string representations: must be strictly rejected (NOT parsed as base 16)
+    const pHexLower = parseSourcePrice('0x10');
+    assert.equal(pHexLower.isValid, false, 'Hexadecimal "0x10" must not be parsed as 16');
+    assert.equal(pHexLower.price, null);
+    assert.ok(pHexLower.reason?.includes('Malformed price string'));
+
+    const pHexUpper = parseSourcePrice('0X1A');
+    assert.equal(pHexUpper.isValid, false, 'Hexadecimal "0X1A" must be rejected');
+    assert.equal(pHexUpper.price, null);
+
+    // Binary string representations: must be strictly rejected
+    const pBin = parseSourcePrice('0b101');
+    assert.equal(pBin.isValid, false, 'Binary "0b101" must not be parsed as 5');
+    assert.equal(pBin.price, null);
+
+    // Octal string representations: must be strictly rejected
+    const pOct = parseSourcePrice('0o77');
+    assert.equal(pOct.isValid, false, 'Octal "0o77" must not be parsed as 63');
+    assert.equal(pOct.price, null);
+
+    // Scientific / exponential notation: must be strictly rejected
+    const pExpLower = parseSourcePrice('1e3');
+    assert.equal(pExpLower.isValid, false, 'Exponential "1e3" must not be parsed as 1000');
+    assert.equal(pExpLower.price, null);
+
+    const pExpUpper = parseSourcePrice('2.5E2');
+    assert.equal(pExpUpper.isValid, false, 'Exponential "2.5E2" must be rejected');
+    assert.equal(pExpUpper.price, null);
+
+    // Currency symbols and leading signs: must be rejected as malformed
+    const pDollar = parseSourcePrice('$12.50');
+    assert.equal(pDollar.isValid, false, 'Currency symbol "$12.50" must be rejected');
+    assert.equal(pDollar.price, null);
+
+    const pPlus = parseSourcePrice('+12.50');
+    assert.equal(pPlus.isValid, false, 'Leading plus sign "+12.50" must be rejected');
+    assert.equal(pPlus.price, null);
+
+    const pNegZero = parseSourcePrice('-0');
+    assert.equal(pNegZero.isValid, false, 'Negative zero string "-0" must be rejected');
+    assert.equal(pNegZero.price, null);
+
+    // Multiple decimal points and trailing dots: must be rejected
+    const pMultiDot = parseSourcePrice('12..50');
+    assert.equal(pMultiDot.isValid, false, 'Double dot "12..50" must be rejected');
+    assert.equal(pMultiDot.price, null);
+
+    const pThreeDots = parseSourcePrice('12.50.00');
+    assert.equal(pThreeDots.isValid, false, 'Multiple dots "12.50.00" must be rejected');
+    assert.equal(pThreeDots.price, null);
+
+    // Valid standard decimal merchant prices with various scales
+    assert.equal(parseSourcePrice('19').isValid, true);
+    assert.equal(parseSourcePrice('19').price, 19);
+    assert.equal(parseSourcePrice('0.5').isValid, true);
+    assert.equal(parseSourcePrice('0.5').price, 0.5);
+    assert.equal(parseSourcePrice('1299.99').isValid, true);
+    assert.equal(parseSourcePrice('1299.99').price, 1299.99);
+
+    // Direct verification of DECIMAL_PRICE_REGEX
+    assert.equal(DECIMAL_PRICE_REGEX.test('0'), true);
+    assert.equal(DECIMAL_PRICE_REGEX.test('0.00'), true);
+    assert.equal(DECIMAL_PRICE_REGEX.test('49.95'), true);
+    assert.equal(DECIMAL_PRICE_REGEX.test('0x10'), false);
+    assert.equal(DECIMAL_PRICE_REGEX.test('1e3'), false);
+    assert.equal(DECIMAL_PRICE_REGEX.test('$10'), false);
+
     // 18b. End-to-end ingestion test: feed containing valid and invalid prices
     const testFeed = {
       products: [
@@ -865,7 +933,7 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const valRes = validateCandidateProduct(validSkuProduct);
     assert.equal(valRes.isValid, true);
 
-    // 19b. Product without SKU: rejected with explicit technical reason documenting storage schema v1.2 requirement
+    // 19b. Product without SKU: rejected with explicit technical reason documenting storage schema v1 requirement
     const missingSkuProduct: Product = {
       ...validSkuProduct,
       id: 'p_missing_sku',
@@ -873,7 +941,14 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     };
     const noSkuRes = validateCandidateProduct(missingSkuProduct);
     assert.equal(noSkuRes.isValid, false);
-    assert.ok(noSkuRes.reasons.some(r => r.includes('Merchant SKU is required by catalog storage schema v1.2')));
+    assert.ok(
+      noSkuRes.reasons.some(r => r.includes(`Merchant SKU is required by catalog storage schema v${CURRENT_SCHEMA_VERSION}`)),
+      `Must cite storage schema v${CURRENT_SCHEMA_VERSION}`
+    );
+    assert.ok(
+      !noSkuRes.reasons.some(r => r.includes('v1.2')),
+      'User-facing error must not cite nonexistent schema v1.2'
+    );
 
     // No dummy or fabricated SKUs are invented
     assert.equal(missingSkuProduct.variants[0].sku.trim(), '');

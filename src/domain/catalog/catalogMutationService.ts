@@ -1,6 +1,6 @@
 import { Product, Finding, ActionItem, StoreProfile, CatalogImportResult } from '../../types';
 import { isValidGtin13 } from '../validation/gtin';
-import { evaluateCandidateProducts } from '../ingestion/storeIngestion';
+import { evaluateCandidateProducts, DECIMAL_PRICE_REGEX } from '../ingestion/storeIngestion';
 
 /**
  * Explicit allowlist of fields that may be mutated by an Action Item.
@@ -284,7 +284,8 @@ export function executeActionApproval(
       let numericPrice: number | undefined;
       if (targetProperty === 'price') {
         const rawPrice = valueToApply === undefined || valueToApply === null ? '' : String(valueToApply);
-        if (rawPrice.trim() === '') {
+        const trimmed = rawPrice.trim();
+        if (trimmed === '') {
           return {
             success: false,
             errorCode: 'UNSUPPORTED_FIELD',
@@ -295,7 +296,18 @@ export function executeActionApproval(
             nextStoreProfile: ctx.storeProfile,
           };
         }
-        numericPrice = Number(rawPrice.trim());
+        if (!DECIMAL_PRICE_REGEX.test(trimmed)) {
+          return {
+            success: false,
+            errorCode: 'UNSUPPORTED_FIELD',
+            message: `Invalid price "${valueToApply}". Price must be a valid non-negative decimal number.`,
+            nextProducts: ctx.products,
+            nextFindings: ctx.findings,
+            nextActions: ctx.actionItems,
+            nextStoreProfile: ctx.storeProfile,
+          };
+        }
+        numericPrice = Number(trimmed);
         if (isNaN(numericPrice) || numericPrice < 0 || !isFinite(numericPrice)) {
           return {
             success: false,
@@ -620,7 +632,7 @@ export function executeActionRecheck(
             }
           } else if (targetProperty === 'price') {
             const rawExpected = expectedValue === undefined || expectedValue === null ? '' : String(expectedValue).trim();
-            if (rawExpected === '') {
+            if (rawExpected === '' || !DECIMAL_PRICE_REGEX.test(rawExpected)) {
               isValid = false;
               failureReason = `Expected price is empty or invalid.`;
             } else {
