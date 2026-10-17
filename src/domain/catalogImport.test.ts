@@ -15,7 +15,8 @@ import {
   parseSourcePrice,
   DECIMAL_PRICE_REGEX,
   parseDecimalPrice,
-  isValidDecimalPriceString
+  isValidDecimalPriceString,
+  numberToPlainDecimal
 } from './validation/price';
 import type { ParsedPriceResult } from './validation/price';
 import { 
@@ -905,6 +906,42 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     assert.equal(parseDecimalPrice('0.50').price, 0.5);
     assert.equal(parseDecimalPrice('0.5').price, 0.5);
 
+    // Small valid fractional prices: must NOT be falsely rejected solely because JavaScript renders them in scientific notation (1e-7)
+    const pSmallFrac1 = parseDecimalPrice('0.0000001');
+    assert.equal(pSmallFrac1.isValid, true, 'Small decimal fraction "0.0000001" must be accepted');
+    assert.equal(pSmallFrac1.price, 0.0000001);
+    assert.equal(numberToPlainDecimal(pSmallFrac1.price!), '0.0000001');
+
+    const pSmallFrac2 = parseDecimalPrice('0.00000001');
+    assert.equal(pSmallFrac2.isValid, true, 'Small decimal fraction "0.00000001" must be accepted');
+    assert.equal(pSmallFrac2.price, 0.00000001);
+
+    const pSmallFrac3 = parseDecimalPrice('0.00000015');
+    assert.equal(pSmallFrac3.isValid, true, 'Small decimal fraction "0.00000015" must be accepted');
+    assert.equal(pSmallFrac3.price, 0.00000015);
+
+    // Scientific notation string input: must be strictly rejected
+    const pSciSmall = parseDecimalPrice('1e-7');
+    assert.equal(pSciSmall.isValid, false, 'Scientific notation string "1e-7" must be rejected as non-decimal merchant price');
+    assert.equal(pSciSmall.price, null);
+
+    // Leading zeros and trailing fractional zeros: normalized to canonical mathematical values
+    const pLeadingZeros1 = parseDecimalPrice('007.50');
+    assert.equal(pLeadingZeros1.isValid, true);
+    assert.equal(pLeadingZeros1.price, 7.5);
+
+    const pLeadingZeros2 = parseDecimalPrice('012.34');
+    assert.equal(pLeadingZeros2.isValid, true);
+    assert.equal(pLeadingZeros2.price, 12.34);
+
+    const pTrailingZeros = parseDecimalPrice('12.3400');
+    assert.equal(pTrailingZeros.isValid, true);
+    assert.equal(pTrailingZeros.price, 12.34);
+
+    const pZeroPadded = parseDecimalPrice('00.00');
+    assert.equal(pZeroPadded.isValid, true);
+    assert.equal(pZeroPadded.price, 0);
+
     // 18b. End-to-end ingestion test: feed containing valid and invalid prices
     const testFeed = {
       products: [
@@ -940,6 +977,10 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
           title: 'Valid Ten Cents Item',
           variants: [{ id: 'var_808', title: 'Default', sku: 'TEN-CENTS', barcode: '0850029389033', price: '0.10', available: true }],
         }),
+        createMockShopifyProduct(809, {
+          title: 'Valid Small Fractional Price Item',
+          variants: [{ id: 'var_809', title: 'Default', sku: 'SMALL-FRAC', barcode: '0850029389040', price: '0.0000001', available: true }],
+        }),
       ],
     };
 
@@ -964,6 +1005,11 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const d808 = details.find(d => d.productId === 'p_808')!;
     assert.equal(d808.status, 'eligible');
     assert.equal(candidates.find(p => p.id === 'p_808')!.variants[0].price, 0.1);
+
+    // Check Candidate 809 (Valid small fraction 0.0000001): accepted, monetary value 0.0000001
+    const d809 = details.find(d => d.productId === 'p_809')!;
+    assert.equal(d809.status, 'eligible');
+    assert.equal(candidates.find(p => p.id === 'p_809')!.variants[0].price, 0.0000001);
 
     // Check Candidate 802 (Missing price): rejected, raw evidence preserved, price is null (NOT 0)
     const c802 = candidates.find(p => p.id === 'p_802')!;
@@ -1010,14 +1056,121 @@ describe('Store Check → Safe Product Catalog Import Suite', () => {
     const initialCatalogCount = products.length;
     const importRes = executeCatalogImport(candidates, getImportContext());
     assert.equal(importRes.success, true);
-    assert.equal(importRes.importedCount, 2, 'Candidate 801 (price 0) and 808 (price 0.1) import cleanly');
+    assert.equal(importRes.importedCount, 3, 'Candidate 801 (price 0), 808 (price 0.1), and 809 (price 0.0000001) import cleanly');
     assert.equal(importRes.rejectedCount, 6, 'All 6 invalid price candidates must be rejected');
-    assert.equal(importRes.nextProducts.length, initialCatalogCount + 2);
+    assert.equal(importRes.nextProducts.length, initialCatalogCount + 3);
 
     // Existing catalog items strictly preserved
     for (let i = 0; i < initialCatalogCount; i++) {
       assert.deepEqual(importRes.nextProducts[i], products[i], 'Existing catalog data must remain completely intact');
     }
+
+    // 18d. Persistence, re-check, and mutation consistency for decimal prices
+    const smallFracProduct = importRes.nextProducts.find(p => p.id === 'p_809')!;
+    assert.ok(smallFracProduct);
+    assert.equal(smallFracProduct.variants[0].price, 0.0000001);
+
+    // Persistence round-trip verifies small fractional price and 0 price without corruption
+    const saveRes = adapter.save({
+      products: importRes.nextProducts,
+      variants: importRes.nextProducts.flatMap(p => p.variants || []),
+      offers: importRes.nextProducts.flatMap(p => p.offers || []),
+      findings,
+      evidence: [],
+      actions: actionItems,
+      storeProfile,
+    });
+    assert.equal(saveRes.success, true);
+    const loadRes = adapter.load();
+    assert.equal(loadRes.type, 'valid');
+    if (loadRes.type === 'valid') {
+      const persisted809 = loadRes.envelope.payload.products.find(p => p.id === 'p_809')!;
+      assert.equal(persisted809.variants[0].price, 0.0000001);
+      const persisted801 = loadRes.envelope.payload.products.find(p => p.id === 'p_801')!;
+      assert.equal(persisted801.variants[0].price, 0);
+    }
+
+    // Mutation rejection for invalid price leaves catalog completely unchanged
+    const originalCandlePrice = products[0].variants[0].price;
+    const badPriceAction: ActionItem = {
+      id: 'act_bad_price_test',
+      findingId: 'find_bad_price',
+      productId: products[0].id,
+      title: 'Set Invalid Price',
+      severity: 'medium',
+      status: 'pending_review',
+      evidenceRequired: false,
+      proposedChange: { field: 'variants[0].price', from: String(originalCandlePrice), to: '0.10000000000000001' },
+      verificationStatus: 'unverified',
+    };
+    const mutRejectRes = executeActionApproval('act_bad_price_test', undefined, {
+      products,
+      findings,
+      actionItems: [badPriceAction],
+      storeProfile,
+      isReadOnly: false,
+    });
+    assert.equal(mutRejectRes.success, false);
+    assert.equal(mutRejectRes.errorCode, 'UNSUPPORTED_FIELD');
+    assert.equal(products[0].variants[0].price, originalCandlePrice, 'Catalog price must not change on mutation failure');
+
+    // Mutation approval with small valid fraction 0.0000001 updates price and verifies in recheck
+    const smallFracAction: ActionItem = {
+      id: 'act_small_frac_test',
+      findingId: 'find_small_frac',
+      productId: products[0].id,
+      title: 'Set Micro-Transaction Price',
+      severity: 'low',
+      status: 'pending_review',
+      evidenceRequired: false,
+      proposedChange: { field: 'variants[0].price', from: String(originalCandlePrice), to: '0.0000001' },
+      verificationStatus: 'unverified',
+    };
+    const mutApproveRes = executeActionApproval('act_small_frac_test', undefined, {
+      products,
+      findings,
+      actionItems: [smallFracAction],
+      storeProfile,
+      isReadOnly: false,
+    });
+    assert.equal(mutApproveRes.success, true);
+    const updatedProd = mutApproveRes.nextProducts.find(p => p.id === products[0].id)!;
+    assert.equal(updatedProd.variants[0].price, 0.0000001);
+
+    // Recheck verifies the small fractional price
+    const recheckSmallFrac = executeActionRecheck('act_small_frac_test', {
+      products: mutApproveRes.nextProducts,
+      findings: mutApproveRes.nextFindings,
+      actionItems: mutApproveRes.nextActions,
+      storeProfile: mutApproveRes.nextStoreProfile,
+      isReadOnly: false,
+    });
+    assert.equal(recheckSmallFrac.success, true);
+    assert.equal(recheckSmallFrac.isVerified, true);
+    assert.equal(recheckSmallFrac.verificationStatus, 'verified_in_catalog');
+
+    // Recheck verifies monetary equivalence between '0.10' and stored 0.1
+    const tenCentsAction: ActionItem = {
+      id: 'act_ten_cents_test',
+      findingId: 'find_ten_cents',
+      productId: 'p_808',
+      title: 'Verify Ten Cents Price',
+      severity: 'low',
+      status: 'approved',
+      evidenceRequired: false,
+      proposedChange: { field: 'variants[0].price', from: '0', to: '0.10' },
+      verificationStatus: 'recheck_required',
+    };
+    const recheckTenCents = executeActionRecheck('act_ten_cents_test', {
+      products: importRes.nextProducts,
+      findings,
+      actionItems: [tenCentsAction],
+      storeProfile,
+      isReadOnly: false,
+    });
+    assert.equal(recheckTenCents.success, true);
+    assert.equal(recheckTenCents.isVerified, true, '0.1 in catalog must verify against expected value "0.10"');
+    assert.equal(recheckTenCents.verificationStatus, 'verified_in_catalog');
   });
 
   // 19. Section 3: SKU Requirements and Stable Product Identity

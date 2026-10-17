@@ -583,6 +583,102 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(recheck.success, true);
       assert.equal(recheck.isVerified, true);
       assert.equal(recheck.verificationStatus, 'verified_in_catalog');
+
+      // 6. Accepts small valid fractional price 0.0000001 without scientific notation false rejection
+      coordinator.actionItems.push({
+        id: 'act_small_frac_price',
+        findingId: 'find_small_frac_price',
+        productId: 'prod_solstice_04',
+        title: 'Set Micro-Price 0.0000001',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '38.50',
+          to: '0.0000001',
+        },
+        verificationStatus: 'unverified',
+      });
+      const resSmallFrac = coordinator.approveAction('act_small_frac_price');
+      assert.equal(resSmallFrac.success, true, 'Small fraction 0.0000001 must be accepted');
+      const candleSmallFrac = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleSmallFrac.variants[0].price, 0.0000001);
+
+      const recheckSmallFrac = coordinator.recheckAction('act_small_frac_price');
+      assert.equal(recheckSmallFrac.success, true);
+      assert.equal(recheckSmallFrac.isVerified, true);
+      assert.equal(recheckSmallFrac.verificationStatus, 'verified_in_catalog');
+
+      // 7. Equivalent decimal representation: re-check verifies '0.10' against stored 0.1
+      coordinator.actionItems.push({
+        id: 'act_equiv_cents',
+        findingId: 'find_equiv_cents',
+        productId: 'prod_solstice_04',
+        title: 'Set Ten Cents',
+        severity: 'low',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '0.0000001',
+          to: '0.1',
+        },
+        verificationStatus: 'unverified',
+      });
+      coordinator.approveAction('act_equiv_cents');
+
+      // Recheck with '0.10' as expected value
+      coordinator.actionItems.push({
+        id: 'act_recheck_ten_cents',
+        findingId: 'find_recheck_ten_cents',
+        productId: 'prod_solstice_04',
+        title: 'Verify Ten Cents Representation',
+        severity: 'low',
+        status: 'approved',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: '0',
+          to: '0.10',
+        },
+        verificationStatus: 'recheck_required',
+      });
+      const recheckTenCents = coordinator.recheckAction('act_recheck_ten_cents');
+      assert.equal(recheckTenCents.success, true);
+      assert.equal(recheckTenCents.isVerified, true, 'Stored 0.1 must verify against approved "0.10"');
+
+      // 8. Atomic rollback on price mutation failure when backend storage write fails
+      const priceBeforeFail = coordinator.products.find(p => p.id === 'prod_solstice_04')!.variants[0].price;
+      coordinator.backend.setItem = () => {
+        throw new Error('Storage write failed (quota exceeded)');
+      };
+      coordinator.actionItems.push({
+        id: 'act_price_rollback_test',
+        findingId: 'find_price_rollback',
+        productId: 'prod_solstice_04',
+        title: 'Price Mutation Failing Storage',
+        severity: 'medium',
+        status: 'pending_review',
+        evidenceRequired: false,
+        proposedChange: {
+          field: 'variants[0].price',
+          from: String(priceBeforeFail),
+          to: '45.00',
+        },
+        verificationStatus: 'unverified',
+      });
+      const resRollback = coordinator.approveAction('act_price_rollback_test');
+      assert.equal(resRollback.success, false);
+      assert.equal((resRollback as { rolledBack?: boolean }).rolledBack, true);
+      const candleAfterFail = coordinator.products.find(p => p.id === 'prod_solstice_04')!;
+      assert.equal(candleAfterFail.variants[0].price, priceBeforeFail, 'Price must rollback if storage persistence fails');
+      assert.equal(coordinator.actionItems.find(a => a.id === 'act_price_rollback_test')?.status, 'pending_review');
+
+      // Restore backend.setItem for subsequent tests
+      coordinator.backend.setItem = (k: string, v: string) => {
+        (coordinator.backend as unknown as { store: Map<string, string> }).store.set(k, v);
+      };
     });
 
     it('variants[0].title updates only title property', () => {

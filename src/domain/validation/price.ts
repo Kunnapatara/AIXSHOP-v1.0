@@ -56,6 +56,30 @@ export function toCanonicalDecimal(decimalStr: string): string {
 }
 
 /**
+ * Formats a JavaScript IEEE-754 finite number into a canonical plain decimal string
+ * without scientific/exponential notation (e.g. converting 1e-7 to '0.0000001').
+ * Prevents false rejection of small valid fractions whose default String(num) uses scientific notation.
+ */
+export function numberToPlainDecimal(num: number): string {
+  const str = String(num);
+  if (!str.includes('e') && !str.includes('E')) {
+    return str;
+  }
+  const [lead, expStr] = str.toLowerCase().split('e');
+  const exp = parseInt(expStr, 10);
+  const [intPart, fracPart = ''] = lead.split('.');
+  if (exp < 0) {
+    const totalLeadingZeros = -exp;
+    return '0.' + '0'.repeat(totalLeadingZeros - 1) + intPart + fracPart;
+  } else {
+    const moved = fracPart.slice(0, exp);
+    const remainingFrac = fracPart.slice(exp);
+    const fullInt = intPart + moved + '0'.repeat(Math.max(0, exp - fracPart.length));
+    return remainingFrac ? fullInt + '.' + remainingFrac : fullInt;
+  }
+}
+
+/**
  * Parses and validates an unknown raw price value against canonical decimal price constraints.
  * 
  * Monetary Precision Invariants:
@@ -158,7 +182,9 @@ export function parseDecimalPrice(rawPrice: unknown): ParsedPriceResult {
 
     // Precision Invariant: Verify that binary floating-point representation does not silently alter
     // or truncate the decimal precision of the intended monetary value.
-    if (String(num) !== canonicalStr) {
+    // Convert to plain decimal string to prevent false rejection of small valid fractions (e.g. 0.0000001 / 1e-7).
+    const plainDecimal = numberToPlainDecimal(num);
+    if (plainDecimal !== canonicalStr) {
       return {
         isValid: false,
         price: null,
