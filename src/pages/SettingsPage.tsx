@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { useAuth } from '../context/AuthContext';
 import { 
   Settings, 
   Store, 
@@ -15,7 +16,11 @@ import {
   Save,
   Lock,
   Terminal,
-  RefreshCw
+  RefreshCw,
+  Building2,
+  User,
+  ArrowRight,
+  UploadCloud
 } from 'lucide-react';
 
 export const SettingsPage: React.FC = () => {
@@ -26,15 +31,27 @@ export const SettingsPage: React.FC = () => {
     addToast,
     isReadOnlyMode,
     isDurableStorage,
+    isCloudWorkspace,
+    migrateDemoDataToCloud,
     products
   } = useApp();
 
-  const [activeTab, setActiveTab] = useState<'profile' | 'connectors' | 'subscription' | 'policies' | 'diagnostics'>('profile');
+  const {
+    user,
+    activeWorkspace,
+    workspaces,
+    isAuthenticated,
+    openAuthModal,
+    switchWorkspace
+  } = useAuth();
+
+  const [activeTab, setActiveTab] = useState<'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics'>('profile');
   const [storeName, setStoreName] = useState(storeProfile.name);
   const [storeDomain, setStoreDomain] = useState(storeProfile.domain);
   const [currency, setCurrency] = useState(storeProfile.currency);
   const [strictness, setStrictness] = useState(storeProfile.truthBoundaryStrictness);
   const [isDiagnosticsUnlocked, setIsDiagnosticsUnlocked] = useState(false);
+  const [isMigratingDemo, setIsMigratingDemo] = useState(false);
 
   React.useEffect(() => {
     setStoreName(storeProfile.name);
@@ -84,6 +101,23 @@ export const SettingsPage: React.FC = () => {
           }`}
         >
           Store Profile
+        </button>
+
+        <button
+          onClick={() => setActiveTab('workspace')}
+          className={`px-4 py-2.5 text-xs font-semibold whitespace-nowrap border-b-2 transition-colors flex items-center gap-1.5 ${
+            activeTab === 'workspace'
+              ? 'border-orange-600 text-orange-700'
+              : 'border-transparent text-stone-600 hover:text-stone-900'
+          }`}
+        >
+          <Building2 className="w-3.5 h-3.5" />
+          <span>Workspace & Database</span>
+          {isCloudWorkspace ? (
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+          ) : (
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+          )}
         </button>
 
         <button
@@ -211,6 +245,156 @@ export const SettingsPage: React.FC = () => {
         </form>
       )}
 
+      {activeTab === 'workspace' && (
+        <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-xs space-y-6 max-w-3xl">
+          <div className="flex items-center justify-between pb-4 border-b border-stone-100">
+            <div>
+              <h3 className="text-base font-bold text-stone-900 flex items-center gap-2">
+                <Building2 className="w-5 h-5 text-orange-600" />
+                <span>Multi-Tenant Workspace & Database Status</span>
+              </h3>
+              <p className="text-xs text-stone-500 mt-0.5">
+                Manage workspace tenant boundaries, database persistence, and demo catalog migration.
+              </p>
+            </div>
+            {isCloudWorkspace ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                PostgreSQL Connected
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-amber-50 text-amber-800 border border-amber-200">
+                <span className="w-2 h-2 rounded-full bg-amber-500" />
+                Demo Mode (Browser Storage)
+              </span>
+            )}
+          </div>
+
+          {/* Account & Active Workspace Card */}
+          {isAuthenticated && activeWorkspace ? (
+            <div className="bg-stone-50 rounded-xl p-4 border border-stone-200 space-y-4">
+              <div className="flex items-start justify-between">
+                <div>
+                  <span className="text-[10px] uppercase font-bold text-stone-400 tracking-wider">Active Workspace</span>
+                  <h4 className="text-sm font-bold text-stone-900 mt-0.5">{activeWorkspace.name}</h4>
+                  <p className="text-xs text-stone-500 font-mono">ID: {activeWorkspace.id} · Slug: {activeWorkspace.slug}</p>
+                </div>
+                <span className="text-xs uppercase font-mono font-bold px-2 py-0.5 bg-stone-200 text-stone-700 rounded-md">
+                  Role: {activeWorkspace.role}
+                </span>
+              </div>
+
+              <div className="pt-3 border-t border-stone-200/60 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div>
+                  <span className="text-stone-500 block font-medium">Logged in as</span>
+                  <span className="text-stone-900 font-semibold">{user?.fullName}</span>
+                </div>
+                <div>
+                  <span className="text-stone-500 block font-medium">Account Email</span>
+                  <span className="text-stone-900 font-mono">{user?.email}</span>
+                </div>
+              </div>
+
+              {workspaces.length > 1 && (
+                <div className="pt-3 border-t border-stone-200/60">
+                  <span className="text-xs font-semibold text-stone-700 block mb-2">Available Workspaces</span>
+                  <div className="flex flex-wrap gap-2">
+                    {workspaces.map(ws => (
+                      <button
+                        key={ws.id}
+                        onClick={() => switchWorkspace(ws.id)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer ${
+                          ws.id === activeWorkspace.id
+                            ? 'bg-orange-50 border-orange-300 text-orange-800'
+                            : 'bg-white border-stone-200 text-stone-700 hover:bg-stone-100'
+                        }`}
+                      >
+                        {ws.name} ({ws.role})
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-5 space-y-3">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div>
+                  <h4 className="text-xs font-bold text-amber-900">Unauthenticated Demo Session</h4>
+                  <p className="text-xs text-amber-800 mt-1 leading-relaxed">
+                    You are exploring AIXSHOP in browser-only demo mode. Catalog changes and settings are preserved in local browser memory. To activate multi-customer PostgreSQL cloud storage and isolate your catalog into a secure workspace, create an account or sign in.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => openAuthModal('register')}
+                className="mt-2 px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <span>Create Merchant Workspace Account</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
+          {/* Migration Path: Import Demo Catalog into Workspace */}
+          <div className="border border-stone-200 rounded-xl p-4 bg-white space-y-3">
+            <div className="flex items-center gap-2">
+              <UploadCloud className="w-4 h-4 text-orange-600" />
+              <h4 className="text-xs font-bold text-stone-900">Demo Catalog Migration Path</h4>
+            </div>
+            <p className="text-xs text-stone-600 leading-relaxed">
+              Import the verified Solstice Mercantile demo catalog fixtures (184 products, variants, audit findings, and action items) directly into your cloud workspace database for evaluation.
+            </p>
+            <button
+              disabled={isMigratingDemo}
+              onClick={async () => {
+                if (!isAuthenticated) {
+                  openAuthModal('register');
+                  return;
+                }
+                setIsMigratingDemo(true);
+                try {
+                  await migrateDemoDataToCloud();
+                } finally {
+                  setIsMigratingDemo(false);
+                }
+              }}
+              className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isMigratingDemo ? 'animate-spin' : ''}`} />
+              <span>{isMigratingDemo ? 'Importing Fixtures...' : 'Import Demo Catalog into Active Workspace'}</span>
+            </button>
+          </div>
+
+          {/* Multi-Tenant Security & Durability Architecture */}
+          <div className="bg-stone-50 rounded-xl p-4 border border-stone-200 space-y-3 text-xs">
+            <h4 className="font-bold text-stone-900 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-emerald-600" />
+              <span>Security Architecture & Tenant Isolation Controls</span>
+            </h4>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-stone-600 leading-relaxed">
+              <div className="space-y-1">
+                <span className="font-semibold text-stone-800 block">Row-Level Workspace Scoping</span>
+                <p>Every SQL query filters strictly by <code className="font-mono text-stone-800">workspace_id</code> derived exclusively from the verified server-side session token. Client-supplied IDs are never trusted as authorization.</p>
+              </div>
+              <div className="space-y-1">
+                <span className="font-semibold text-stone-800 block">Cryptographic Password Hashing</span>
+                <p>Passwords are hashed using Node.js <code className="font-mono text-stone-800">crypto.scrypt</code> with a 16-byte random salt and verified with timing-safe comparison to prevent timing side-channel attacks.</p>
+              </div>
+              <div className="space-y-1">
+                <span className="font-semibold text-stone-800 block">Hashed Session Defense</span>
+                <p>Session tokens are stored in the database exclusively as SHA-256 hashes. If a database snapshot is disclosed, raw session tokens cannot be extracted.</p>
+              </div>
+              <div className="space-y-1">
+                <span className="font-semibold text-stone-800 block">Monetary Precision Guarantee</span>
+                <p>Catalog variant prices are persisted using <code className="font-mono text-stone-800">NUMERIC(14, 2)</code> with strict two-decimal half-up rounding, eliminating floating-point drift.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {activeTab === 'connectors' && (
         <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-xs space-y-5">
           <div className="flex items-center justify-between pb-3 border-b border-stone-100">
@@ -292,7 +476,7 @@ export const SettingsPage: React.FC = () => {
             <div className="flex items-center justify-between text-xs">
               <span className="font-semibold text-stone-900">Catalog SKU Utilization</span>
               <span className="font-mono text-stone-600">
-                {products.length} catalog products / {storeProfile.skuLimit} SKU Limit ({((products.length / storeProfile.skuLimit) * 100).toFixed(1)}%)
+                {products.length} catalog products / {storeProfile.skuLimit || 2500} SKU Limit ({((products.length / (storeProfile.skuLimit || 2500)) * 100).toFixed(1)}%)
               </span>
             </div>
 
@@ -300,12 +484,12 @@ export const SettingsPage: React.FC = () => {
             <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden">
               <div 
                 className="bg-orange-600 h-2.5 rounded-full" 
-                style={{ width: `${Math.min(100, (products.length / storeProfile.skuLimit) * 100)}%` }}
+                style={{ width: `${Math.min(100, (products.length / (storeProfile.skuLimit || 2500)) * 100)}%` }}
               ></div>
             </div>
 
             <p className="text-xs text-stone-500">
-              Capacity baseline: {storeProfile.skuLimit} SKUs. Plan tier and limits reflect local workspace configuration without verified third-party billing enforcement.
+              Capacity baseline: {storeProfile.skuLimit || 2500} SKUs. Plan tier and limits reflect local workspace configuration without verified third-party billing enforcement.
             </p>
           </div>
 

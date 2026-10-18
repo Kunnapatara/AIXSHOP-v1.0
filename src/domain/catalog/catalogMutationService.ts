@@ -181,7 +181,7 @@ export function executeActionApproval(
 
   const valueToApply = customApprovedValue !== undefined
     ? customApprovedValue
-    : item.proposedChange.to;
+    : (item.proposedChange.to ?? (item.proposedChange as any)?.proposed);
 
   let nextProducts = ctx.products;
   let nextStoreProfile: StoreProfile = {

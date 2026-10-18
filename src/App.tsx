@@ -4,8 +4,10 @@
  */
 
 import React from 'react';
+import { AuthProvider } from './context/AuthContext';
 import { AppProvider, useApp } from './context/AppContext';
 import { AppShell } from './components/layout/AppShell';
+import { AuthModal } from './components/auth/AuthModal';
 import { LandingPage } from './pages/LandingPage';
 import { HomePage } from './pages/HomePage';
 import { AuditPage } from './pages/AuditPage';
@@ -41,14 +43,17 @@ const AppContent: React.FC = () => {
   return (
     <AppShell>
       {renderCurrentPage()}
+      <AuthModal />
     </AppShell>
   );
 };
 
 export default function App() {
   return (
-    <AppProvider>
-      <AppContent />
-    </AppProvider>
+    <AuthProvider>
+      <AppProvider>
+        <AppContent />
+      </AppProvider>
+    </AuthProvider>
   );
 }

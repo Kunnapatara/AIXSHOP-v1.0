@@ -1,0 +1,734 @@
+import { Pool, PoolClient } from 'pg';
+import { 
+  DatabaseRepository, 
+  CreateUserData, 
+  CreateWorkspaceData, 
+  CreateSessionData 
+} from './repository';
+import { 
+  UserRecord, 
+  WorkspaceRecord, 
+  WorkspaceMembershipRecord, 
+  SessionRecord, 
+  WorkspaceRole 
+} from '../types';
+import { 
+  Product, 
+  Variant, 
+  Offer, 
+  EvidenceDocument, 
+  Finding, 
+  ActionItem, 
+  StoreProfile,
+  CatalogImportResult,
+  ProductCandidate
+} from '../../types';
+import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
+import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
+
+export class PostgresRepository implements DatabaseRepository {
+  private pool: Pool;
+
+  constructor(pool: Pool) {
+    this.pool = pool;
+  }
+
+  getBackendType(): 'postgres' {
+    return 'postgres';
+  }
+
+  async ping(): Promise<boolean> {
+    try {
+      const res = await this.pool.query('SELECT 1');
+      return res.rowCount !== null && res.rowCount > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  async createUser(data: CreateUserData): Promise<UserRecord> {
+    const query = `
+      INSERT INTO users (id, email, password_hash, full_name, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, NOW(), NOW())
+      RETURNING id, email, password_hash AS "passwordHash", full_name AS "fullName", created_at AS "createdAt", updated_at AS "updatedAt"
+    `;
+    const res = await this.pool.query(query, [data.id, data.email, data.passwordHash, data.fullName]);
+    return res.rows[0];
+  }
+
+  async getUserByEmail(email: string): Promise<UserRecord | null> {
+    const query = `
+      SELECT id, email, password_hash AS "passwordHash", full_name AS "fullName", created_at AS "createdAt", updated_at AS "updatedAt"
+      FROM users
+      WHERE LOWER(email) = LOWER($1)
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [email]);
+    return res.rows[0] || null;
+  }
+
+  async getUserById(id: string): Promise<UserRecord | null> {
+    const query = `
+      SELECT id, email, password_hash AS "passwordHash", full_name AS "fullName", created_at AS "createdAt", updated_at AS "updatedAt"
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [id]);
+    return res.rows[0] || null;
+  }
+
+  async createWorkspace(
+    data: CreateWorkspaceData, 
+    ownerUserId: string
+  ): Promise<{ workspace: WorkspaceRecord; membership: WorkspaceMembershipRecord }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const wsQuery = `
+        INSERT INTO workspaces (id, name, slug, created_at, updated_at)
+        VALUES ($1, $2, $3, NOW(), NOW())
+        RETURNING id, name, slug, created_at AS "createdAt", updated_at AS "updatedAt"
+      `;
+      const wsRes = await client.query(wsQuery, [data.id, data.name, data.slug]);
+      const workspace: WorkspaceRecord = wsRes.rows[0];
+
+      const membershipId = `mem_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const memQuery = `
+        INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at)
+        VALUES ($1, $2, $3, 'owner', NOW())
+        RETURNING id, workspace_id AS "workspaceId", user_id AS "userId", role, created_at AS "createdAt"
+      `;
+      const memRes = await client.query(memQuery, [membershipId, workspace.id, ownerUserId]);
+      const membership: WorkspaceMembershipRecord = memRes.rows[0];
+
+      // Also create default store record for the workspace
+      const storeId = `store_${workspace.id}`;
+      const storeQuery = `
+        INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, 'USD', 0, 0, 'balanced', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+        ON CONFLICT (id) DO NOTHING
+      `;
+      await client.query(storeQuery, [storeId, workspace.id, `${workspace.name} Store`, `${workspace.slug}.myshopify.com`]);
+
+      await client.query('COMMIT');
+      return { workspace, membership };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getWorkspaceById(workspaceId: string): Promise<WorkspaceRecord | null> {
+    const query = `
+      SELECT id, name, slug, created_at AS "createdAt", updated_at AS "updatedAt"
+      FROM workspaces
+      WHERE id = $1
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [workspaceId]);
+    return res.rows[0] || null;
+  }
+
+  async getUserWorkspaces(userId: string): Promise<Array<WorkspaceRecord & { role: WorkspaceRole }>> {
+    const query = `
+      SELECT w.id, w.name, w.slug, w.created_at AS "createdAt", w.updated_at AS "updatedAt", m.role
+      FROM workspaces w
+      INNER JOIN workspace_memberships m ON w.id = m.workspace_id
+      WHERE m.user_id = $1
+      ORDER BY w.created_at ASC
+    `;
+    const res = await this.pool.query(query, [userId]);
+    return res.rows;
+  }
+
+  async getMembership(workspaceId: string, userId: string): Promise<WorkspaceMembershipRecord | null> {
+    const query = `
+      SELECT id, workspace_id AS "workspaceId", user_id AS "userId", role, created_at AS "createdAt"
+      FROM workspace_memberships
+      WHERE workspace_id = $1 AND user_id = $2
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [workspaceId, userId]);
+    return res.rows[0] || null;
+  }
+
+  async createSession(data: CreateSessionData): Promise<SessionRecord> {
+    const query = `
+      INSERT INTO sessions (id, session_token_hash, user_id, active_workspace_id, expires_at, created_at, last_active_at, ip_address, user_agent)
+      VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6, $7)
+      RETURNING id, session_token_hash AS "sessionTokenHash", user_id AS "userId", active_workspace_id AS "activeWorkspaceId", expires_at AS "expiresAt", created_at AS "createdAt", last_active_at AS "lastActiveAt", ip_address AS "ipAddress", user_agent AS "userAgent"
+    `;
+    const res = await this.pool.query(query, [
+      data.id,
+      data.sessionTokenHash,
+      data.userId,
+      data.activeWorkspaceId,
+      data.expiresAt,
+      data.ipAddress || null,
+      data.userAgent || null,
+    ]);
+    return res.rows[0];
+  }
+
+  async getSessionByTokenHash(tokenHash: string): Promise<SessionRecord | null> {
+    const query = `
+      SELECT id, session_token_hash AS "sessionTokenHash", user_id AS "userId", active_workspace_id AS "activeWorkspaceId", expires_at AS "expiresAt", created_at AS "createdAt", last_active_at AS "lastActiveAt", ip_address AS "ipAddress", user_agent AS "userAgent"
+      FROM sessions
+      WHERE session_token_hash = $1 AND expires_at > NOW()
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [tokenHash]);
+    return res.rows[0] || null;
+  }
+
+  async deleteSession(tokenHash: string): Promise<void> {
+    await this.pool.query('DELETE FROM sessions WHERE session_token_hash = $1', [tokenHash]);
+  }
+
+  async deleteUserSessions(userId: string): Promise<void> {
+    await this.pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+  }
+
+  async updateSessionWorkspace(sessionId: string, newWorkspaceId: string): Promise<void> {
+    await this.pool.query(
+      'UPDATE sessions SET active_workspace_id = $1, last_active_at = NOW() WHERE id = $2',
+      [newWorkspaceId, sessionId]
+    );
+  }
+
+  async getStoreByWorkspace(workspaceId: string): Promise<StoreProfile | null> {
+    const query = `
+      SELECT id, name, domain, currency, sku_count AS "skuCount", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
+      FROM stores
+      WHERE workspace_id = $1
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [workspaceId]);
+    if (!res.rows[0]) return null;
+    const r = res.rows[0];
+    return {
+      name: r.name,
+      domain: r.domain,
+      platform: 'Shopify Storefront API v2025-01',
+      skuCount: r.skuCount,
+      skuLimit: 2500,
+      tier: r.tier,
+      lastAuditDate: new Date().toISOString(),
+      currency: r.currency,
+      connectors: typeof r.connectorsJson === 'string' ? JSON.parse(r.connectorsJson) : r.connectorsJson,
+      catalogCompletenessAvg: r.catalogCompletenessAvg,
+      evidenceCoverageAvg: 70,
+      truthBoundaryStrictness: r.truthBoundaryStrictness,
+    };
+  }
+
+  async saveStoreProfile(workspaceId: string, profile: StoreProfile): Promise<StoreProfile> {
+    const storeId = `store_${workspaceId}`;
+    const query = `
+      INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        domain = EXCLUDED.domain,
+        currency = EXCLUDED.currency,
+        sku_count = EXCLUDED.sku_count,
+        catalog_completeness_avg = EXCLUDED.catalog_completeness_avg,
+        truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
+        tier = EXCLUDED.tier,
+        connectors_json = EXCLUDED.connectors_json,
+        updated_at = NOW()
+      RETURNING name, domain, currency, sku_count AS "skuCount", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
+    `;
+    const res = await this.pool.query(query, [
+      storeId,
+      workspaceId,
+      profile.name,
+      profile.domain,
+      profile.currency,
+      profile.skuCount,
+      profile.catalogCompletenessAvg,
+      profile.truthBoundaryStrictness,
+      profile.tier,
+      JSON.stringify(profile.connectors || []),
+    ]);
+    const r = res.rows[0];
+    return {
+      name: r.name,
+      domain: r.domain,
+      platform: profile.platform || 'Shopify Storefront API v2025-01',
+      skuCount: r.skuCount,
+      skuLimit: profile.skuLimit || 2500,
+      tier: r.tier,
+      lastAuditDate: profile.lastAuditDate || new Date().toISOString(),
+      currency: r.currency,
+      connectors: typeof r.connectorsJson === 'string' ? JSON.parse(r.connectorsJson) : r.connectorsJson,
+      catalogCompletenessAvg: r.catalogCompletenessAvg,
+      evidenceCoverageAvg: profile.evidenceCoverageAvg || 70,
+      truthBoundaryStrictness: r.truthBoundaryStrictness,
+    };
+  }
+
+  async loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null> {
+    const store = await this.getStoreByWorkspace(workspaceId);
+    if (!store) return null;
+
+    // Load products
+    const prodRes = await this.pool.query(
+      `SELECT id, title, brand, category, description, image, status, completeness_score AS "completenessScore", evidence_coverage_score AS "evidenceCoverageScore", external_discovery_status AS "externalDiscoveryStatus", attributes_json AS "attributesJson", findings_count AS "findingsCount", last_audited AS "lastAudited"
+       FROM products
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    // Load variants
+    const varRes = await this.pool.query(
+      `SELECT id, product_id AS "productId", sku, title, barcode, price, inventory_count AS "inventoryCount", attributes_json AS "attributesJson"
+       FROM variants
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    // Load offers
+    const offRes = await this.pool.query(
+      `SELECT id, product_id AS "productId", channel, price, currency, availability, condition, url, merchant_id AS "merchantId", last_sync AS "lastSync"
+       FROM offers
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    // Load evidence
+    const eviRes = await this.pool.query(
+      `SELECT id, product_id AS "productId", title, type, issuer, date_verified AS "dateVerified", url, status
+       FROM evidence_documents
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    // Load findings
+    const finRes = await this.pool.query(
+      `SELECT id, product_id AS "productId", scope, type, severity, title, description, observed_evidence AS "observedEvidence", derived_conclusion AS "derivedConclusion", merchant_verified AS "merchantVerified", why_it_matters AS "whyItMatters", suggested_correction AS "suggestedCorrection", target_field AS "targetField", current_value AS "currentValue", recommended_value AS "recommendedValue", action_item_id AS "actionItemId"
+       FROM findings
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    // Load action items
+    const actRes = await this.pool.query(
+      `SELECT id, finding_id AS "findingId", product_id AS "productId", title, severity, status, verification_status AS "verificationStatus", proposed_change_json AS "proposedChangeJson", audit_log_json AS "auditLogJson"
+       FROM action_items
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    const variantsByProduct = new Map<string, Variant[]>();
+    for (const r of varRes.rows) {
+      const v: Variant = {
+        id: r.id,
+        sku: r.sku,
+        title: r.title,
+        barcode: r.barcode,
+        price: r.price !== null ? parseFloat(r.price) : null,
+        inventoryCount: r.inventoryCount,
+        attributes: typeof r.attributesJson === 'string' ? JSON.parse(r.attributesJson) : r.attributesJson,
+      };
+      if (!variantsByProduct.has(r.productId)) variantsByProduct.set(r.productId, []);
+      variantsByProduct.get(r.productId)!.push(v);
+    }
+
+    const offersByProduct = new Map<string, Offer[]>();
+    for (const r of offRes.rows) {
+      const o: Offer = {
+        id: r.id,
+        channel: r.channel,
+        price: parseFloat(r.price),
+        currency: r.currency,
+        availability: r.availability,
+        condition: r.condition,
+        url: r.url,
+        merchantId: r.merchantId,
+        lastSync: r.lastSync,
+      };
+      if (!offersByProduct.has(r.productId)) offersByProduct.set(r.productId, []);
+      offersByProduct.get(r.productId)!.push(o);
+    }
+
+    const evidenceByProduct = new Map<string, EvidenceDocument[]>();
+    for (const r of eviRes.rows) {
+      const e: EvidenceDocument = {
+        id: r.id,
+        title: r.title,
+        type: r.type,
+        issuer: r.issuer,
+        dateVerified: r.dateVerified,
+        url: r.url,
+        status: r.status,
+      };
+      if (!evidenceByProduct.has(r.productId)) evidenceByProduct.set(r.productId, []);
+      evidenceByProduct.get(r.productId)!.push(e);
+    }
+
+    const products: Product[] = prodRes.rows.map(r => ({
+      id: r.id,
+      title: r.title,
+      brand: r.brand,
+      category: r.category,
+      description: r.description,
+      image: r.image,
+      status: r.status,
+      completenessScore: r.completenessScore,
+      evidenceCoverageScore: r.evidenceCoverageScore,
+      externalDiscoveryStatus: r.externalDiscoveryStatus,
+      attributes: typeof r.attributesJson === 'string' ? JSON.parse(r.attributesJson) : r.attributesJson,
+      variants: variantsByProduct.get(r.id) || [],
+      offers: offersByProduct.get(r.id) || [],
+      evidenceDocuments: evidenceByProduct.get(r.id) || [],
+      findingsCount: r.findingsCount,
+      lastAudited: r.lastAudited,
+    }));
+
+    const findings: Finding[] = finRes.rows.map(r => ({
+      id: r.id,
+      productId: r.productId || undefined,
+      scope: r.scope,
+      type: r.type,
+      severity: r.severity,
+      title: r.title,
+      description: r.description,
+      observedEvidence: r.observedEvidence,
+      derivedConclusion: r.derivedConclusion,
+      merchantVerified: r.merchantVerified,
+      whyItMatters: r.whyItMatters,
+      suggestedCorrection: r.suggestedCorrection || undefined,
+      targetField: r.targetField || undefined,
+      currentValue: r.currentValue || undefined,
+      recommendedValue: r.recommendedValue || undefined,
+      actionItemId: r.actionItemId || undefined,
+    }));
+
+    const actions: ActionItem[] = actRes.rows.map(r => ({
+      id: r.id,
+      findingId: r.findingId,
+      productId: r.productId || undefined,
+      title: r.title,
+      severity: r.severity,
+      status: r.status,
+      evidenceRequired: r.evidence_required ?? false,
+      verificationStatus: r.verificationStatus,
+      proposedChange: typeof r.proposedChangeJson === 'string' ? JSON.parse(r.proposedChangeJson) : r.proposedChangeJson,
+      auditLog: typeof r.auditLogJson === 'string' ? JSON.parse(r.auditLogJson) : r.auditLogJson,
+    }));
+
+    return {
+      products,
+      variants: products.flatMap(p => p.variants || []),
+      offers: products.flatMap(p => p.offers || []),
+      findings,
+      actions,
+      evidence: products.flatMap(p => p.evidenceDocuments || []),
+      storeProfile: store,
+    };
+  }
+
+  async saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const storeId = `store_${workspaceId}`;
+
+      // Update store profile
+      await client.query(
+        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           domain = EXCLUDED.domain,
+           currency = EXCLUDED.currency,
+           sku_count = EXCLUDED.sku_count,
+           catalog_completeness_avg = EXCLUDED.catalog_completeness_avg,
+           truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
+           tier = EXCLUDED.tier,
+           connectors_json = EXCLUDED.connectors_json,
+           updated_at = NOW()`,
+        [
+          storeId,
+          workspaceId,
+          payload.storeProfile.name,
+          payload.storeProfile.domain,
+          payload.storeProfile.currency,
+          payload.products.length,
+          payload.storeProfile.catalogCompletenessAvg,
+          payload.storeProfile.truthBoundaryStrictness,
+          payload.storeProfile.tier,
+          JSON.stringify(payload.storeProfile.connectors || []),
+        ]
+      );
+
+      // Clean old child records for this workspace in transaction
+      await client.query('DELETE FROM action_items WHERE workspace_id = $1', [workspaceId]);
+      await client.query('DELETE FROM findings WHERE workspace_id = $1', [workspaceId]);
+      await client.query('DELETE FROM evidence_documents WHERE workspace_id = $1', [workspaceId]);
+      await client.query('DELETE FROM offers WHERE workspace_id = $1', [workspaceId]);
+      await client.query('DELETE FROM variants WHERE workspace_id = $1', [workspaceId]);
+      await client.query('DELETE FROM products WHERE workspace_id = $1', [workspaceId]);
+
+      // Insert products
+      for (const p of payload.products) {
+        await client.query(
+          `INSERT INTO products (id, workspace_id, store_id, title, brand, category, description, image, status, completeness_score, evidence_coverage_score, external_discovery_status, attributes_json, findings_count, last_audited, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, NOW(), NOW())`,
+          [
+            p.id,
+            workspaceId,
+            storeId,
+            p.title,
+            p.brand,
+            p.category,
+            p.description,
+            p.image,
+            p.status,
+            p.completenessScore,
+            p.evidenceCoverageScore,
+            p.externalDiscoveryStatus,
+            JSON.stringify(p.attributes || {}),
+            p.findingsCount,
+            p.lastAudited,
+          ]
+        );
+
+        // Insert variants
+        for (const v of p.variants || []) {
+          await client.query(
+            `INSERT INTO variants (id, workspace_id, product_id, sku, title, barcode, price, inventory_count, attributes_json, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW(), NOW())`,
+            [
+              v.id,
+              workspaceId,
+              p.id,
+              v.sku,
+              v.title,
+              v.barcode || '',
+              v.price,
+              v.inventoryCount ?? null,
+              JSON.stringify(v.attributes || {}),
+            ]
+          );
+        }
+
+        // Insert offers
+        for (const o of p.offers || []) {
+          await client.query(
+            `INSERT INTO offers (id, workspace_id, product_id, channel, price, currency, availability, condition, url, merchant_id, last_sync, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+            [
+              o.id,
+              workspaceId,
+              p.id,
+              o.channel,
+              o.price,
+              o.currency,
+              o.availability,
+              o.condition,
+              o.url,
+              o.merchantId,
+              o.lastSync,
+            ]
+          );
+        }
+
+        // Insert evidence
+        for (const e of p.evidenceDocuments || []) {
+          await client.query(
+            `INSERT INTO evidence_documents (id, workspace_id, product_id, title, type, issuer, date_verified, url, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+            [
+              e.id,
+              workspaceId,
+              p.id,
+              e.title,
+              e.type,
+              e.issuer,
+              e.dateVerified,
+              e.url || null,
+              e.status,
+            ]
+          );
+        }
+      }
+
+      // Insert findings
+      for (const f of payload.findings) {
+        await client.query(
+          `INSERT INTO findings (id, workspace_id, store_id, product_id, scope, type, severity, title, description, observed_evidence, derived_conclusion, merchant_verified, why_it_matters, suggested_correction, target_field, current_value, recommended_value, action_item_id, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW())`,
+          [
+            f.id,
+            workspaceId,
+            storeId,
+            f.productId || null,
+            f.scope,
+            f.type,
+            f.severity,
+            f.title,
+            f.description,
+            f.observedEvidence,
+            f.derivedConclusion,
+            f.merchantVerified,
+            f.whyItMatters,
+            f.suggestedCorrection || null,
+            f.targetField || null,
+            f.currentValue || null,
+            f.recommendedValue || null,
+            f.actionItemId || null,
+          ]
+        );
+      }
+
+      // Insert action items
+      for (const a of payload.actions) {
+        await client.query(
+          `INSERT INTO action_items (id, workspace_id, store_id, finding_id, product_id, title, severity, status, verification_status, proposed_change_json, audit_log_json, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, NOW(), NOW())`,
+          [
+            a.id,
+            workspaceId,
+            storeId,
+            a.findingId,
+            a.productId || null,
+            a.title,
+            a.severity,
+            a.status,
+            a.verificationStatus,
+            JSON.stringify(a.proposedChange || {}),
+            JSON.stringify(a.auditLog || []),
+          ]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async approveAction(
+    workspaceId: string, 
+    actionId: string, 
+    customApprovedValue?: string
+  ): Promise<{ action: ActionItem; product?: Product }> {
+    const catalog = await this.loadWorkspaceCatalog(workspaceId);
+    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+
+    const result = executeActionApproval(actionId, customApprovedValue, {
+      products: catalog.products,
+      findings: catalog.findings,
+      actionItems: catalog.actions,
+      storeProfile: catalog.storeProfile,
+      isReadOnly: false,
+    });
+
+    if (!result.success) {
+      throw new Error(result.message || 'Action approval failed');
+    }
+
+    await this.saveWorkspaceCatalog(workspaceId, {
+      ...catalog,
+      actions: result.nextActions,
+      products: result.nextProducts,
+      findings: result.nextFindings,
+      storeProfile: result.nextStoreProfile,
+    });
+
+    const updatedAction = result.nextActions.find(a => a.id === actionId);
+    if (!updatedAction) throw new Error(`Action ${actionId} not found after mutation`);
+    const updatedProduct = updatedAction.productId 
+      ? result.nextProducts.find(p => p.id === updatedAction.productId)
+      : undefined;
+
+    return { action: updatedAction, product: updatedProduct };
+  }
+
+  async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
+    const catalog = await this.loadWorkspaceCatalog(workspaceId);
+    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+
+    const result = executeActionDismissal(actionId, {
+      products: catalog.products,
+      findings: catalog.findings,
+      actionItems: catalog.actions,
+      storeProfile: catalog.storeProfile,
+      isReadOnly: false,
+    });
+
+    if (!result.success) {
+      throw new Error(result.message || 'Action dismissal failed');
+    }
+
+    await this.saveWorkspaceCatalog(workspaceId, {
+      ...catalog,
+      actions: result.nextActions,
+    });
+
+    const updatedAction = result.nextActions.find(a => a.id === actionId);
+    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+    return { action: updatedAction };
+  }
+
+  async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
+    const catalog = await this.loadWorkspaceCatalog(workspaceId);
+    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+
+    const result = executeActionRecheck(actionId, {
+      products: catalog.products,
+      findings: catalog.findings,
+      actionItems: catalog.actions,
+      storeProfile: catalog.storeProfile,
+      isReadOnly: false,
+    });
+
+    if (!result.success) {
+      throw new Error(result.message || 'Action recheck failed');
+    }
+
+    await this.saveWorkspaceCatalog(workspaceId, {
+      ...catalog,
+      actions: result.nextActions,
+      findings: result.nextFindings || catalog.findings,
+    });
+
+    const updatedAction = result.nextActions.find(a => a.id === actionId);
+    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+    return { action: updatedAction };
+  }
+
+  async importCatalog(
+    workspaceId: string,
+    candidates: any[]
+  ): Promise<CatalogImportResult> {
+    const catalog = await this.loadWorkspaceCatalog(workspaceId);
+    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+
+    const importRes = executeCatalogImport(candidates, {
+      products: catalog.products,
+      findings: catalog.findings,
+      actionItems: catalog.actions,
+      storeProfile: catalog.storeProfile,
+      isReadOnly: false,
+    });
+
+    if (importRes.importedCount > 0) {
+      await this.saveWorkspaceCatalog(workspaceId, {
+        ...catalog,
+        products: importRes.nextProducts,
+        storeProfile: importRes.nextStoreProfile,
+      });
+    }
+
+    return importRes;
+  }
+}

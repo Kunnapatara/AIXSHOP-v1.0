@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
+import { useAuth } from '../../context/AuthContext';
 import { NavigationPage } from '../../types';
 import { 
   Home, 
@@ -10,11 +11,17 @@ import {
   Menu, 
   X, 
   Store, 
-  ExternalLink,
-  ChevronRight,
-  ShieldCheck,
-  Sparkles,
-  AlertTriangle
+  ExternalLink, 
+  ChevronRight, 
+  ShieldCheck, 
+  Sparkles, 
+  AlertTriangle,
+  User,
+  LogOut,
+  LogIn,
+  Database,
+  Building2,
+  ChevronDown
 } from 'lucide-react';
 import { ToastContainer } from '../common/ToastContainer';
 
@@ -32,10 +39,22 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
     findings,
     actionItems,
     isReadOnlyMode,
-    readOnlyReason
+    readOnlyReason,
+    isCloudWorkspace
   } = useApp();
 
+  const {
+    user,
+    activeWorkspace,
+    workspaces,
+    isAuthenticated,
+    openAuthModal,
+    logout,
+    switchWorkspace
+  } = useAuth();
+
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [workspaceDropdownOpen, setWorkspaceDropdownOpen] = useState(false);
 
   // If currently on Landing page, we render landing page with its own specialized top/footer layout
   if (currentPage === 'landing') {
@@ -104,18 +123,41 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
             </button>
           </div>
 
-          {/* Connected Store Header Indicator */}
-          <div className="px-4 py-3 mx-3 mt-3 bg-stone-50 border border-stone-200/80 rounded-xl">
-            <div className="flex items-center gap-2">
-              <Store className="w-4 h-4 text-orange-600 shrink-0" />
-              <div className="min-w-0 flex-1">
-                <p className="text-xs font-semibold text-stone-900 truncate">
-                  {storeProfile.name}
-                </p>
-                <p className="text-[11px] font-mono text-stone-500 truncate">
-                  {storeProfile.skuCount} active products
-                </p>
+          {/* Connected Store / Workspace Header Indicator */}
+          <div className="px-3.5 py-3 mx-3 mt-3 bg-stone-50 border border-stone-200/80 rounded-xl space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <Store className="w-4 h-4 text-orange-600 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-stone-900 truncate">
+                    {isAuthenticated && activeWorkspace ? activeWorkspace.name : storeProfile.name}
+                  </p>
+                  <p className="text-[11px] font-mono text-stone-500 truncate">
+                    {storeProfile.skuCount} active products
+                  </p>
+                </div>
               </div>
+            </div>
+
+            {/* Storage Mode Badge */}
+            <div className="pt-2 border-t border-stone-200/60 flex items-center justify-between text-[11px]">
+              {isCloudWorkspace ? (
+                <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/60">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  Cloud · PostgreSQL
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 font-medium text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md border border-amber-200/60">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                  Demo · Browser Only
+                </span>
+              )}
+
+              {isAuthenticated && activeWorkspace && (
+                <span className="text-[10px] uppercase font-mono font-bold px-1.5 py-0.5 bg-stone-200/70 text-stone-600 rounded">
+                  {activeWorkspace.role}
+                </span>
+              )}
             </div>
           </div>
 
@@ -222,8 +264,27 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
             </div>
           </div>
 
-          {/* Top Bar Actions: Account / Settings link and Demo Mode Badge */}
+          {/* Top Bar Actions: Account / Settings link and Auth / Workspace controls */}
           <div className="flex items-center gap-2 shrink-0">
+            {/* Storage Mode indicator */}
+            <div className="hidden sm:flex items-center">
+              {isCloudWorkspace ? (
+                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
+                  <Database className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Cloud DB Active</span>
+                </span>
+              ) : (
+                <button
+                  onClick={() => openAuthModal('register')}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
+                  title="Click to sign up and enable persistent PostgreSQL cloud workspace"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Demo Mode · Enable Cloud</span>
+                </button>
+              )}
+            </div>
+
             <button
               onClick={() => navigateTo('landing')}
               className="hidden lg:inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-stone-600 bg-stone-100 hover:bg-stone-200 rounded-lg transition-colors min-h-[36px]"
@@ -235,13 +296,76 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
             {/* Store / Settings Entry Point */}
             <button
               onClick={() => navigateTo('settings')}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-stone-200 hover:border-stone-300 bg-white text-xs font-medium text-stone-800 transition-colors min-h-[44px]"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-stone-200 hover:border-stone-300 bg-white text-xs font-medium text-stone-800 transition-colors min-h-[36px]"
               aria-label="Store configuration and account settings"
             >
               <Store className="w-3.5 h-3.5 text-orange-600" />
-              <span className="hidden sm:inline font-medium">{storeProfile.name.split(' ')[0]} Store</span>
+              <span className="hidden sm:inline font-medium">{storeProfile.name.split(' ')[0]}</span>
               <Settings className="w-3.5 h-3.5 text-stone-500" />
             </button>
+
+            {/* User Auth Button / Dropdown */}
+            {isAuthenticated ? (
+              <div className="relative">
+                <button
+                  onClick={() => setAccountMenuOpen(!accountMenuOpen)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-stone-100 hover:bg-stone-200 text-stone-800 text-xs font-semibold transition-colors min-h-[36px] cursor-pointer"
+                >
+                  <User className="w-3.5 h-3.5 text-stone-600" />
+                  <span className="max-w-[100px] truncate">{user?.fullName?.split(' ')[0] || 'Account'}</span>
+                  <ChevronDown className="w-3 h-3 text-stone-400" />
+                </button>
+
+                {accountMenuOpen && (
+                  <div className="absolute right-0 mt-2 w-56 bg-white rounded-xl shadow-lg border border-stone-200 p-2 z-50 text-xs animate-in fade-in zoom-in-95">
+                    <div className="px-3 py-2 border-b border-stone-100 mb-1">
+                      <p className="font-semibold text-stone-900 truncate">{user?.fullName}</p>
+                      <p className="text-stone-500 font-mono text-[11px] truncate">{user?.email}</p>
+                    </div>
+
+                    {workspaces.length > 1 && (
+                      <div className="py-1 border-b border-stone-100 mb-1">
+                        <p className="px-3 py-1 text-[10px] font-semibold text-stone-400 uppercase">Switch Workspace</p>
+                        {workspaces.map(ws => (
+                          <button
+                            key={ws.id}
+                            onClick={() => {
+                              switchWorkspace(ws.id);
+                              setAccountMenuOpen(false);
+                            }}
+                            className={`w-full text-left px-3 py-1.5 rounded-lg text-xs flex items-center justify-between ${
+                              ws.id === activeWorkspace?.id ? 'bg-orange-50 text-orange-700 font-semibold' : 'text-stone-700 hover:bg-stone-50'
+                            }`}
+                          >
+                            <span className="truncate">{ws.name}</span>
+                            <span className="text-[10px] uppercase font-mono text-stone-400">{ws.role}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    <button
+                      onClick={() => {
+                        setAccountMenuOpen(false);
+                        logout();
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-red-600 hover:bg-red-50 font-medium transition-colors cursor-pointer"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      <span>Sign Out</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <button
+                onClick={() => openAuthModal('login')}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold shadow-xs transition-colors min-h-[36px] cursor-pointer"
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                <span>Sign In</span>
+              </button>
+            )}
           </div>
         </header>
 

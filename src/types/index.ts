@@ -111,30 +111,34 @@ export interface ActionItem {
   lastRecheckTimestamp?: string;
   approvedAt?: string;
   dismissedAt?: string;
+  auditLog?: any[];
 }
 
 export interface StoreConnector {
   id: string;
   name: string;
   type: 'shopify' | 'google_merchant' | 'meta_catalog' | 'custom_erp';
-  status: 'connected' | 'disconnected' | 'read_only' | 'error';
+  status: 'connected' | 'disconnected' | 'read_only' | 'error' | 'not_configured';
   lastSync: string;
   productCountSynced: number;
+  syncedSkuCount?: number;
+  readOnly?: boolean;
   writeBackAuthorized: boolean;
+  missingReason?: string;
 }
 
 export interface StoreProfile {
   name: string;
   domain: string;
-  platform: string;
+  platform?: string;
   skuCount: number;
-  skuLimit: number;
+  skuLimit?: number;
   tier: string;
-  lastAuditDate: string;
+  lastAuditDate?: string;
   currency: string;
   connectors: StoreConnector[];
   catalogCompletenessAvg: number;
-  evidenceCoverageAvg: number;
+  evidenceCoverageAvg?: number;
   truthBoundaryStrictness: 'strict' | 'standard' | 'relaxed';
   catalogPolicy?: {
     units?: string;
@@ -200,4 +204,7 @@ export interface CatalogImportResult {
   nextStoreProfile: StoreProfile;
   details: CandidateProductStatus[];
 }
+
+export type ProductCandidate = Product;
+
 

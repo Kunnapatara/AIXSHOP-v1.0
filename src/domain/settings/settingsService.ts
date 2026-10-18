@@ -80,7 +80,7 @@ export function validateAndApplyProfileUpdate(
 export function applyConnectorToggle(
   currentProfile: StoreProfile,
   connectorId: string,
-  isReadOnly: boolean,
+  isReadOnly: boolean = false,
   syncOptions?: ConnectorSyncExecutionOptions
 ): SettingsMutationResult {
   if (isReadOnly) {
@@ -100,14 +100,15 @@ export function applyConnectorToggle(
     };
   }
 
-  // If connector is disconnected, connecting requires live OAuth / API integration
-  if (connector.status === 'disconnected') {
+  // If connector is disconnected or not_configured, connecting requires live OAuth / API integration
+  if (connector.status === 'disconnected' || connector.status === 'not_configured') {
     // Check if a real verified result was supplied by an actual integration
     if (!syncOptions?.verifiedResult) {
       return {
         success: false,
         errorCode: 'INTEGRATION_UNAVAILABLE',
         message: `Live integration for "${connector.name}" is not configured in this environment. External OAuth and synchronization APIs are unavailable.`,
+        nextProfile: currentProfile,
       };
     }
 

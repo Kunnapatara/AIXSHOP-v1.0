@@ -31,6 +31,8 @@ import {
   validateAndApplyProfileUpdate, 
   applyConnectorToggle 
 } from '../domain/settings/settingsService';
+import { useAuth } from './AuthContext';
+import { apiClient } from '../api/client';
 
 export interface ToastMessage {
   id: string;
@@ -58,6 +60,7 @@ interface AppContextType {
   readOnlyReason: string | null;
   storageLoadResult: StorageLoadResult | null;
   isDurableStorage: boolean;
+  isCloudWorkspace: boolean;
   setMobileMenuOpen: (open: boolean) => void;
   setSelectedActionId: (id: string | null) => void;
   navigateTo: (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => void;
@@ -65,12 +68,13 @@ interface AppContextType {
   returnFromProductDetail: () => void;
   runStoreCheck: (url: string) => Promise<void>;
   importDiscoveredProducts: () => Promise<CatalogImportResult | null>;
-  approveAction: (actionId: string, customApprovedValue?: string) => void;
-  dismissAction: (actionId: string) => void;
-  recheckAction: (actionId: string) => void;
+  approveAction: (actionId: string, customApprovedValue?: string) => Promise<void> | void;
+  dismissAction: (actionId: string) => Promise<void> | void;
+  recheckAction: (actionId: string) => Promise<void> | void;
   recheckProduct: (productId: string) => void;
-  updateStoreProfile: (updates: Partial<StoreProfile>) => { success: boolean; error?: string };
-  toggleConnectorSync: (connectorId: string) => { success: boolean; error?: string };
+  updateStoreProfile: (updates: Partial<StoreProfile>) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
+  toggleConnectorSync: (connectorId: string) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
+  migrateDemoDataToCloud: () => Promise<boolean>;
   addToast: (title: string, message: string, type?: ToastMessage['type']) => void;
   removeToast: (id: string) => void;
   resetToSeedData: () => void;
@@ -104,6 +108,17 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const isInitializedRef = useRef<boolean>(false);
 
+  // Check auth context safely (null if outside AuthProvider in test environments)
+  let authContext: any = null;
+  try {
+    authContext = useAuth();
+  } catch {
+    authContext = null;
+  }
+
+  const isCloudWorkspace = Boolean(authContext?.isAuthenticated && authContext?.activeWorkspace);
+  const activeWorkspaceId = authContext?.activeWorkspace?.id;
+
   const addToast = (title: string, message: string, type: ToastMessage['type'] = 'info') => {
     const id = `toast_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     setToasts(prev => [...prev, { id, title, message, type }]);
@@ -116,7 +131,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  // Helper to persist current application state
+  // Helper to persist current application state to local storage when in unauthenticated / demo mode
   const persistState = (
     nextProducts: Product[],
     nextFindings: Finding[],
@@ -149,47 +164,80 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     return res;
   };
 
-  // Hydrate from Storage on initial mount
+  // Hydrate: Cloud API if authenticated in active workspace; otherwise local storage adapter
   useEffect(() => {
-    if (isInitializedRef.current) return;
-    isInitializedRef.current = true;
+    if (!isCloudWorkspace) {
+      if (!isInitializedRef.current) {
+        isInitializedRef.current = true;
+        const result = storageAdapter.load();
+        setStorageLoadResult(result);
 
-    const result = storageAdapter.load();
-    setStorageLoadResult(result);
-
-    if (result.type === 'valid') {
-      const p = result.envelope.payload;
-      setProducts(p.products);
-      setFindings(p.findings);
-      setActionItems(p.actions);
-      setStoreProfile(p.storeProfile);
-      addToast('Session Restored', 'Your verified catalog workspace has been loaded.', 'info');
-    } else if (result.type === 'not_found') {
-      // First boot: save initial seed envelope
-      persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
-    } else if (result.type === 'corrupt') {
-      // Technical diagnostic in console for developers
-      console.warn(`[AIXSHOP Storage] Corrupted local data detected and preserved in backup: ${result.backupKey}`);
-      addToast(
-        'Workspace Restored',
-        'A problem was detected with local session data. Your workspace has been safely restored with default catalog items.',
-        'warning'
-      );
-    } else if (result.type === 'unsupported_version') {
-      // Technical diagnostic in console for developers
-      console.warn(`[AIXSHOP Storage] Future schema version (${result.foundVersion}) detected. Enabling read-only mode.`);
-      setIsReadOnlyMode(true);
-      setReadOnlyReason(storageAdapter.getReadOnlyReason());
-      addToast(
-        'Read-Only Mode Active',
-        'This catalog was updated in a newer version. Editing is temporarily paused to protect your store data.',
-        'warning'
-      );
-    } else if (result.type === 'storage_failure') {
-      console.warn(`[AIXSHOP Storage] Storage error: ${result.error}`);
-      addToast('Storage Restricted', 'Local storage is currently restricted. Your catalog is available for this session.', 'warning');
+        if (result.type === 'valid') {
+          const p = result.envelope.payload;
+          setProducts(p.products);
+          setFindings(p.findings);
+          setActionItems(p.actions);
+          setStoreProfile(p.storeProfile);
+          addToast('Demo Session Loaded', 'Your local demo workspace catalog has been loaded.', 'info');
+        } else if (result.type === 'not_found') {
+          persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
+        } else if (result.type === 'corrupt') {
+          console.warn(`[AIXSHOP Storage] Corrupted local data detected and preserved in backup: ${result.backupKey}`);
+          addToast(
+            'Workspace Restored',
+            'A problem was detected with local session data. Restored with default catalog items.',
+            'warning'
+          );
+        } else if (result.type === 'unsupported_version') {
+          console.warn(`[AIXSHOP Storage] Future schema version (${result.foundVersion}) detected. Enabling read-only mode.`);
+          setIsReadOnlyMode(true);
+          setReadOnlyReason(storageAdapter.getReadOnlyReason());
+          addToast(
+            'Read-Only Mode Active',
+            'This catalog was updated in a newer version. Editing is temporarily paused to protect your store data.',
+            'warning'
+          );
+        } else if (result.type === 'storage_failure') {
+          console.warn(`[AIXSHOP Storage] Storage error: ${result.error}`);
+          addToast('Storage Restricted', 'Local storage is currently restricted. Your catalog is available for this session.', 'warning');
+        }
+      }
+      return;
     }
-  }, []);
+
+    // Authenticated Cloud Workspace mode: Load from backend API
+    let isCancelled = false;
+    async function loadCloudCatalog() {
+      try {
+        const res = await apiClient.getCatalog();
+        if (isCancelled) return;
+        setProducts(res.catalog.products);
+        setFindings(res.catalog.findings);
+        setActionItems(res.catalog.actions);
+        setStoreProfile(res.catalog.storeProfile);
+        setIsReadOnlyMode(false);
+        setReadOnlyReason(null);
+        addToast(
+          'Workspace Connected',
+          `Loaded catalog for workspace "${authContext.activeWorkspace.name}". Data is durably persisted to PostgreSQL.`,
+          'success'
+        );
+      } catch (err: any) {
+        if (isCancelled) return;
+        console.error('[AIXSHOP Cloud] Failed to load workspace catalog:', err);
+        addToast(
+          'Cloud Catalog Error',
+          err.message || 'Failed to load catalog from server. Local state preserved.',
+          'error'
+        );
+      }
+    }
+
+    loadCloudCatalog();
+    return () => {
+      isCancelled = true;
+    };
+  }, [isCloudWorkspace, activeWorkspaceId]);
 
   const navigateTo = (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => {
     setMobileMenuOpen(false);
@@ -278,6 +326,25 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       return null;
     }
 
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.importCatalog(lastIngestionResult.candidateProducts);
+        if (res.success && res.result) {
+          const catRes = await apiClient.getCatalog();
+          setProducts(catRes.catalog.products);
+          setFindings(catRes.catalog.findings);
+          setActionItems(catRes.catalog.actions);
+          setStoreProfile(catRes.catalog.storeProfile);
+          addToast('Catalog Import Complete', res.result.message, 'success');
+          return res.result;
+        }
+        return null;
+      } catch (err: any) {
+        addToast('Import Failed (Rolled Back)', err.message || 'Server rejected catalog import. Catalog preserved.', 'error');
+        return null;
+      }
+    }
+
     if (isReadOnlyMode) {
       addToast('Import Disabled', 'Storage is in read-only compatibility mode.', 'warning');
       return null;
@@ -335,7 +402,23 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     return res;
   };
 
-  const approveAction = (actionId: string, customApprovedValue?: string) => {
+  const approveAction = async (actionId: string, customApprovedValue?: string) => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.approveAction(actionId, customApprovedValue);
+        if (res.success && res.action) {
+          setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
+          if (res.product) {
+            setProducts(prev => prev.map(p => p.id === res.product!.id ? res.product! : p));
+          }
+          addToast('Remediation Approved', 'Action successfully approved and durably persisted to PostgreSQL.', 'success');
+        }
+      } catch (err: any) {
+        addToast('Action Failed (Rolled Back)', err.message || 'Failed to approve action on server.', 'error');
+      }
+      return;
+    }
+
     const res = executeActionApproval(actionId, customApprovedValue, {
       products,
       findings,
@@ -384,7 +467,20 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     );
   };
 
-  const dismissAction = (actionId: string) => {
+  const dismissAction = async (actionId: string) => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.dismissAction(actionId);
+        if (res.success && res.action) {
+          setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
+          addToast('Action Dismissed', 'Action dismissed and durably persisted.', 'info');
+        }
+      } catch (err: any) {
+        addToast('Dismiss Failed', err.message || 'Failed to dismiss action on server.', 'error');
+      }
+      return;
+    }
+
     const res = executeActionDismissal(actionId, {
       products,
       findings,
@@ -417,7 +513,20 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     addToast('Action Dismissed', res.message, 'info');
   };
 
-  const recheckAction = (actionId: string) => {
+  const recheckAction = async (actionId: string) => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.recheckAction(actionId);
+        if (res.success && res.action) {
+          setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
+          addToast('Action Re-checked', 'Action evaluated and durably updated.', 'info');
+        }
+      } catch (err: any) {
+        addToast('Re-check Failed', err.message || 'Failed to re-check action on server.', 'error');
+      }
+      return;
+    }
+
     const res = executeActionRecheck(actionId, {
       products,
       findings,
@@ -483,7 +592,22 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   };
 
-  const updateStoreProfile = (updates: Partial<StoreProfile>): { success: boolean; error?: string } => {
+  const updateStoreProfile = async (updates: Partial<StoreProfile>): Promise<{ success: boolean; error?: string }> => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.updateStoreProfile(updates);
+        if (res.success && res.store) {
+          setStoreProfile(res.store);
+          addToast('Store Settings Saved', 'Store configuration updated and durably persisted to PostgreSQL.', 'success');
+          return { success: true };
+        }
+        return { success: false, error: 'Failed to update store profile' };
+      } catch (err: any) {
+        addToast('Settings Save Failed', err.message || 'Failed to update store profile on server.', 'error');
+        return { success: false, error: err.message };
+      }
+    }
+
     const valRes = validateAndApplyProfileUpdate(storeProfile, updates, isReadOnlyMode);
     if (!valRes.success || !valRes.nextProfile) {
       addToast(
@@ -520,7 +644,22 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     return { success: true };
   };
 
-  const toggleConnectorSync = (connectorId: string): { success: boolean; error?: string } => {
+  const toggleConnectorSync = async (connectorId: string): Promise<{ success: boolean; error?: string }> => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.toggleConnector(connectorId);
+        if (res.success && res.store) {
+          setStoreProfile(res.store);
+          addToast('Connector Status Updated', 'Connector configuration updated and durably persisted.', 'info');
+          return { success: true };
+        }
+        return { success: false, error: 'Failed to toggle connector' };
+      } catch (err: any) {
+        addToast('Connector Update Failed', err.message || 'Failed to toggle connector on server.', 'error');
+        return { success: false, error: err.message };
+      }
+    }
+
     const toggleRes = applyConnectorToggle(storeProfile, connectorId, isReadOnlyMode);
     if (!toggleRes.success || !toggleRes.nextProfile) {
       addToast(
@@ -554,6 +693,34 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
 
     return { success: true };
+  };
+
+  const migrateDemoDataToCloud = async (): Promise<boolean> => {
+    if (!isCloudWorkspace) {
+      authContext?.openAuthModal?.('register');
+      return false;
+    }
+
+    try {
+      const res = await apiClient.migrateDemoData();
+      if (res.success) {
+        const catRes = await apiClient.getCatalog();
+        setProducts(catRes.catalog.products);
+        setFindings(catRes.catalog.findings);
+        setActionItems(catRes.catalog.actions);
+        setStoreProfile(catRes.catalog.storeProfile);
+        addToast(
+          'Demo Catalog Imported',
+          `Successfully migrated ${res.skuCount} demo products into your cloud workspace "${authContext.activeWorkspace.name}".`,
+          'success'
+        );
+        return true;
+      }
+      return false;
+    } catch (err: any) {
+      addToast('Migration Failed', err.message || 'Failed to migrate demo data to workspace.', 'error');
+      return false;
+    }
   };
 
   const resetToSeedData = () => {
@@ -590,7 +757,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         isReadOnlyMode,
         readOnlyReason,
         storageLoadResult,
-        isDurableStorage: storageAdapter.isDurable(),
+        isDurableStorage: isCloudWorkspace ? true : storageAdapter.isDurable(),
+        isCloudWorkspace,
         setMobileMenuOpen,
         setSelectedActionId,
         navigateTo,
@@ -604,6 +772,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         recheckProduct,
         updateStoreProfile,
         toggleConnectorSync,
+        migrateDemoDataToCloud,
         addToast,
         removeToast,
         resetToSeedData,
