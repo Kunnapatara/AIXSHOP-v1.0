@@ -562,7 +562,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   };
 
-  const recheckProduct = (productId: string) => {
+  const recheckProduct = async (productId: string) => {
     const res = executeProductRecheck(productId, {
       products,
       findings,
@@ -576,10 +576,31 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       return;
     }
 
-    const saveRes = persistState(res.nextProducts, findings, actionItems, storeProfile);
-    if (!saveRes.success) {
-      addToast('Persistence Failed', `Could not persist product audit: ${saveRes.error}`, 'error');
-      return;
+    if (isCloudWorkspace) {
+      try {
+        const saveRes = await apiClient.saveCatalog({
+          products: res.nextProducts,
+          variants: res.nextProducts.flatMap(p => p.variants || []),
+          offers: res.nextProducts.flatMap(p => p.offers || []),
+          findings,
+          actions: actionItems,
+          evidence: res.nextProducts.flatMap(p => p.evidenceDocuments || []),
+          storeProfile,
+        });
+        if (!saveRes.success) {
+          addToast('Persistence Failed', 'Could not persist product audit to cloud database.', 'error');
+          return;
+        }
+      } catch (err: any) {
+        addToast('Persistence Failed', err.message || 'Could not persist product audit to cloud database.', 'error');
+        return;
+      }
+    } else {
+      const saveRes = persistState(res.nextProducts, findings, actionItems, storeProfile);
+      if (!saveRes.success) {
+        addToast('Persistence Failed', `Could not persist product audit: ${saveRes.error}`, 'error');
+        return;
+      }
     }
 
     setProducts(res.nextProducts);

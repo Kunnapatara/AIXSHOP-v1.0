@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createApp } from './src/server/app';
+import { getDatabaseRepository } from './src/server/db/index';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,7 +11,22 @@ const __dirname = path.dirname(__filename);
 async function start() {
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isProd = process.env.NODE_ENV === 'production';
-  const app = createApp();
+
+  // Acquire database repository — in production this strictly requires PostgreSQL configuration
+  const repo = getDatabaseRepository();
+
+  if (isProd) {
+    console.log('[AIXSHOP Startup] Verifying PostgreSQL connection for production...');
+    const isConnected = await repo.ping();
+    if (!isConnected) {
+      throw new Error(
+        '[AIXSHOP Fatal Startup Error] Could not establish connection to PostgreSQL in production. Please check DATABASE_URL, network connectivity, and credentials.'
+      );
+    }
+    console.log('[AIXSHOP Startup] PostgreSQL database connection verified successfully.');
+  }
+
+  const app = createApp(repo);
 
   if (!isProd) {
     console.log('[AIXSHOP] Starting development server with Vite middleware...');

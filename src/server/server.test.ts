@@ -1,9 +1,14 @@
-import { test, describe, before, after } from 'node:test';
+import { test, describe, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
 import { PostgresRepository } from './db/postgresRepository';
+import { getDatabaseRepository, setDatabaseRepository, getPostgresPoolConfig } from './db/index';
+import { runMigrations } from './db/migrate';
 import { Pool } from 'pg';
 
 describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', () => {
@@ -479,7 +484,117 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
   });
 
-  // 5. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance)
+  // 5. Production Startup Configuration & Safety Rules
+  describe('Production Startup Configuration & Safety Rules', () => {
+    const originalEnv = { ...process.env };
+
+    afterEach(() => {
+      // Restore environment and database repository state
+      process.env = { ...originalEnv };
+      setDatabaseRepository(null);
+    });
+
+    test('production environment strictly fails startup when PostgreSQL config is missing', () => {
+      process.env.NODE_ENV = 'production';
+      delete process.env.DATABASE_URL;
+      delete process.env.SQL_HOST;
+      setDatabaseRepository(null);
+
+      assert.throws(
+        () => {
+          getDatabaseRepository();
+        },
+        (err: any) => {
+          assert.match(err.message, /\[AIXSHOP Fatal Startup Error\]/i);
+          assert.match(err.message, /NODE_ENV=production/i);
+          assert.match(err.message, /strictly prohibited in production/i);
+          return true;
+        }
+      );
+    });
+
+    test('development environment safely falls back to MemoryRepository when PostgreSQL is unconfigured', () => {
+      process.env.NODE_ENV = 'development';
+      delete process.env.DATABASE_URL;
+      delete process.env.SQL_HOST;
+      setDatabaseRepository(null);
+
+      const devRepo = getDatabaseRepository();
+      assert.equal(devRepo.getBackendType(), 'memory');
+    });
+
+    test('PostgreSQL pool configuration parses SSL securely without disabling verification indiscriminately', () => {
+      process.env.SQL_HOST = 'db.internal.example.com';
+      process.env.SQL_PORT = '5432';
+      process.env.SQL_USER = 'app_user';
+      process.env.SQL_PASSWORD = 'secret_password';
+      process.env.SQL_DB_NAME = 'aixshop_db';
+      process.env.DATABASE_SSL = 'true';
+      delete process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+
+      const poolConfig = getPostgresPoolConfig();
+      assert.ok(poolConfig);
+      assert.equal((poolConfig as any).host, 'db.internal.example.com');
+      // Must enforce certificate verification by default
+      assert.deepEqual((poolConfig as any).ssl, { rejectUnauthorized: true });
+
+      // Only allows relaxed verification when explicitly requested by operator
+      process.env.DATABASE_SSL_REJECT_UNAUTHORIZED = 'false';
+      const relaxedConfig = getPostgresPoolConfig();
+      assert.deepEqual((relaxedConfig as any).ssl, { rejectUnauthorized: false });
+    });
+  });
+
+  // 6. Database Migration Runner & Schema Integrity
+  describe('Database Migration Runner & Schema Integrity', () => {
+    test('runMigrations fails clearly when no PostgreSQL configuration exists', async () => {
+      const originalUrl = process.env.DATABASE_URL;
+      const originalHost = process.env.SQL_HOST;
+      delete process.env.DATABASE_URL;
+      delete process.env.SQL_HOST;
+
+      try {
+        await assert.rejects(
+          async () => {
+            await runMigrations();
+          },
+          (err: any) => {
+            assert.match(err.message, /\[AIXSHOP Migration Error\]/i);
+            assert.match(err.message, /DATABASE_URL or SQL_HOST/i);
+            return true;
+          }
+        );
+      } finally {
+        if (originalUrl) process.env.DATABASE_URL = originalUrl;
+        if (originalHost) process.env.SQL_HOST = originalHost;
+      }
+    });
+
+    test('001_initial_schema.sql exists and contains valid multi-tenant DDL and table definitions', () => {
+      const migrationPath = path.resolve(process.cwd(), 'src/server/db/migrations/001_initial_schema.sql');
+      assert.equal(fs.existsSync(migrationPath), true, '001_initial_schema.sql must exist');
+
+      const sqlContent = fs.readFileSync(migrationPath, 'utf-8');
+      // Must contain non-destructive DDL
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS users/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS workspaces/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS workspace_memberships/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS sessions/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS stores/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS products/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS variants/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS offers/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS evidence_documents/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS findings/i);
+      assert.match(sqlContent, /CREATE TABLE IF NOT EXISTS action_items/i);
+      // Strict 2-decimal monetary precision
+      assert.match(sqlContent, /NUMERIC\(14,\s*2\)/i);
+      // No destructive DROP TABLE commands
+      assert.doesNotMatch(sqlContent, /DROP TABLE/i);
+    });
+  });
+
+  // 7. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance)
   describe('Live PostgreSQL Infrastructure Verification', () => {
     const hasLivePg = Boolean(process.env.DATABASE_URL || process.env.SQL_HOST);
 
@@ -499,3 +614,4 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
   });
 });
+
