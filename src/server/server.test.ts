@@ -873,7 +873,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       };
     }
 
-    test('1. pool.connect() rejects: preserves original error and does not crash cleanup', async () => {
+    test('1. custom pool: pool.connect() rejects: preserves original error and does not close custom pool', async () => {
       const { pool, getEndCalled } = createMockPool({
         connectReject: new Error('ECONNREFUSED 127.0.0.1:5432 - Connection refused'),
       });
@@ -889,6 +889,37 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       );
       // Custom pool must NOT be closed by runner
       assert.equal(getEndCalled(), false);
+    });
+
+    test('1b. internally created pool: pool.connect() rejects: calls pool.end() and preserves original error', async () => {
+      process.env.DATABASE_URL = 'postgresql://mock_user:mock_pass@127.0.0.1:5432/mock_db';
+      let internalPoolEndCalled = false;
+      const originalConnect = Pool.prototype.connect;
+      const originalEnd = Pool.prototype.end;
+
+      Pool.prototype.connect = async function () {
+        throw new Error('Connection refused on internal pool');
+      };
+      Pool.prototype.end = async function () {
+        internalPoolEndCalled = true;
+      };
+
+      try {
+        await assert.rejects(
+          async () => {
+            await runMigrations();
+          },
+          (err: any) => {
+            assert.match(err.message, /Connection refused on internal pool/);
+            return true;
+          }
+        );
+        assert.equal(internalPoolEndCalled, true, 'Internally created pool must be closed via pool.end()');
+      } finally {
+        Pool.prototype.connect = originalConnect;
+        Pool.prototype.end = originalEnd;
+        delete process.env.DATABASE_URL;
+      }
     });
 
     test('2. SQL migration failure triggers ROLLBACK, advisory unlock, and releases client', async () => {
@@ -945,7 +976,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
 
     test('4. Advisory lock unlock failure does not mask original migration error', async () => {
-      const { pool, getReleaseCalled, getExecutedQueries } = createMockPool({
+      const { pool, getReleaseCalled } = createMockPool({
         unlockReject: true,
         clientQueryRejectOn: (sql) => {
           if (sql.includes('CREATE TABLE IF NOT EXISTS users')) {
@@ -968,7 +999,32 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.equal(getReleaseCalled(), true, 'Must release client despite unlock failure');
     });
 
-    test('5. Successful migration acquires advisory lock, commits transaction, unlocks, and releases client', async () => {
+    test('5. Lock not acquired: does not attempt unlock if lock acquisition query fails', async () => {
+      const { pool, getReleaseCalled, getExecutedQueries } = createMockPool({
+        clientQueryRejectOn: (sql) => {
+          if (sql.includes('SELECT pg_advisory_lock')) {
+            return new Error('Deadlock detected when acquiring migration lock');
+          }
+          return null;
+        },
+      });
+
+      await assert.rejects(
+        async () => {
+          await runMigrations(pool);
+        },
+        (err: any) => {
+          assert.match(err.message, /Deadlock detected/);
+          return true;
+        }
+      );
+
+      const queries = getExecutedQueries();
+      assert.ok(!queries.some((q) => q.includes('SELECT pg_advisory_unlock')), 'Must NOT attempt unlock if lock was not acquired');
+      assert.equal(getReleaseCalled(), true, 'Must still release client back to pool');
+    });
+
+    test('6. Successful migration acquires advisory lock, commits transaction, unlocks, and releases client', async () => {
       const { pool, getReleaseCalled, getExecutedQueries, getEndCalled } = createMockPool({});
 
       const result = await runMigrations(pool);
@@ -985,7 +1041,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.equal(getEndCalled(), false, 'Must not close caller pool');
     });
 
-    test('6. checkMigrationStatus() is strictly read-only and does not mutate schema', async () => {
+    test('7. checkMigrationStatus() is strictly read-only and does not mutate schema', async () => {
       const { checkMigrationStatus } = await import('./db/migrate');
       const { pool, getReleaseCalled, getExecutedQueries, getEndCalled } = createMockPool({
         queryHandler: async (sql) => {
@@ -1013,7 +1069,13 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
   // 8. PostgreSQL Schema Readiness Accuracy & Constraints (Task 2)
   describe('PostgreSQL Schema Readiness Accuracy & Constraints', () => {
-    function createMockPostgresPool(columnRows: any[], hasFk: boolean = true, appliedMigrations: string[] = ['001_initial_schema.sql'], missingTable: boolean = false) {
+    function createMockPostgresPool(options: {
+      columnRows: any[];
+      fkRows?: any[];
+      appliedMigrations?: string[];
+      missingTable?: boolean;
+      queryReject?: Error;
+    }) {
       let releaseCalled = false;
       const allRequiredTables = [
         'users', 'workspaces', 'workspace_memberships', 'sessions', 'stores',
@@ -1021,21 +1083,34 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         'action_items', 'schema_migrations',
       ];
 
+      const defaultFkRows = [
+        {
+          source_table: 'products',
+          source_column: 'workspace_id',
+          target_table: 'workspaces',
+          target_column: 'id',
+          on_delete: 'CASCADE',
+        },
+      ];
+
       const mockClient = {
         query: async (sql: string) => {
+          if (options.queryReject) {
+            throw options.queryReject;
+          }
           if (sql.includes('information_schema.tables')) {
             return {
-              rows: (missingTable ? allRequiredTables.filter(t => t !== 'variants') : allRequiredTables).map(t => ({ table_name: t })),
+              rows: (options.missingTable ? allRequiredTables.filter(t => t !== 'variants') : allRequiredTables).map(t => ({ table_name: t })),
             };
           }
           if (sql.includes('information_schema.columns')) {
-            return { rows: columnRows };
+            return { rows: options.columnRows };
           }
-          if (sql.includes('table_constraints')) {
-            return { rows: [{ exists: hasFk }] };
+          if (sql.includes('information_schema.table_constraints')) {
+            return { rows: options.fkRows !== undefined ? options.fkRows : defaultFkRows };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: appliedMigrations.map(id => ({ id })) };
+            return { rows: (options.appliedMigrations || ['001_initial_schema.sql']).map(id => ({ id })) };
           }
           return { rows: [] };
         },
@@ -1063,6 +1138,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         numeric_precision: 14,
         numeric_scale: 2,
         is_nullable: 'YES',
+        character_maximum_length: null,
       },
       {
         table_name: 'sessions',
@@ -1071,6 +1147,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         numeric_precision: null,
         numeric_scale: null,
         is_nullable: 'NO',
+        character_maximum_length: 128,
       },
       {
         table_name: 'products',
@@ -1079,57 +1156,154 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         numeric_precision: null,
         numeric_scale: null,
         is_nullable: 'NO',
+        character_maximum_length: 64,
       },
     ];
 
-    test('valid schema returns isReady: true with details and releases client', async () => {
-      const { repo, getReleaseCalled } = createMockPostgresPool(validColumns, true);
+    test('1. valid schema returns isReady: true with details and releases client', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, true);
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('missing required table reports isReady: false with missingTables list', async () => {
-      const { repo, getReleaseCalled } = createMockPostgresPool(validColumns, true, ['001_initial_schema.sql'], true);
+    test('2. missing required table reports isReady: false with missingTables list', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns, missingTable: true });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
       assert.ok(res.missingTables?.includes('variants'));
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('variants.price with wrong data type (e.g. varchar) reports schema error', async () => {
+    test('3. variants.price with wrong data type (e.g. varchar) reports schema error', async () => {
       const invalidColumns = validColumns.map(c => c.column_name === 'price' ? { ...c, data_type: 'character varying' } : c);
-      const { repo, getReleaseCalled } = createMockPostgresPool(invalidColumns, true);
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: invalidColumns });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
       assert.match(res.error!, /variants\.price has data type "character varying", expected "numeric"/);
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('variants.price with wrong precision or scale (e.g. 10, 4) reports schema error', async () => {
+    test('4. variants.price with wrong precision or scale (e.g. 10, 4) reports schema error', async () => {
       const invalidColumns = validColumns.map(c => c.column_name === 'price' ? { ...c, numeric_precision: 10, numeric_scale: 4 } : c);
-      const { repo, getReleaseCalled } = createMockPostgresPool(invalidColumns, true);
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: invalidColumns });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
       assert.match(res.error!, /NUMERIC\(14, 2\)/);
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('sessions.session_token_hash missing or nullable reports schema error', async () => {
+    test('5. sessions.session_token_hash nullable reports schema error', async () => {
       const invalidColumns = validColumns.map(c => c.column_name === 'session_token_hash' ? { ...c, is_nullable: 'YES' } : c);
-      const { repo, getReleaseCalled } = createMockPostgresPool(invalidColumns, true);
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: invalidColumns });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
       assert.match(res.error!, /sessions\.session_token_hash must be NOT NULL/);
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('products.workspace_id missing foreign key constraint reports schema error', async () => {
-      const { repo, getReleaseCalled } = createMockPostgresPool(validColumns, false);
+    test('6. sessions.session_token_hash with wrong length (e.g. 64 instead of 128) reports schema error', async () => {
+      const invalidColumns = validColumns.map(c => c.column_name === 'session_token_hash' ? { ...c, character_maximum_length: 64 } : c);
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: invalidColumns });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.match(res.error!, /foreign key constraint on workspace_id/);
+      assert.match(res.error!, /sessions\.session_token_hash length is 64, expected VARCHAR\(128\)/);
       assert.equal(getReleaseCalled(), true);
+    });
+
+    test('7. products.workspace_id nullable reports schema error', async () => {
+      const invalidColumns = validColumns.map(c => c.column_name === 'workspace_id' ? { ...c, is_nullable: 'YES' } : c);
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: invalidColumns });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /products\.workspace_id must be NOT NULL/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('8. products.workspace_id with wrong length (e.g. 32 instead of 64) reports schema error', async () => {
+      const invalidColumns = validColumns.map(c => c.column_name === 'workspace_id' ? { ...c, character_maximum_length: 32 } : c);
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: invalidColumns });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /products\.workspace_id length is 32, expected VARCHAR\(64\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('9. products.workspace_id missing foreign key constraint reports schema error', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns, fkRows: [] });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /products table missing foreign key constraint on workspace_id/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('10. products.workspace_id foreign key referencing wrong table (e.g. stores) reports schema error', async () => {
+      const wrongFk = [
+        {
+          source_table: 'products',
+          source_column: 'workspace_id',
+          target_table: 'stores',
+          target_column: 'id',
+          on_delete: 'CASCADE',
+        },
+      ];
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns, fkRows: wrongFk });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /foreign key references wrong table "stores", expected "workspaces"/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('11. products.workspace_id foreign key referencing wrong column (e.g. slug) reports schema error', async () => {
+      const wrongFk = [
+        {
+          source_table: 'products',
+          source_column: 'workspace_id',
+          target_table: 'workspaces',
+          target_column: 'slug',
+          on_delete: 'CASCADE',
+        },
+      ];
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns, fkRows: wrongFk });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /foreign key references wrong column "slug", expected "id"/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('12. products.workspace_id foreign key with wrong delete rule (e.g. SET NULL) reports schema error', async () => {
+      const wrongFk = [
+        {
+          source_table: 'products',
+          source_column: 'workspace_id',
+          target_table: 'workspaces',
+          target_column: 'id',
+          on_delete: 'SET NULL',
+        },
+      ];
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns, fkRows: wrongFk });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /foreign key delete rule is "SET NULL", expected "CASCADE"/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('13. client is released back to pool even when query fails with database exception', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        queryReject: new Error('Postgres connection reset by peer during check'),
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /connection reset by peer/);
+      assert.equal(getReleaseCalled(), true, 'Must release client in finally on query failure');
+    });
+
+    test('14. error message never exposes database password, session tokens, or secrets', async () => {
+      const { repo } = createMockPostgresPool({ columnRows: validColumns, missingTable: true });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.doesNotMatch(res.error!, /password|secret|token/i);
     });
   });
 

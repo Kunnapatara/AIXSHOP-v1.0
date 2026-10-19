@@ -88,7 +88,7 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify key column integrity, types, precision/scale, and nullability
+        // Verify key column integrity, types, precision/scale, length, and nullability
         const colRes = await client.query<{
           table_name: string;
           column_name: string;
@@ -96,6 +96,7 @@ export class PostgresRepository implements DatabaseRepository {
           numeric_precision: number | null;
           numeric_scale: number | null;
           is_nullable: string;
+          character_maximum_length: number | null;
         }>(`
           SELECT 
             table_name, 
@@ -103,7 +104,8 @@ export class PostgresRepository implements DatabaseRepository {
             data_type, 
             numeric_precision, 
             numeric_scale, 
-            is_nullable
+            is_nullable,
+            character_maximum_length
           FROM information_schema.columns 
           WHERE (table_schema = current_schema() OR table_schema = 'public')
             AND (
@@ -150,6 +152,12 @@ export class PostgresRepository implements DatabaseRepository {
             error: `Database schema integrity error: sessions.session_token_hash has data type "${sessionTokenCol.data_type}", expected "character varying".`,
           };
         }
+        if (sessionTokenCol.character_maximum_length !== 128) {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: sessions.session_token_hash length is ${sessionTokenCol.character_maximum_length}, expected VARCHAR(128).`,
+          };
+        }
         if (sessionTokenCol.is_nullable !== 'NO') {
           return {
             isReady: false,
@@ -171,6 +179,12 @@ export class PostgresRepository implements DatabaseRepository {
             error: `Database schema integrity error: products.workspace_id has data type "${productWsCol.data_type}", expected "character varying".`,
           };
         }
+        if (productWsCol.character_maximum_length !== 64) {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products.workspace_id length is ${productWsCol.character_maximum_length}, expected VARCHAR(64).`,
+          };
+        }
         if (productWsCol.is_nullable !== 'NO') {
           return {
             isReady: false,
@@ -178,24 +192,62 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify foreign key constraint on products(workspace_id)
-        const fkRes = await client.query<{ exists: boolean }>(`
-          SELECT EXISTS (
-            SELECT 1 
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-              ON tc.constraint_name = kcu.constraint_name
-              AND tc.table_schema = kcu.table_schema
-            WHERE (tc.table_schema = current_schema() OR tc.table_schema = 'public')
-              AND tc.table_name = 'products'
-              AND kcu.column_name = 'workspace_id'
-              AND tc.constraint_type = 'FOREIGN KEY'
-          ) AS "exists";
+        // Verify foreign key constraint on products(workspace_id) -> workspaces(id) ON DELETE CASCADE
+        const fkRes = await client.query<{
+          source_table: string;
+          source_column: string;
+          target_table: string;
+          target_column: string;
+          on_delete: string;
+        }>(`
+          SELECT 
+            kcu.table_name AS source_table,
+            kcu.column_name AS source_column,
+            ccu.table_name AS target_table,
+            ccu.column_name AS target_column,
+            rc.delete_rule AS on_delete
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+          JOIN information_schema.referential_constraints rc
+            ON tc.constraint_name = rc.constraint_name
+            AND tc.table_schema = rc.constraint_schema
+          JOIN information_schema.constraint_column_usage ccu
+            ON rc.unique_constraint_name = ccu.constraint_name
+            AND rc.unique_constraint_schema = ccu.table_schema
+          WHERE (tc.table_schema = current_schema() OR tc.table_schema = 'public')
+            AND tc.table_name = 'products'
+            AND kcu.column_name = 'workspace_id'
+            AND tc.constraint_type = 'FOREIGN KEY';
         `);
-        if (!fkRes.rows[0]?.exists) {
+
+        if (fkRes.rows.length === 0) {
           return {
             isReady: false,
             error: 'Database schema integrity error: products table missing foreign key constraint on workspace_id.',
+          };
+        }
+
+        const fk = fkRes.rows[0];
+        if (fk.target_table !== 'workspaces') {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products(workspace_id) foreign key references wrong table "${fk.target_table}", expected "workspaces".`,
+          };
+        }
+
+        if (fk.target_column !== 'id') {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products(workspace_id) foreign key references wrong column "${fk.target_column}", expected "id".`,
+          };
+        }
+
+        if (fk.on_delete !== 'CASCADE') {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products(workspace_id) foreign key delete rule is "${fk.on_delete}", expected "CASCADE".`,
           };
         }
 
