@@ -11,7 +11,8 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test": "tsx --test \"src/**/*.test.ts\"",
-    "db:migrate": "tsx src/server/db/migrate.ts"
+    "db:migrate": "tsx src/server/db/migrate.ts",
+    "db:status": "tsx src/server/db/migrate.ts --status"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

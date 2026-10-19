@@ -3,7 +3,10 @@ import {
   DatabaseRepository, 
   CreateUserData, 
   CreateWorkspaceData, 
-  CreateSessionData 
+  CreateSessionData,
+  RegisterUserData,
+  RegisterUserResult,
+  SchemaReadinessResult
 } from './repository';
 import { 
   UserRecord, 
@@ -37,12 +40,180 @@ export class PostgresRepository implements DatabaseRepository {
     return 'postgres';
   }
 
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+
   async ping(): Promise<boolean> {
     try {
       const res = await this.pool.query('SELECT 1');
       return res.rowCount !== null && res.rowCount > 0;
     } catch {
       return false;
+    }
+  }
+
+  async checkSchemaReadiness(): Promise<SchemaReadinessResult> {
+    const requiredTables = [
+      'users',
+      'workspaces',
+      'workspace_memberships',
+      'sessions',
+      'stores',
+      'products',
+      'variants',
+      'offers',
+      'evidence_documents',
+      'findings',
+      'action_items',
+      'schema_migrations',
+    ];
+
+    try {
+      const client = await this.pool.connect();
+      try {
+        const res = await client.query<{ table_name: string }>(`
+          SELECT table_name 
+          FROM information_schema.tables 
+          WHERE table_schema = current_schema() OR table_schema = 'public'
+        `);
+        const existingTables = new Set(res.rows.map(r => r.table_name.toLowerCase()));
+        const missingTables = requiredTables.filter(t => !existingTables.has(t.toLowerCase()));
+
+        if (missingTables.length > 0) {
+          return {
+            isReady: false,
+            missingTables,
+            error: `Missing required database tables: ${missingTables.join(', ')}. Please run "npm run db:migrate" to initialize the schema.`,
+          };
+        }
+
+        // Verify applied migrations
+        const migRes = await client.query<{ id: string }>(
+          'SELECT id FROM schema_migrations ORDER BY id ASC'
+        );
+        const appliedMigrations = migRes.rows.map(r => r.id);
+
+        if (!appliedMigrations.includes('001_initial_schema.sql')) {
+          return {
+            isReady: false,
+            pendingMigrations: ['001_initial_schema.sql'],
+            error: 'Required migration "001_initial_schema.sql" has not been applied. Run "npm run db:migrate".',
+          };
+        }
+
+        return {
+          isReady: true,
+          details: {
+            checkedTables: requiredTables,
+            appliedMigrations,
+          },
+        };
+      } finally {
+        client.release();
+      }
+    } catch (err: any) {
+      return {
+        isReady: false,
+        error: `Database schema readiness check failed: ${err.message || 'Connection error'}`,
+      };
+    }
+  }
+
+  async registerUser(data: RegisterUserData): Promise<RegisterUserResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Insert user
+      const userRes = await client.query(
+        `INSERT INTO users (id, email, password_hash, full_name, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())
+         RETURNING id, email, password_hash AS "passwordHash", full_name AS "fullName", created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [data.user.id, data.user.email, data.user.passwordHash, data.user.fullName]
+      );
+      const user: UserRecord = userRes.rows[0];
+
+      // 2. Insert workspace
+      const wsRes = await client.query(
+        `INSERT INTO workspaces (id, name, slug, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())
+         RETURNING id, name, slug, created_at AS "createdAt", updated_at AS "updatedAt"`,
+        [data.workspace.id, data.workspace.name, data.workspace.slug]
+      );
+      const workspace: WorkspaceRecord = wsRes.rows[0];
+
+      // 3. Insert workspace membership (owner)
+      const memId = `mem_${data.workspace.id}_${data.user.id}`;
+      const memRes = await client.query(
+        `INSERT INTO workspace_memberships (id, workspace_id, user_id, role, created_at)
+         VALUES ($1, $2, $3, 'owner', NOW())
+         RETURNING id, workspace_id AS "workspaceId", user_id AS "userId", role, created_at AS "createdAt"`,
+        [memId, workspace.id, user.id]
+      );
+      const membership: WorkspaceMembershipRecord = memRes.rows[0];
+
+      // 4. Create default store
+      const storeId = `store_${workspace.id}`;
+      const defaultConnectors = [
+        {
+          id: 'shopify_primary',
+          type: 'shopify',
+          name: 'Shopify Storefront Connector',
+          status: 'not_configured',
+          lastSync: 'Never',
+          productCountSynced: 0,
+          syncedSkuCount: 0,
+          readOnly: true,
+          writeBackAuthorized: false,
+          missingReason: 'Real Shopify OAuth 2.0 application setup and customer credentials are required.',
+        },
+      ];
+      await client.query(
+        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())`,
+        [
+          storeId,
+          workspace.id,
+          `${workspace.name} Store`,
+          `${workspace.slug}.myshopify.com`,
+          'USD',
+          0,
+          0,
+          'standard',
+          'Free Audit',
+          JSON.stringify(defaultConnectors),
+        ]
+      );
+
+      // 5. Insert session
+      const sessRes = await client.query(
+        `INSERT INTO sessions (id, session_token_hash, user_id, active_workspace_id, expires_at, created_at, last_active_at, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6, $7)
+         RETURNING id, session_token_hash AS "sessionTokenHash", user_id AS "userId", active_workspace_id AS "activeWorkspaceId", expires_at AS "expiresAt", created_at AS "createdAt", last_active_at AS "lastActiveAt", ip_address AS "ipAddress", user_agent AS "userAgent"`,
+        [
+          data.session.id,
+          data.session.sessionTokenHash,
+          user.id,
+          workspace.id,
+          data.session.expiresAt,
+          data.session.ipAddress || null,
+          data.session.userAgent || null,
+        ]
+      );
+      const session: SessionRecord = sessRes.rows[0];
+
+      await client.query('COMMIT');
+      return { user, workspace, membership, session };
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('[AIXSHOP Database] Registration rollback failed:', rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
     }
   }
 
@@ -609,7 +780,11 @@ export class PostgresRepository implements DatabaseRepository {
 
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+      }
       throw err;
     } finally {
       client.release();

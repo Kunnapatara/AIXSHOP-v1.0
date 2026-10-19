@@ -2,7 +2,10 @@ import {
   DatabaseRepository, 
   CreateUserData, 
   CreateWorkspaceData, 
-  CreateSessionData 
+  CreateSessionData,
+  RegisterUserData,
+  RegisterUserResult,
+  SchemaReadinessResult
 } from './repository';
 import { 
   UserRecord, 
@@ -54,8 +57,118 @@ export class MemoryRepository implements DatabaseRepository {
     return 'memory';
   }
 
+  async close(): Promise<void> {
+    // MemoryRepository holds no external socket/pool handles
+    return Promise.resolve();
+  }
+
   async ping(): Promise<boolean> {
     return true;
+  }
+
+  async checkSchemaReadiness(): Promise<SchemaReadinessResult> {
+    return {
+      isReady: true,
+      details: {
+        checkedTables: [
+          'users',
+          'workspaces',
+          'workspace_memberships',
+          'sessions',
+          'stores',
+          'products',
+          'variants',
+          'offers',
+          'evidence_documents',
+          'findings',
+          'action_items',
+          'schema_migrations',
+        ],
+        appliedMigrations: ['001_initial_schema.sql'],
+      },
+    };
+  }
+
+  async registerUser(data: RegisterUserData): Promise<RegisterUserResult> {
+    const emailNorm = data.user.email.trim().toLowerCase();
+    for (const u of this.users.values()) {
+      if (u.email.toLowerCase() === emailNorm) {
+        const err: any = new Error('duplicate key value violates unique constraint "users_email_key"');
+        err.code = '23505';
+        throw err;
+      }
+    }
+
+    const user: UserRecord = {
+      id: data.user.id,
+      email: emailNorm,
+      passwordHash: data.user.passwordHash,
+      fullName: data.user.fullName,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const workspace: WorkspaceRecord = {
+      id: data.workspace.id,
+      name: data.workspace.name,
+      slug: data.workspace.slug,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    const memId = `mem_${workspace.id}_${user.id}`;
+    const membership: WorkspaceMembershipRecord = {
+      id: memId,
+      workspaceId: workspace.id,
+      userId: user.id,
+      role: 'owner',
+      createdAt: new Date().toISOString(),
+    };
+
+    const store: StoreProfile = {
+      name: `${workspace.name} Store`,
+      domain: `${workspace.slug}.myshopify.com`,
+      currency: 'USD',
+      skuCount: 0,
+      catalogCompletenessAvg: 0,
+      truthBoundaryStrictness: 'standard',
+      tier: 'Free Audit',
+      connectors: [
+        {
+          id: 'shopify_primary',
+          type: 'shopify',
+          name: 'Shopify Storefront Connector',
+          status: 'not_configured',
+          lastSync: 'Never',
+          productCountSynced: 0,
+          syncedSkuCount: 0,
+          readOnly: true,
+          writeBackAuthorized: false,
+          missingReason: 'Real Shopify OAuth 2.0 application setup and customer credentials are required.',
+        },
+      ],
+    };
+
+    const session: SessionRecord = {
+      id: data.session.id,
+      sessionTokenHash: data.session.sessionTokenHash,
+      userId: user.id,
+      activeWorkspaceId: workspace.id,
+      expiresAt: data.session.expiresAt,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+      ipAddress: data.session.ipAddress,
+      userAgent: data.session.userAgent,
+    };
+
+    // Atomic commit to state
+    this.users.set(user.id, user);
+    this.workspaces.set(workspace.id, workspace);
+    this.memberships.set(memId, membership);
+    this.stores.set(workspace.id, store);
+    this.sessions.set(session.sessionTokenHash, session);
+
+    return { user, workspace, membership, session };
   }
 
   private seedDemo() {

@@ -86,11 +86,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
 
       // Load workspace catalog to verify action belongs to this workspace
       const catalog = await repo.loadWorkspaceCatalog(workspaceId);
-      if (!catalog) {
-        return res.status(404).json({ error: 'Workspace catalog not found' });
-      }
-
-      const existingAction = catalog.actions.find(a => a.id === actionId);
+      const existingAction = catalog?.actions.find(a => a.id === actionId);
       if (!existingAction) {
         // Enforce strict workspace isolation: if action does not exist in this workspace, return 404
         return res.status(404).json({ 
@@ -119,11 +115,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       const actionId = req.params.id;
 
       const catalog = await repo.loadWorkspaceCatalog(workspaceId);
-      if (!catalog) {
-        return res.status(404).json({ error: 'Workspace catalog not found' });
-      }
-
-      const existingAction = catalog.actions.find(a => a.id === actionId);
+      const existingAction = catalog?.actions.find(a => a.id === actionId);
       if (!existingAction) {
         return res.status(404).json({ 
           error: `Action ${actionId} not found in current workspace`,
@@ -150,11 +142,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       const actionId = req.params.id;
 
       const catalog = await repo.loadWorkspaceCatalog(workspaceId);
-      if (!catalog) {
-        return res.status(404).json({ error: 'Workspace catalog not found' });
-      }
-
-      const existingAction = catalog.actions.find(a => a.id === actionId);
+      const existingAction = catalog?.actions.find(a => a.id === actionId);
       if (!existingAction) {
         return res.status(404).json({ 
           error: `Action ${actionId} not found in current workspace`,

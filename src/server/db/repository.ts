@@ -42,10 +42,39 @@ export interface CreateSessionData {
   userAgent?: string;
 }
 
+export interface RegisterUserData {
+  user: CreateUserData;
+  workspace: CreateWorkspaceData;
+  session: CreateSessionData;
+}
+
+export interface RegisterUserResult {
+  user: UserRecord;
+  workspace: WorkspaceRecord;
+  membership: WorkspaceMembershipRecord;
+  session: SessionRecord;
+}
+
+export interface SchemaReadinessResult {
+  isReady: boolean;
+  missingTables?: string[];
+  pendingMigrations?: string[];
+  error?: string;
+  details?: {
+    checkedTables: string[];
+    appliedMigrations: string[];
+  };
+}
+
 export interface DatabaseRepository {
-  // Database health / connectivity
+  // Database health & readiness
   ping(): Promise<boolean>;
+  checkSchemaReadiness(): Promise<SchemaReadinessResult>;
   getBackendType(): 'postgres' | 'memory';
+  close?(): Promise<void>;
+
+  // Atomic Registration
+  registerUser(data: RegisterUserData): Promise<RegisterUserResult>;
 
   // Users
   createUser(data: CreateUserData): Promise<UserRecord>;

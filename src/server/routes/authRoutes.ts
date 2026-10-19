@@ -58,15 +58,6 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
       // Hash password
       const passwordHash = await hashPassword(password);
       const userId = `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-      const user = await repo.createUser({
-        id: userId,
-        email: email.trim().toLowerCase(),
-        passwordHash,
-        fullName: fullName.trim(),
-      });
-
-      // Create workspace and owner membership
       const wsSlug = workspaceName
         .trim()
         .toLowerCase()
@@ -74,28 +65,33 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
         .replace(/^-|-$/g, '') || `ws-${Date.now()}`;
       const wsId = `ws_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-      const { workspace } = await repo.createWorkspace(
-        {
+      const rawToken = generateSessionToken();
+      const tokenHash = hashSessionToken(rawToken);
+      const expiresAt = new Date(Date.now() + THIRTY_DAYS_MS).toISOString();
+      const sessId = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+      // Atomic registration (transaction in PostgreSQL, atomic commit in Memory)
+      const { user, workspace } = await repo.registerUser({
+        user: {
+          id: userId,
+          email: email.trim().toLowerCase(),
+          passwordHash,
+          fullName: fullName.trim(),
+        },
+        workspace: {
           id: wsId,
           name: workspaceName.trim(),
           slug: `${wsSlug}-${Math.random().toString(36).substring(2, 5)}`,
         },
-        user.id
-      );
-
-      // Create session
-      const rawToken = generateSessionToken();
-      const tokenHash = hashSessionToken(rawToken);
-      const expiresAt = new Date(Date.now() + THIRTY_DAYS_MS).toISOString();
-
-      await repo.createSession({
-        id: `sess_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        sessionTokenHash: tokenHash,
-        userId: user.id,
-        activeWorkspaceId: workspace.id,
-        expiresAt,
-        ipAddress: req.ip,
-        userAgent: req.headers['user-agent'],
+        session: {
+          id: sessId,
+          sessionTokenHash: tokenHash,
+          userId,
+          activeWorkspaceId: wsId,
+          expiresAt,
+          ipAddress: req.ip,
+          userAgent: req.headers['user-agent'],
+        },
       });
 
       setSessionCookie(res, rawToken);

@@ -24,6 +24,15 @@ async function start() {
       );
     }
     console.log('[AIXSHOP Startup] PostgreSQL database connection verified successfully.');
+
+    console.log('[AIXSHOP Startup] Verifying PostgreSQL database schema readiness...');
+    const schemaStatus = await repo.checkSchemaReadiness();
+    if (!schemaStatus.isReady) {
+      throw new Error(
+        `[AIXSHOP Fatal Startup Error] PostgreSQL database schema is not ready: ${schemaStatus.error}`
+      );
+    }
+    console.log('[AIXSHOP Startup] PostgreSQL schema and migrations verified successfully.');
   }
 
   const app = createApp(repo);
@@ -50,12 +59,48 @@ async function start() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[AIXSHOP] Server listening on http://0.0.0.0:${PORT}`);
   });
+
+  // Graceful shutdown handling
+  let isShuttingDown = false;
+  const gracefulShutdown = async (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[AIXSHOP] Received ${signal}. Initiating graceful shutdown...`);
+
+    server.close(async (err) => {
+      if (err) {
+        console.error('[AIXSHOP] Error closing HTTP server:', err);
+      } else {
+        console.log('[AIXSHOP] HTTP server closed.');
+      }
+
+      if (repo.close) {
+        try {
+          await repo.close();
+          console.log('[AIXSHOP] Database pool connection closed.');
+        } catch (dbErr) {
+          console.error('[AIXSHOP] Error closing database pool:', dbErr);
+        }
+      }
+
+      process.exit(err ? 1 : 0);
+    });
+
+    // Force exit if shutdown hangs beyond 10 seconds
+    setTimeout(() => {
+      console.error('[AIXSHOP] Graceful shutdown timeout exceeded (10s). Forcing process exit.');
+      process.exit(1);
+    }, 10000).unref();
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 start().catch((err) => {
-  console.error('[AIXSHOP Fatal Startup Error]:', err);
+  console.error('[AIXSHOP Fatal Startup Error]:', err?.message || err);
   process.exit(1);
 });
