@@ -12,7 +12,8 @@
     "lint": "tsc --noEmit",
     "test": "tsx --test \"src/**/*.test.ts\"",
     "db:migrate": "tsx src/server/db/migrate.ts",
-    "db:status": "tsx src/server/db/migrate.ts --status"
+    "db:status": "tsx src/server/db/migrate.ts --status",
+    "migrate": "tsx src/server/db/migrate.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

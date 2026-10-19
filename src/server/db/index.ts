@@ -7,21 +7,50 @@ import { MemoryRepository } from './memoryRepository';
 let defaultRepo: DatabaseRepository | null = null;
 
 /**
- * Builds PostgreSQL pool configuration respecting SSL settings without indiscriminately disabling verification.
- * Returns null if neither DATABASE_URL nor SQL_HOST is present.
+ * Builds PostgreSQL pool configuration respecting environment variable precedence:
+ * Precedence:
+ * 1. DATABASE_URL
+ * 2. SQL_* variables: SQL_HOST, SQL_PORT, SQL_USER, SQL_PASSWORD, SQL_DB_NAME
+ * 3. PG* variables: PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE
+ *
+ * Returns null if no PostgreSQL configuration is present.
+ * Throws a descriptive configuration error (without leaking secrets) if required discrete fields are missing or invalid.
  */
 export function getPostgresPoolConfig(): PoolConfig | null {
-  const hasPgHost = Boolean(process.env.SQL_HOST || process.env.DATABASE_URL);
-  if (!hasPgHost) return null;
+  const databaseUrl = process.env.DATABASE_URL?.trim();
+
+  // Discrete variables: precedence SQL_* > PG*
+  const host = process.env.SQL_HOST?.trim() || process.env.PGHOST?.trim();
+  const portStr = process.env.SQL_PORT?.trim() || process.env.PGPORT?.trim();
+  const user = process.env.SQL_USER?.trim() || process.env.PGUSER?.trim();
+  const password = process.env.SQL_PASSWORD || process.env.PGPASSWORD;
+  const database = process.env.SQL_DB_NAME?.trim() || process.env.PGDATABASE?.trim();
+
+  if (!databaseUrl && !host) {
+    return null;
+  }
 
   let sslConfig: boolean | { rejectUnauthorized: boolean; ca?: string } | undefined = undefined;
 
   // Strict SSL evaluation: Never disable certificate verification indiscriminately
-  const sslMode = process.env.PGSSLMODE || (process.env.DATABASE_SSL === 'true' ? 'require' : undefined);
-  if (sslMode === 'require' || sslMode === 'verify-full' || sslMode === 'verify-ca' || process.env.DATABASE_SSL === 'true') {
-    const rejectUnauthorized = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false';
-    let caCert: string | undefined = undefined;
+  const sslMode = process.env.PGSSLMODE?.trim();
+  const isSslRequested = 
+    process.env.DATABASE_SSL === 'true' || 
+    sslMode === 'require' || 
+    sslMode === 'verify-full' || 
+    sslMode === 'verify-ca';
 
+  if (isSslRequested) {
+    const isRejectUnauthorizedDisabled = process.env.DATABASE_SSL_REJECT_UNAUTHORIZED === 'false';
+    const isProduction = process.env.NODE_ENV === 'production';
+
+    if (isProduction && isRejectUnauthorizedDisabled) {
+      console.warn(
+        '[AIXSHOP Security Warning] SSL certificate verification is explicitly disabled (DATABASE_SSL_REJECT_UNAUTHORIZED=false). This is strongly discouraged in production.'
+      );
+    }
+
+    let caCert: string | undefined = undefined;
     if (process.env.PGSSLROOTCERT && fs.existsSync(process.env.PGSSLROOTCERT)) {
       caCert = fs.readFileSync(process.env.PGSSLROOTCERT, 'utf-8');
     } else if (process.env.SQL_CA_CERT) {
@@ -29,28 +58,55 @@ export function getPostgresPoolConfig(): PoolConfig | null {
     }
 
     sslConfig = {
-      rejectUnauthorized,
+      rejectUnauthorized: !isRejectUnauthorizedDisabled,
       ...(caCert ? { ca: caCert } : {}),
     };
   }
 
-  return process.env.DATABASE_URL
-    ? {
-        connectionString: process.env.DATABASE_URL,
-        ...(sslConfig !== undefined ? { ssl: sslConfig } : {}),
-        max: 10,
-        connectionTimeoutMillis: 10000,
-      }
-    : {
-        host: process.env.SQL_HOST,
-        port: process.env.SQL_PORT ? parseInt(process.env.SQL_PORT, 10) : 5432,
-        user: process.env.SQL_USER,
-        password: process.env.SQL_PASSWORD,
-        database: process.env.SQL_DB_NAME,
-        ...(sslConfig !== undefined ? { ssl: sslConfig } : {}),
-        max: 10,
-        connectionTimeoutMillis: 10000,
-      };
+  // 1. Primary: DATABASE_URL takes highest precedence
+  if (databaseUrl) {
+    return {
+      connectionString: databaseUrl,
+      ...(sslConfig !== undefined ? { ssl: sslConfig } : {}),
+      max: 10,
+      connectionTimeoutMillis: 10000,
+    };
+  }
+
+  // 2. Discrete parameters validation
+  if (!database) {
+    throw new Error(
+      '[AIXSHOP Configuration Error] Database name is missing. Please set SQL_DB_NAME or PGDATABASE.'
+    );
+  }
+
+  if (!user) {
+    throw new Error(
+      '[AIXSHOP Configuration Error] Database user is missing. Please set SQL_USER or PGUSER.'
+    );
+  }
+
+  let port = 5432;
+  if (portStr) {
+    const parsedPort = parseInt(portStr, 10);
+    if (isNaN(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
+      throw new Error(
+        `[AIXSHOP Configuration Error] Invalid database port "${portStr}". Must be an integer between 1 and 65535.`
+      );
+    }
+    port = parsedPort;
+  }
+
+  return {
+    host,
+    port,
+    user,
+    password,
+    database,
+    ...(sslConfig !== undefined ? { ssl: sslConfig } : {}),
+    max: 10,
+    connectionTimeoutMillis: 10000,
+  };
 }
 
 /**
@@ -74,7 +130,7 @@ export function getDatabaseRepository(): DatabaseRepository {
   // Production safety rule: Fail startup clearly when PostgreSQL configuration is missing
   if (isProduction) {
     throw new Error(
-      '[AIXSHOP Fatal Startup Error] Production environment (NODE_ENV=production) requires durable PostgreSQL database configuration (DATABASE_URL or SQL_HOST). In-memory database fallback is strictly prohibited in production to prevent customer data loss.'
+      '[AIXSHOP Fatal Startup Error] Production environment (NODE_ENV=production) requires durable PostgreSQL database configuration (DATABASE_URL, SQL_HOST, or PGHOST). In-memory database fallback is strictly prohibited in production to prevent customer data loss.'
     );
   }
 

@@ -62,11 +62,33 @@ export class MemoryRepository implements DatabaseRepository {
     return Promise.resolve();
   }
 
+  private isConnected: boolean = true;
+  private isSchemaReady: boolean = true;
+  private schemaReadyError?: string;
+
+  setConnected(connected: boolean): void {
+    this.isConnected = connected;
+  }
+
+  setSchemaReady(ready: boolean, error?: string): void {
+    this.isSchemaReady = ready;
+    this.schemaReadyError = error;
+  }
+
   async ping(): Promise<boolean> {
-    return true;
+    return this.isConnected;
   }
 
   async checkSchemaReadiness(): Promise<SchemaReadinessResult> {
+    if (!this.isConnected) {
+      return { isReady: false, error: 'Database connection unreachable' };
+    }
+    if (!this.isSchemaReady) {
+      return { 
+        isReady: false, 
+        error: this.schemaReadyError || 'Database schema incomplete or migrations pending' 
+      };
+    }
     return {
       isReady: true,
       details: {

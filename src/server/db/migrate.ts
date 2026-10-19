@@ -13,16 +13,23 @@ export interface MigrationResult {
   totalMigrations: number;
 }
 
+// Documented 64-bit constant for PostgreSQL advisory locking:
+// Key 1: 0x41495853 = 1095325779 ('AIXS' in ASCII)
+// Key 2: 0x4d494752 = 1296656210 ('MIGR' in ASCII)
+const MIGRATION_ADVISORY_LOCK_KEY_1 = 1095325779;
+const MIGRATION_ADVISORY_LOCK_KEY_2 = 1296656210;
+
 /**
  * Runs pending PostgreSQL migrations in alphabetical order.
  * Creates schema_migrations table if not exists and tracks applied files.
- * Non-destructive and safe to run multiple times (idempotent).
+ * Uses PostgreSQL advisory lock to prevent race conditions during concurrent deployments.
+ * Non-destructive, transactional per migration, and safe to run multiple times (idempotent).
  */
 export async function runMigrations(customPool?: Pool): Promise<MigrationResult> {
   const poolConfig = getPostgresPoolConfig();
   if (!poolConfig && !customPool) {
     throw new Error(
-      '[AIXSHOP Migration Error] Cannot run database migrations: PostgreSQL is not configured in the environment. Set DATABASE_URL or SQL_HOST before running migrations.'
+      '[AIXSHOP Migration Error] Cannot run database migrations: PostgreSQL is not configured in the environment. Set DATABASE_URL, SQL_HOST, or PGHOST before running migrations.'
     );
   }
 
@@ -30,7 +37,17 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
   const shouldClosePool = !customPool;
 
   const client: PoolClient = await pool.connect();
+  let lockAcquired = false;
+
   try {
+    // Acquire PostgreSQL advisory lock to serialize concurrent migration runs
+    console.log('[AIXSHOP Migration] Acquiring migration advisory lock...');
+    await client.query('SELECT pg_advisory_lock($1, $2)', [
+      MIGRATION_ADVISORY_LOCK_KEY_1,
+      MIGRATION_ADVISORY_LOCK_KEY_2,
+    ]);
+    lockAcquired = true;
+
     // 1. Ensure migrations tracking table exists
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -66,7 +83,7 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
       const filePath = path.join(migrationsDir, file);
       const sql = fs.readFileSync(filePath, 'utf-8');
 
-      // Execute within transaction
+      // Execute within transaction: schema changes + tracking entry succeed or rollback together
       await client.query('BEGIN');
       try {
         await client.query(sql);
@@ -74,9 +91,9 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
         await client.query('COMMIT');
         applied.push(file);
         console.log(`[AIXSHOP Migration] ✓ Successfully applied ${file}`);
-      } catch (err) {
+      } catch (err: any) {
         await client.query('ROLLBACK');
-        console.error(`[AIXSHOP Migration Failed] Error executing ${file}:`, err);
+        console.error(`[AIXSHOP Migration Failed] Error executing ${file}:`, err?.message || err);
         throw err;
       }
     }
@@ -91,6 +108,16 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
       totalMigrations: files.length,
     };
   } finally {
+    if (lockAcquired) {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1, $2)', [
+          MIGRATION_ADVISORY_LOCK_KEY_1,
+          MIGRATION_ADVISORY_LOCK_KEY_2,
+        ]);
+      } catch (unlockErr: any) {
+        // Connection loss automatically releases session advisory lock in Postgres
+      }
+    }
     client.release();
     if (shouldClosePool) {
       await pool.end();
@@ -114,7 +141,7 @@ export async function checkMigrationStatus(customPool?: Pool): Promise<Migration
   const poolConfig = getPostgresPoolConfig();
   if (!poolConfig && !customPool) {
     throw new Error(
-      '[AIXSHOP Migration Error] Cannot check migration status: PostgreSQL is not configured in the environment. Set DATABASE_URL or SQL_HOST before checking status.'
+      '[AIXSHOP Migration Error] Cannot check migration status: PostgreSQL is not configured in the environment. Set DATABASE_URL, SQL_HOST, or PGHOST before checking status.'
     );
   }
 

@@ -18,31 +18,43 @@ export function createApp(customRepo?: DatabaseRepository): Express {
 
   const DB_TIMEOUT_MS = 3000;
 
+  function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+    let timer: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
+    });
+
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    });
+  }
+
   async function checkReadiness(r: DatabaseRepository): Promise<{
     connected: boolean;
     schemaReady: boolean;
     reason?: string;
   }> {
     try {
-      // Live connectivity check with timeout
-      const isConnected = await Promise.race([
+      // Live connectivity check with timeout and timer cleanup
+      const isConnected = await withTimeout(
         r.ping(),
-        new Promise<boolean>((_, reject) =>
-          setTimeout(() => reject(new Error('Database connectivity check timed out')), DB_TIMEOUT_MS)
-        ),
-      ]);
+        DB_TIMEOUT_MS,
+        'Database connectivity check timed out'
+      );
 
       if (!isConnected) {
         return { connected: false, schemaReady: false, reason: 'Database connection unreachable' };
       }
 
-      // Live schema readiness check with timeout
-      const schemaResult = await Promise.race([
+      // Live schema readiness check with timeout and timer cleanup
+      const schemaResult = await withTimeout(
         r.checkSchemaReadiness(),
-        new Promise<any>((_, reject) =>
-          setTimeout(() => reject(new Error('Schema readiness check timed out')), DB_TIMEOUT_MS)
-        ),
-      ]);
+        DB_TIMEOUT_MS,
+        'Schema readiness check timed out'
+      );
 
       if (!schemaResult.isReady) {
         return {

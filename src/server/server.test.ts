@@ -37,14 +37,83 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
   });
 
-  // 1. Health check
-  test('GET /api/health returns service status and database backend', async () => {
-    const res = await fetch(`${baseUrl}/api/health`);
-    assert.equal(res.status, 200);
-    const data = await res.json();
-    assert.equal(data.status, 'ok');
-    assert.equal(data.database.backend, 'memory');
-    assert.equal(data.database.connected, true);
+  // 1. Health & Readiness Probes (Task C & Task D)
+  describe('Health Checks & Readiness Probes', () => {
+    afterEach(() => {
+      // Ensure repo is reset to healthy state after each test
+      repo.setConnected(true);
+      repo.setSchemaReady(true);
+    });
+
+    test('GET /api/health returns service status and database backend', async () => {
+      const res = await fetch(`${baseUrl}/api/health`);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.status, 'ok');
+      assert.equal(data.database.backend, 'memory');
+      assert.equal(data.database.connected, true);
+      assert.equal(data.database.schemaReady, true);
+    });
+
+    test('GET /api/health/live returns 200 OK even when database is disconnected', async () => {
+      repo.setConnected(false);
+      const res = await fetch(`${baseUrl}/api/health/live`);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.status, 'ok');
+      assert.equal(data.probe, 'liveness');
+      assert.ok(data.uptime >= 0);
+    });
+
+    test('GET /api/health/ready returns 200 OK when database and schema are ready', async () => {
+      const res = await fetch(`${baseUrl}/api/health/ready`);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.status, 'ok');
+      assert.equal(data.probe, 'readiness');
+      assert.equal(data.database.connected, true);
+      assert.equal(data.database.schemaReady, true);
+    });
+
+    test('GET /api/health/ready returns 503 Unavailable when database connectivity fails', async () => {
+      repo.setConnected(false);
+      const res = await fetch(`${baseUrl}/api/health/ready`);
+      assert.equal(res.status, 503);
+      const data = await res.json();
+      assert.equal(data.status, 'unavailable');
+      assert.equal(data.probe, 'readiness');
+      assert.equal(data.database.connected, false);
+      assert.match(data.database.reason, /unreachable/i);
+    });
+
+    test('GET /api/health/ready returns 503 Unavailable when database schema is not ready', async () => {
+      repo.setSchemaReady(false, 'Missing required table: variants');
+      const res = await fetch(`${baseUrl}/api/health/ready`);
+      assert.equal(res.status, 503);
+      const data = await res.json();
+      assert.equal(data.status, 'unavailable');
+      assert.equal(data.database.connected, true);
+      assert.equal(data.database.schemaReady, false);
+      assert.match(data.database.reason, /Missing required table: variants/i);
+    });
+
+    test('GET /api/health?probe=live returns 200 OK regardless of database state', async () => {
+      repo.setConnected(false);
+      const res = await fetch(`${baseUrl}/api/health?probe=live`);
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.status, 'ok');
+      assert.equal(data.probe, 'liveness');
+    });
+
+    test('GET /api/health returns 503 Unavailable when database is not ready', async () => {
+      repo.setConnected(false);
+      const res = await fetch(`${baseUrl}/api/health`);
+      assert.equal(res.status, 503);
+      const data = await res.json();
+      assert.equal(data.status, 'unavailable');
+      assert.equal(data.database.connected, false);
+    });
   });
 
   // 2. Authentication & Registration
@@ -498,6 +567,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       process.env.NODE_ENV = 'production';
       delete process.env.DATABASE_URL;
       delete process.env.SQL_HOST;
+      delete process.env.PGHOST;
       setDatabaseRepository(null);
 
       assert.throws(
@@ -517,10 +587,129 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       process.env.NODE_ENV = 'development';
       delete process.env.DATABASE_URL;
       delete process.env.SQL_HOST;
+      delete process.env.PGHOST;
       setDatabaseRepository(null);
 
       const devRepo = getDatabaseRepository();
       assert.equal(devRepo.getBackendType(), 'memory');
+    });
+
+    test('DATABASE_URL takes precedence over discrete SQL_* and PG* variables', () => {
+      process.env.DATABASE_URL = 'postgresql://primary_user:secret_url_pass@url-host.internal:5432/primary_db';
+      process.env.SQL_HOST = 'sql-host.internal';
+      process.env.SQL_USER = 'sql_user';
+      process.env.SQL_DB_NAME = 'sql_db';
+      process.env.PGHOST = 'pg-host.internal';
+
+      const poolConfig = getPostgresPoolConfig();
+      assert.ok(poolConfig);
+      assert.equal((poolConfig as any).connectionString, 'postgresql://primary_user:secret_url_pass@url-host.internal:5432/primary_db');
+      assert.equal((poolConfig as any).host, undefined);
+    });
+
+    test('SQL_* variables take precedence over fallback PG* variables', () => {
+      delete process.env.DATABASE_URL;
+      process.env.SQL_HOST = 'sql-host.internal';
+      process.env.SQL_PORT = '5433';
+      process.env.SQL_USER = 'sql_user';
+      process.env.SQL_PASSWORD = 'sql_password';
+      process.env.SQL_DB_NAME = 'sql_db';
+
+      process.env.PGHOST = 'pg-host.internal';
+      process.env.PGPORT = '5434';
+      process.env.PGUSER = 'pg_user';
+      process.env.PGPASSWORD = 'pg_password';
+      process.env.PGDATABASE = 'pg_db';
+
+      const poolConfig = getPostgresPoolConfig();
+      assert.ok(poolConfig);
+      assert.equal((poolConfig as any).host, 'sql-host.internal');
+      assert.equal((poolConfig as any).port, 5433);
+      assert.equal((poolConfig as any).user, 'sql_user');
+      assert.equal((poolConfig as any).database, 'sql_db');
+    });
+
+    test('PG* variables work as fallback when SQL_* are not defined', () => {
+      delete process.env.DATABASE_URL;
+      delete process.env.SQL_HOST;
+      delete process.env.SQL_PORT;
+      delete process.env.SQL_USER;
+      delete process.env.SQL_PASSWORD;
+      delete process.env.SQL_DB_NAME;
+
+      process.env.PGHOST = 'pg-host.internal';
+      process.env.PGPORT = '5432';
+      process.env.PGUSER = 'pg_user';
+      process.env.PGPASSWORD = 'pg_password';
+      process.env.PGDATABASE = 'pg_db';
+
+      const poolConfig = getPostgresPoolConfig();
+      assert.ok(poolConfig);
+      assert.equal((poolConfig as any).host, 'pg-host.internal');
+      assert.equal((poolConfig as any).user, 'pg_user');
+      assert.equal((poolConfig as any).database, 'pg_db');
+    });
+
+    test('throws configuration error without secrets when database name is missing', () => {
+      delete process.env.DATABASE_URL;
+      process.env.SQL_HOST = 'sql-host.internal';
+      process.env.SQL_USER = 'sql_user';
+      process.env.SQL_PASSWORD = 'super_secret_db_pass';
+      delete process.env.SQL_DB_NAME;
+      delete process.env.PGDATABASE;
+
+      assert.throws(
+        () => {
+          getPostgresPoolConfig();
+        },
+        (err: any) => {
+          assert.match(err.message, /\[AIXSHOP Configuration Error\]/i);
+          assert.match(err.message, /Database name is missing/i);
+          // Crucial: Must never leak password or connection secret
+          assert.doesNotMatch(err.message, /super_secret_db_pass/);
+          return true;
+        }
+      );
+    });
+
+    test('throws configuration error without secrets when user is missing', () => {
+      delete process.env.DATABASE_URL;
+      process.env.SQL_HOST = 'sql-host.internal';
+      delete process.env.SQL_USER;
+      delete process.env.PGUSER;
+      process.env.SQL_PASSWORD = 'super_secret_db_pass';
+      process.env.SQL_DB_NAME = 'sql_db';
+
+      assert.throws(
+        () => {
+          getPostgresPoolConfig();
+        },
+        (err: any) => {
+          assert.match(err.message, /\[AIXSHOP Configuration Error\]/i);
+          assert.match(err.message, /Database user is missing/i);
+          assert.doesNotMatch(err.message, /super_secret_db_pass/);
+          return true;
+        }
+      );
+    });
+
+    test('throws configuration error when port is invalid integer', () => {
+      delete process.env.DATABASE_URL;
+      process.env.SQL_HOST = 'sql-host.internal';
+      process.env.SQL_USER = 'sql_user';
+      process.env.SQL_DB_NAME = 'sql_db';
+      process.env.SQL_PORT = 'invalid_port';
+
+      assert.throws(
+        () => {
+          getPostgresPoolConfig();
+        },
+        (err: any) => {
+          assert.match(err.message, /\[AIXSHOP Configuration Error\]/i);
+          assert.match(err.message, /Invalid database port/i);
+          return true;
+        }
+      );
     });
 
     test('PostgreSQL pool configuration parses SSL securely without disabling verification indiscriminately', () => {
@@ -550,8 +739,10 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('runMigrations fails clearly when no PostgreSQL configuration exists', async () => {
       const originalUrl = process.env.DATABASE_URL;
       const originalHost = process.env.SQL_HOST;
+      const originalPgHost = process.env.PGHOST;
       delete process.env.DATABASE_URL;
       delete process.env.SQL_HOST;
+      delete process.env.PGHOST;
 
       try {
         await assert.rejects(
@@ -560,13 +751,41 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           },
           (err: any) => {
             assert.match(err.message, /\[AIXSHOP Migration Error\]/i);
-            assert.match(err.message, /DATABASE_URL or SQL_HOST/i);
+            assert.match(err.message, /DATABASE_URL, SQL_HOST, or PGHOST/i);
             return true;
           }
         );
       } finally {
         if (originalUrl) process.env.DATABASE_URL = originalUrl;
         if (originalHost) process.env.SQL_HOST = originalHost;
+        if (originalPgHost) process.env.PGHOST = originalPgHost;
+      }
+    });
+
+    test('checkMigrationStatus fails clearly when no PostgreSQL configuration exists', async () => {
+      const { checkMigrationStatus } = await import('./db/migrate');
+      const originalUrl = process.env.DATABASE_URL;
+      const originalHost = process.env.SQL_HOST;
+      const originalPgHost = process.env.PGHOST;
+      delete process.env.DATABASE_URL;
+      delete process.env.SQL_HOST;
+      delete process.env.PGHOST;
+
+      try {
+        await assert.rejects(
+          async () => {
+            await checkMigrationStatus();
+          },
+          (err: any) => {
+            assert.match(err.message, /\[AIXSHOP Migration Error\]/i);
+            assert.match(err.message, /DATABASE_URL, SQL_HOST, or PGHOST/i);
+            return true;
+          }
+        );
+      } finally {
+        if (originalUrl) process.env.DATABASE_URL = originalUrl;
+        if (originalHost) process.env.SQL_HOST = originalHost;
+        if (originalPgHost) process.env.PGHOST = originalPgHost;
       }
     });
 

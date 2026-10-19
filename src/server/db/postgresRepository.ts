@@ -88,6 +88,37 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
+        // Verify key column integrity
+        const colRes = await client.query<{ table_name: string; column_name: string; data_type: string }>(`
+          SELECT table_name, column_name, data_type 
+          FROM information_schema.columns 
+          WHERE (table_schema = current_schema() OR table_schema = 'public')
+            AND (
+              (table_name = 'variants' AND column_name = 'price') OR
+              (table_name = 'sessions' AND column_name = 'session_token_hash') OR
+              (table_name = 'products' AND column_name = 'workspace_id')
+            )
+        `);
+        const colMap = new Map(colRes.rows.map(r => [`${r.table_name}.${r.column_name}`, r.data_type]));
+        if (!colMap.has('variants.price') || colMap.get('variants.price') !== 'numeric') {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: variants.price column must exist with NUMERIC type.',
+          };
+        }
+        if (!colMap.has('sessions.session_token_hash')) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: sessions table missing session_token_hash column.',
+          };
+        }
+        if (!colMap.has('products.workspace_id')) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: products table missing workspace_id column for multi-tenant isolation.',
+          };
+        }
+
         // Verify applied migrations
         const migRes = await client.query<{ id: string }>(
           'SELECT id FROM schema_migrations ORDER BY id ASC'
