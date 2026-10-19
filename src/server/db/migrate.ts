@@ -35,11 +35,14 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
 
   const pool = customPool || new Pool(poolConfig!);
   const shouldClosePool = !customPool;
-
-  const client: PoolClient = await pool.connect();
+  let client: PoolClient | null = null;
   let lockAcquired = false;
+  let clientReleased = false;
+  let poolClosed = false;
 
   try {
+    client = await pool.connect();
+
     // Acquire PostgreSQL advisory lock to serialize concurrent migration runs
     console.log('[AIXSHOP Migration] Acquiring migration advisory lock...');
     await client.query('SELECT pg_advisory_lock($1, $2)', [
@@ -92,7 +95,11 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
         applied.push(file);
         console.log(`[AIXSHOP Migration] ✓ Successfully applied ${file}`);
       } catch (err: any) {
-        await client.query('ROLLBACK');
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr: any) {
+          console.error(`[AIXSHOP Migration Rollback Warning] Rollback failed for ${file}:`, rollbackErr?.message || rollbackErr);
+        }
         console.error(`[AIXSHOP Migration Failed] Error executing ${file}:`, err?.message || err);
         throw err;
       }
@@ -108,19 +115,33 @@ export async function runMigrations(customPool?: Pool): Promise<MigrationResult>
       totalMigrations: files.length,
     };
   } finally {
-    if (lockAcquired) {
+    if (lockAcquired && client) {
       try {
         await client.query('SELECT pg_advisory_unlock($1, $2)', [
           MIGRATION_ADVISORY_LOCK_KEY_1,
           MIGRATION_ADVISORY_LOCK_KEY_2,
         ]);
       } catch (unlockErr: any) {
-        // Connection loss automatically releases session advisory lock in Postgres
+        // Connection loss automatically releases session advisory lock in Postgres; do not mask original error
       }
     }
-    client.release();
-    if (shouldClosePool) {
-      await pool.end();
+
+    if (client && !clientReleased) {
+      try {
+        client.release();
+        clientReleased = true;
+      } catch {
+        // Guard against double release
+      }
+    }
+
+    if (shouldClosePool && !poolClosed) {
+      try {
+        await pool.end();
+        poolClosed = true;
+      } catch {
+        // Guard against double end
+      }
     }
   }
 }
@@ -147,9 +168,12 @@ export async function checkMigrationStatus(customPool?: Pool): Promise<Migration
 
   const pool = customPool || new Pool(poolConfig!);
   const shouldClosePool = !customPool;
+  let client: PoolClient | null = null;
+  let clientReleased = false;
+  let poolClosed = false;
 
-  const client: PoolClient = await pool.connect();
   try {
+    client = await pool.connect();
     const tableRes = await client.query<{ exists: boolean }>(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -182,9 +206,22 @@ export async function checkMigrationStatus(customPool?: Pool): Promise<Migration
       appliedMigrations,
     };
   } finally {
-    client.release();
-    if (shouldClosePool) {
-      await pool.end();
+    if (client && !clientReleased) {
+      try {
+        client.release();
+        clientReleased = true;
+      } catch {
+        // Guard against double release
+      }
+    }
+
+    if (shouldClosePool && !poolClosed) {
+      try {
+        await pool.end();
+        poolClosed = true;
+      } catch {
+        // Guard against double end
+      }
     }
   }
 }

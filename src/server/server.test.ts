@@ -813,7 +813,327 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
   });
 
-  // 7. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance)
+  // 7. Migration Runner Resource Cleanup & Error Handling (Task 1 & Task 4)
+  describe('Migration Runner Resource Cleanup & Error Handling', () => {
+    function createMockPool(options: {
+      connectReject?: Error;
+      queryHandler?: (sql: string, params?: any[]) => Promise<any>;
+      clientQueryRejectOn?: (sql: string) => Error | null;
+      unlockReject?: boolean;
+    }) {
+      let endCalled = false;
+      let releaseCalled = false;
+      const executedQueries: string[] = [];
+
+      const mockClient = {
+        query: async (sql: string, params?: any[]) => {
+          executedQueries.push(sql.trim());
+          if (options.unlockReject && sql.includes('SELECT pg_advisory_unlock')) {
+            throw new Error('Database connection terminated while unlocking');
+          }
+          if (options.clientQueryRejectOn) {
+            const err = options.clientQueryRejectOn(sql);
+            if (err) throw err;
+          }
+          if (options.queryHandler) {
+            return options.queryHandler(sql, params);
+          }
+          if (sql.includes('SELECT pg_advisory_lock')) return { rows: [] };
+          if (sql.includes('SELECT pg_advisory_unlock')) return { rows: [] };
+          if (sql.includes('SELECT id FROM schema_migrations')) return { rows: [] };
+          if (sql.includes('CREATE TABLE')) return { rows: [] };
+          if (sql.includes('INSERT INTO schema_migrations')) return { rows: [] };
+          if (sql.includes('BEGIN') || sql.includes('COMMIT') || sql.includes('ROLLBACK')) return { rows: [] };
+          return { rows: [], rowCount: 1 };
+        },
+        release: () => {
+          releaseCalled = true;
+        },
+      };
+
+      const mockPool = {
+        connect: async () => {
+          if (options.connectReject) throw options.connectReject;
+          return mockClient;
+        },
+        end: async () => {
+          endCalled = true;
+        },
+        query: async (sql: string, params?: any[]) => {
+          return mockClient.query(sql, params);
+        },
+      };
+
+      return {
+        pool: mockPool as unknown as Pool,
+        mockClient,
+        getEndCalled: () => endCalled,
+        getReleaseCalled: () => releaseCalled,
+        getExecutedQueries: () => executedQueries,
+      };
+    }
+
+    test('1. pool.connect() rejects: preserves original error and does not crash cleanup', async () => {
+      const { pool, getEndCalled } = createMockPool({
+        connectReject: new Error('ECONNREFUSED 127.0.0.1:5432 - Connection refused'),
+      });
+
+      await assert.rejects(
+        async () => {
+          await runMigrations(pool);
+        },
+        (err: any) => {
+          assert.match(err.message, /ECONNREFUSED/);
+          return true;
+        }
+      );
+      // Custom pool must NOT be closed by runner
+      assert.equal(getEndCalled(), false);
+    });
+
+    test('2. SQL migration failure triggers ROLLBACK, advisory unlock, and releases client', async () => {
+      const { pool, getReleaseCalled, getExecutedQueries, getEndCalled } = createMockPool({
+        clientQueryRejectOn: (sql) => {
+          if (sql.includes('CREATE TABLE IF NOT EXISTS users')) {
+            return new Error('syntax error at or near "MISTAKE"');
+          }
+          return null;
+        },
+      });
+
+      await assert.rejects(
+        async () => {
+          await runMigrations(pool);
+        },
+        (err: any) => {
+          assert.match(err.message, /syntax error/);
+          return true;
+        }
+      );
+
+      const queries = getExecutedQueries();
+      assert.ok(queries.some((q) => q.includes('ROLLBACK')), 'Must issue ROLLBACK on migration failure');
+      assert.ok(queries.some((q) => q.includes('SELECT pg_advisory_unlock')), 'Must release advisory lock in finally');
+      assert.equal(getReleaseCalled(), true, 'Must release client back to pool');
+      assert.equal(getEndCalled(), false, 'Must not close caller pool');
+    });
+
+    test('3. COMMIT failure triggers ROLLBACK attempt without masking original error', async () => {
+      const { pool, getReleaseCalled, getExecutedQueries } = createMockPool({
+        clientQueryRejectOn: (sql) => {
+          if (sql === 'COMMIT') {
+            return new Error('Transaction serialization conflict on COMMIT');
+          }
+          return null;
+        },
+      });
+
+      await assert.rejects(
+        async () => {
+          await runMigrations(pool);
+        },
+        (err: any) => {
+          assert.match(err.message, /serialization conflict/);
+          return true;
+        }
+      );
+
+      const queries = getExecutedQueries();
+      assert.ok(queries.some((q) => q.includes('ROLLBACK')), 'Must attempt ROLLBACK on COMMIT failure');
+      assert.ok(queries.some((q) => q.includes('SELECT pg_advisory_unlock')), 'Must unlock advisory lock');
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('4. Advisory lock unlock failure does not mask original migration error', async () => {
+      const { pool, getReleaseCalled, getExecutedQueries } = createMockPool({
+        unlockReject: true,
+        clientQueryRejectOn: (sql) => {
+          if (sql.includes('CREATE TABLE IF NOT EXISTS users')) {
+            return new Error('Primary database disk full');
+          }
+          return null;
+        },
+      });
+
+      await assert.rejects(
+        async () => {
+          await runMigrations(pool);
+        },
+        (err: any) => {
+          assert.match(err.message, /Primary database disk full/);
+          return true;
+        }
+      );
+
+      assert.equal(getReleaseCalled(), true, 'Must release client despite unlock failure');
+    });
+
+    test('5. Successful migration acquires advisory lock, commits transaction, unlocks, and releases client', async () => {
+      const { pool, getReleaseCalled, getExecutedQueries, getEndCalled } = createMockPool({});
+
+      const result = await runMigrations(pool);
+      assert.ok(result.totalMigrations > 0);
+      assert.ok(result.applied.length > 0);
+
+      const queries = getExecutedQueries();
+      assert.ok(queries.some((q) => q.includes('SELECT pg_advisory_lock')), 'Must acquire advisory lock');
+      assert.ok(queries.some((q) => q.includes('BEGIN')), 'Must begin transaction');
+      assert.ok(queries.some((q) => q.includes('INSERT INTO schema_migrations')), 'Must record migration');
+      assert.ok(queries.some((q) => q.includes('COMMIT')), 'Must commit transaction');
+      assert.ok(queries.some((q) => q.includes('SELECT pg_advisory_unlock')), 'Must release advisory lock');
+      assert.equal(getReleaseCalled(), true, 'Must release client');
+      assert.equal(getEndCalled(), false, 'Must not close caller pool');
+    });
+
+    test('6. checkMigrationStatus() is strictly read-only and does not mutate schema', async () => {
+      const { checkMigrationStatus } = await import('./db/migrate');
+      const { pool, getReleaseCalled, getExecutedQueries, getEndCalled } = createMockPool({
+        queryHandler: async (sql) => {
+          if (sql.includes('information_schema.tables')) {
+            return { rows: [{ exists: true }] };
+          }
+          if (sql.includes('SELECT id FROM schema_migrations')) {
+            return { rows: [{ id: '001_initial_schema.sql' }] };
+          }
+          return { rows: [] };
+        },
+      });
+
+      const status = await checkMigrationStatus(pool);
+      assert.equal(status.isUpToDate, true);
+      assert.equal(status.pendingCount, 0);
+      assert.equal(status.appliedCount, 1);
+
+      const queries = getExecutedQueries();
+      assert.ok(!queries.some((q) => q.includes('BEGIN') || q.includes('INSERT') || q.includes('CREATE')), 'Must be strictly read-only');
+      assert.equal(getReleaseCalled(), true);
+      assert.equal(getEndCalled(), false);
+    });
+  });
+
+  // 8. PostgreSQL Schema Readiness Accuracy & Constraints (Task 2)
+  describe('PostgreSQL Schema Readiness Accuracy & Constraints', () => {
+    function createMockPostgresPool(columnRows: any[], hasFk: boolean = true, appliedMigrations: string[] = ['001_initial_schema.sql'], missingTable: boolean = false) {
+      let releaseCalled = false;
+      const allRequiredTables = [
+        'users', 'workspaces', 'workspace_memberships', 'sessions', 'stores',
+        'products', 'variants', 'offers', 'evidence_documents', 'findings',
+        'action_items', 'schema_migrations',
+      ];
+
+      const mockClient = {
+        query: async (sql: string) => {
+          if (sql.includes('information_schema.tables')) {
+            return {
+              rows: (missingTable ? allRequiredTables.filter(t => t !== 'variants') : allRequiredTables).map(t => ({ table_name: t })),
+            };
+          }
+          if (sql.includes('information_schema.columns')) {
+            return { rows: columnRows };
+          }
+          if (sql.includes('table_constraints')) {
+            return { rows: [{ exists: hasFk }] };
+          }
+          if (sql.includes('SELECT id FROM schema_migrations')) {
+            return { rows: appliedMigrations.map(id => ({ id })) };
+          }
+          return { rows: [] };
+        },
+        release: () => {
+          releaseCalled = true;
+        },
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+        end: async () => {},
+      };
+
+      return {
+        repo: new PostgresRepository(mockPool as unknown as Pool),
+        getReleaseCalled: () => releaseCalled,
+      };
+    }
+
+    const validColumns = [
+      {
+        table_name: 'variants',
+        column_name: 'price',
+        data_type: 'numeric',
+        numeric_precision: 14,
+        numeric_scale: 2,
+        is_nullable: 'YES',
+      },
+      {
+        table_name: 'sessions',
+        column_name: 'session_token_hash',
+        data_type: 'character varying',
+        numeric_precision: null,
+        numeric_scale: null,
+        is_nullable: 'NO',
+      },
+      {
+        table_name: 'products',
+        column_name: 'workspace_id',
+        data_type: 'character varying',
+        numeric_precision: null,
+        numeric_scale: null,
+        is_nullable: 'NO',
+      },
+    ];
+
+    test('valid schema returns isReady: true with details and releases client', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool(validColumns, true);
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, true);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('missing required table reports isReady: false with missingTables list', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool(validColumns, true, ['001_initial_schema.sql'], true);
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.ok(res.missingTables?.includes('variants'));
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('variants.price with wrong data type (e.g. varchar) reports schema error', async () => {
+      const invalidColumns = validColumns.map(c => c.column_name === 'price' ? { ...c, data_type: 'character varying' } : c);
+      const { repo, getReleaseCalled } = createMockPostgresPool(invalidColumns, true);
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /variants\.price has data type "character varying", expected "numeric"/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('variants.price with wrong precision or scale (e.g. 10, 4) reports schema error', async () => {
+      const invalidColumns = validColumns.map(c => c.column_name === 'price' ? { ...c, numeric_precision: 10, numeric_scale: 4 } : c);
+      const { repo, getReleaseCalled } = createMockPostgresPool(invalidColumns, true);
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /NUMERIC\(14, 2\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('sessions.session_token_hash missing or nullable reports schema error', async () => {
+      const invalidColumns = validColumns.map(c => c.column_name === 'session_token_hash' ? { ...c, is_nullable: 'YES' } : c);
+      const { repo, getReleaseCalled } = createMockPostgresPool(invalidColumns, true);
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /sessions\.session_token_hash must be NOT NULL/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('products.workspace_id missing foreign key constraint reports schema error', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool(validColumns, false);
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /foreign key constraint on workspace_id/);
+      assert.equal(getReleaseCalled(), true);
+    });
+  });
+
+  // 9. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance)
   describe('Live PostgreSQL Infrastructure Verification', () => {
     const hasLivePg = Boolean(process.env.DATABASE_URL || process.env.SQL_HOST);
 

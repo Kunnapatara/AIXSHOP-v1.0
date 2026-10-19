@@ -88,9 +88,22 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify key column integrity
-        const colRes = await client.query<{ table_name: string; column_name: string; data_type: string }>(`
-          SELECT table_name, column_name, data_type 
+        // Verify key column integrity, types, precision/scale, and nullability
+        const colRes = await client.query<{
+          table_name: string;
+          column_name: string;
+          data_type: string;
+          numeric_precision: number | null;
+          numeric_scale: number | null;
+          is_nullable: string;
+        }>(`
+          SELECT 
+            table_name, 
+            column_name, 
+            data_type, 
+            numeric_precision, 
+            numeric_scale, 
+            is_nullable
           FROM information_schema.columns 
           WHERE (table_schema = current_schema() OR table_schema = 'public')
             AND (
@@ -99,23 +112,90 @@ export class PostgresRepository implements DatabaseRepository {
               (table_name = 'products' AND column_name = 'workspace_id')
             )
         `);
-        const colMap = new Map(colRes.rows.map(r => [`${r.table_name}.${r.column_name}`, r.data_type]));
-        if (!colMap.has('variants.price') || colMap.get('variants.price') !== 'numeric') {
+
+        const colMap = new Map(colRes.rows.map(r => [`${r.table_name}.${r.column_name}`, r]));
+
+        // 2.1 Verify variants.price
+        const priceCol = colMap.get('variants.price');
+        if (!priceCol) {
           return {
             isReady: false,
-            error: 'Database schema integrity error: variants.price column must exist with NUMERIC type.',
+            error: 'Database schema integrity error: variants table missing price column.',
           };
         }
-        if (!colMap.has('sessions.session_token_hash')) {
+        if (priceCol.data_type !== 'numeric') {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: variants.price has data type "${priceCol.data_type}", expected "numeric".`,
+          };
+        }
+        if (priceCol.numeric_precision !== 14 || priceCol.numeric_scale !== 2) {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: variants.price precision/scale is (${priceCol.numeric_precision}, ${priceCol.numeric_scale}), expected NUMERIC(14, 2).`,
+          };
+        }
+
+        // 2.2 Verify sessions.session_token_hash
+        const sessionTokenCol = colMap.get('sessions.session_token_hash');
+        if (!sessionTokenCol) {
           return {
             isReady: false,
             error: 'Database schema integrity error: sessions table missing session_token_hash column.',
           };
         }
-        if (!colMap.has('products.workspace_id')) {
+        if (sessionTokenCol.data_type !== 'character varying') {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: sessions.session_token_hash has data type "${sessionTokenCol.data_type}", expected "character varying".`,
+          };
+        }
+        if (sessionTokenCol.is_nullable !== 'NO') {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: sessions.session_token_hash must be NOT NULL.',
+          };
+        }
+
+        // 2.3 Verify products.workspace_id
+        const productWsCol = colMap.get('products.workspace_id');
+        if (!productWsCol) {
           return {
             isReady: false,
             error: 'Database schema integrity error: products table missing workspace_id column for multi-tenant isolation.',
+          };
+        }
+        if (productWsCol.data_type !== 'character varying') {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products.workspace_id has data type "${productWsCol.data_type}", expected "character varying".`,
+          };
+        }
+        if (productWsCol.is_nullable !== 'NO') {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: products.workspace_id must be NOT NULL.',
+          };
+        }
+
+        // Verify foreign key constraint on products(workspace_id)
+        const fkRes = await client.query<{ exists: boolean }>(`
+          SELECT EXISTS (
+            SELECT 1 
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            WHERE (tc.table_schema = current_schema() OR tc.table_schema = 'public')
+              AND tc.table_name = 'products'
+              AND kcu.column_name = 'workspace_id'
+              AND tc.constraint_type = 'FOREIGN KEY'
+          ) AS "exists";
+        `);
+        if (!fkRes.rows[0]?.exists) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: products table missing foreign key constraint on workspace_id.',
           };
         }
 
