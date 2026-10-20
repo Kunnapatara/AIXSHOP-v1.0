@@ -12,7 +12,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'uq_stores_workspace_id'
       AND t.relname = 'stores'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE stores ADD CONSTRAINT uq_stores_workspace_id UNIQUE (workspace_id, id);
@@ -28,7 +28,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'fk_products_store_workspace'
       AND t.relname = 'products'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE products ADD CONSTRAINT fk_products_store_workspace
@@ -46,7 +46,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'fk_findings_store_workspace'
       AND t.relname = 'findings'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE findings ADD CONSTRAINT fk_findings_store_workspace
@@ -65,7 +65,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'fk_findings_product_workspace'
       AND t.relname = 'findings'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE findings ADD CONSTRAINT fk_findings_product_workspace
@@ -83,7 +83,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'fk_action_items_store_workspace'
       AND t.relname = 'action_items'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE action_items ADD CONSTRAINT fk_action_items_store_workspace
@@ -101,7 +101,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'fk_action_items_finding_workspace'
       AND t.relname = 'action_items'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE action_items ADD CONSTRAINT fk_action_items_finding_workspace
@@ -120,7 +120,7 @@ BEGIN
     JOIN pg_namespace n ON t.relnamespace = n.oid
     WHERE c.conname = 'fk_action_items_product_workspace'
       AND t.relname = 'action_items'
-      AND (n.nspname = current_schema() OR n.nspname = 'public')
+      AND n.nspname = current_schema()
   ) THEN
     BEGIN
       ALTER TABLE action_items ADD CONSTRAINT fk_action_items_product_workspace

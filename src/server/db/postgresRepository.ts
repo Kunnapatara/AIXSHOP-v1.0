@@ -75,7 +75,7 @@ export class PostgresRepository implements DatabaseRepository {
         const res = await client.query<{ table_name: string }>(`
           SELECT table_name 
           FROM information_schema.tables 
-          WHERE table_schema = current_schema() OR table_schema = 'public'
+          WHERE table_schema = current_schema()
         `);
         const existingTables = new Set(res.rows.map(r => r.table_name.toLowerCase()));
         const missingTables = requiredTables.filter(t => !existingTables.has(t.toLowerCase()));
@@ -107,7 +107,7 @@ export class PostgresRepository implements DatabaseRepository {
             is_nullable,
             character_maximum_length
           FROM information_schema.columns 
-          WHERE (table_schema = current_schema() OR table_schema = 'public')
+          WHERE table_schema = current_schema()
             AND (
               (table_name = 'variants' AND column_name = 'price') OR
               (table_name = 'sessions' AND column_name = 'session_token_hash') OR
@@ -215,8 +215,8 @@ export class PostgresRepository implements DatabaseRepository {
             AND tc.table_schema = rc.constraint_schema
           JOIN information_schema.constraint_column_usage ccu
             ON rc.unique_constraint_name = ccu.constraint_name
-            AND rc.unique_constraint_schema = ccu.table_schema
-          WHERE (tc.table_schema = current_schema() OR tc.table_schema = 'public')
+            AND rc.unique_constraint_schema = ccu.constraint_schema
+          WHERE tc.table_schema = current_schema()
             AND tc.table_name = 'products'
             AND kcu.column_name = 'workspace_id'
             AND tc.constraint_type = 'FOREIGN KEY';
@@ -299,7 +299,7 @@ export class PostgresRepository implements DatabaseRepository {
           JOIN pg_class src_t ON c.conrelid = src_t.oid
           LEFT JOIN pg_class tgt_t ON c.confrelid = tgt_t.oid
           JOIN pg_namespace n ON src_t.relnamespace = n.oid
-          WHERE (n.nspname = current_schema() OR n.nspname = 'public')
+          WHERE n.nspname = current_schema()
             AND c.contype IN ('f', 'u', 'p');
         `);
 

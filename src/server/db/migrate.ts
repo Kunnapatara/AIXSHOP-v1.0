@@ -177,7 +177,7 @@ export async function checkMigrationStatus(customPool?: Pool): Promise<Migration
     const tableRes = await client.query<{ exists: boolean }>(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
-        WHERE (table_schema = current_schema() OR table_schema = 'public') AND table_name = 'schema_migrations'
+        WHERE table_schema = current_schema() AND table_name = 'schema_migrations'
       ) AS "exists";
     `);
 
