@@ -63,6 +63,7 @@ export interface SchemaReadinessResult {
   details?: {
     checkedTables: string[];
     appliedMigrations: string[];
+    verifiedConstraints?: string[];
   };
 }
 

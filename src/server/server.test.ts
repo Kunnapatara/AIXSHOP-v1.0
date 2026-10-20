@@ -1198,6 +1198,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     function createMockPostgresPool(options: {
       columnRows: any[];
       fkRows?: any[];
+      catalogConstraints?: any[];
       appliedMigrations?: string[];
       missingTable?: boolean;
       queryReject?: Error;
@@ -1219,6 +1220,65 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         },
       ];
 
+      const defaultConstraints = [
+        {
+          source_table: 'stores',
+          target_table: '',
+          constraint_name: 'uq_stores_workspace_id',
+          constraint_type: 'u',
+          source_columns: 'workspace_id,id',
+          target_columns: '',
+        },
+        {
+          source_table: 'products',
+          target_table: 'stores',
+          constraint_name: 'fk_products_store_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,store_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_table: 'findings',
+          target_table: 'stores',
+          constraint_name: 'fk_findings_store_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,store_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_table: 'findings',
+          target_table: 'products',
+          constraint_name: 'fk_findings_product_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,product_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_table: 'action_items',
+          target_table: 'stores',
+          constraint_name: 'fk_action_items_store_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,store_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_table: 'action_items',
+          target_table: 'findings',
+          constraint_name: 'fk_action_items_finding_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,finding_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_table: 'action_items',
+          target_table: 'products',
+          constraint_name: 'fk_action_items_product_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,product_id',
+          target_columns: 'workspace_id,id',
+        },
+      ];
+
       const mockClient = {
         query: async (sql: string) => {
           if (options.queryReject) {
@@ -1235,8 +1295,11 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           if (sql.includes('information_schema.table_constraints')) {
             return { rows: options.fkRows !== undefined ? options.fkRows : defaultFkRows };
           }
+          if (sql.includes('pg_constraint')) {
+            return { rows: options.catalogConstraints !== undefined ? options.catalogConstraints : defaultConstraints };
+          }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: (options.appliedMigrations || ['001_initial_schema.sql']).map(id => ({ id })) };
+            return { rows: (options.appliedMigrations || ['001_initial_schema.sql', '002_tenant_referential_integrity.sql']).map(id => ({ id })) };
           }
           return { rows: [] };
         },
@@ -1430,6 +1493,138 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
       assert.doesNotMatch(res.error!, /password|secret|token/i);
+    });
+
+    test('[Mock Unit Test] 15. checkSchemaReadiness fails when 001_initial_schema.sql is recorded but 002_tenant_referential_integrity.sql is pending', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql'], // 002 is missing/pending
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql']);
+      assert.match(res.error!, /Required migration "002_tenant_referential_integrity\.sql" has not been applied/);
+      assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
+    });
+
+    test('[Mock Unit Test] 16. checkSchemaReadiness fails when both migrations recorded but stores(workspace_id, id) unique key is absent', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          // Missing stores unique constraint
+          {
+            source_table: 'products',
+            target_table: 'stores',
+            constraint_name: 'fk_products_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,store_id',
+            target_columns: 'workspace_id,id',
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /stores table missing unique key on \(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 17. checkSchemaReadiness fails when both migrations recorded but composite FK products(workspace_id, store_id) is absent', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_table: 'stores',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'workspace_id,id',
+            target_columns: '',
+          },
+          // Missing fk_products_store_workspace
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /missing required composite foreign key constraint: products\(workspace_id, store_id\) -> stores\(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 18. checkSchemaReadiness fails when both migrations recorded but composite FK action_items(workspace_id, finding_id) is absent', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_table: 'stores',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'workspace_id,id',
+            target_columns: '',
+          },
+          {
+            source_table: 'products',
+            target_table: 'stores',
+            constraint_name: 'fk_products_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,store_id',
+            target_columns: 'workspace_id,id',
+          },
+          {
+            source_table: 'findings',
+            target_table: 'stores',
+            constraint_name: 'fk_findings_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,store_id',
+            target_columns: 'workspace_id,id',
+          },
+          {
+            source_table: 'findings',
+            target_table: 'products',
+            constraint_name: 'fk_findings_product_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,product_id',
+            target_columns: 'workspace_id,id',
+          },
+          {
+            source_table: 'action_items',
+            target_table: 'stores',
+            constraint_name: 'fk_action_items_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,store_id',
+            target_columns: 'workspace_id,id',
+          },
+          // action_items -> findings missing!
+          {
+            source_table: 'action_items',
+            target_table: 'products',
+            constraint_name: 'fk_action_items_product_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,product_id',
+            target_columns: 'workspace_id,id',
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /action_items\(workspace_id, finding_id\) -> findings\(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 19. checkSchemaReadiness succeeds (isReady: true) when both migrations recorded and all composite constraints exist', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, true);
+      assert.deepEqual(res.details?.appliedMigrations, ['001_initial_schema.sql', '002_tenant_referential_integrity.sql']);
+      assert.ok(res.details?.verifiedConstraints?.includes('stores(workspace_id, id) UNIQUE'));
+      assert.ok(res.details?.verifiedConstraints?.includes('products(workspace_id, store_id) -> stores(workspace_id, id)'));
+      assert.ok(res.details?.verifiedConstraints?.includes('action_items(workspace_id, finding_id) -> findings(workspace_id, id)'));
+      assert.equal(getReleaseCalled(), true);
     });
   });
 

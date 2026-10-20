@@ -251,18 +251,143 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify applied migrations
+        // Verify applied migrations (both 001 and 002 are required)
         const migRes = await client.query<{ id: string }>(
           'SELECT id FROM schema_migrations ORDER BY id ASC'
         );
         const appliedMigrations = migRes.rows.map(r => r.id);
 
-        if (!appliedMigrations.includes('001_initial_schema.sql')) {
+        const requiredMigrations = [
+          '001_initial_schema.sql',
+          '002_tenant_referential_integrity.sql',
+        ];
+        const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
+
+        if (pendingMigrations.length > 0) {
           return {
             isReady: false,
-            pendingMigrations: ['001_initial_schema.sql'],
-            error: 'Required migration "001_initial_schema.sql" has not been applied. Run "npm run db:migrate".',
+            pendingMigrations,
+            error: `Required migration "${pendingMigrations[0]}" has not been applied. Run "npm run db:migrate".`,
           };
+        }
+
+        // Verify required composite foreign-key and unique constraints in catalog metadata
+        const catalogConstraintsRes = await client.query<{
+          source_table: string;
+          target_table: string;
+          constraint_name: string;
+          constraint_type: string;
+          source_columns: string;
+          target_columns: string;
+        }>(`
+          SELECT
+            src_t.relname AS source_table,
+            COALESCE(tgt_t.relname, '') AS target_table,
+            c.conname AS constraint_name,
+            c.contype AS constraint_type,
+            COALESCE((
+              SELECT string_agg(att.attname, ',' ORDER BY u.attpos)
+              FROM unnest(c.conkey) WITH ORDINALITY AS u(attnum, attpos)
+              JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = u.attnum
+            ), '') AS source_columns,
+            COALESCE((
+              SELECT string_agg(att.attname, ',' ORDER BY u.attpos)
+              FROM unnest(c.confkey) WITH ORDINALITY AS u(attnum, attpos)
+              JOIN pg_attribute att ON att.attrelid = c.confrelid AND att.attnum = u.attnum
+            ), '') AS target_columns
+          FROM pg_constraint c
+          JOIN pg_class src_t ON c.conrelid = src_t.oid
+          LEFT JOIN pg_class tgt_t ON c.confrelid = tgt_t.oid
+          JOIN pg_namespace n ON src_t.relnamespace = n.oid
+          WHERE (n.nspname = current_schema() OR n.nspname = 'public')
+            AND c.contype IN ('f', 'u', 'p');
+        `);
+
+        const normCols = (cols: string) =>
+          cols
+            .split(',')
+            .map(c => c.trim().toLowerCase())
+            .filter(Boolean)
+            .sort()
+            .join(',');
+
+        const catalogRows = catalogConstraintsRes.rows;
+
+        // 4.1 Verify unique constraint on stores(workspace_id, id)
+        const hasStoreUnique = catalogRows.some(
+          r =>
+            r.source_table === 'stores' &&
+            ['u', 'p'].includes(r.constraint_type) &&
+            normCols(r.source_columns) === 'id,workspace_id'
+        );
+        if (!hasStoreUnique) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: stores table missing unique key on (workspace_id, id). Run "npm run db:migrate".',
+          };
+        }
+
+        // 4.2 Verify required composite foreign keys
+        const requiredCompositeFks = [
+          {
+            sourceTable: 'products',
+            sourceColumns: 'store_id,workspace_id',
+            targetTable: 'stores',
+            targetColumns: 'id,workspace_id',
+            description: 'products(workspace_id, store_id) -> stores(workspace_id, id)',
+          },
+          {
+            sourceTable: 'findings',
+            sourceColumns: 'store_id,workspace_id',
+            targetTable: 'stores',
+            targetColumns: 'id,workspace_id',
+            description: 'findings(workspace_id, store_id) -> stores(workspace_id, id)',
+          },
+          {
+            sourceTable: 'findings',
+            sourceColumns: 'product_id,workspace_id',
+            targetTable: 'products',
+            targetColumns: 'id,workspace_id',
+            description: 'findings(workspace_id, product_id) -> products(workspace_id, id)',
+          },
+          {
+            sourceTable: 'action_items',
+            sourceColumns: 'store_id,workspace_id',
+            targetTable: 'stores',
+            targetColumns: 'id,workspace_id',
+            description: 'action_items(workspace_id, store_id) -> stores(workspace_id, id)',
+          },
+          {
+            sourceTable: 'action_items',
+            sourceColumns: 'finding_id,workspace_id',
+            targetTable: 'findings',
+            targetColumns: 'id,workspace_id',
+            description: 'action_items(workspace_id, finding_id) -> findings(workspace_id, id)',
+          },
+          {
+            sourceTable: 'action_items',
+            sourceColumns: 'product_id,workspace_id',
+            targetTable: 'products',
+            targetColumns: 'id,workspace_id',
+            description: 'action_items(workspace_id, product_id) -> products(workspace_id, id)',
+          },
+        ];
+
+        for (const reqFk of requiredCompositeFks) {
+          const match = catalogRows.some(
+            r =>
+              r.source_table === reqFk.sourceTable &&
+              r.target_table === reqFk.targetTable &&
+              r.constraint_type === 'f' &&
+              normCols(r.source_columns) === reqFk.sourceColumns &&
+              normCols(r.target_columns) === reqFk.targetColumns
+          );
+          if (!match) {
+            return {
+              isReady: false,
+              error: `Database schema integrity error: missing required composite foreign key constraint: ${reqFk.description}. Run "npm run db:migrate".`,
+            };
+          }
         }
 
         return {
@@ -270,6 +395,11 @@ export class PostgresRepository implements DatabaseRepository {
           details: {
             checkedTables: requiredTables,
             appliedMigrations,
+            verifiedConstraints: [
+              'stores(workspace_id, id) UNIQUE',
+              ...requiredCompositeFks.map(f => f.description),
+              'products(workspace_id) -> workspaces(id)',
+            ],
           },
         };
       } finally {
