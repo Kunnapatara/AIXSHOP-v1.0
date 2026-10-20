@@ -192,17 +192,31 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
+        // Verify active schema identity
+        const schemaRes = await client.query<{ schema_name: string }>('SELECT current_schema() AS schema_name');
+        const activeSchema = schemaRes.rows[0]?.schema_name;
+        if (!activeSchema) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: Unable to determine active database schema via current_schema().',
+          };
+        }
+
         // Verify foreign key constraint on products(workspace_id) -> workspaces(id) ON DELETE CASCADE
         const fkRes = await client.query<{
+          source_schema: string;
           source_table: string;
           source_column: string;
+          target_schema: string;
           target_table: string;
           target_column: string;
           on_delete: string;
         }>(`
           SELECT 
+            kcu.table_schema AS source_schema,
             kcu.table_name AS source_table,
             kcu.column_name AS source_column,
+            ccu.table_schema AS target_schema,
             ccu.table_name AS target_table,
             ccu.column_name AS target_column,
             rc.delete_rule AS on_delete
@@ -230,6 +244,23 @@ export class PostgresRepository implements DatabaseRepository {
         }
 
         const fk = fkRes.rows[0];
+        const fkSourceSchema = fk.source_schema || activeSchema;
+        const fkTargetSchema = fk.target_schema || activeSchema;
+
+        if (fkSourceSchema !== activeSchema) {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products(workspace_id) foreign key source schema is "${fk.source_schema}", expected active schema "${activeSchema}".`,
+          };
+        }
+
+        if (fkTargetSchema !== activeSchema) {
+          return {
+            isReady: false,
+            error: `Database schema integrity error: products(workspace_id) foreign key references target schema "${fk.target_schema}", expected active schema "${activeSchema}".`,
+          };
+        }
+
         if (fk.target_table !== 'workspaces') {
           return {
             isReady: false,
@@ -273,7 +304,9 @@ export class PostgresRepository implements DatabaseRepository {
 
         // Verify required composite foreign-key and unique constraints in catalog metadata
         const catalogConstraintsRes = await client.query<{
+          source_schema: string;
           source_table: string;
+          target_schema: string;
           target_table: string;
           constraint_name: string;
           constraint_type: string;
@@ -281,7 +314,9 @@ export class PostgresRepository implements DatabaseRepository {
           target_columns: string;
         }>(`
           SELECT
+            src_ns.nspname AS source_schema,
             src_t.relname AS source_table,
+            COALESCE(tgt_ns.nspname, '') AS target_schema,
             COALESCE(tgt_t.relname, '') AS target_table,
             c.conname AS constraint_name,
             c.contype AS constraint_type,
@@ -297,96 +332,115 @@ export class PostgresRepository implements DatabaseRepository {
             ), '') AS target_columns
           FROM pg_constraint c
           JOIN pg_class src_t ON c.conrelid = src_t.oid
+          JOIN pg_namespace src_ns ON src_t.relnamespace = src_ns.oid
           LEFT JOIN pg_class tgt_t ON c.confrelid = tgt_t.oid
-          JOIN pg_namespace n ON src_t.relnamespace = n.oid
-          WHERE n.nspname = current_schema()
+          LEFT JOIN pg_namespace tgt_ns ON tgt_t.relnamespace = tgt_ns.oid
+          WHERE src_ns.nspname = current_schema()
             AND c.contype IN ('f', 'u', 'p');
         `);
 
-        const normCols = (cols: string) =>
+        const parseCols = (cols: string): string[] =>
           cols
-            .split(',')
-            .map(c => c.trim().toLowerCase())
-            .filter(Boolean)
-            .sort()
-            .join(',');
+            ? cols.split(',').map(c => c.trim().toLowerCase()).filter(Boolean)
+            : [];
+
+        const arraysEqual = (a: string[], b: string[]): boolean =>
+          a.length === b.length && a.every((val, idx) => val === b[idx]);
 
         const catalogRows = catalogConstraintsRes.rows;
 
-        // 4.1 Verify unique constraint on stores(workspace_id, id)
-        const hasStoreUnique = catalogRows.some(
+        // 4.1 Verify unique constraint on stores(workspace_id, id) with exact ordinal order
+        const expectedStoreCols = ['workspace_id', 'id'];
+        const storeUniqueConstraint = catalogRows.find(
           r =>
+            (r.source_schema || activeSchema) === activeSchema &&
             r.source_table === 'stores' &&
             ['u', 'p'].includes(r.constraint_type) &&
-            normCols(r.source_columns) === 'id,workspace_id'
+            arraysEqual(parseCols(r.source_columns), expectedStoreCols)
         );
-        if (!hasStoreUnique) {
+
+        if (!storeUniqueConstraint) {
           return {
             isReady: false,
             error: 'Database schema integrity error: stores table missing unique key on (workspace_id, id). Run "npm run db:migrate".',
           };
         }
 
-        // 4.2 Verify required composite foreign keys
+        // 4.2 Verify required composite foreign keys with exact ordinal mapping and active schema scoping
         const requiredCompositeFks = [
           {
             sourceTable: 'products',
-            sourceColumns: 'store_id,workspace_id',
+            sourceColumns: ['workspace_id', 'store_id'],
             targetTable: 'stores',
-            targetColumns: 'id,workspace_id',
+            targetColumns: ['workspace_id', 'id'],
             description: 'products(workspace_id, store_id) -> stores(workspace_id, id)',
           },
           {
             sourceTable: 'findings',
-            sourceColumns: 'store_id,workspace_id',
+            sourceColumns: ['workspace_id', 'store_id'],
             targetTable: 'stores',
-            targetColumns: 'id,workspace_id',
+            targetColumns: ['workspace_id', 'id'],
             description: 'findings(workspace_id, store_id) -> stores(workspace_id, id)',
           },
           {
             sourceTable: 'findings',
-            sourceColumns: 'product_id,workspace_id',
+            sourceColumns: ['workspace_id', 'product_id'],
             targetTable: 'products',
-            targetColumns: 'id,workspace_id',
+            targetColumns: ['workspace_id', 'id'],
             description: 'findings(workspace_id, product_id) -> products(workspace_id, id)',
           },
           {
             sourceTable: 'action_items',
-            sourceColumns: 'store_id,workspace_id',
+            sourceColumns: ['workspace_id', 'store_id'],
             targetTable: 'stores',
-            targetColumns: 'id,workspace_id',
+            targetColumns: ['workspace_id', 'id'],
             description: 'action_items(workspace_id, store_id) -> stores(workspace_id, id)',
           },
           {
             sourceTable: 'action_items',
-            sourceColumns: 'finding_id,workspace_id',
+            sourceColumns: ['workspace_id', 'finding_id'],
             targetTable: 'findings',
-            targetColumns: 'id,workspace_id',
+            targetColumns: ['workspace_id', 'id'],
             description: 'action_items(workspace_id, finding_id) -> findings(workspace_id, id)',
           },
           {
             sourceTable: 'action_items',
-            sourceColumns: 'product_id,workspace_id',
+            sourceColumns: ['workspace_id', 'product_id'],
             targetTable: 'products',
-            targetColumns: 'id,workspace_id',
+            targetColumns: ['workspace_id', 'id'],
             description: 'action_items(workspace_id, product_id) -> products(workspace_id, id)',
           },
         ];
 
         for (const reqFk of requiredCompositeFks) {
-          const match = catalogRows.some(
+          const matchingFk = catalogRows.find(
             r =>
+              (r.source_schema || activeSchema) === activeSchema &&
               r.source_table === reqFk.sourceTable &&
+              (r.target_schema || activeSchema) === activeSchema &&
               r.target_table === reqFk.targetTable &&
               r.constraint_type === 'f' &&
-              normCols(r.source_columns) === reqFk.sourceColumns &&
-              normCols(r.target_columns) === reqFk.targetColumns
+              arraysEqual(parseCols(r.source_columns), reqFk.sourceColumns) &&
+              arraysEqual(parseCols(r.target_columns), reqFk.targetColumns)
           );
-          if (!match) {
+
+          if (!matchingFk) {
             return {
               isReady: false,
               error: `Database schema integrity error: missing required composite foreign key constraint: ${reqFk.description}. Run "npm run db:migrate".`,
             };
+          }
+
+          // Positional mapping verification
+          const actualSrcCols = parseCols(matchingFk.source_columns);
+          const actualTgtCols = parseCols(matchingFk.target_columns);
+          for (let i = 0; i < reqFk.sourceColumns.length; i++) {
+            if (actualSrcCols[i] !== reqFk.sourceColumns[i] || actualTgtCols[i] !== reqFk.targetColumns[i]) {
+              return {
+                isReady: false,
+                error: `Database schema integrity error: composite foreign key ${reqFk.description} column mapping mismatch at ordinal position ${i}: expected (${reqFk.sourceColumns[i]} -> ${reqFk.targetColumns[i]}), got (${actualSrcCols[i]} -> ${actualTgtCols[i]}).`,
+              };
+            }
           }
         }
 

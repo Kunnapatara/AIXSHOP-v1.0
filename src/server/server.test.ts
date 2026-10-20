@@ -11,6 +11,9 @@ import { getDatabaseRepository, setDatabaseRepository, getPostgresPoolConfig } f
 import { runMigrations, checkMigrationStatus } from './db/migrate';
 import { Pool } from 'pg';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', () => {
   let server: http.Server;
   let baseUrl: string;
@@ -1191,6 +1194,33 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.equal(getReleaseCalled(), true);
       assert.equal(getEndCalled(), false);
     });
+
+    test('8. Migration 002 failure on incompatible same-named constraint triggers ROLLBACK and releases client', async () => {
+      const { pool, getReleaseCalled, getExecutedQueries, getEndCalled } = createMockPool({
+        clientQueryRejectOn: (sql) => {
+          if (sql.includes('uq_stores_workspace_id') || sql.includes('002_tenant_referential_integrity')) {
+            return new Error('[AIXSHOP Migration 002 Error] Incompatible constraint "uq_stores_workspace_id" already exists (table: public.stores, type: u, columns: {id,workspace_id}). Expected UNIQUE stores(workspace_id, id).');
+          }
+          return null;
+        },
+      });
+
+      await assert.rejects(
+        async () => {
+          await runMigrations(pool);
+        },
+        (err: any) => {
+          assert.match(err.message, /Incompatible constraint "uq_stores_workspace_id"/);
+          return true;
+        }
+      );
+
+      const queries = getExecutedQueries();
+      assert.ok(queries.some((q) => q.includes('ROLLBACK')), 'Must issue ROLLBACK on migration failure');
+      assert.ok(queries.some((q) => q.includes('SELECT pg_advisory_unlock')), 'Must release advisory lock in finally');
+      assert.equal(getReleaseCalled(), true, 'Must release client back to pool');
+      assert.equal(getEndCalled(), false, 'Must not close caller pool');
+    });
   });
 
   // 8. PostgreSQL Schema Readiness Accuracy & Constraints (Task 2)
@@ -1202,6 +1232,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       appliedMigrations?: string[];
       missingTable?: boolean;
       queryReject?: Error;
+      currentSchema?: string;
     }) {
       let releaseCalled = false;
       const allRequiredTables = [
@@ -1212,8 +1243,10 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
       const defaultFkRows = [
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'products',
           source_column: 'workspace_id',
+          target_schema: options.currentSchema || 'public',
           target_table: 'workspaces',
           target_column: 'id',
           on_delete: 'CASCADE',
@@ -1222,7 +1255,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
       const defaultConstraints = [
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'stores',
+          target_schema: '',
           target_table: '',
           constraint_name: 'uq_stores_workspace_id',
           constraint_type: 'u',
@@ -1230,7 +1265,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_columns: '',
         },
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'products',
+          target_schema: options.currentSchema || 'public',
           target_table: 'stores',
           constraint_name: 'fk_products_store_workspace',
           constraint_type: 'f',
@@ -1238,7 +1275,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_columns: 'workspace_id,id',
         },
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'findings',
+          target_schema: options.currentSchema || 'public',
           target_table: 'stores',
           constraint_name: 'fk_findings_store_workspace',
           constraint_type: 'f',
@@ -1246,7 +1285,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_columns: 'workspace_id,id',
         },
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'findings',
+          target_schema: options.currentSchema || 'public',
           target_table: 'products',
           constraint_name: 'fk_findings_product_workspace',
           constraint_type: 'f',
@@ -1254,7 +1295,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_columns: 'workspace_id,id',
         },
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'action_items',
+          target_schema: options.currentSchema || 'public',
           target_table: 'stores',
           constraint_name: 'fk_action_items_store_workspace',
           constraint_type: 'f',
@@ -1262,7 +1305,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_columns: 'workspace_id,id',
         },
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'action_items',
+          target_schema: options.currentSchema || 'public',
           target_table: 'findings',
           constraint_name: 'fk_action_items_finding_workspace',
           constraint_type: 'f',
@@ -1270,7 +1315,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_columns: 'workspace_id,id',
         },
         {
+          source_schema: options.currentSchema || 'public',
           source_table: 'action_items',
+          target_schema: options.currentSchema || 'public',
           target_table: 'products',
           constraint_name: 'fk_action_items_product_workspace',
           constraint_type: 'f',
@@ -1286,6 +1333,9 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           executedQueries.push(sql);
           if (options.queryReject) {
             throw options.queryReject;
+          }
+          if (sql.includes('SELECT current_schema()')) {
+            return { rows: [{ schema_name: options.currentSchema || 'public' }] };
           }
           if (sql.includes('information_schema.tables')) {
             return {
@@ -1658,7 +1708,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.ok(fkQuery && fkQuery.includes('rc.unique_constraint_schema = ccu.constraint_schema'));
 
       const catalogQuery = queries.find(q => q.includes('pg_constraint'));
-      assert.ok(catalogQuery && catalogQuery.includes('n.nspname = current_schema()'));
+      assert.ok(catalogQuery && (catalogQuery.includes('src_ns.nspname = current_schema()') || catalogQuery.includes('nspname = current_schema()')));
     });
 
     test('[Mock Unit Test] 21. checkMigrationStatus strictly scopes schema_migrations check to current_schema()', async () => {
@@ -1885,6 +1935,193 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.ok(verified.includes('action_items(workspace_id, product_id) -> products(workspace_id, id)'));
       assert.ok(verified.includes('products(workspace_id) -> workspaces(id)'));
       assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 27. checkSchemaReadiness rejects foreign key when source column order is reversed', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_schema: 'public',
+            source_table: 'stores',
+            target_schema: '',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'workspace_id,id',
+            target_columns: '',
+          },
+          {
+            source_schema: 'public',
+            source_table: 'products',
+            target_schema: 'public',
+            target_table: 'stores',
+            constraint_name: 'fk_products_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'store_id,workspace_id', // REVERSED source column order!
+            target_columns: 'workspace_id,id',
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /missing required composite foreign key constraint: products\(workspace_id, store_id\) -> stores\(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 28. checkSchemaReadiness rejects foreign key when target column order is reversed', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_schema: 'public',
+            source_table: 'stores',
+            target_schema: '',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'workspace_id,id',
+            target_columns: '',
+          },
+          {
+            source_schema: 'public',
+            source_table: 'products',
+            target_schema: 'public',
+            target_table: 'stores',
+            constraint_name: 'fk_products_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,store_id',
+            target_columns: 'id,workspace_id', // REVERSED target column order!
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /missing required composite foreign key constraint: products\(workspace_id, store_id\) -> stores\(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 29. checkSchemaReadiness rejects foreign key pointing to same-named table in wrong schema', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_schema: 'public',
+            source_table: 'stores',
+            target_schema: '',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'workspace_id,id',
+            target_columns: '',
+          },
+          {
+            source_schema: 'public',
+            source_table: 'products',
+            target_schema: 'analytics_schema', // WRONG target schema!
+            target_table: 'stores',
+            constraint_name: 'fk_products_store_workspace',
+            constraint_type: 'f',
+            source_columns: 'workspace_id,store_id',
+            target_columns: 'workspace_id,id',
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /missing required composite foreign key constraint: products\(workspace_id, store_id\) -> stores\(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 30. checkSchemaReadiness rejects constraint when source table is in unexpected schema', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_schema: 'staging_schema', // WRONG source schema!
+            source_table: 'stores',
+            target_schema: '',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'workspace_id,id',
+            target_columns: '',
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /stores table missing unique key on \(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 31. stores(workspace_id, id) unique key is rejected if actual ordered definition is reversed (id, workspace_id)', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        catalogConstraints: [
+          {
+            source_schema: 'public',
+            source_table: 'stores',
+            target_schema: '',
+            target_table: '',
+            constraint_name: 'uq_stores_workspace_id',
+            constraint_type: 'u',
+            source_columns: 'id,workspace_id', // REVERSED ordered unique definition!
+            target_columns: '',
+          },
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /stores table missing unique key on \(workspace_id, id\)/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 32. products(workspace_id) -> workspaces(id) is rejected if referenced table is in wrong schema', async () => {
+      const wrongSchemaFk = [
+        {
+          source_schema: 'public',
+          source_table: 'products',
+          source_column: 'workspace_id',
+          target_schema: 'other_tenant_schema', // WRONG target schema!
+          target_table: 'workspaces',
+          target_column: 'id',
+          on_delete: 'CASCADE',
+        },
+      ];
+      const { repo, getReleaseCalled } = createMockPostgresPool({ columnRows: validColumns, fkRows: wrongSchemaFk });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.match(res.error!, /products\(workspace_id\) foreign key references target schema "other_tenant_schema", expected active schema "public"/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 33. checkSchemaReadiness succeeds in custom active schema when constraints match that active schema', async () => {
+      const customSchema = 'tenant_prod_app';
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        currentSchema: customSchema,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, true);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 34. Migration 002 SQL source contains strict constraint definition verification and IS DISTINCT FROM guards', () => {
+      const migrationPath = path.resolve(__dirname, 'db/migrations/002_tenant_referential_integrity.sql');
+      const content = fs.readFileSync(migrationPath, 'utf-8');
+
+      assert.ok(content.includes('IS DISTINCT FROM'), 'Migration 002 must use IS DISTINCT FROM to prevent NULL logic bypass');
+      assert.ok(content.includes('[AIXSHOP Migration 002 Error] Incompatible constraint "uq_stores_workspace_id" already exists'), 'Must raise explicit error on incompatible unique constraint');
+      assert.ok(content.includes('[AIXSHOP Migration 002 Error] Incompatible foreign key "fk_products_store_workspace" already exists'), 'Must raise explicit error on incompatible foreign key');
+      assert.ok(content.includes('ARRAY[\'workspace_id\', \'id\']'), 'Must validate exact array column order');
+      assert.ok(!content.includes('OR n.nspname = \'public\''), 'Must not leak schema checks into public');
     });
   });
 
