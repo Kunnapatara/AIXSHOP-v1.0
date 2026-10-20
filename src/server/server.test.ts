@@ -466,6 +466,108 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const varA = catA?.products[0].variants[0];
       assert.equal(varA?.price, 49.99);
     });
+
+    test('User B attempting to recheck User A action is rejected with 404 (anti-cross-tenant)', async () => {
+      const res = await fetch(`${baseUrl}/api/catalog/actions/act_a_01/recheck`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      });
+      assert.equal(res.status, 404);
+      const data = await res.json();
+      assert.equal(data.code, 'ACTION_NOT_FOUND');
+    });
+
+    test('User B sending payload with workspaceId of User A in PUT /api/catalog does NOT overwrite User A', async () => {
+      const res = await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            workspaceId: workspaceIdA, // Malicious spoofing attempt
+            storeId: `store_${workspaceIdA}`,
+            products: [
+              {
+                id: 'prod_malicious',
+                title: 'Malicious Injected Product',
+                brand: 'Hacker',
+                category: 'Spoofed',
+                description: 'Attempt to pollute Tenant A',
+                image: '',
+                status: 'active',
+                completenessScore: 10,
+                evidenceCoverageScore: 10,
+                externalDiscoveryStatus: 'unindexed',
+                attributes: {},
+                variants: [],
+                offers: [],
+                evidenceDocuments: [],
+                findingsCount: 0,
+                lastAudited: '2026-10-20',
+              },
+            ],
+            variants: [],
+            offers: [],
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: {
+              name: 'Spoofed Store',
+              domain: 'spoofed.myshopify.com',
+              currency: 'USD',
+              skuCount: 1,
+              catalogCompletenessAvg: 10,
+              truthBoundaryStrictness: 'standard',
+              tier: 'Free Audit',
+              connectors: [],
+            },
+          },
+        }),
+      });
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.workspaceId, workspaceIdB, 'Server must enforce session workspaceId, ignoring body workspaceId');
+
+      // Verify User A data is untouched and unaffected
+      const catA = await repo.loadWorkspaceCatalog(workspaceIdA);
+      assert.equal(catA?.products.some(p => p.id === 'prod_malicious'), false, 'User A catalog must not be polluted');
+
+      // Verify User B data was saved under User B workspace
+      const catB = await repo.loadWorkspaceCatalog(workspaceIdB);
+      assert.equal(catB?.products.some(p => p.id === 'prod_malicious'), true, 'Saved under User B workspace');
+    });
+
+    test('User B importing catalog cannot affect or pollute User A workspace', async () => {
+      const res = await fetch(`${baseUrl}/api/catalog/import`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          candidates: [
+            {
+              id: 'imported_b_01',
+              title: 'User B Imported Item',
+              brand: 'Brand B',
+              category: 'Import',
+              variants: [{ sku: 'SKU-B-IMP', price: 29.99 }],
+            },
+          ],
+        }),
+      });
+      assert.equal(res.status, 200);
+
+      const catA = await repo.loadWorkspaceCatalog(workspaceIdA);
+      assert.equal(catA?.products.some(p => p.id === 'imported_b_01'), false, 'User A catalog remains isolated');
+    });
   });
 
   // 4. Invalid Request Payloads & Atomic Rollback
@@ -811,6 +913,30 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       // No destructive DROP TABLE commands
       assert.doesNotMatch(sqlContent, /DROP TABLE/i);
     });
+
+    test('002_tenant_referential_integrity.sql exists and contains composite foreign key constraints across stores, products, findings, and actions', () => {
+      const migrationPath = path.resolve(process.cwd(), 'src/server/db/migrations/002_tenant_referential_integrity.sql');
+      assert.equal(fs.existsSync(migrationPath), true, '002_tenant_referential_integrity.sql must exist');
+
+      const sqlContent = fs.readFileSync(migrationPath, 'utf-8');
+      // Must contain candidate key on stores
+      assert.match(sqlContent, /uq_stores_workspace_id\s+UNIQUE\s*\(workspace_id,\s*id\)/i);
+      // Must contain composite foreign key on products -> stores
+      assert.match(sqlContent, /fk_products_store_workspace[\s\S]*?FOREIGN KEY\s*\(workspace_id,\s*store_id\)[\s\S]*?REFERENCES stores\s*\(workspace_id,\s*id\)/i);
+      // Must contain composite foreign key on findings -> stores
+      assert.match(sqlContent, /fk_findings_store_workspace[\s\S]*?FOREIGN KEY\s*\(workspace_id,\s*store_id\)[\s\S]*?REFERENCES stores\s*\(workspace_id,\s*id\)/i);
+      // Must contain composite foreign key on findings -> products
+      assert.match(sqlContent, /fk_findings_product_workspace[\s\S]*?FOREIGN KEY\s*\(workspace_id,\s*product_id\)[\s\S]*?REFERENCES products\s*\(workspace_id,\s*id\)/i);
+      // Must contain composite foreign key on action_items -> stores
+      assert.match(sqlContent, /fk_action_items_store_workspace[\s\S]*?FOREIGN KEY\s*\(workspace_id,\s*store_id\)[\s\S]*?REFERENCES stores\s*\(workspace_id,\s*id\)/i);
+      // Must contain composite foreign key on action_items -> findings
+      assert.match(sqlContent, /fk_action_items_finding_workspace[\s\S]*?FOREIGN KEY\s*\(workspace_id,\s*finding_id\)[\s\S]*?REFERENCES findings\s*\(workspace_id,\s*id\)/i);
+      // Must contain composite foreign key on action_items -> products
+      assert.match(sqlContent, /fk_action_items_product_workspace[\s\S]*?FOREIGN KEY\s*\(workspace_id,\s*product_id\)[\s\S]*?REFERENCES products\s*\(workspace_id,\s*id\)/i);
+      // Non-destructive: no DROP TABLE or TRUNCATE
+      assert.doesNotMatch(sqlContent, /DROP TABLE/i);
+      assert.doesNotMatch(sqlContent, /TRUNCATE/i);
+    });
   });
 
   // 7. Migration Runner Resource Cleanup & Error Handling (Task 1 & Task 4)
@@ -1049,7 +1175,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: [{ exists: true }] };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: [{ id: '001_initial_schema.sql' }] };
+            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }] };
           }
           return { rows: [] };
         },
@@ -1058,7 +1184,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const status = await checkMigrationStatus(pool);
       assert.equal(status.isUpToDate, true);
       assert.equal(status.pendingCount, 0);
-      assert.equal(status.appliedCount, 1);
+      assert.equal(status.appliedCount, 2);
 
       const queries = getExecutedQueries();
       assert.ok(!queries.some((q) => q.includes('BEGIN') || q.includes('INSERT') || q.includes('CREATE')), 'Must be strictly read-only');
