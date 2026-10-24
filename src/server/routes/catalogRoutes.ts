@@ -8,6 +8,12 @@ import {
   initialFindings, 
   initialActionItems 
 } from '../../data/mockData';
+import {
+  calculateImportUsage,
+  checkPlanQuota,
+  countCatalogSkus,
+  withWorkspaceLock
+} from '../services/entitlementService';
 
 export function createCatalogRoutes(repo: DatabaseRepository): Router {
   const router = Router();
@@ -60,6 +66,31 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
 
       if (!payload || !Array.isArray(payload.products) || !Array.isArray(payload.actions)) {
         return res.status(400).json({ error: 'Invalid catalog payload format' });
+      }
+
+      // Enforce authoritative plan quota on full catalog payload
+      const store = await repo.getStoreByWorkspace(workspaceId);
+      const proposedSkus = countCatalogSkus(payload.products);
+      const quotaCheck = checkPlanQuota(store, [], proposedSkus);
+      if (!quotaCheck.allowed) {
+        return res.status(403).json({
+          error: quotaCheck.error,
+          code: 'PLAN_QUOTA_EXCEEDED',
+          limit: quotaCheck.limit,
+          currentUsage: 0,
+          additionalUsage: proposedSkus,
+          projectedUsage: proposedSkus,
+          tier: quotaCheck.tier,
+        });
+      }
+
+      // Never trust client-supplied tier or skuLimit in payload.storeProfile
+      if (store && payload.storeProfile) {
+        payload.storeProfile = {
+          ...payload.storeProfile,
+          tier: store.tier,
+          skuLimit: store.skuLimit,
+        };
       }
 
       // Never trust user-supplied storeId or workspaceId in body; derive from server session
@@ -172,11 +203,36 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Invalid candidates array' });
       }
 
-      const result = await repo.importCatalog(workspaceId, candidates);
+      // Serialize concurrent import requests per workspace to prevent quota race conditions
+      return await withWorkspaceLock(workspaceId, async () => {
+        // Authoritative server-side store & catalog resolution (ignoring any client-supplied body params)
+        const store = await repo.getStoreByWorkspace(workspaceId);
+        const catalog = await repo.loadWorkspaceCatalog(workspaceId);
+        const existingProducts = catalog?.products || [];
 
-      return res.json({
-        success: true,
-        result,
+        // Deduplicate and calculate additional usage according to domain rules
+        const { additionalSkus } = calculateImportUsage(candidates, existingProducts);
+
+        // Authoritative server-side quota validation
+        const quotaCheck = checkPlanQuota(store, existingProducts, additionalSkus);
+        if (!quotaCheck.allowed) {
+          return res.status(403).json({
+            error: quotaCheck.error,
+            code: 'PLAN_QUOTA_EXCEEDED',
+            limit: quotaCheck.limit,
+            currentUsage: quotaCheck.currentUsage,
+            additionalUsage: quotaCheck.additionalUsage,
+            projectedUsage: quotaCheck.projectedUsage,
+            tier: quotaCheck.tier,
+          });
+        }
+
+        const result = await repo.importCatalog(workspaceId, candidates);
+
+        return res.json({
+          success: true,
+          result,
+        });
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Catalog import error:', err);
@@ -200,6 +256,20 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         tier: 'Free Audit' as const,
         connectors: [],
       };
+
+      const demoSkus = countCatalogSkus(initialProducts);
+      const quotaCheck = checkPlanQuota(currentStore, [], demoSkus);
+      if (!quotaCheck.allowed) {
+        return res.status(403).json({
+          error: quotaCheck.error,
+          code: 'PLAN_QUOTA_EXCEEDED',
+          limit: quotaCheck.limit,
+          currentUsage: 0,
+          additionalUsage: demoSkus,
+          projectedUsage: demoSkus,
+          tier: quotaCheck.tier,
+        });
+      }
 
       const demoPayload: StoragePayloadV1 = {
         products: JSON.parse(JSON.stringify(initialProducts)),

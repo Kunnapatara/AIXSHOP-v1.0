@@ -28,6 +28,7 @@ import {
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
+import { calculateImportUsage, checkPlanQuota } from '../services/entitlementService';
 
 export class PostgresRepository implements DatabaseRepository {
   private pool: Pool;
@@ -1234,6 +1235,13 @@ export class PostgresRepository implements DatabaseRepository {
   ): Promise<CatalogImportResult> {
     const catalog = await this.loadWorkspaceCatalog(workspaceId);
     if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+
+    const store = await this.getStoreByWorkspace(workspaceId);
+    const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
+    const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
+    if (!quotaCheck.allowed) {
+      throw new Error(quotaCheck.error || 'Plan quota exceeded');
+    }
 
     const importRes = executeCatalogImport(candidates, {
       products: catalog.products,

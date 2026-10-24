@@ -29,7 +29,12 @@ export function createStoreRoutes(repo: DatabaseRepository): Router {
   router.put('/profile', requireAuth, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const updates = req.body || {};
+      const rawUpdates = req.body || {};
+      const updates = { ...rawUpdates };
+      // Authoritative security boundary: never allow client requests to mutate plan tier or SKU limits
+      delete updates.tier;
+      delete updates.skuLimit;
+      delete updates.skuCount;
 
       const currentStore = await repo.getStoreByWorkspace(workspaceId);
       if (!currentStore) {

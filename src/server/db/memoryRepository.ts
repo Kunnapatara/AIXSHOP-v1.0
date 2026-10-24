@@ -38,6 +38,7 @@ import {
   executeActionRecheck, 
   executeCatalogImport 
 } from '../../domain/catalog/catalogMutationService';
+import { calculateImportUsage, checkPlanQuota } from '../services/entitlementService';
 
 export class MemoryRepository implements DatabaseRepository {
   private users: Map<string, UserRecord> = new Map();
@@ -152,6 +153,7 @@ export class MemoryRepository implements DatabaseRepository {
       domain: `${workspace.slug}.myshopify.com`,
       currency: 'USD',
       skuCount: 0,
+      skuLimit: 2500,
       catalogCompletenessAvg: 0,
       truthBoundaryStrictness: 'standard',
       tier: 'Free Audit',
@@ -183,12 +185,20 @@ export class MemoryRepository implements DatabaseRepository {
       userAgent: data.session.userAgent,
     };
 
-    // Atomic commit to state
     this.users.set(user.id, user);
     this.workspaces.set(workspace.id, workspace);
     this.memberships.set(memId, membership);
     this.stores.set(workspace.id, store);
     this.sessions.set(session.sessionTokenHash, session);
+    this.catalogs.set(workspace.id, {
+      products: [],
+      variants: [],
+      offers: [],
+      findings: [],
+      actions: [],
+      evidence: [],
+      storeProfile: store,
+    });
 
     return { user, workspace, membership, session };
   }
@@ -296,6 +306,7 @@ export class MemoryRepository implements DatabaseRepository {
       domain: `${workspace.slug}.myshopify.com`,
       currency: 'USD',
       skuCount: 0,
+      skuLimit: 2500,
       catalogCompletenessAvg: 0,
       truthBoundaryStrictness: 'standard',
       tier: 'Free Audit',
@@ -419,7 +430,21 @@ export class MemoryRepository implements DatabaseRepository {
 
   async loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null> {
     const cat = this.catalogs.get(workspaceId);
-    if (!cat) return null;
+    if (!cat) {
+      const store = this.stores.get(workspaceId);
+      if (!store || !this.workspaces.has(workspaceId)) return null;
+      const initialCatalog: StoragePayloadV1 = {
+        products: [],
+        variants: [],
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+        storeProfile: store,
+      };
+      this.catalogs.set(workspaceId, initialCatalog);
+      return JSON.parse(JSON.stringify(initialCatalog));
+    }
     // Return deep clone
     return JSON.parse(JSON.stringify(cat));
   }
@@ -530,6 +555,13 @@ export class MemoryRepository implements DatabaseRepository {
   ): Promise<CatalogImportResult> {
     const catalog = await this.loadWorkspaceCatalog(workspaceId);
     if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+
+    const store = await this.getStoreByWorkspace(workspaceId);
+    const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
+    const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
+    if (!quotaCheck.allowed) {
+      throw new Error(quotaCheck.error || 'Plan quota exceeded');
+    }
 
     const importRes = executeCatalogImport(candidates, {
       products: catalog.products,
