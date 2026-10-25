@@ -68,39 +68,41 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Invalid catalog payload format' });
       }
 
-      // Enforce authoritative plan quota on full catalog payload
-      const store = await repo.getStoreByWorkspace(workspaceId);
-      const proposedSkus = countCatalogSkus(payload.products);
-      const quotaCheck = checkPlanQuota(store, [], proposedSkus);
-      if (!quotaCheck.allowed) {
-        return res.status(403).json({
-          error: quotaCheck.error,
-          code: 'PLAN_QUOTA_EXCEEDED',
-          limit: quotaCheck.limit,
-          currentUsage: 0,
-          additionalUsage: proposedSkus,
-          projectedUsage: proposedSkus,
-          tier: quotaCheck.tier,
+      return await withWorkspaceLock(workspaceId, async () => {
+        // Enforce authoritative plan quota on full catalog payload
+        const store = await repo.getStoreByWorkspace(workspaceId);
+        const proposedSkus = countCatalogSkus(payload.products);
+        const quotaCheck = checkPlanQuota(store, [], proposedSkus);
+        if (!quotaCheck.allowed) {
+          return res.status(403).json({
+            error: quotaCheck.error,
+            code: 'PLAN_QUOTA_EXCEEDED',
+            limit: quotaCheck.limit,
+            currentUsage: 0,
+            additionalUsage: proposedSkus,
+            projectedUsage: proposedSkus,
+            tier: quotaCheck.tier,
+          });
+        }
+
+        // Never trust client-supplied tier or skuLimit in payload.storeProfile
+        if (store && payload.storeProfile) {
+          payload.storeProfile = {
+            ...payload.storeProfile,
+            tier: store.tier,
+            skuLimit: store.skuLimit,
+          };
+        }
+
+        // Never trust user-supplied storeId or workspaceId in body; derive from server session
+        await repo.saveWorkspaceCatalog(workspaceId, payload);
+
+        return res.json({
+          success: true,
+          workspaceId,
+          skuCount: payload.products.length,
+          timestamp: new Date().toISOString(),
         });
-      }
-
-      // Never trust client-supplied tier or skuLimit in payload.storeProfile
-      if (store && payload.storeProfile) {
-        payload.storeProfile = {
-          ...payload.storeProfile,
-          tier: store.tier,
-          skuLimit: store.skuLimit,
-        };
-      }
-
-      // Never trust user-supplied storeId or workspaceId in body; derive from server session
-      await repo.saveWorkspaceCatalog(workspaceId, payload);
-
-      return res.json({
-        success: true,
-        workspaceId,
-        skuCount: payload.products.length,
-        timestamp: new Date().toISOString(),
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Failed to save catalog:', err);
@@ -244,52 +246,55 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   router.post('/migrate-demo', requireAuth, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const currentStore = await repo.getStoreByWorkspace(workspaceId);
 
-      const storeProfile = currentStore || {
-        name: `${req.workspace!.name} Store`,
-        domain: `${req.workspace!.slug}.myshopify.com`,
-        currency: 'USD',
-        skuCount: initialProducts.length,
-        catalogCompletenessAvg: 88,
-        truthBoundaryStrictness: 'standard' as const,
-        tier: 'Free Audit' as const,
-        connectors: [],
-      };
+      return await withWorkspaceLock(workspaceId, async () => {
+        const currentStore = await repo.getStoreByWorkspace(workspaceId);
 
-      const demoSkus = countCatalogSkus(initialProducts);
-      const quotaCheck = checkPlanQuota(currentStore, [], demoSkus);
-      if (!quotaCheck.allowed) {
-        return res.status(403).json({
-          error: quotaCheck.error,
-          code: 'PLAN_QUOTA_EXCEEDED',
-          limit: quotaCheck.limit,
-          currentUsage: 0,
-          additionalUsage: demoSkus,
-          projectedUsage: demoSkus,
-          tier: quotaCheck.tier,
-        });
-      }
-
-      const demoPayload: StoragePayloadV1 = {
-        products: JSON.parse(JSON.stringify(initialProducts)),
-        variants: initialProducts.flatMap(p => p.variants || []),
-        offers: initialProducts.flatMap(p => p.offers || []),
-        findings: JSON.parse(JSON.stringify(initialFindings)),
-        actions: JSON.parse(JSON.stringify(initialActionItems)),
-        evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
-        storeProfile: {
-          ...storeProfile,
+        const storeProfile = currentStore || {
+          name: `${req.workspace!.name} Store`,
+          domain: `${req.workspace!.slug}.myshopify.com`,
+          currency: 'USD',
           skuCount: initialProducts.length,
-        },
-      };
+          catalogCompletenessAvg: 88,
+          truthBoundaryStrictness: 'standard' as const,
+          tier: 'Free Audit' as const,
+          connectors: [],
+        };
 
-      await repo.saveWorkspaceCatalog(workspaceId, demoPayload);
+        const demoSkus = countCatalogSkus(initialProducts);
+        const quotaCheck = checkPlanQuota(currentStore, [], demoSkus);
+        if (!quotaCheck.allowed) {
+          return res.status(403).json({
+            error: quotaCheck.error,
+            code: 'PLAN_QUOTA_EXCEEDED',
+            limit: quotaCheck.limit,
+            currentUsage: 0,
+            additionalUsage: demoSkus,
+            projectedUsage: demoSkus,
+            tier: quotaCheck.tier,
+          });
+        }
 
-      return res.json({
-        success: true,
-        message: 'Demo catalog successfully imported to cloud workspace',
-        skuCount: initialProducts.length,
+        const demoPayload: StoragePayloadV1 = {
+          products: JSON.parse(JSON.stringify(initialProducts)),
+          variants: initialProducts.flatMap(p => p.variants || []),
+          offers: initialProducts.flatMap(p => p.offers || []),
+          findings: JSON.parse(JSON.stringify(initialFindings)),
+          actions: JSON.parse(JSON.stringify(initialActionItems)),
+          evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
+          storeProfile: {
+            ...storeProfile,
+            skuCount: initialProducts.length,
+          },
+        };
+
+        await repo.saveWorkspaceCatalog(workspaceId, demoPayload);
+
+        return res.json({
+          success: true,
+          message: 'Demo catalog successfully imported to cloud workspace',
+          skuCount: initialProducts.length,
+        });
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Demo migration error:', err);

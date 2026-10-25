@@ -1178,7 +1178,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: [{ exists: true }] };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }] };
+            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }, { id: '003_store_sku_limit.sql' }] };
           }
           return { rows: [] };
         },
@@ -1187,7 +1187,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const status = await checkMigrationStatus(pool);
       assert.equal(status.isUpToDate, true);
       assert.equal(status.pendingCount, 0);
-      assert.equal(status.appliedCount, 2);
+      assert.equal(status.appliedCount, 3);
 
       const queries = getExecutedQueries();
       assert.ok(!queries.some((q) => q.includes('BEGIN') || q.includes('INSERT') || q.includes('CREATE')), 'Must be strictly read-only');
@@ -1720,7 +1720,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: [{ exists: true }] };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }] };
+            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }, { id: '003_store_sku_limit.sql' }] };
           }
           return { rows: [] };
         },
@@ -1733,7 +1733,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
       const status = await checkMigrationStatus(mockPool as unknown as Pool);
       assert.equal(status.isUpToDate, true);
-      assert.equal(status.appliedCount, 2);
+      assert.equal(status.appliedCount, 3);
 
       const tableCheckQuery = executedQueries.find(q => q.includes('information_schema.tables'));
       assert.ok(tableCheckQuery, 'Must query information_schema.tables');

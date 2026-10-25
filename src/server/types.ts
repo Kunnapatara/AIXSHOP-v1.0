@@ -56,6 +56,7 @@ export interface StoreRecord {
   domain: string;
   currency: string;
   skuCount: number;
+  skuLimit?: number | null;
   catalogCompletenessAvg: number;
   truthBoundaryStrictness: 'conservative' | 'balanced' | 'permissive';
   tier: 'Free Audit' | 'Growth' | 'Enterprise';

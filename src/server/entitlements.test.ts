@@ -8,7 +8,8 @@ import {
   countCatalogSkus, 
   calculateImportUsage, 
   checkPlanQuota, 
-  resolveWorkspacePlanEntitlement 
+  resolveWorkspacePlanEntitlement,
+  getActiveWorkspaceLockCount
 } from './services/entitlementService';
 
 describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suite', () => {
@@ -602,6 +603,71 @@ describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suit
       // Final catalog count must not exceed 3
       const finalCatalogB = await repo.loadWorkspaceCatalog(workspaceIdB);
       assert.equal(finalCatalogB?.products.length, 2, 'Catalog must contain exactly 2 SKUs and never exceed limit 3');
+    });
+
+    test('13. Cross-endpoint concurrency: POST /api/catalog/import racing with PUT /api/catalog participates in the same serialization and enforces quota', async () => {
+      // Set Workspace B limit to 3 SKUs
+      const storeB = await repo.getStoreByWorkspace(workspaceIdB);
+      assert.ok(storeB);
+      await repo.saveStoreProfile(workspaceIdB, {
+        ...storeB,
+        skuLimit: 3,
+      });
+
+      // Clear Workspace B catalog so currentUsage = 0
+      const catalogB = await repo.loadWorkspaceCatalog(workspaceIdB);
+      assert.ok(catalogB);
+      await repo.saveWorkspaceCatalog(workspaceIdB, {
+        ...catalogB,
+        products: [],
+      });
+
+      // Launch simultaneous POST /import (2 SKUs) and PUT /catalog (2 SKUs) -> combined 4 > 3
+      const reqImport = fetch(`${baseUrl}/api/catalog/import`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenUserB}`,
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          candidates: [
+            buildCandidateProduct('cross_batch_imp1', ['SKU-XB-1']),
+            buildCandidateProduct('cross_batch_imp2', ['SKU-XB-2']),
+          ],
+        }),
+      });
+
+      const reqPut = fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${tokenUserB}`,
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            ...catalogB,
+            products: [
+              buildCandidateProduct('cross_batch_put1', ['SKU-XP-1']),
+              buildCandidateProduct('cross_batch_put2', ['SKU-XP-2']),
+            ],
+          },
+        }),
+      });
+
+      const [resImp, resPut] = await Promise.all([reqImport, reqPut]);
+      const statuses = [resImp.status, resPut.status].sort();
+
+      // Serialization ensures they do not race to exceed quota
+      assert.ok(statuses.includes(200));
+
+      const finalCatalog = await repo.loadWorkspaceCatalog(workspaceIdB);
+      assert.ok((finalCatalog?.products.length || 0) <= 3, 'Catalog must not exceed workspace limit 3');
+    });
+
+    test('14. Workspace lock cleanup ensures no lingering lock entries in memory', async () => {
+      assert.equal(getActiveWorkspaceLockCount(), 0, 'Workspace locks map must be clean and empty after operations finish');
     });
   });
 });

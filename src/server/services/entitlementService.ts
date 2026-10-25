@@ -20,10 +20,33 @@ export interface QuotaCheckResult {
   error?: string;
 }
 
+export const VERIFIED_TIERS = {
+  STARTER: 'Starter',
+  GROWTH: 'Growth',
+  ENTERPRISE: 'Enterprise',
+  FREE_AUDIT: 'Free Audit',
+} as const;
+
+export const DEFAULT_TIER_LIMITS: Readonly<Record<string, number>> = {
+  'starter': 250,
+  'starter tier': 250,
+  'growth': 2500,
+  'growth tier': 2500,
+  'enterprise': Infinity,
+  'enterprise tier': Infinity,
+  'free audit': 2500,
+};
+
+/**
+ * Legacy hardcoded default that previously leaked from PostgreSQL repository.
+ * Must never accidentally override Starter (to 2500) or cap Enterprise (to 2500).
+ */
+const LEGACY_STALE_DEFAULT_SKU_LIMIT = 2500;
+
 /**
  * Resolves the effective plan and applicable SKU limits from trusted server-side data.
  * Does not trust any client-supplied request fields.
- * Fails safely if store data is missing, corrupted, or invalid.
+ * Validates whole-number limits and fails safely if store data is missing, corrupted, or invalid.
  */
 export function resolveWorkspacePlanEntitlement(
   storeProfile: StoreProfile | null | undefined
@@ -39,46 +62,38 @@ export function resolveWorkspacePlanEntitlement(
   }
 
   const rawTier = (storeProfile.tier || '').trim();
+  const normTier = (rawTier || 'Free Audit').toLowerCase();
 
-  // If explicit numeric skuLimit is defined on the server store profile
-  if (typeof storeProfile.skuLimit === 'number' && !isNaN(storeProfile.skuLimit)) {
-    if (storeProfile.skuLimit < 0) {
+  // Validate numeric limit integrity if specified
+  const hasRawLimit = storeProfile.skuLimit !== undefined && storeProfile.skuLimit !== null;
+  if (hasRawLimit) {
+    const rawVal = storeProfile.skuLimit;
+    if (
+      typeof rawVal !== 'number' ||
+      isNaN(rawVal) ||
+      !Number.isInteger(rawVal) ||
+      rawVal < 0
+    ) {
       return {
         isValid: false,
         tier: rawTier || 'Unknown',
         skuLimit: 0,
         isUnlimited: false,
-        error: 'Invalid negative SKU quota configured on workspace.',
+        error: 'Invalid whole-number SKU quota configured on workspace.',
       };
     }
+  }
 
-    if (rawTier === 'Enterprise' || rawTier === 'Enterprise Tier') {
-      if (storeProfile.skuLimit === 0) {
-        return {
-          isValid: true,
-          tier: 'Enterprise',
-          skuLimit: Infinity,
-          isUnlimited: true,
-        };
-      }
+  // 1. Enterprise Tier (Must be genuinely unlimited unless an explicit non-stale contracted quota is set)
+  if (normTier === 'enterprise' || normTier === 'enterprise tier') {
+    if (hasRawLimit && storeProfile.skuLimit !== LEGACY_STALE_DEFAULT_SKU_LIMIT && storeProfile.skuLimit! > 0) {
       return {
         isValid: true,
         tier: 'Enterprise',
-        skuLimit: storeProfile.skuLimit,
+        skuLimit: storeProfile.skuLimit!,
         isUnlimited: false,
       };
     }
-
-    return {
-      isValid: true,
-      tier: rawTier || 'Free Audit',
-      skuLimit: storeProfile.skuLimit,
-      isUnlimited: false,
-    };
-  }
-
-  // Authoritative plan fallbacks based on existing tier definitions in codebase
-  if (rawTier === 'Enterprise' || rawTier === 'Enterprise Tier') {
     return {
       isValid: true,
       tier: 'Enterprise',
@@ -87,38 +102,58 @@ export function resolveWorkspacePlanEntitlement(
     };
   }
 
-  if (rawTier === 'Starter' || rawTier === 'Starter Tier') {
+  // 2. Starter Tier (Must never receive 2500 from legacy stale default)
+  if (normTier === 'starter' || normTier === 'starter tier') {
+    if (hasRawLimit && storeProfile.skuLimit !== LEGACY_STALE_DEFAULT_SKU_LIMIT) {
+      return {
+        isValid: true,
+        tier: 'Starter',
+        skuLimit: storeProfile.skuLimit!,
+        isUnlimited: false,
+      };
+    }
     return {
       isValid: true,
       tier: 'Starter',
-      skuLimit: 250,
+      skuLimit: DEFAULT_TIER_LIMITS['starter'],
       isUnlimited: false,
     };
   }
 
-  if (rawTier === 'Growth' || rawTier === 'Growth Tier') {
+  // 3. Growth Tier
+  if (normTier === 'growth' || normTier === 'growth tier') {
     return {
       isValid: true,
       tier: 'Growth',
-      skuLimit: 2500,
+      skuLimit: hasRawLimit ? storeProfile.skuLimit! : DEFAULT_TIER_LIMITS['growth'],
       isUnlimited: false,
     };
   }
 
-  if (rawTier === 'Free Audit' || rawTier === '') {
-    // Default baseline for newly initialized workspaces (matches postgresRepository baseline)
+  // 4. Free Audit
+  if (normTier === 'free audit' || normTier === '') {
     return {
       isValid: true,
       tier: 'Free Audit',
-      skuLimit: 2500,
+      skuLimit: hasRawLimit ? storeProfile.skuLimit! : DEFAULT_TIER_LIMITS['free audit'],
       isUnlimited: false,
     };
   }
 
-  // Unrecognized tier without explicit skuLimit fails safely
+  // 5. Custom/unrecognized tier with explicit valid SKU limit is honored
+  if (hasRawLimit && storeProfile.skuLimit !== LEGACY_STALE_DEFAULT_SKU_LIMIT) {
+    return {
+      isValid: true,
+      tier: rawTier || 'Custom',
+      skuLimit: storeProfile.skuLimit!,
+      isUnlimited: false,
+    };
+  }
+
+  // 6. Unrecognized tier fails safely if no authoritative limit exists
   return {
     isValid: false,
-    tier: rawTier,
+    tier: rawTier || 'Unknown',
     skuLimit: 0,
     isUnlimited: false,
     error: `Unrecognized plan tier "${rawTier}" with no authoritative SKU limit.`,
@@ -231,29 +266,36 @@ export function checkPlanQuota(
 
 /**
  * In-process asynchronous mutex per workspace to serialize simultaneous import/catalog
- * operations and eliminate concurrent quota race conditions.
+ * operations and eliminate concurrent quota race conditions across endpoints.
+ * Includes complete cleanup of completed promise chains to prevent memory leaks.
  */
 const workspaceLocks = new Map<string, Promise<unknown>>();
 
 export async function withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
-  const currentLock = workspaceLocks.get(workspaceId) || Promise.resolve();
-  let release: () => void;
-  const newLock = new Promise<void>((resolve) => {
-    release = resolve;
+  const prevLock = workspaceLocks.get(workspaceId) || Promise.resolve();
+
+  let releaseCurrent: () => void;
+  const currentTurnPromise = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
   });
 
-  workspaceLocks.set(
-    workspaceId,
-    currentLock.then(() => newLock, () => newLock)
-  );
+  const chainTail = prevLock.catch(() => {}).then(() => currentTurnPromise);
+  workspaceLocks.set(workspaceId, chainTail);
 
   try {
-    await currentLock;
+    await prevLock.catch(() => {});
     return await fn();
   } finally {
-    release!();
-    if (workspaceLocks.get(workspaceId) === newLock) {
+    releaseCurrent!();
+    if (workspaceLocks.get(workspaceId) === chainTail) {
       workspaceLocks.delete(workspaceId);
     }
   }
+}
+
+/**
+ * Test inspection helper to verify workspace lock cleanup
+ */
+export function getActiveWorkspaceLockCount(): number {
+  return workspaceLocks.size;
 }

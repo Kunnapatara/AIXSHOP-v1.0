@@ -720,7 +720,7 @@ export class PostgresRepository implements DatabaseRepository {
 
   async getStoreByWorkspace(workspaceId: string): Promise<StoreProfile | null> {
     const query = `
-      SELECT id, name, domain, currency, sku_count AS "skuCount", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
+      SELECT id, name, domain, currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
       FROM stores
       WHERE workspace_id = $1
       LIMIT 1
@@ -728,12 +728,13 @@ export class PostgresRepository implements DatabaseRepository {
     const res = await this.pool.query(query, [workspaceId]);
     if (!res.rows[0]) return null;
     const r = res.rows[0];
+    const parsedLimit = (typeof r.skuLimit === 'number' && !isNaN(r.skuLimit)) ? r.skuLimit : undefined;
     return {
       name: r.name,
       domain: r.domain,
       platform: 'Shopify Storefront API v2025-01',
       skuCount: r.skuCount,
-      skuLimit: 2500,
+      skuLimit: parsedLimit,
       tier: r.tier,
       lastAuditDate: new Date().toISOString(),
       currency: r.currency,
@@ -746,20 +747,24 @@ export class PostgresRepository implements DatabaseRepository {
 
   async saveStoreProfile(workspaceId: string, profile: StoreProfile): Promise<StoreProfile> {
     const storeId = `store_${workspaceId}`;
+    const cleanSkuLimit = (typeof profile.skuLimit === 'number' && Number.isInteger(profile.skuLimit) && profile.skuLimit >= 0)
+      ? profile.skuLimit
+      : null;
     const query = `
-      INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
+      INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, sku_limit, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW(), NOW())
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         domain = EXCLUDED.domain,
         currency = EXCLUDED.currency,
         sku_count = EXCLUDED.sku_count,
+        sku_limit = EXCLUDED.sku_limit,
         catalog_completeness_avg = EXCLUDED.catalog_completeness_avg,
         truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
         tier = EXCLUDED.tier,
         connectors_json = EXCLUDED.connectors_json,
         updated_at = NOW()
-      RETURNING name, domain, currency, sku_count AS "skuCount", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
+      RETURNING name, domain, currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
     `;
     const res = await this.pool.query(query, [
       storeId,
@@ -768,6 +773,7 @@ export class PostgresRepository implements DatabaseRepository {
       profile.domain,
       profile.currency,
       profile.skuCount,
+      cleanSkuLimit,
       profile.catalogCompletenessAvg,
       profile.truthBoundaryStrictness,
       profile.tier,
@@ -779,7 +785,7 @@ export class PostgresRepository implements DatabaseRepository {
       domain: r.domain,
       platform: profile.platform || 'Shopify Storefront API v2025-01',
       skuCount: r.skuCount,
-      skuLimit: profile.skuLimit || 2500,
+      skuLimit: (typeof r.skuLimit === 'number' && !isNaN(r.skuLimit)) ? r.skuLimit : undefined,
       tier: r.tier,
       lastAuditDate: profile.lastAuditDate || new Date().toISOString(),
       currency: r.currency,
@@ -957,7 +963,10 @@ export class PostgresRepository implements DatabaseRepository {
       await client.query('BEGIN');
       const storeId = `store_${workspaceId}`;
 
-      // Update store profile
+      // Database-level row lock on workspace store to prevent concurrent mutation races
+      await client.query('SELECT id FROM stores WHERE workspace_id = $1 FOR UPDATE', [workspaceId]);
+
+      // Update store profile, preserving server-managed tier and sku_limit
       await client.query(
         `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
@@ -968,7 +977,6 @@ export class PostgresRepository implements DatabaseRepository {
            sku_count = EXCLUDED.sku_count,
            catalog_completeness_avg = EXCLUDED.catalog_completeness_avg,
            truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
-           tier = EXCLUDED.tier,
            connectors_json = EXCLUDED.connectors_json,
            updated_at = NOW()`,
         [

@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS stores (
   catalog_completeness_avg INTEGER NOT NULL DEFAULT 0,
   truth_boundary_strictness VARCHAR(32) NOT NULL DEFAULT 'balanced',
   tier VARCHAR(32) NOT NULL DEFAULT 'Free Audit',
+  sku_limit INTEGER,
   connectors_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
