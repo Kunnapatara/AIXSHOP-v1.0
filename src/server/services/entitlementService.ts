@@ -20,6 +20,26 @@ export interface QuotaCheckResult {
   error?: string;
 }
 
+export class PlanQuotaExceededError extends Error {
+  code = 'PLAN_QUOTA_EXCEEDED';
+  status = 403;
+  limit: number;
+  currentUsage: number;
+  additionalUsage: number;
+  projectedUsage: number;
+  tier: string;
+
+  constructor(quotaCheck: QuotaCheckResult) {
+    super(quotaCheck.error || 'Plan quota exceeded');
+    this.name = 'PlanQuotaExceededError';
+    this.limit = quotaCheck.limit;
+    this.currentUsage = quotaCheck.currentUsage;
+    this.additionalUsage = quotaCheck.additionalUsage;
+    this.projectedUsage = quotaCheck.projectedUsage;
+    this.tier = quotaCheck.tier;
+  }
+}
+
 export const VERIFIED_TIERS = {
   STARTER: 'Starter',
   GROWTH: 'Growth',

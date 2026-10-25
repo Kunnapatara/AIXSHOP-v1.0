@@ -6,7 +6,7 @@ DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns 
-    WHERE table_name = 'stores' AND column_name = 'sku_limit'
+    WHERE table_schema = current_schema() AND table_name = 'stores' AND column_name = 'sku_limit'
   ) THEN
     ALTER TABLE stores ADD COLUMN sku_limit INTEGER;
   END IF;

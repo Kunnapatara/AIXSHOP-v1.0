@@ -105,6 +105,17 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       });
     } catch (err: any) {
+      if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
+        return res.status(403).json({
+          error: err.message,
+          code: 'PLAN_QUOTA_EXCEEDED',
+          limit: err.limit,
+          currentUsage: err.currentUsage,
+          additionalUsage: err.additionalUsage,
+          projectedUsage: err.projectedUsage,
+          tier: err.tier,
+        });
+      }
       console.error('[AIXSHOP Catalog] Failed to save catalog:', err);
       return res.status(500).json({ error: 'Failed to persist workspace catalog' });
     }
@@ -237,6 +248,17 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       });
     } catch (err: any) {
+      if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
+        return res.status(403).json({
+          error: err.message,
+          code: 'PLAN_QUOTA_EXCEEDED',
+          limit: err.limit,
+          currentUsage: err.currentUsage,
+          additionalUsage: err.additionalUsage,
+          projectedUsage: err.projectedUsage,
+          tier: err.tier,
+        });
+      }
       console.error('[AIXSHOP Catalog] Catalog import error:', err);
       return res.status(500).json({ error: err.message || 'Failed to import catalog' });
     }
@@ -297,6 +319,17 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       });
     } catch (err: any) {
+      if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
+        return res.status(403).json({
+          error: err.message,
+          code: 'PLAN_QUOTA_EXCEEDED',
+          limit: err.limit,
+          currentUsage: err.currentUsage,
+          additionalUsage: err.additionalUsage,
+          projectedUsage: err.projectedUsage,
+          tier: err.tier,
+        });
+      }
       console.error('[AIXSHOP Catalog] Demo migration error:', err);
       return res.status(500).json({ error: 'Failed to migrate demo data to workspace' });
     }

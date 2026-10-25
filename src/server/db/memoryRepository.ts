@@ -38,7 +38,12 @@ import {
   executeActionRecheck, 
   executeCatalogImport 
 } from '../../domain/catalog/catalogMutationService';
-import { calculateImportUsage, checkPlanQuota } from '../services/entitlementService';
+import { 
+  calculateImportUsage, 
+  checkPlanQuota, 
+  countCatalogSkus, 
+  PlanQuotaExceededError 
+} from '../services/entitlementService';
 
 export class MemoryRepository implements DatabaseRepository {
   private users: Map<string, UserRecord> = new Map();
@@ -454,8 +459,33 @@ export class MemoryRepository implements DatabaseRepository {
     if (!this.workspaces.has(workspaceId)) {
       throw new Error(`Workspace ${workspaceId} does not exist`);
     }
+
+    const store = this.stores.get(workspaceId);
+    const authoritativeStore: StoreProfile = store || {
+      name: payload.storeProfile?.name || `${workspaceId} Store`,
+      domain: payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
+      currency: payload.storeProfile?.currency || 'USD',
+      skuCount: 0,
+      catalogCompletenessAvg: 0,
+      truthBoundaryStrictness: 'standard',
+      tier: 'Free Audit',
+      connectors: [],
+    };
+
+    const proposedSkus = countCatalogSkus(payload.products);
+    const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
+    if (!quotaCheck.allowed) {
+      throw new PlanQuotaExceededError(quotaCheck);
+    }
+
     this.catalogs.set(workspaceId, JSON.parse(JSON.stringify(payload)));
-    this.stores.set(workspaceId, JSON.parse(JSON.stringify(payload.storeProfile)));
+    this.stores.set(workspaceId, {
+      ...authoritativeStore,
+      ...(payload.storeProfile ? JSON.parse(JSON.stringify(payload.storeProfile)) : {}),
+      tier: authoritativeStore.tier,
+      skuLimit: authoritativeStore.skuLimit,
+      skuCount: payload.products.length,
+    });
   }
 
   async approveAction(
@@ -560,7 +590,7 @@ export class MemoryRepository implements DatabaseRepository {
     const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
     const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
     if (!quotaCheck.allowed) {
-      throw new Error(quotaCheck.error || 'Plan quota exceeded');
+      throw new PlanQuotaExceededError(quotaCheck);
     }
 
     const importRes = executeCatalogImport(candidates, {

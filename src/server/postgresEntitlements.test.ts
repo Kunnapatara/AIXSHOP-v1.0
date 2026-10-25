@@ -213,7 +213,7 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
       assert.ok(executedStatements.some(s => s === 'BEGIN'));
       // Verify row lock was acquired on stores table with FOR UPDATE
       assert.ok(
-        executedStatements.some(s => s.includes('SELECT id FROM stores WHERE workspace_id = $1 FOR UPDATE')),
+        executedStatements.some(s => s.includes('FROM stores') && s.includes('FOR UPDATE')),
         'Must execute SELECT ... FOR UPDATE on stores to serialize cross-instance mutations'
       );
       // Verify that ON CONFLICT in saveWorkspaceCatalog does NOT overwrite tier
@@ -268,6 +268,235 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
 
       // After task completion, lock must be cleaned up
       assert.equal(getActiveWorkspaceLockCount(), 0, 'Active workspace locks count must be 0 after completion');
+    });
+
+    test('8. Independent DB connection concurrency: simulated 2 parallel DB connections calling importCatalog directly (bypassing in-memory lock) serialize via FOR UPDATE', async () => {
+      const clientLocks = new Map<string, Promise<void>>();
+      const connectionLog: string[] = [];
+
+      function createSimulatedDbClient(clientLabel: string) {
+        let releaseLock: (() => void) | null = null;
+        return {
+          query: async (sql: string, params?: any[]) => {
+            if (sql === 'BEGIN') {
+              connectionLog.push(`${clientLabel}:BEGIN`);
+              return { rows: [] };
+            }
+            if (sql.includes('FOR UPDATE')) {
+              connectionLog.push(`${clientLabel}:ACQUIRE_ROW_LOCK`);
+              const existingLock = clientLocks.get('ws_concurrency');
+              if (existingLock) {
+                // Wait for the other DB transaction to finish, simulating PostgreSQL row-level wait
+                await existingLock;
+              }
+              const lockPromise = new Promise<void>((resolve) => {
+                releaseLock = resolve;
+              });
+              clientLocks.set('ws_concurrency', lockPromise);
+
+              return {
+                rows: [
+                  {
+                    id: 'store_ws_concurrency',
+                    tier: 'Starter',
+                    sku_limit: 250,
+                    name: 'Concurrency Store',
+                    domain: 'concurrency.myshopify.com',
+                    currency: 'USD',
+                    sku_count: 0,
+                    catalog_completeness_avg: 0,
+                    truth_boundary_strictness: 'standard',
+                    connectors_json: '[]',
+                  },
+                ],
+              };
+            }
+            if (sql.includes('SELECT') && sql.includes('FROM products')) {
+              return { rows: [] };
+            }
+            if (sql.includes('SELECT') && sql.includes('FROM variants')) {
+              return { rows: [] };
+            }
+            if (sql.includes('SELECT') && (sql.includes('FROM offers') || sql.includes('FROM findings') || sql.includes('FROM action_items') || sql.includes('FROM evidence_documents'))) {
+              return { rows: [] };
+            }
+            if (sql === 'COMMIT') {
+              connectionLog.push(`${clientLabel}:COMMIT`);
+              if (releaseLock) {
+                releaseLock();
+                clientLocks.delete('ws_concurrency');
+              }
+              return { rows: [] };
+            }
+            if (sql === 'ROLLBACK') {
+              connectionLog.push(`${clientLabel}:ROLLBACK`);
+              if (releaseLock) {
+                releaseLock();
+                clientLocks.delete('ws_concurrency');
+              }
+              return { rows: [] };
+            }
+            return { rows: [] };
+          },
+          release: () => {
+            connectionLog.push(`${clientLabel}:RELEASE`);
+            if (releaseLock) {
+              releaseLock();
+              clientLocks.delete('ws_concurrency');
+            }
+          },
+        };
+      }
+
+      let clientCounter = 0;
+      const simulatedPool = {
+        connect: async () => {
+          clientCounter++;
+          return createSimulatedDbClient(`Client${clientCounter}`);
+        },
+      };
+
+      const repo = new PostgresRepository(simulatedPool as unknown as Pool);
+
+      // Call importCatalog from 2 parallel connections directly (NO withWorkspaceLock in-memory wrapper!)
+      const candidateBatchA = [
+        {
+          id: 'cand_a1',
+          name: 'Product A1',
+          variants: [{ id: 'var_a1', sku: 'SKU-A1', title: 'Default', price: 20 }],
+        },
+      ];
+      const candidateBatchB = [
+        {
+          id: 'cand_b1',
+          name: 'Product B1',
+          variants: [{ id: 'var_b1', sku: 'SKU-B1', title: 'Default', price: 30 }],
+        },
+      ];
+
+      const [resA, resB] = await Promise.all([
+        repo.importCatalog('ws_concurrency', candidateBatchA),
+        repo.importCatalog('ws_concurrency', candidateBatchB),
+      ]);
+
+      assert.ok(resA);
+      assert.ok(resB);
+      assert.ok(connectionLog.includes('Client1:ACQUIRE_ROW_LOCK'));
+      assert.ok(connectionLog.includes('Client2:ACQUIRE_ROW_LOCK'));
+      assert.ok(connectionLog.includes('Client1:COMMIT'));
+      assert.ok(connectionLog.includes('Client2:COMMIT'));
+      assert.equal(clientLocks.size, 0, 'Database row locks must be cleanly released');
+    });
+
+    test('9. Transactional rollback in saveWorkspaceCatalog on quota violation leaves 0 modified rows', async () => {
+      const executedStatements: string[] = [];
+      const mockClient = {
+        query: async (sql: string) => {
+          executedStatements.push(sql);
+          if (sql.includes('FOR UPDATE')) {
+            return {
+              rows: [
+                {
+                  id: 'store_ws_rb',
+                  tier: 'Starter',
+                  sku_limit: 2, // Hard limit 2 SKUs
+                  name: 'Rollback Store',
+                  domain: 'rollback.myshopify.com',
+                  currency: 'USD',
+                  sku_count: 0,
+                  catalog_completeness_avg: 0,
+                  truth_boundary_strictness: 'standard',
+                  connectors_json: '[]',
+                },
+              ],
+            };
+          }
+          return { rows: [] };
+        },
+        release: () => {},
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+
+      // Attempt to save 3 products (> 2 SKU limit)
+      await assert.rejects(
+        async () => {
+          await repo.saveWorkspaceCatalog('ws_rb', {
+            products: [
+              { id: 'p1', title: 'P1', brand: '', category: '', description: '', image: '', status: 'active', completenessScore: 100, evidenceCoverageScore: 100, externalDiscoveryStatus: 'observed_in_sample', attributes: {}, findingsCount: 0, lastAudited: '', variants: [{ id: 'v1', sku: 'SKU-1', title: 'V1', barcode: '', price: 10, inventoryCount: 1, attributes: {} }], offers: [], evidenceDocuments: [] },
+              { id: 'p2', title: 'P2', brand: '', category: '', description: '', image: '', status: 'active', completenessScore: 100, evidenceCoverageScore: 100, externalDiscoveryStatus: 'observed_in_sample', attributes: {}, findingsCount: 0, lastAudited: '', variants: [{ id: 'v2', sku: 'SKU-2', title: 'V2', barcode: '', price: 20, inventoryCount: 1, attributes: {} }], offers: [], evidenceDocuments: [] },
+              { id: 'p3', title: 'P3', brand: '', category: '', description: '', image: '', status: 'active', completenessScore: 100, evidenceCoverageScore: 100, externalDiscoveryStatus: 'observed_in_sample', attributes: {}, findingsCount: 0, lastAudited: '', variants: [{ id: 'v3', sku: 'SKU-3', title: 'V3', barcode: '', price: 30, inventoryCount: 1, attributes: {} }], offers: [], evidenceDocuments: [] },
+            ],
+            variants: [],
+            offers: [],
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: {
+              name: 'Rollback Store',
+              domain: 'rollback.myshopify.com',
+              currency: 'USD',
+              skuCount: 0,
+              catalogCompletenessAvg: 0,
+              truthBoundaryStrictness: 'standard',
+              tier: 'Starter',
+              connectors: [],
+            },
+          });
+        },
+        (err: any) => {
+          assert.equal(err.code, 'PLAN_QUOTA_EXCEEDED');
+          return true;
+        }
+      );
+
+      // Verify that ROLLBACK was executed and no DELETE or INSERT INTO products occurred
+      assert.ok(executedStatements.includes('ROLLBACK'), 'Must execute ROLLBACK when quota is exceeded');
+      assert.ok(!executedStatements.some(s => s.includes('DELETE FROM products')), 'Must never delete products if quota check failed');
+      assert.ok(!executedStatements.some(s => s.includes('INSERT INTO products')), 'Must never insert products if quota check failed');
+    });
+
+    test('10. Workspace isolation: Workspace A query strictly scopes to workspace_id parameter', async () => {
+      const executedParamsList: any[][] = [];
+      const mockClient = {
+        query: async (sql: string, params?: any[]) => {
+          if (params) executedParamsList.push(params);
+          if (sql.includes('FROM stores')) {
+            return {
+              rows: [
+                {
+                  name: 'Isolated Store A',
+                  domain: 'iso-a.myshopify.com',
+                  currency: 'USD',
+                  skuCount: 5,
+                  catalogCompletenessAvg: 80,
+                  truthBoundaryStrictness: 'standard',
+                  tier: 'Starter',
+                  connectorsJson: '[]',
+                  skuLimit: null,
+                },
+              ],
+            };
+          }
+          return { rows: [] };
+        },
+        release: () => {},
+      };
+
+      const mockPool = {
+        query: mockClient.query,
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+      await repo.getStoreByWorkspace('workspace_tenant_a');
+
+      assert.ok(executedParamsList.length > 0);
+      assert.equal(executedParamsList[0][0], 'workspace_tenant_a', 'Query must parameterize workspace_id strictly');
     });
   });
 

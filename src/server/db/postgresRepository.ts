@@ -28,7 +28,12 @@ import {
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
-import { calculateImportUsage, checkPlanQuota } from '../services/entitlementService';
+import { 
+  calculateImportUsage, 
+  checkPlanQuota, 
+  countCatalogSkus, 
+  PlanQuotaExceededError 
+} from '../services/entitlementService';
 
 export class PostgresRepository implements DatabaseRepository {
   private pool: Pool;
@@ -796,52 +801,47 @@ export class PostgresRepository implements DatabaseRepository {
     };
   }
 
-  async loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null> {
-    const store = await this.getStoreByWorkspace(workspaceId);
-    if (!store) return null;
-
-    // Load products
-    const prodRes = await this.pool.query(
+  private async loadCatalogRows(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    workspaceId: string,
+    store: StoreProfile
+  ): Promise<StoragePayloadV1> {
+    const prodRes = await queryable.query(
       `SELECT id, title, brand, category, description, image, status, completeness_score AS "completenessScore", evidence_coverage_score AS "evidenceCoverageScore", external_discovery_status AS "externalDiscoveryStatus", attributes_json AS "attributesJson", findings_count AS "findingsCount", last_audited AS "lastAudited"
        FROM products
        WHERE workspace_id = $1`,
       [workspaceId]
     );
 
-    // Load variants
-    const varRes = await this.pool.query(
+    const varRes = await queryable.query(
       `SELECT id, product_id AS "productId", sku, title, barcode, price, inventory_count AS "inventoryCount", attributes_json AS "attributesJson"
        FROM variants
        WHERE workspace_id = $1`,
       [workspaceId]
     );
 
-    // Load offers
-    const offRes = await this.pool.query(
+    const offRes = await queryable.query(
       `SELECT id, product_id AS "productId", channel, price, currency, availability, condition, url, merchant_id AS "merchantId", last_sync AS "lastSync"
        FROM offers
        WHERE workspace_id = $1`,
       [workspaceId]
     );
 
-    // Load evidence
-    const eviRes = await this.pool.query(
+    const eviRes = await queryable.query(
       `SELECT id, product_id AS "productId", title, type, issuer, date_verified AS "dateVerified", url, status
        FROM evidence_documents
        WHERE workspace_id = $1`,
       [workspaceId]
     );
 
-    // Load findings
-    const finRes = await this.pool.query(
+    const finRes = await queryable.query(
       `SELECT id, product_id AS "productId", scope, type, severity, title, description, observed_evidence AS "observedEvidence", derived_conclusion AS "derivedConclusion", merchant_verified AS "merchantVerified", why_it_matters AS "whyItMatters", suggested_correction AS "suggestedCorrection", target_field AS "targetField", current_value AS "currentValue", recommended_value AS "recommendedValue", action_item_id AS "actionItemId"
        FROM findings
        WHERE workspace_id = $1`,
       [workspaceId]
     );
 
-    // Load action items
-    const actRes = await this.pool.query(
+    const actRes = await queryable.query(
       `SELECT id, finding_id AS "findingId", product_id AS "productId", title, severity, status, verification_status AS "verificationStatus", proposed_change_json AS "proposedChangeJson", audit_log_json AS "auditLogJson"
        FROM action_items
        WHERE workspace_id = $1`,
@@ -895,7 +895,7 @@ export class PostgresRepository implements DatabaseRepository {
       evidenceByProduct.get(r.productId)!.push(e);
     }
 
-    const products: Product[] = prodRes.rows.map(r => ({
+    const products: Product[] = prodRes.rows.map((r: any) => ({
       id: r.id,
       title: r.title,
       brand: r.brand,
@@ -914,7 +914,7 @@ export class PostgresRepository implements DatabaseRepository {
       lastAudited: r.lastAudited,
     }));
 
-    const findings: Finding[] = finRes.rows.map(r => ({
+    const findings: Finding[] = finRes.rows.map((r: any) => ({
       id: r.id,
       productId: r.productId || undefined,
       scope: r.scope,
@@ -933,7 +933,7 @@ export class PostgresRepository implements DatabaseRepository {
       actionItemId: r.actionItemId || undefined,
     }));
 
-    const actions: ActionItem[] = actRes.rows.map(r => ({
+    const actions: ActionItem[] = actRes.rows.map((r: any) => ({
       id: r.id,
       findingId: r.findingId,
       productId: r.productId || undefined,
@@ -957,182 +957,266 @@ export class PostgresRepository implements DatabaseRepository {
     };
   }
 
+  private async saveCatalogRows(
+    client: PoolClient,
+    workspaceId: string,
+    payload: StoragePayloadV1,
+    storeId: string,
+    authoritativeStore: StoreProfile
+  ): Promise<void> {
+    // Update store profile, preserving server-managed tier and sku_limit
+    await client.query(
+      `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW(), NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         domain = EXCLUDED.domain,
+         currency = EXCLUDED.currency,
+         sku_count = EXCLUDED.sku_count,
+         catalog_completeness_avg = EXCLUDED.catalog_completeness_avg,
+         truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
+         tier = EXCLUDED.tier,
+         sku_limit = EXCLUDED.sku_limit,
+         connectors_json = EXCLUDED.connectors_json,
+         updated_at = NOW()`,
+      [
+        storeId,
+        workspaceId,
+        payload.storeProfile?.name || authoritativeStore.name,
+        payload.storeProfile?.domain || authoritativeStore.domain,
+        payload.storeProfile?.currency || authoritativeStore.currency,
+        payload.products.length,
+        payload.storeProfile?.catalogCompletenessAvg ?? authoritativeStore.catalogCompletenessAvg ?? 0,
+        payload.storeProfile?.truthBoundaryStrictness || authoritativeStore.truthBoundaryStrictness,
+        authoritativeStore.tier,
+        authoritativeStore.skuLimit !== undefined ? authoritativeStore.skuLimit : null,
+        JSON.stringify(payload.storeProfile?.connectors || authoritativeStore.connectors || []),
+      ]
+    );
+
+    // Clean old child records for this workspace in transaction
+    await client.query('DELETE FROM action_items WHERE workspace_id = $1', [workspaceId]);
+    await client.query('DELETE FROM findings WHERE workspace_id = $1', [workspaceId]);
+    await client.query('DELETE FROM evidence_documents WHERE workspace_id = $1', [workspaceId]);
+    await client.query('DELETE FROM offers WHERE workspace_id = $1', [workspaceId]);
+    await client.query('DELETE FROM variants WHERE workspace_id = $1', [workspaceId]);
+    await client.query('DELETE FROM products WHERE workspace_id = $1', [workspaceId]);
+
+    // Insert products
+    for (const p of payload.products) {
+      await client.query(
+        `INSERT INTO products (id, workspace_id, store_id, title, brand, category, description, image, status, completeness_score, evidence_coverage_score, external_discovery_status, attributes_json, findings_count, last_audited, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, NOW(), NOW())`,
+        [
+          p.id,
+          workspaceId,
+          storeId,
+          p.title,
+          p.brand,
+          p.category,
+          p.description,
+          p.image,
+          p.status,
+          p.completenessScore,
+          p.evidenceCoverageScore,
+          p.externalDiscoveryStatus,
+          JSON.stringify(p.attributes || {}),
+          p.findingsCount,
+          p.lastAudited,
+        ]
+      );
+
+      // Insert variants
+      for (const v of p.variants || []) {
+        await client.query(
+          `INSERT INTO variants (id, workspace_id, product_id, sku, title, barcode, price, inventory_count, attributes_json, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW(), NOW())`,
+          [
+            v.id,
+            workspaceId,
+            p.id,
+            v.sku,
+            v.title,
+            v.barcode || '',
+            v.price,
+            v.inventoryCount ?? null,
+            JSON.stringify(v.attributes || {}),
+          ]
+        );
+      }
+
+      // Insert offers
+      for (const o of p.offers || []) {
+        await client.query(
+          `INSERT INTO offers (id, workspace_id, product_id, channel, price, currency, availability, condition, url, merchant_id, last_sync, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
+          [
+            o.id,
+            workspaceId,
+            p.id,
+            o.channel,
+            o.price,
+            o.currency,
+            o.availability,
+            o.condition,
+            o.url,
+            o.merchantId,
+            o.lastSync,
+          ]
+        );
+      }
+
+      // Insert evidence
+      for (const e of p.evidenceDocuments || []) {
+        await client.query(
+          `INSERT INTO evidence_documents (id, workspace_id, product_id, title, type, issuer, date_verified, url, status, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+          [
+            e.id,
+            workspaceId,
+            p.id,
+            e.title,
+            e.type,
+            e.issuer,
+            e.dateVerified,
+            e.url || null,
+            e.status,
+          ]
+        );
+      }
+    }
+
+    // Insert findings
+    for (const f of payload.findings) {
+      await client.query(
+        `INSERT INTO findings (id, workspace_id, store_id, product_id, scope, type, severity, title, description, observed_evidence, derived_conclusion, merchant_verified, why_it_matters, suggested_correction, target_field, current_value, recommended_value, action_item_id, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW())`,
+        [
+          f.id,
+          workspaceId,
+          storeId,
+          f.productId || null,
+          f.scope,
+          f.type,
+          f.severity,
+          f.title,
+          f.description,
+          f.observedEvidence,
+          f.derivedConclusion,
+          f.merchantVerified,
+          f.whyItMatters,
+          f.suggestedCorrection || null,
+          f.targetField || null,
+          f.currentValue || null,
+          f.recommendedValue || null,
+          f.actionItemId || null,
+        ]
+      );
+    }
+
+    // Insert action items
+    for (const a of payload.actions) {
+      await client.query(
+        `INSERT INTO action_items (id, workspace_id, store_id, finding_id, product_id, title, severity, status, verification_status, proposed_change_json, audit_log_json, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, NOW(), NOW())`,
+        [
+          a.id,
+          workspaceId,
+          storeId,
+          a.findingId,
+          a.productId || null,
+          a.title,
+          a.severity,
+          a.status,
+          a.verificationStatus,
+          JSON.stringify(a.proposedChange || {}),
+          JSON.stringify(a.auditLog || []),
+        ]
+      );
+    }
+  }
+
+  async loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null> {
+    const store = await this.getStoreByWorkspace(workspaceId);
+    if (!store) return null;
+    return this.loadCatalogRows(this.pool, workspaceId, store);
+  }
+
   async saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       const storeId = `store_${workspaceId}`;
 
-      // Database-level row lock on workspace store to prevent concurrent mutation races
-      await client.query('SELECT id FROM stores WHERE workspace_id = $1 FOR UPDATE', [workspaceId]);
-
-      // Update store profile, preserving server-managed tier and sku_limit
-      await client.query(
-        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
-         ON CONFLICT (id) DO UPDATE SET
-           name = EXCLUDED.name,
-           domain = EXCLUDED.domain,
-           currency = EXCLUDED.currency,
-           sku_count = EXCLUDED.sku_count,
-           catalog_completeness_avg = EXCLUDED.catalog_completeness_avg,
-           truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
-           connectors_json = EXCLUDED.connectors_json,
-           updated_at = NOW()`,
-        [
-          storeId,
-          workspaceId,
-          payload.storeProfile.name,
-          payload.storeProfile.domain,
-          payload.storeProfile.currency,
-          payload.products.length,
-          payload.storeProfile.catalogCompletenessAvg,
-          payload.storeProfile.truthBoundaryStrictness,
-          payload.storeProfile.tier,
-          JSON.stringify(payload.storeProfile.connectors || []),
-        ]
+      // 1. Consistent lock order: Acquire row-level lock on stores table
+      let storeRes = await client.query<{
+        id: string;
+        tier: string;
+        sku_limit: number | null;
+        name: string;
+        domain: string;
+        currency: string;
+        sku_count: number;
+        catalog_completeness_avg: number;
+        truth_boundary_strictness: string;
+        connectors_json: any;
+      }>(
+        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+         FROM stores
+         WHERE workspace_id = $1
+         FOR UPDATE`,
+        [workspaceId]
       );
 
-      // Clean old child records for this workspace in transaction
-      await client.query('DELETE FROM action_items WHERE workspace_id = $1', [workspaceId]);
-      await client.query('DELETE FROM findings WHERE workspace_id = $1', [workspaceId]);
-      await client.query('DELETE FROM evidence_documents WHERE workspace_id = $1', [workspaceId]);
-      await client.query('DELETE FROM offers WHERE workspace_id = $1', [workspaceId]);
-      await client.query('DELETE FROM variants WHERE workspace_id = $1', [workspaceId]);
-      await client.query('DELETE FROM products WHERE workspace_id = $1', [workspaceId]);
-
-      // Insert products
-      for (const p of payload.products) {
+      if (storeRes.rows.length === 0) {
         await client.query(
-          `INSERT INTO products (id, workspace_id, store_id, title, brand, category, description, image, status, completeness_score, evidence_coverage_score, external_discovery_status, attributes_json, findings_count, last_audited, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, NOW(), NOW())`,
-          [
-            p.id,
-            workspaceId,
-            storeId,
-            p.title,
-            p.brand,
-            p.category,
-            p.description,
-            p.image,
-            p.status,
-            p.completenessScore,
-            p.evidenceCoverageScore,
-            p.externalDiscoveryStatus,
-            JSON.stringify(p.attributes || {}),
-            p.findingsCount,
-            p.lastAudited,
-          ]
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+           ON CONFLICT (id) DO NOTHING`,
+          [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
         );
-
-        // Insert variants
-        for (const v of p.variants || []) {
-          await client.query(
-            `INSERT INTO variants (id, workspace_id, product_id, sku, title, barcode, price, inventory_count, attributes_json, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, NOW(), NOW())`,
-            [
-              v.id,
-              workspaceId,
-              p.id,
-              v.sku,
-              v.title,
-              v.barcode || '',
-              v.price,
-              v.inventoryCount ?? null,
-              JSON.stringify(v.attributes || {}),
-            ]
-          );
-        }
-
-        // Insert offers
-        for (const o of p.offers || []) {
-          await client.query(
-            `INSERT INTO offers (id, workspace_id, product_id, channel, price, currency, availability, condition, url, merchant_id, last_sync, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())`,
-            [
-              o.id,
-              workspaceId,
-              p.id,
-              o.channel,
-              o.price,
-              o.currency,
-              o.availability,
-              o.condition,
-              o.url,
-              o.merchantId,
-              o.lastSync,
-            ]
-          );
-        }
-
-        // Insert evidence
-        for (const e of p.evidenceDocuments || []) {
-          await client.query(
-            `INSERT INTO evidence_documents (id, workspace_id, product_id, title, type, issuer, date_verified, url, status, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
-            [
-              e.id,
-              workspaceId,
-              p.id,
-              e.title,
-              e.type,
-              e.issuer,
-              e.dateVerified,
-              e.url || null,
-              e.status,
-            ]
-          );
-        }
-      }
-
-      // Insert findings
-      for (const f of payload.findings) {
-        await client.query(
-          `INSERT INTO findings (id, workspace_id, store_id, product_id, scope, type, severity, title, description, observed_evidence, derived_conclusion, merchant_verified, why_it_matters, suggested_correction, target_field, current_value, recommended_value, action_item_id, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW())`,
-          [
-            f.id,
-            workspaceId,
-            storeId,
-            f.productId || null,
-            f.scope,
-            f.type,
-            f.severity,
-            f.title,
-            f.description,
-            f.observedEvidence,
-            f.derivedConclusion,
-            f.merchantVerified,
-            f.whyItMatters,
-            f.suggestedCorrection || null,
-            f.targetField || null,
-            f.currentValue || null,
-            f.recommendedValue || null,
-            f.actionItemId || null,
-          ]
+        storeRes = await client.query(
+          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+           FROM stores
+           WHERE workspace_id = $1
+           FOR UPDATE`,
+          [workspaceId]
         );
       }
 
-      // Insert action items
-      for (const a of payload.actions) {
-        await client.query(
-          `INSERT INTO action_items (id, workspace_id, store_id, finding_id, product_id, title, severity, status, verification_status, proposed_change_json, audit_log_json, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, NOW(), NOW())`,
-          [
-            a.id,
-            workspaceId,
-            storeId,
-            a.findingId,
-            a.productId || null,
-            a.title,
-            a.severity,
-            a.status,
-            a.verificationStatus,
-            JSON.stringify(a.proposedChange || {}),
-            JSON.stringify(a.auditLog || []),
-          ]
-        );
+      const lockedRow = storeRes.rows[0] || {
+        id: storeId,
+        tier: 'Free Audit',
+        sku_limit: null,
+        name: payload.storeProfile?.name || 'Store',
+        domain: payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
+        currency: payload.storeProfile?.currency || 'USD',
+        sku_count: 0,
+        catalog_completeness_avg: 0,
+        truth_boundary_strictness: 'standard',
+        connectors_json: '[]',
+      };
+      const authoritativeStore: StoreProfile = {
+        name: lockedRow.name || payload.storeProfile?.name || 'Store',
+        domain: lockedRow.domain || payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
+        currency: lockedRow.currency || payload.storeProfile?.currency || 'USD',
+        skuCount: lockedRow.sku_count || 0,
+        catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+        truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
+        tier: (lockedRow.tier || 'Free Audit') as any,
+        skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
+        connectors: typeof lockedRow.connectors_json === 'string' ? JSON.parse(lockedRow.connectors_json) : (lockedRow.connectors_json || []),
+      };
+
+      // 2. Authoritative quota check inside the transaction under the row lock
+      const proposedSkus = countCatalogSkus(payload.products);
+      const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
+      if (!quotaCheck.allowed) {
+        throw new PlanQuotaExceededError(quotaCheck);
       }
+
+      // 3. Persist rows under the lock
+      await this.saveCatalogRows(client, workspaceId, payload, storeId, authoritativeStore);
 
       await client.query('COMMIT');
     } catch (err) {
@@ -1241,32 +1325,121 @@ export class PostgresRepository implements DatabaseRepository {
     workspaceId: string,
     candidates: any[]
   ): Promise<CatalogImportResult> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const storeId = `store_${workspaceId}`;
 
-    const store = await this.getStoreByWorkspace(workspaceId);
-    const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
-    const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
-    if (!quotaCheck.allowed) {
-      throw new Error(quotaCheck.error || 'Plan quota exceeded');
-    }
+      // 1. Consistent lock order: Acquire row-level lock on stores table
+      let storeRes = await client.query<{
+        id: string;
+        tier: string;
+        sku_limit: number | null;
+        name: string;
+        domain: string;
+        currency: string;
+        sku_count: number;
+        catalog_completeness_avg: number;
+        truth_boundary_strictness: string;
+        connectors_json: any;
+      }>(
+        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+         FROM stores
+         WHERE workspace_id = $1
+         FOR UPDATE`,
+        [workspaceId]
+      );
 
-    const importRes = executeCatalogImport(candidates, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
-    });
+      if (storeRes.rows.length === 0) {
+        await client.query(
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+           ON CONFLICT (id) DO NOTHING`,
+          [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
+        );
+        storeRes = await client.query(
+          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+           FROM stores
+           WHERE workspace_id = $1
+           FOR UPDATE`,
+          [workspaceId]
+        );
+      }
 
-    if (importRes.importedCount > 0) {
-      await this.saveWorkspaceCatalog(workspaceId, {
-        ...catalog,
-        products: importRes.nextProducts,
-        storeProfile: importRes.nextStoreProfile,
+      const lockedRow = storeRes.rows[0] || {
+        id: storeId,
+        tier: 'Free Audit',
+        sku_limit: null,
+        name: 'Store',
+        domain: `${workspaceId}.myshopify.com`,
+        currency: 'USD',
+        sku_count: 0,
+        catalog_completeness_avg: 0,
+        truth_boundary_strictness: 'standard',
+        connectors_json: '[]',
+      };
+      const authoritativeStore: StoreProfile = {
+        name: lockedRow.name || 'Store',
+        domain: lockedRow.domain || `${workspaceId}.myshopify.com`,
+        currency: lockedRow.currency || 'USD',
+        skuCount: lockedRow.sku_count || 0,
+        catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+        truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
+        tier: (lockedRow.tier || 'Free Audit') as any,
+        skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
+        connectors: typeof lockedRow.connectors_json === 'string' ? JSON.parse(lockedRow.connectors_json) : (lockedRow.connectors_json || []),
+      };
+
+      // 2. Load existing catalog inside the transaction on the same locked client
+      const existingCatalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
+
+      // 3. Deduplicate and calculate additional usage under the lock
+      const { additionalSkus } = calculateImportUsage(candidates, existingCatalog.products);
+
+      // 4. Authoritative server-side quota validation under the lock
+      const quotaCheck = checkPlanQuota(authoritativeStore, existingCatalog.products, additionalSkus);
+      if (!quotaCheck.allowed) {
+        throw new PlanQuotaExceededError(quotaCheck);
+      }
+
+      // 5. Ingest domain candidates
+      const importRes = executeCatalogImport(candidates, {
+        products: existingCatalog.products,
+        findings: existingCatalog.findings,
+        actionItems: existingCatalog.actions,
+        storeProfile: authoritativeStore,
+        isReadOnly: false,
       });
-    }
 
-    return importRes;
+      if (importRes.importedCount > 0) {
+        await this.saveCatalogRows(
+          client,
+          workspaceId,
+          {
+            products: importRes.nextProducts,
+            variants: importRes.nextProducts.flatMap(p => p.variants || []),
+            offers: existingCatalog.offers,
+            findings: existingCatalog.findings,
+            actions: existingCatalog.actions,
+            evidence: existingCatalog.evidence,
+            storeProfile: importRes.nextStoreProfile,
+          },
+          storeId,
+          authoritativeStore
+        );
+      }
+
+      await client.query('COMMIT');
+      return importRes;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 }
