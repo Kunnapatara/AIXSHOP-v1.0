@@ -498,6 +498,487 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
       assert.ok(executedParamsList.length > 0);
       assert.equal(executedParamsList[0][0], 'workspace_tenant_a', 'Query must parameterize workspace_id strictly');
     });
+
+    test('11. SKU accounting: saveWorkspaceCatalog persists variant count to stores.sku_count, not products.length', async () => {
+      let capturedSkuCountParam: number | null = null;
+      let releaseCalled = false;
+
+      const mockClient = {
+        query: async (sql: string, params?: any[]) => {
+          if (sql.includes('SELECT id, tier, sku_limit')) {
+            return {
+              rows: [
+                {
+                  id: 'store_ws_sku_acc',
+                  tier: 'Growth',
+                  sku_limit: 2500,
+                  name: 'Growth Store',
+                  domain: 'growth.myshopify.com',
+                  currency: 'USD',
+                  sku_count: 0,
+                  catalog_completeness_avg: 80,
+                  truth_boundary_strictness: 'standard',
+                  connectors_json: '[]',
+                },
+              ],
+            };
+          }
+          if (sql.includes('INSERT INTO stores')) {
+            // Parameter index 6 is sku_count in INSERT INTO stores
+            capturedSkuCountParam = params?.[5];
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+        release: () => { releaseCalled = true; },
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+
+      // 2 products with 3 variants each = 6 SKUs total
+      const sampleProducts: Product[] = [
+        {
+          id: 'prod_1',
+          title: 'T-Shirt',
+          brand: 'FashionCo',
+          category: 'Apparel',
+          description: 'A fine shirt',
+          image: '',
+          status: 'active',
+          completenessScore: 90,
+          evidenceCoverageScore: 80,
+          externalDiscoveryStatus: 'observed_in_sample',
+          attributes: {},
+          findingsCount: 0,
+          lastAudited: '',
+          variants: [
+            { id: 'v1', sku: 'TS-S', title: 'Small', barcode: '', price: 20, inventoryCount: 5, attributes: {} },
+            { id: 'v2', sku: 'TS-M', title: 'Medium', barcode: '', price: 20, inventoryCount: 5, attributes: {} },
+            { id: 'v3', sku: 'TS-L', title: 'Large', barcode: '', price: 20, inventoryCount: 5, attributes: {} },
+          ],
+          offers: [],
+          evidenceDocuments: [],
+        },
+        {
+          id: 'prod_2',
+          title: 'Jeans',
+          brand: 'FashionCo',
+          category: 'Apparel',
+          description: 'Denim jeans',
+          image: '',
+          status: 'active',
+          completenessScore: 90,
+          evidenceCoverageScore: 80,
+          externalDiscoveryStatus: 'observed_in_sample',
+          attributes: {},
+          findingsCount: 0,
+          lastAudited: '',
+          variants: [
+            { id: 'v4', sku: 'JN-30', title: '30W', barcode: '', price: 60, inventoryCount: 3, attributes: {} },
+            { id: 'v5', sku: 'JN-32', title: '32W', barcode: '', price: 60, inventoryCount: 3, attributes: {} },
+            { id: 'v6', sku: 'JN-34', title: '34W', barcode: '', price: 60, inventoryCount: 3, attributes: {} },
+          ],
+          offers: [],
+          evidenceDocuments: [],
+        },
+      ];
+
+      await repo.saveWorkspaceCatalog('ws_sku_acc', {
+        products: sampleProducts,
+        variants: sampleProducts.flatMap(p => p.variants || []),
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+      });
+
+      assert.equal(capturedSkuCountParam, 6, 'stores.sku_count must record 6 variants, not products.length (2)');
+      assert.equal(releaseCalled, true, 'Client must be released after save');
+    });
+
+    test('12. SKU accounting: Products without variants count as 1 SKU each', async () => {
+      let capturedSkuCountParam: number | null = null;
+
+      const mockClient = {
+        query: async (sql: string, params?: any[]) => {
+          if (sql.includes('SELECT id, tier, sku_limit')) {
+            return {
+              rows: [{
+                id: 'store_ws_no_vars',
+                tier: 'Starter',
+                sku_limit: 250,
+                name: 'Store',
+                domain: 'store.myshopify.com',
+                currency: 'USD',
+                sku_count: 0,
+                catalog_completeness_avg: 0,
+                truth_boundary_strictness: 'standard',
+                connectors_json: '[]',
+              }],
+            };
+          }
+          if (sql.includes('INSERT INTO stores')) {
+            capturedSkuCountParam = params?.[5];
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+        release: () => {},
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+
+      // 3 products, each with empty variants array
+      const sampleProducts: Product[] = [
+        { id: 'p1', title: 'Gift Card 10', brand: '', category: '', description: '', image: '', status: 'active', completenessScore: 100, evidenceCoverageScore: 100, externalDiscoveryStatus: 'observed_in_sample', attributes: {}, findingsCount: 0, lastAudited: '', variants: [], offers: [], evidenceDocuments: [] },
+        { id: 'p2', title: 'Gift Card 25', brand: '', category: '', description: '', image: '', status: 'active', completenessScore: 100, evidenceCoverageScore: 100, externalDiscoveryStatus: 'observed_in_sample', attributes: {}, findingsCount: 0, lastAudited: '', variants: [], offers: [], evidenceDocuments: [] },
+        { id: 'p3', title: 'Gift Card 50', brand: '', category: '', description: '', image: '', status: 'active', completenessScore: 100, evidenceCoverageScore: 100, externalDiscoveryStatus: 'observed_in_sample', attributes: {}, findingsCount: 0, lastAudited: '', variants: [], offers: [], evidenceDocuments: [] },
+      ];
+
+      await repo.saveWorkspaceCatalog('ws_no_vars', {
+        products: sampleProducts,
+        variants: [],
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+      });
+
+      assert.equal(capturedSkuCountParam, 3, 'Products with 0 variants must count as 1 SKU each');
+    });
+
+    test('13. Action update atomicity: approveAction executes in single transaction with SELECT FOR UPDATE', async () => {
+      const executedQueries: string[] = [];
+      let releaseCalled = false;
+
+      const mockClient = {
+        query: async (sql: string, params?: any[]) => {
+          executedQueries.push(sql);
+          if (sql.includes('SELECT id, tier, sku_limit') && sql.includes('FOR UPDATE')) {
+            return {
+              rows: [{
+                id: 'store_ws_act',
+                tier: 'Growth',
+                sku_limit: 2500,
+                name: 'Action Store',
+                domain: 'action.myshopify.com',
+                currency: 'USD',
+                sku_count: 1,
+                catalog_completeness_avg: 80,
+                truth_boundary_strictness: 'standard',
+                connectors_json: '[]',
+              }],
+            };
+          }
+          if (sql.includes('SELECT') && sql.includes('FROM products')) {
+            return {
+              rows: [{
+                id: 'prod_1',
+                title: 'Widget A',
+                brand: 'Acme',
+                category: 'Tools',
+                description: 'A tool',
+                image: '',
+                status: 'active',
+                completenessScore: 80,
+                evidenceCoverageScore: 80,
+                externalDiscoveryStatus: 'observed_in_sample',
+                attributesJson: '{}',
+                findingsCount: 1,
+                lastAudited: '',
+              }],
+            };
+          }
+          if (sql.includes('SELECT') && sql.includes('FROM action_items')) {
+            return {
+              rows: [{
+                id: 'act_1',
+                findingId: 'find_1',
+                productId: 'prod_1',
+                title: 'Fix title',
+                severity: 'medium',
+                status: 'pending_review',
+                verificationStatus: 'unverified',
+                proposedChangeJson: JSON.stringify({ field: 'title / marketing claims', proposedValue: 'Widget A Pro' }),
+                auditLogJson: '[]',
+              }],
+            };
+          }
+          if (sql.includes('FROM findings')) {
+            return {
+              rows: [{
+                id: 'find_1',
+                productId: 'prod_1',
+                scope: 'product',
+                type: 'inconsistency',
+                severity: 'medium',
+                title: 'Title mismatch',
+                description: 'Desc',
+                observedEvidence: 'E',
+                derivedConclusion: 'C',
+                merchantVerified: false,
+                whyItMatters: 'W',
+                actionItemId: 'act_1',
+              }],
+            };
+          }
+          return { rows: [] };
+        },
+        release: () => { releaseCalled = true; },
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+      const res = await repo.approveAction('ws_act', 'act_1');
+
+      assert.ok(res.action);
+      assert.equal(res.action.status, 'approved');
+      assert.equal(res.action.id, 'act_1');
+
+      // Verify transaction sequence: BEGIN -> SELECT ... FOR UPDATE -> COMMIT
+      const beginIdx = executedQueries.findIndex(q => q === 'BEGIN');
+      const lockIdx = executedQueries.findIndex(q => q.includes('FOR UPDATE'));
+      const commitIdx = executedQueries.findIndex(q => q === 'COMMIT');
+
+      assert.ok(beginIdx !== -1, 'Must call BEGIN');
+      assert.ok(lockIdx !== -1, 'Must acquire store lock with FOR UPDATE');
+      assert.ok(commitIdx !== -1, 'Must call COMMIT');
+      assert.ok(beginIdx < lockIdx, 'BEGIN must precede FOR UPDATE lock');
+      assert.ok(lockIdx < commitIdx, 'Lock must be held until COMMIT');
+      assert.equal(releaseCalled, true, 'Client must be released back to pool');
+    });
+
+    test('14. Action update atomicity: dismissAction and recheckAction execute under row lock and commit', async () => {
+      const executedQueries: string[] = [];
+
+      const mockClient = {
+        query: async (sql: string) => {
+          executedQueries.push(sql);
+          if (sql.includes('FOR UPDATE')) {
+            return {
+              rows: [{
+                id: 'store_ws_dismiss',
+                tier: 'Starter',
+                sku_limit: 250,
+                name: 'Store',
+                domain: 'store.myshopify.com',
+                currency: 'USD',
+                sku_count: 1,
+                catalog_completeness_avg: 80,
+                truth_boundary_strictness: 'standard',
+                connectors_json: '[]',
+              }],
+            };
+          }
+          if (sql.includes('FROM action_items')) {
+            return {
+              rows: [{
+                id: 'act_dismiss',
+                findingId: 'find_d',
+                productId: 'p_d',
+                title: 'Optional field review',
+                severity: 'low',
+                status: 'pending',
+                verificationStatus: 'unverified',
+                proposedChangeJson: '{}',
+                auditLogJson: '[]',
+              }],
+            };
+          }
+          return { rows: [] };
+        },
+        release: () => {},
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+      const res = await repo.dismissAction('ws_dismiss', 'act_dismiss');
+
+      assert.ok(res.action);
+      assert.equal(res.action.status, 'dismissed');
+
+      assert.ok(executedQueries.includes('BEGIN'));
+      assert.ok(executedQueries.some(q => q.includes('FOR UPDATE')));
+      assert.ok(executedQueries.includes('COMMIT'));
+    });
+
+    test('15. Action update failure triggers clean ROLLBACK and releases database client', async () => {
+      let rollbackCalled = false;
+      let releaseCalled = false;
+
+      const mockClient = {
+        query: async (sql: string) => {
+          if (sql === 'ROLLBACK') {
+            rollbackCalled = true;
+            return { rows: [] };
+          }
+          if (sql.includes('FOR UPDATE')) {
+            // Store not found
+            return { rows: [] };
+          }
+          return { rows: [] };
+        },
+        release: () => { releaseCalled = true; },
+      };
+
+      const mockPool = {
+        connect: async () => mockClient,
+      };
+
+      const repo = new PostgresRepository(mockPool as unknown as Pool);
+
+      await assert.rejects(
+        async () => {
+          await repo.approveAction('ws_missing', 'act_none');
+        },
+        (err: any) => {
+          assert.match(err.message, /not found/);
+          return true;
+        }
+      );
+
+      assert.equal(rollbackCalled, true, 'ROLLBACK must be executed on action failure');
+      assert.equal(releaseCalled, true, 'Client must be released on failure');
+    });
+
+    test('16. MemoryRepository concurrency: Overlapping approveAction and dismissAction on different actions preserve both mutations', async () => {
+      const { MemoryRepository } = await import('./db/memoryRepository');
+      const memRepo = new MemoryRepository(false);
+
+      // Create owner user, workspace and initial store
+      const user = await memRepo.createUser({
+        email: 'concurrency_owner@example.com',
+        passwordHash: 'hash123',
+        fullName: 'Concurrency Owner',
+      });
+      const { workspace } = await memRepo.createWorkspace(
+        { name: 'Concurrency Retail', slug: 'concurrency-retail' },
+        user.id
+      );
+      await memRepo.saveWorkspaceCatalog(workspace.id, {
+        products: [
+          {
+            id: 'p_conc',
+            title: 'Wireless Earbuds',
+            brand: 'AudioTech',
+            category: 'Electronics',
+            description: 'Bluetooth earbuds',
+            image: '',
+            status: 'active',
+            completenessScore: 85,
+            evidenceCoverageScore: 80,
+            externalDiscoveryStatus: 'observed_in_sample',
+            attributes: {},
+            findingsCount: 2,
+            lastAudited: '',
+            variants: [{ id: 'v_conc', sku: 'SKU-EARBUDS', title: 'Black', barcode: '', price: 99, inventoryCount: 10, attributes: {} }],
+            offers: [],
+            evidenceDocuments: [],
+          },
+        ],
+        variants: [],
+        offers: [],
+        findings: [
+          {
+            id: 'find_1',
+            productId: 'p_conc',
+            scope: 'product',
+            type: 'inconsistency',
+            severity: 'medium',
+            title: 'Fix title formatting',
+            description: '',
+            observedEvidence: '',
+            derivedConclusion: '',
+            merchantVerified: false,
+            whyItMatters: '',
+            actionItemId: 'act_1',
+          },
+          {
+            id: 'find_2',
+            productId: 'p_conc',
+            scope: 'product',
+            type: 'inconsistency',
+            severity: 'low',
+            title: 'Optional barcode note',
+            description: '',
+            observedEvidence: '',
+            derivedConclusion: '',
+            merchantVerified: false,
+            whyItMatters: '',
+            actionItemId: 'act_2',
+          },
+        ],
+        actions: [
+          {
+            id: 'act_1',
+            findingId: 'find_1',
+            productId: 'p_conc',
+            title: 'Approve title fix',
+            severity: 'medium',
+            status: 'pending_review',
+            verificationStatus: 'unverified',
+            proposedChange: { field: 'title / marketing claims', proposedValue: 'AudioTech Wireless Earbuds Pro' },
+            auditLog: [],
+          },
+          {
+            id: 'act_2',
+            findingId: 'find_2',
+            productId: 'p_conc',
+            title: 'Dismiss optional barcode',
+            severity: 'low',
+            status: 'pending_review',
+            verificationStatus: 'unverified',
+            proposedChange: {},
+            auditLog: [],
+          },
+        ],
+        evidence: [],
+        storeProfile: {
+          name: 'Concurrency Store',
+          domain: 'conc.myshopify.com',
+          currency: 'USD',
+          skuCount: 1,
+          catalogCompletenessAvg: 85,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Growth',
+          connectors: [],
+        },
+      });
+
+      // Launch simultaneous approveAction(act_1) and dismissAction(act_2)
+      const p1 = memRepo.approveAction(workspace.id, 'act_1');
+      const p2 = memRepo.dismissAction(workspace.id, 'act_2');
+
+      const [resApprove, resDismiss] = await Promise.all([p1, p2]);
+
+      assert.equal(resApprove.action.status, 'approved');
+      assert.equal(resDismiss.action.status, 'dismissed');
+
+      // Verify the persisted catalog has BOTH mutations preserved
+      const finalCatalog = await memRepo.loadWorkspaceCatalog(workspace.id);
+      assert.ok(finalCatalog);
+
+      const action1 = finalCatalog?.actions.find(a => a.id === 'act_1');
+      const action2 = finalCatalog?.actions.find(a => a.id === 'act_2');
+
+      assert.equal(action1?.status, 'approved', 'Action 1 must be approved');
+      assert.equal(action2?.status, 'dismissed', 'Action 2 must be dismissed — neither mutation lost');
+      assert.equal(finalCatalog?.storeProfile?.skuCount, 1, 'SKU count preserved as 1');
+    });
   });
 
   // 2. Live PostgreSQL Infrastructure Integration (Conditional)

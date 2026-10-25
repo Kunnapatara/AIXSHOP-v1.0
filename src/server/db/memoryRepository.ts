@@ -454,7 +454,28 @@ export class MemoryRepository implements DatabaseRepository {
     return JSON.parse(JSON.stringify(cat));
   }
 
-  async saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
+  private workspaceLocks: Map<string, Promise<void>> = new Map();
+
+  private async withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+    const prevLock = this.workspaceLocks.get(workspaceId) || Promise.resolve();
+    let releaseLock: () => void;
+    const nextLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    this.workspaceLocks.set(workspaceId, prevLock.then(() => nextLock, () => nextLock));
+
+    await prevLock;
+    try {
+      return await fn();
+    } finally {
+      releaseLock!();
+      if (this.workspaceLocks.get(workspaceId) === nextLock) {
+        this.workspaceLocks.delete(workspaceId);
+      }
+    }
+  }
+
+  private async saveWorkspaceCatalogInternal(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
     // Validate workspace exists
     if (!this.workspaces.has(workspaceId)) {
       throw new Error(`Workspace ${workspaceId} does not exist`);
@@ -478,13 +499,24 @@ export class MemoryRepository implements DatabaseRepository {
       throw new PlanQuotaExceededError(quotaCheck);
     }
 
-    this.catalogs.set(workspaceId, JSON.parse(JSON.stringify(payload)));
-    this.stores.set(workspaceId, {
+    const updatedStoreProfile: StoreProfile = {
       ...authoritativeStore,
       ...(payload.storeProfile ? JSON.parse(JSON.stringify(payload.storeProfile)) : {}),
       tier: authoritativeStore.tier,
       skuLimit: authoritativeStore.skuLimit,
-      skuCount: payload.products.length,
+      skuCount: proposedSkus,
+    };
+
+    const payloadToStore: StoragePayloadV1 = JSON.parse(JSON.stringify(payload));
+    payloadToStore.storeProfile = updatedStoreProfile;
+
+    this.catalogs.set(workspaceId, payloadToStore);
+    this.stores.set(workspaceId, updatedStoreProfile);
+  }
+
+  async saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
+    return this.withWorkspaceLock(workspaceId, async () => {
+      await this.saveWorkspaceCatalogInternal(workspaceId, payload);
     });
   }
 
@@ -493,122 +525,131 @@ export class MemoryRepository implements DatabaseRepository {
     actionId: string, 
     customApprovedValue?: string
   ): Promise<{ action: ActionItem; product?: Product }> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.withWorkspaceLock(workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(workspaceId);
+      if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
 
-    const result = executeActionApproval(actionId, customApprovedValue, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
+      const result = executeActionApproval(actionId, customApprovedValue, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile,
+        isReadOnly: false,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || 'Action approval failed');
+      }
+
+      const updatedCatalog: StoragePayloadV1 = {
+        ...catalog,
+        actions: result.nextActions,
+        products: result.nextProducts,
+        findings: result.nextFindings,
+        storeProfile: result.nextStoreProfile,
+      };
+      await this.saveWorkspaceCatalogInternal(workspaceId, updatedCatalog);
+
+      const updatedAction = result.nextActions.find(a => a.id === actionId);
+      if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+      const updatedProduct = updatedAction.productId
+        ? result.nextProducts.find(p => p.id === updatedAction.productId)
+        : undefined;
+
+      return { action: updatedAction, product: updatedProduct };
     });
-
-    if (!result.success) {
-      throw new Error(result.message || 'Action approval failed');
-    }
-
-    const updatedCatalog: StoragePayloadV1 = {
-      ...catalog,
-      actions: result.nextActions,
-      products: result.nextProducts,
-      findings: result.nextFindings,
-      storeProfile: result.nextStoreProfile,
-    };
-    await this.saveWorkspaceCatalog(workspaceId, updatedCatalog);
-
-    const updatedAction = result.nextActions.find(a => a.id === actionId);
-    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-    const updatedProduct = updatedAction.productId
-      ? result.nextProducts.find(p => p.id === updatedAction.productId)
-      : undefined;
-
-    return { action: updatedAction, product: updatedProduct };
   }
 
   async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.withWorkspaceLock(workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(workspaceId);
+      if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
 
-    const result = executeActionDismissal(actionId, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
+      const result = executeActionDismissal(actionId, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile,
+        isReadOnly: false,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || 'Action dismissal failed');
+      }
+
+      await this.saveWorkspaceCatalogInternal(workspaceId, {
+        ...catalog,
+        actions: result.nextActions,
+      });
+
+      const updatedAction = result.nextActions.find(a => a.id === actionId);
+      if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+      return { action: updatedAction };
     });
-
-    if (!result.success) {
-      throw new Error(result.message || 'Action dismissal failed');
-    }
-
-    await this.saveWorkspaceCatalog(workspaceId, {
-      ...catalog,
-      actions: result.nextActions,
-    });
-
-    const updatedAction = result.nextActions.find(a => a.id === actionId);
-    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-    return { action: updatedAction };
   }
 
   async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.withWorkspaceLock(workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(workspaceId);
+      if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
 
-    const result = executeActionRecheck(actionId, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
+      const result = executeActionRecheck(actionId, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile,
+        isReadOnly: false,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || 'Action recheck failed');
+      }
+
+      await this.saveWorkspaceCatalogInternal(workspaceId, {
+        ...catalog,
+        actions: result.nextActions,
+        findings: result.nextFindings || catalog.findings,
+      });
+
+      const updatedAction = result.nextActions.find(a => a.id === actionId);
+      if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+      return { action: updatedAction };
     });
-
-    if (!result.success) {
-      throw new Error(result.message || 'Action recheck failed');
-    }
-
-    await this.saveWorkspaceCatalog(workspaceId, {
-      ...catalog,
-      actions: result.nextActions,
-      findings: result.nextFindings || catalog.findings,
-    });
-
-    const updatedAction = result.nextActions.find(a => a.id === actionId);
-    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-    return { action: updatedAction };
   }
 
   async importCatalog(
     workspaceId: string,
     candidates: any[]
   ): Promise<CatalogImportResult> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.withWorkspaceLock(workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(workspaceId);
+      if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
 
-    const store = await this.getStoreByWorkspace(workspaceId);
-    const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
-    const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
-    if (!quotaCheck.allowed) {
-      throw new PlanQuotaExceededError(quotaCheck);
-    }
+      const store = await this.getStoreByWorkspace(workspaceId);
+      const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
+      const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
+      if (!quotaCheck.allowed) {
+        throw new PlanQuotaExceededError(quotaCheck);
+      }
 
-    const importRes = executeCatalogImport(candidates, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
-    });
-
-    if (importRes.importedCount > 0) {
-      await this.saveWorkspaceCatalog(workspaceId, {
-        ...catalog,
-        products: importRes.nextProducts,
-        storeProfile: importRes.nextStoreProfile,
+      const importRes = executeCatalogImport(candidates, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile,
+        isReadOnly: false,
       });
-    }
 
-    return importRes;
+      if (importRes.importedCount > 0) {
+        await this.saveWorkspaceCatalogInternal(workspaceId, {
+          ...catalog,
+          products: importRes.nextProducts,
+          storeProfile: importRes.nextStoreProfile,
+        });
+      }
+
+      return importRes;
+    });
   }
 }
+

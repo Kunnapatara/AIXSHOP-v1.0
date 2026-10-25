@@ -100,7 +100,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.json({
           success: true,
           workspaceId,
-          skuCount: payload.products.length,
+          skuCount: proposedSkus,
           timestamp: new Date().toISOString(),
         });
       });
@@ -272,18 +272,18 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       return await withWorkspaceLock(workspaceId, async () => {
         const currentStore = await repo.getStoreByWorkspace(workspaceId);
 
+        const demoSkus = countCatalogSkus(initialProducts);
         const storeProfile = currentStore || {
           name: `${req.workspace!.name} Store`,
           domain: `${req.workspace!.slug}.myshopify.com`,
           currency: 'USD',
-          skuCount: initialProducts.length,
+          skuCount: demoSkus,
           catalogCompletenessAvg: 88,
           truthBoundaryStrictness: 'standard' as const,
           tier: 'Free Audit' as const,
           connectors: [],
         };
 
-        const demoSkus = countCatalogSkus(initialProducts);
         const quotaCheck = checkPlanQuota(currentStore, [], demoSkus);
         if (!quotaCheck.allowed) {
           return res.status(403).json({
@@ -306,7 +306,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
           storeProfile: {
             ...storeProfile,
-            skuCount: initialProducts.length,
+            skuCount: demoSkus,
           },
         };
 
@@ -315,7 +315,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.json({
           success: true,
           message: 'Demo catalog successfully imported to cloud workspace',
-          skuCount: initialProducts.length,
+          skuCount: demoSkus,
         });
       });
     } catch (err: any) {

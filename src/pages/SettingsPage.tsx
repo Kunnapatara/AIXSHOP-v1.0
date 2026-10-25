@@ -473,24 +473,35 @@ export const SettingsPage: React.FC = () => {
           </div>
 
           <div className="p-5 bg-stone-50 rounded-xl border border-stone-200 space-y-3">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-semibold text-stone-900">Catalog SKU Utilization</span>
-              <span className="font-mono text-stone-600">
-                {products.length} catalog products / {storeProfile.skuLimit || 2500} SKU Limit ({((products.length / (storeProfile.skuLimit || 2500)) * 100).toFixed(1)}%)
-              </span>
-            </div>
+            {(() => {
+              const currentSkuCount = typeof storeProfile.skuCount === 'number'
+                ? storeProfile.skuCount
+                : products.reduce((acc, p) => acc + (p.variants?.length ? p.variants.length : 1), 0);
+              const effectiveLimit = storeProfile.skuLimit || 2500;
+              const utilizationPct = ((currentSkuCount / effectiveLimit) * 100).toFixed(1);
+              return (
+                <>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-stone-900">Catalog SKU Utilization</span>
+                    <span className="font-mono text-stone-600">
+                      {currentSkuCount} / {effectiveLimit} SKUs ({utilizationPct}%)
+                    </span>
+                  </div>
 
-            {/* Progress bar */}
-            <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden">
-              <div 
-                className="bg-orange-600 h-2.5 rounded-full" 
-                style={{ width: `${Math.min(100, (products.length / (storeProfile.skuLimit || 2500)) * 100)}%` }}
-              ></div>
-            </div>
+                  {/* Progress bar */}
+                  <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden">
+                    <div 
+                      className="bg-orange-600 h-2.5 rounded-full" 
+                      style={{ width: `${Math.min(100, (currentSkuCount / effectiveLimit) * 100)}%` }}
+                    ></div>
+                  </div>
 
-            <p className="text-xs text-stone-500">
-              Capacity baseline: {storeProfile.skuLimit || 2500} SKUs. Plan tier and limits reflect local workspace configuration without verified third-party billing enforcement.
-            </p>
+                  <p className="text-xs text-stone-500">
+                    Capacity baseline: {effectiveLimit} SKUs (1 variant = 1 SKU). Plan tier and limits reflect local workspace configuration without verified third-party billing enforcement.
+                  </p>
+                </>
+              );
+            })()}
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">

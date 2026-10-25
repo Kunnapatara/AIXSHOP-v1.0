@@ -964,6 +964,12 @@ export class PostgresRepository implements DatabaseRepository {
     storeId: string,
     authoritativeStore: StoreProfile
   ): Promise<void> {
+    const authoritativeSkuCount = countCatalogSkus(payload.products);
+    authoritativeStore.skuCount = authoritativeSkuCount;
+    if (payload.storeProfile) {
+      payload.storeProfile.skuCount = authoritativeSkuCount;
+    }
+
     // Update store profile, preserving server-managed tier and sku_limit
     await client.query(
       `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, created_at, updated_at)
@@ -985,7 +991,7 @@ export class PostgresRepository implements DatabaseRepository {
         payload.storeProfile?.name || authoritativeStore.name,
         payload.storeProfile?.domain || authoritativeStore.domain,
         payload.storeProfile?.currency || authoritativeStore.currency,
-        payload.products.length,
+        authoritativeSkuCount,
         payload.storeProfile?.catalogCompletenessAvg ?? authoritativeStore.catalogCompletenessAvg ?? 0,
         payload.storeProfile?.truthBoundaryStrictness || authoritativeStore.truthBoundaryStrictness,
         authoritativeStore.tier,
@@ -1231,94 +1237,182 @@ export class PostgresRepository implements DatabaseRepository {
     }
   }
 
+  private async mutateCatalogUnderLock<T>(
+    workspaceId: string,
+    mutator: (catalog: StoragePayloadV1, authoritativeStore: StoreProfile) => { nextCatalog: StoragePayloadV1; result: T }
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const storeId = `store_${workspaceId}`;
+
+      // 1. Consistent lock order: Acquire row-level lock on stores table first
+      let storeRes = await client.query<{
+        id: string;
+        tier: string;
+        sku_limit: number | null;
+        name: string;
+        domain: string;
+        currency: string;
+        sku_count: number;
+        catalog_completeness_avg: number;
+        truth_boundary_strictness: string;
+        connectors_json: any;
+      }>(
+        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+         FROM stores
+         WHERE workspace_id = $1
+         FOR UPDATE`,
+        [workspaceId]
+      );
+
+      if (storeRes.rows.length === 0) {
+        throw new Error(`Workspace ${workspaceId} catalog not found`);
+      }
+
+      const lockedRow = storeRes.rows[0];
+      const authoritativeStore: StoreProfile = {
+        name: lockedRow.name || 'Store',
+        domain: lockedRow.domain || `${workspaceId}.myshopify.com`,
+        currency: lockedRow.currency || 'USD',
+        skuCount: lockedRow.sku_count || 0,
+        catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+        truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
+        tier: (lockedRow.tier || 'Free Audit') as any,
+        skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
+        connectors: typeof lockedRow.connectors_json === 'string' ? JSON.parse(lockedRow.connectors_json) : (lockedRow.connectors_json || []),
+      };
+
+      // 2. Read latest catalog state using that same transaction client, AFTER acquiring the lock
+      const catalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
+      if (!catalog) {
+        throw new Error(`Workspace ${workspaceId} catalog not found`);
+      }
+
+      // 3. Apply the requested mutation to the latest authoritative state
+      const { nextCatalog, result } = mutator(catalog, authoritativeStore);
+
+      // 4. Validate quota under the lock
+      const proposedSkus = countCatalogSkus(nextCatalog.products);
+      const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
+      if (!quotaCheck.allowed) {
+        throw new PlanQuotaExceededError(quotaCheck);
+      }
+
+      // 5. Persist the updated catalog through transaction-aware helper reusing the same client
+      await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, authoritativeStore);
+
+      // 6. Commit
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async approveAction(
     workspaceId: string, 
     actionId: string, 
     customApprovedValue?: string
   ): Promise<{ action: ActionItem; product?: Product }> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
+      const result = executeActionApproval(actionId, customApprovedValue, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile || authoritativeStore,
+        isReadOnly: false,
+      });
 
-    const result = executeActionApproval(actionId, customApprovedValue, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
+      if (!result.success) {
+        throw new Error(result.message || 'Action approval failed');
+      }
+
+      const nextCatalog: StoragePayloadV1 = {
+        ...catalog,
+        actions: result.nextActions,
+        products: result.nextProducts,
+        findings: result.nextFindings,
+        storeProfile: result.nextStoreProfile || catalog.storeProfile,
+      };
+
+      const updatedAction = result.nextActions.find(a => a.id === actionId);
+      if (!updatedAction) throw new Error(`Action ${actionId} not found after mutation`);
+      const updatedProduct = updatedAction.productId 
+        ? result.nextProducts.find(p => p.id === updatedAction.productId)
+        : undefined;
+
+      return {
+        nextCatalog,
+        result: { action: updatedAction, product: updatedProduct },
+      };
     });
-
-    if (!result.success) {
-      throw new Error(result.message || 'Action approval failed');
-    }
-
-    await this.saveWorkspaceCatalog(workspaceId, {
-      ...catalog,
-      actions: result.nextActions,
-      products: result.nextProducts,
-      findings: result.nextFindings,
-      storeProfile: result.nextStoreProfile,
-    });
-
-    const updatedAction = result.nextActions.find(a => a.id === actionId);
-    if (!updatedAction) throw new Error(`Action ${actionId} not found after mutation`);
-    const updatedProduct = updatedAction.productId 
-      ? result.nextProducts.find(p => p.id === updatedAction.productId)
-      : undefined;
-
-    return { action: updatedAction, product: updatedProduct };
   }
 
   async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
+      const result = executeActionDismissal(actionId, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile || authoritativeStore,
+        isReadOnly: false,
+      });
 
-    const result = executeActionDismissal(actionId, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
+      if (!result.success) {
+        throw new Error(result.message || 'Action dismissal failed');
+      }
+
+      const nextCatalog: StoragePayloadV1 = {
+        ...catalog,
+        actions: result.nextActions,
+      };
+
+      const updatedAction = result.nextActions.find(a => a.id === actionId);
+      if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+
+      return {
+        nextCatalog,
+        result: { action: updatedAction },
+      };
     });
-
-    if (!result.success) {
-      throw new Error(result.message || 'Action dismissal failed');
-    }
-
-    await this.saveWorkspaceCatalog(workspaceId, {
-      ...catalog,
-      actions: result.nextActions,
-    });
-
-    const updatedAction = result.nextActions.find(a => a.id === actionId);
-    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-    return { action: updatedAction };
   }
 
   async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
-    const catalog = await this.loadWorkspaceCatalog(workspaceId);
-    if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
+    return this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
+      const result = executeActionRecheck(actionId, {
+        products: catalog.products,
+        findings: catalog.findings,
+        actionItems: catalog.actions,
+        storeProfile: catalog.storeProfile || authoritativeStore,
+        isReadOnly: false,
+      });
 
-    const result = executeActionRecheck(actionId, {
-      products: catalog.products,
-      findings: catalog.findings,
-      actionItems: catalog.actions,
-      storeProfile: catalog.storeProfile,
-      isReadOnly: false,
+      if (!result.success) {
+        throw new Error(result.message || 'Action recheck failed');
+      }
+
+      const nextCatalog: StoragePayloadV1 = {
+        ...catalog,
+        actions: result.nextActions,
+        findings: result.nextFindings || catalog.findings,
+      };
+
+      const updatedAction = result.nextActions.find(a => a.id === actionId);
+      if (!updatedAction) throw new Error(`Action ${actionId} not found`);
+
+      return {
+        nextCatalog,
+        result: { action: updatedAction },
+      };
     });
-
-    if (!result.success) {
-      throw new Error(result.message || 'Action recheck failed');
-    }
-
-    await this.saveWorkspaceCatalog(workspaceId, {
-      ...catalog,
-      actions: result.nextActions,
-      findings: result.nextFindings || catalog.findings,
-    });
-
-    const updatedAction = result.nextActions.find(a => a.id === actionId);
-    if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-    return { action: updatedAction };
   }
 
   async importCatalog(
