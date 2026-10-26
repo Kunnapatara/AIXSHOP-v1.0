@@ -454,25 +454,31 @@ export class MemoryRepository implements DatabaseRepository {
     return JSON.parse(JSON.stringify(cat));
   }
 
-  private workspaceLocks: Map<string, Promise<void>> = new Map();
+  private workspaceLocks: Map<string, Promise<unknown>> = new Map();
 
-  private async withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+  async withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
     const prevLock = this.workspaceLocks.get(workspaceId) || Promise.resolve();
-    let releaseLock: () => void;
-    const nextLock = new Promise<void>((resolve) => {
-      releaseLock = resolve;
+    let releaseCurrent: () => void;
+    const currentTurnPromise = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
     });
-    this.workspaceLocks.set(workspaceId, prevLock.then(() => nextLock, () => nextLock));
 
-    await prevLock;
+    const chainTail = prevLock.catch(() => {}).then(() => currentTurnPromise);
+    this.workspaceLocks.set(workspaceId, chainTail);
+
     try {
+      await prevLock.catch(() => {});
       return await fn();
     } finally {
-      releaseLock!();
-      if (this.workspaceLocks.get(workspaceId) === nextLock) {
+      releaseCurrent!();
+      if (this.workspaceLocks.get(workspaceId) === chainTail) {
         this.workspaceLocks.delete(workspaceId);
       }
     }
+  }
+
+  getActiveWorkspaceLockCount(): number {
+    return this.workspaceLocks.size;
   }
 
   private async saveWorkspaceCatalogInternal(workspaceId: string, payload: StoragePayloadV1): Promise<void> {

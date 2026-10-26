@@ -594,6 +594,16 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
         findings: [],
         actions: [],
         evidence: [],
+        storeProfile: {
+          name: 'Store',
+          domain: 'store.myshopify.com',
+          currency: 'USD',
+          skuCount: 0,
+          catalogCompletenessAvg: 80,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Growth',
+          connectors: [],
+        },
       });
 
       assert.equal(capturedSkuCountParam, 6, 'stores.sku_count must record 6 variants, not products.length (2)');
@@ -650,6 +660,16 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
         findings: [],
         actions: [],
         evidence: [],
+        storeProfile: {
+          name: 'Store',
+          domain: 'store.myshopify.com',
+          currency: 'USD',
+          skuCount: 0,
+          catalogCompletenessAvg: 80,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Starter',
+          connectors: [],
+        },
       });
 
       assert.equal(capturedSkuCountParam, 3, 'Products with 0 variants must count as 1 SKU each');
@@ -861,12 +881,13 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
 
       // Create owner user, workspace and initial store
       const user = await memRepo.createUser({
+        id: 'usr_conc_owner',
         email: 'concurrency_owner@example.com',
         passwordHash: 'hash123',
         fullName: 'Concurrency Owner',
       });
       const { workspace } = await memRepo.createWorkspace(
-        { name: 'Concurrency Retail', slug: 'concurrency-retail' },
+        { id: 'ws_concurrency', name: 'Concurrency Retail', slug: 'concurrency-retail' },
         user.id
       );
       await memRepo.saveWorkspaceCatalog(workspace.id, {
@@ -897,7 +918,7 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
             id: 'find_1',
             productId: 'p_conc',
             scope: 'product',
-            type: 'inconsistency',
+            type: 'inconsistent_attributes',
             severity: 'medium',
             title: 'Fix title formatting',
             description: '',
@@ -911,7 +932,7 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
             id: 'find_2',
             productId: 'p_conc',
             scope: 'product',
-            type: 'inconsistency',
+            type: 'inconsistent_attributes',
             severity: 'low',
             title: 'Optional barcode note',
             description: '',
@@ -931,7 +952,8 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
             severity: 'medium',
             status: 'pending_review',
             verificationStatus: 'unverified',
-            proposedChange: { field: 'title / marketing claims', proposedValue: 'AudioTech Wireless Earbuds Pro' },
+            evidenceRequired: false,
+            proposedChange: { field: 'title / marketing claims', from: 'Wireless Earbuds', to: 'AudioTech Wireless Earbuds Pro' },
             auditLog: [],
           },
           {
@@ -942,7 +964,8 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
             severity: 'low',
             status: 'pending_review',
             verificationStatus: 'unverified',
-            proposedChange: {},
+            evidenceRequired: false,
+            proposedChange: { field: 'title / marketing claims', from: '', to: '' },
             auditLog: [],
           },
         ],
@@ -978,6 +1001,111 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
       assert.equal(action1?.status, 'approved', 'Action 1 must be approved');
       assert.equal(action2?.status, 'dismissed', 'Action 2 must be dismissed — neither mutation lost');
       assert.equal(finalCatalog?.storeProfile?.skuCount, 1, 'SKU count preserved as 1');
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 0, 'Workspace lock entry must be removed after operations complete');
+    });
+
+    test('17. MemoryRepository workspace lock cleanup: Sequential operations drain and remove map entries', async () => {
+      const { MemoryRepository } = await import('./db/memoryRepository');
+      const memRepo = new MemoryRepository(false);
+
+      const op1 = await memRepo.withWorkspaceLock('ws_seq', async () => 'result_1');
+      assert.equal(op1, 'result_1');
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 0, 'Map must be empty after first sequential operation');
+
+      const op2 = await memRepo.withWorkspaceLock('ws_seq', async () => 'result_2');
+      assert.equal(op2, 'result_2');
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 0, 'Map must remain empty after second sequential operation');
+    });
+
+    test('18. MemoryRepository workspace lock cleanup: Overlapping operations preserve queue and clean up after draining', async () => {
+      const { MemoryRepository } = await import('./db/memoryRepository');
+      const memRepo = new MemoryRepository(false);
+
+      const executionOrder: number[] = [];
+      let resolveFirst: () => void;
+      const firstGate = new Promise<void>((resolve) => {
+        resolveFirst = resolve;
+      });
+
+      // Launch Op 1 which blocks on firstGate
+      const p1 = memRepo.withWorkspaceLock('ws_overlap', async () => {
+        await firstGate;
+        executionOrder.push(1);
+        return 'res_1';
+      });
+
+      // Launch Op 2 immediately while Op 1 is running
+      const p2 = memRepo.withWorkspaceLock('ws_overlap', async () => {
+        executionOrder.push(2);
+        return 'res_2';
+      });
+
+      // Launch Op 3 immediately while Op 1 and Op 2 are in flight
+      const p3 = memRepo.withWorkspaceLock('ws_overlap', async () => {
+        executionOrder.push(3);
+        return 'res_3';
+      });
+
+      // Lock count should be 1 during execution
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 1, 'Lock map must have 1 active queue for ws_overlap');
+
+      // Unblock Op 1
+      resolveFirst!();
+
+      const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+      assert.equal(r1, 'res_1');
+      assert.equal(r2, 'res_2');
+      assert.equal(r3, 'res_3');
+
+      // Assert strictly sequential execution
+      assert.deepEqual(executionOrder, [1, 2, 3], 'Operations must execute strictly in FIFO queued order');
+
+      // Assert complete cleanup after the queue drained
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 0, 'Lock map entry must be deleted after queue drains');
+    });
+
+    test('19. MemoryRepository workspace lock: Rejected operations do not permanently block subsequent operations', async () => {
+      const { MemoryRepository } = await import('./db/memoryRepository');
+      const memRepo = new MemoryRepository(false);
+
+      // Op 1 will fail with an error
+      const pFail = memRepo.withWorkspaceLock('ws_fail', async () => {
+        throw new Error('Simulated repository error');
+      });
+
+      // Op 2 queued behind the failing operation
+      const pSuccess = memRepo.withWorkspaceLock('ws_fail', async () => {
+        return 'recovered_ok';
+      });
+
+      await assert.rejects(
+        pFail,
+        (err: any) => {
+          assert.equal(err.message, 'Simulated repository error');
+          return true;
+        }
+      );
+
+      // Op 2 must still execute successfully and not hang
+      const res = await pSuccess;
+      assert.equal(res, 'recovered_ok', 'Subsequent operation must succeed despite previous rejection');
+
+      // Map must clean up properly
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 0, 'Lock map entry must be cleaned up after recovery');
+    });
+
+    test('20. MemoryRepository workspace lock: Multi-workspace accumulation does not leak memory', async () => {
+      const { MemoryRepository } = await import('./db/memoryRepository');
+      const memRepo = new MemoryRepository(false);
+
+      // Run operations across 10 distinct workspaces
+      const tasks = Array.from({ length: 10 }, (_, i) =>
+        memRepo.withWorkspaceLock(`ws_tenant_${i}`, async () => `done_${i}`)
+      );
+
+      const results = await Promise.all(tasks);
+      assert.equal(results.length, 10);
+      assert.equal(memRepo.getActiveWorkspaceLockCount(), 0, 'All workspace locks must be removed upon completion, zero memory leakage');
     });
   });
 

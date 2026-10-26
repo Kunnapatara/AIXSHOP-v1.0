@@ -1225,6 +1225,13 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
   // 8. PostgreSQL Schema Readiness Accuracy & Constraints (Task 2)
   describe('PostgreSQL Schema Readiness Accuracy & Constraints', () => {
+    const ALL_REQUIRED_MIGRATIONS = [
+      '001_initial_schema.sql',
+      '002_tenant_referential_integrity.sql',
+      '003_store_sku_limit.sql',
+      '004_backfill_store_sku_count.sql',
+    ];
+
     function createMockPostgresPool(options: {
       columnRows: any[];
       fkRows?: any[];
@@ -1352,7 +1359,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: options.catalogConstraints !== undefined ? options.catalogConstraints : defaultConstraints };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: (options.appliedMigrations || ['001_initial_schema.sql', '002_tenant_referential_integrity.sql']).map(id => ({ id })) };
+            return { rows: (options.appliedMigrations || ALL_REQUIRED_MIGRATIONS).map(id => ({ id })) };
           }
           return { rows: [] };
         },
@@ -1552,19 +1559,31 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 15. checkSchemaReadiness fails when 001_initial_schema.sql is recorded but 002_tenant_referential_integrity.sql is pending', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql'], // 002 is missing/pending
+        appliedMigrations: ['001_initial_schema.sql'], // 002, 003, 004 are pending
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql']);
+      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql']);
       assert.match(res.error!, /Required migration "002_tenant_referential_integrity\.sql" has not been applied/);
+      assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
+    });
+
+    test('[Mock Unit Test] 15b. checkSchemaReadiness fails when 004_backfill_store_sku_count.sql is pending', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql'], // 004 is missing/pending
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql']);
+      assert.match(res.error!, /Required migration "004_backfill_store_sku_count\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
 
     test('[Mock Unit Test] 16. checkSchemaReadiness fails when both migrations recorded but stores(workspace_id, id) unique key is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           // Missing stores unique constraint
           {
@@ -1586,7 +1605,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 17. checkSchemaReadiness fails when both migrations recorded but composite FK products(workspace_id, store_id) is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_table: 'stores',
@@ -1608,7 +1627,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 18. checkSchemaReadiness fails when both migrations recorded but composite FK action_items(workspace_id, finding_id) is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_table: 'stores',
@@ -1667,14 +1686,14 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('[Mock Unit Test] 19. checkSchemaReadiness succeeds (isReady: true) when both migrations recorded and all composite constraints exist', async () => {
+    test('[Mock Unit Test] 19. checkSchemaReadiness succeeds (isReady: true) when all 4 migrations recorded and all composite constraints exist', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, true);
-      assert.deepEqual(res.details?.appliedMigrations, ['001_initial_schema.sql', '002_tenant_referential_integrity.sql']);
+      assert.deepEqual(res.details?.appliedMigrations, ALL_REQUIRED_MIGRATIONS);
       assert.ok(res.details?.verifiedConstraints?.includes('stores(workspace_id, id) UNIQUE'));
       assert.ok(res.details?.verifiedConstraints?.includes('products(workspace_id, store_id) -> stores(workspace_id, id)'));
       assert.ok(res.details?.verifiedConstraints?.includes('action_items(workspace_id, finding_id) -> findings(workspace_id, id)'));
@@ -1684,7 +1703,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 20. checkSchemaReadiness strictly scopes all queries to current_schema() without hardcoded public leakage', async () => {
       const { repo, getExecutedQueries } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
       });
       await repo.checkSchemaReadiness();
       const queries = getExecutedQueries();
@@ -1744,7 +1763,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 22. checkSchemaReadiness fails when findings(workspace_id, store_id) composite FK is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_table: 'stores',
@@ -1774,7 +1793,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 23. checkSchemaReadiness fails when findings(workspace_id, product_id) composite FK is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_table: 'stores',
@@ -1812,7 +1831,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 24. checkSchemaReadiness fails when action_items(workspace_id, store_id) composite FK is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_table: 'stores',
@@ -1858,7 +1877,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 25. checkSchemaReadiness fails when action_items(workspace_id, product_id) composite FK is absent', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_table: 'stores',
@@ -1917,14 +1936,14 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('[Mock Unit Test] 26. checkSchemaReadiness reports all 7 referential constraints and 2 migrations in details', async () => {
+    test('[Mock Unit Test] 26. checkSchemaReadiness reports all 7 referential constraints and 4 migrations in details', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, true);
-      assert.deepEqual(res.details?.appliedMigrations, ['001_initial_schema.sql', '002_tenant_referential_integrity.sql']);
+      assert.deepEqual(res.details?.appliedMigrations, ALL_REQUIRED_MIGRATIONS);
       const verified = res.details?.verifiedConstraints || [];
       assert.ok(verified.includes('stores(workspace_id, id) UNIQUE'));
       assert.ok(verified.includes('products(workspace_id, store_id) -> stores(workspace_id, id)'));
@@ -1940,7 +1959,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 27. checkSchemaReadiness rejects foreign key when source column order is reversed', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_schema: 'public',
@@ -1973,7 +1992,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 28. checkSchemaReadiness rejects foreign key when target column order is reversed', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_schema: 'public',
@@ -2006,7 +2025,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 29. checkSchemaReadiness rejects foreign key pointing to same-named table in wrong schema', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_schema: 'public',
@@ -2039,7 +2058,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 30. checkSchemaReadiness rejects constraint when source table is in unexpected schema', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_schema: 'staging_schema', // WRONG source schema!
@@ -2062,7 +2081,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 31. stores(workspace_id, id) unique key is rejected if actual ordered definition is reversed (id, workspace_id)', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
         catalogConstraints: [
           {
             source_schema: 'public',
@@ -2106,7 +2125,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
         currentSchema: customSchema,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql'],
+        appliedMigrations: ALL_REQUIRED_MIGRATIONS,
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, true);

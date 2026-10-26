@@ -288,7 +288,7 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify applied migrations (both 001 and 002 are required)
+        // Verify applied migrations (001, 002, 003, and 004 are all required for current version)
         const migRes = await client.query<{ id: string }>(
           'SELECT id FROM schema_migrations ORDER BY id ASC'
         );
@@ -297,6 +297,8 @@ export class PostgresRepository implements DatabaseRepository {
         const requiredMigrations = [
           '001_initial_schema.sql',
           '002_tenant_referential_integrity.sql',
+          '003_store_sku_limit.sql',
+          '004_backfill_store_sku_count.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
