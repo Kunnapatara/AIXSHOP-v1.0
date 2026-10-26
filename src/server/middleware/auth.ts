@@ -1,9 +1,28 @@
 import { Response, NextFunction } from 'express';
-import { AuthRequest } from '../types';
+import { AuthRequest, WorkspaceRole } from '../types';
 import { DatabaseRepository } from '../db/repository';
 import { hashSessionToken } from '../security/tokens';
 
+// Bounded in-memory rate limiting store with active TTL cleanup
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+let lastPruneAt = Date.now();
+const MAX_RATE_LIMITER_ENTRIES = 5000;
+
+function pruneExpiredRateLimitEntries(now: number) {
+  for (const [key, value] of loginAttempts.entries()) {
+    if (now > value.resetAt) {
+      loginAttempts.delete(key);
+    }
+  }
+}
+
+export function _resetRateLimiter(): void {
+  loginAttempts.clear();
+}
+
+export function _getRateLimiterSize(): number {
+  return loginAttempts.size;
+}
 
 export function createAuthMiddleware(repo: DatabaseRepository) {
   return async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
@@ -34,6 +53,15 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
         });
       }
 
+      // Explicit server-side session expiry verification
+      const expiresAtDate = new Date(session.expiresAt);
+      if (isNaN(expiresAtDate.getTime()) || expiresAtDate.getTime() <= Date.now()) {
+        return res.status(401).json({ 
+          error: 'Authentication required: session has expired',
+          code: 'SESSION_EXPIRED' 
+        });
+      }
+
       // 3. Look up user
       const user = await repo.getUserById(session.userId);
       if (!user) {
@@ -53,6 +81,7 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
       }
 
       // 5. Strictly verify user's membership and permissions in this workspace
+      // If user was removed from the workspace, access is immediately revoked
       const membership = await repo.getMembership(workspace.id, user.id);
       if (!membership) {
         return res.status(403).json({ 
@@ -84,12 +113,37 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
 }
 
 /**
- * Basic IP rate limiter for authentication endpoints (prevent brute-force).
+ * Role-based authorization middleware.
+ * Verifies that the authenticated user holds an authorized role in the active workspace.
+ */
+export function requireRole(allowedRoles: WorkspaceRole[]) {
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.workspace || !allowedRoles.includes(req.workspace.role)) {
+      return res.status(403).json({
+        error: `Forbidden: role "${req.workspace?.role || 'none'}" lacks required permissions. Requires one of: ${allowedRoles.join(', ')}`,
+        code: 'FORBIDDEN_INSUFFICIENT_ROLE',
+      });
+    }
+    next();
+  };
+}
+
+/**
+ * IP rate limiter for authentication endpoints (prevent brute-force).
+ * Implements bounded memory growth with active expiration pruning.
+ * Note: In-memory rate limiting is scoped to a single process instance.
  */
 export function authRateLimiter(maxAttempts = 15, windowMs = 15 * 60 * 1000) {
   return (req: any, res: Response, next: NextFunction) => {
     const ip = req.ip || req.connection?.remoteAddress || 'unknown';
     const now = Date.now();
+
+    // Active prune every minute or when capacity threshold reached
+    if (now - lastPruneAt > 60000 || loginAttempts.size > MAX_RATE_LIMITER_ENTRIES) {
+      pruneExpiredRateLimitEntries(now);
+      lastPruneAt = now;
+    }
+
     const entry = loginAttempts.get(ip);
 
     if (entry) {
@@ -113,23 +167,58 @@ export function authRateLimiter(maxAttempts = 15, windowMs = 15 * 60 * 1000) {
 }
 
 /**
- * CSRF Protection for state-modifying requests using cookies
+ * CSRF Protection for state-modifying requests using session cookies.
+ * 
+ * Rules:
+ * - Safe HTTP methods (GET, HEAD, OPTIONS) are exempt.
+ * - Requests without session cookie (e.g. pure Bearer token API requests) are exempt.
+ * - State-changing cookie requests MUST present a valid custom header:
+ *   'X-Requested-With: XMLHttpRequest' OR 'X-CSRF-Token'.
+ * - Origin / Referer validation is performed when present to ensure same-origin consistency.
+ * - Content-Type: application/json alone is explicitly NOT sufficient to bypass CSRF.
  */
 export function csrfProtection(req: any, res: Response, next: NextFunction) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     return next();
   }
 
-  // Modern browsers require preflight for JSON + custom header.
-  // Validate that request includes a custom header or comes with same-origin
-  const customHeader = req.headers['x-requested-with'] || req.headers['x-csrf-token'];
-  const contentType = req.headers['content-type'];
+  // Pure token-based (Bearer) or unauthenticated requests are not subject to cookie-based CSRF
+  if (!req.cookies?.aixshop_session) {
+    return next();
+  }
 
-  if (req.cookies?.aixshop_session && !customHeader && !contentType?.includes('application/json')) {
+  // Validate custom anti-CSRF header
+  const customHeader = req.headers['x-requested-with'] || req.headers['x-csrf-token'];
+  const hasValidHeader = (
+    req.headers['x-requested-with'] === 'XMLHttpRequest' ||
+    (typeof req.headers['x-csrf-token'] === 'string' && req.headers['x-csrf-token'].trim().length > 0)
+  );
+
+  if (!hasValidHeader) {
     return res.status(403).json({ 
-      error: 'Forbidden: Missing CSRF verification header',
+      error: 'Forbidden: Missing or invalid CSRF verification header. State-modifying cookie requests require X-Requested-With or X-CSRF-Token header.',
       code: 'CSRF_REJECTED' 
     });
+  }
+
+  // Validate Origin header when present
+  const origin = req.headers['origin'];
+  if (origin && typeof origin === 'string') {
+    try {
+      const originUrl = new URL(origin);
+      const reqHost = req.headers['host'];
+      if (reqHost && originUrl.host !== reqHost) {
+        return res.status(403).json({
+          error: 'Forbidden: Cross-origin state modification rejected.',
+          code: 'CSRF_ORIGIN_MISMATCH',
+        });
+      }
+    } catch {
+      return res.status(403).json({
+        error: 'Forbidden: Malformed Origin header.',
+        code: 'CSRF_ORIGIN_INVALID',
+      });
+    }
   }
 
   next();

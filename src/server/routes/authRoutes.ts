@@ -204,6 +204,20 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
     }
   });
 
+  // POST /api/auth/logout-all — Revoke all active sessions across all devices
+  router.post('/logout-all', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const userId = req.user!.id;
+      await repo.deleteUserSessions(userId);
+      clearSessionCookie(res);
+      return res.json({ success: true, message: 'All active sessions revoked successfully' });
+    } catch (err: any) {
+      console.error('[AIXSHOP Auth] Logout-all error:', err);
+      clearSessionCookie(res);
+      return res.status(500).json({ error: 'Failed to revoke sessions' });
+    }
+  });
+
   // GET /api/auth/me
   router.get('/me', requireAuth, async (req: AuthRequest, res) => {
     try {

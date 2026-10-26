@@ -27,6 +27,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
+import { SubscriptionRecord, BillingEventRecord } from '../billing/types';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
 import { 
   calculateImportUsage, 
@@ -1537,5 +1538,76 @@ export class PostgresRepository implements DatabaseRepository {
     } finally {
       client.release();
     }
+  }
+
+  // Billing & Subscriptions
+  async getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null> {
+    const res = await this.pool.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM subscriptions
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+    if (res.rows.length === 0) return null;
+    return res.rows[0];
+  }
+
+  async saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord> {
+    const res = await this.pool.query<any>(
+      `INSERT INTO subscriptions (id, workspace_id, provider, customer_id, subscription_id, tier, status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+       ON CONFLICT (workspace_id) DO UPDATE SET
+         provider = EXCLUDED.provider,
+         customer_id = EXCLUDED.customer_id,
+         subscription_id = EXCLUDED.subscription_id,
+         tier = EXCLUDED.tier,
+         status = EXCLUDED.status,
+         current_period_start = EXCLUDED.current_period_start,
+         current_period_end = EXCLUDED.current_period_end,
+         cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+         updated_at = NOW()
+       RETURNING id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [
+        subscription.id,
+        subscription.workspaceId,
+        subscription.provider,
+        subscription.customerId,
+        subscription.subscriptionId,
+        subscription.tier,
+        subscription.status,
+        subscription.currentPeriodStart,
+        subscription.currentPeriodEnd,
+        subscription.cancelAtPeriodEnd,
+      ]
+    );
+    return res.rows[0];
+  }
+
+  async getBillingEventById(eventId: string): Promise<BillingEventRecord | null> {
+    const res = await this.pool.query<any>(
+      `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey", payload_json AS "payload", status, processed_at AS "processedAt"
+       FROM billing_events
+       WHERE event_id = $1`,
+      [eventId]
+    );
+    if (res.rows.length === 0) return null;
+    return res.rows[0];
+  }
+
+  async saveBillingEvent(event: BillingEventRecord): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO billing_events (id, provider, event_id, event_type, idempotency_key, payload_json, status, processed_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW())
+       ON CONFLICT (event_id) DO NOTHING`,
+      [
+        event.id,
+        event.provider,
+        event.eventId,
+        event.eventType,
+        event.idempotencyKey,
+        JSON.stringify(event.payload || {}),
+        event.status,
+      ]
+    );
   }
 }

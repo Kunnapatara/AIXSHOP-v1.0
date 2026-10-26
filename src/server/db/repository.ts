@@ -18,6 +18,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
+import { SubscriptionRecord, BillingEventRecord } from '../billing/types';
 
 export interface CreateUserData {
   id: string;
@@ -124,4 +125,10 @@ export interface DatabaseRepository {
     workspaceId: string,
     candidates: ProductCandidate[]
   ): Promise<CatalogImportResult>;
+
+  // Billing & Subscriptions
+  getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null>;
+  saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord>;
+  getBillingEventById(eventId: string): Promise<BillingEventRecord | null>;
+  saveBillingEvent(event: BillingEventRecord): Promise<void>;
 }

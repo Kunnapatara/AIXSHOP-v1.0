@@ -5,6 +5,7 @@ import { getDatabaseRepository } from './db/index';
 import { createAuthRoutes } from './routes/authRoutes';
 import { createCatalogRoutes } from './routes/catalogRoutes';
 import { createStoreRoutes } from './routes/storeRoutes';
+import { createBillingRoutes } from './routes/billingRoutes';
 import { csrfProtection } from './middleware/auth';
 
 export function createApp(customRepo?: DatabaseRepository): Express {
@@ -139,6 +140,7 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   app.use('/api/auth', createAuthRoutes(repo));
   app.use('/api/catalog', createCatalogRoutes(repo));
   app.use('/api/store', createStoreRoutes(repo));
+  app.use('/api/billing', createBillingRoutes(repo));
 
   // Global error handler
   app.use((err: any, req: any, res: any, next: any) => {

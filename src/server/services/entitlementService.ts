@@ -1,11 +1,14 @@
 import { StoreProfile, Product, ProductCandidate, CandidateProductStatus } from '../../types';
 import { evaluateCandidateProducts } from '../../domain/ingestion/storeIngestion';
+import { SubscriptionRecord } from '../billing/types';
 
 export interface WorkspacePlanEntitlement {
   isValid: boolean;
   tier: string;
   skuLimit: number;
   isUnlimited: boolean;
+  subscriptionStatus?: string;
+  isPastDue?: boolean;
   error?: string;
 }
 
@@ -69,7 +72,8 @@ const LEGACY_STALE_DEFAULT_SKU_LIMIT = 2500;
  * Validates whole-number limits and fails safely if store data is missing, corrupted, or invalid.
  */
 export function resolveWorkspacePlanEntitlement(
-  storeProfile: StoreProfile | null | undefined
+  storeProfile: StoreProfile | null | undefined,
+  subscription?: SubscriptionRecord | null
 ): WorkspacePlanEntitlement {
   if (!storeProfile) {
     return {
@@ -81,7 +85,21 @@ export function resolveWorkspacePlanEntitlement(
     };
   }
 
-  const rawTier = (storeProfile.tier || '').trim();
+  // If a verified subscription is provided, it serves as authoritative billing source
+  let rawTier = (storeProfile.tier || '').trim();
+  let isPastDue = false;
+
+  if (subscription) {
+    if (subscription.status === 'active') {
+      rawTier = subscription.tier;
+    } else if (subscription.status === 'past_due') {
+      rawTier = subscription.tier;
+      isPastDue = true;
+    } else if (subscription.status === 'canceled' || subscription.status === 'expired') {
+      rawTier = 'Free Audit';
+    }
+  }
+
   const normTier = (rawTier || 'Free Audit').toLowerCase();
 
   // Validate numeric limit integrity if specified
@@ -112,6 +130,8 @@ export function resolveWorkspacePlanEntitlement(
         tier: 'Enterprise',
         skuLimit: storeProfile.skuLimit!,
         isUnlimited: false,
+        isPastDue,
+        subscriptionStatus: subscription?.status,
       };
     }
     return {
@@ -119,6 +139,8 @@ export function resolveWorkspacePlanEntitlement(
       tier: 'Enterprise',
       skuLimit: Infinity,
       isUnlimited: true,
+      isPastDue,
+      subscriptionStatus: subscription?.status,
     };
   }
 
@@ -130,6 +152,8 @@ export function resolveWorkspacePlanEntitlement(
         tier: 'Starter',
         skuLimit: storeProfile.skuLimit!,
         isUnlimited: false,
+        isPastDue,
+        subscriptionStatus: subscription?.status,
       };
     }
     return {
@@ -137,6 +161,8 @@ export function resolveWorkspacePlanEntitlement(
       tier: 'Starter',
       skuLimit: DEFAULT_TIER_LIMITS['starter'],
       isUnlimited: false,
+      isPastDue,
+      subscriptionStatus: subscription?.status,
     };
   }
 
@@ -147,6 +173,8 @@ export function resolveWorkspacePlanEntitlement(
       tier: 'Growth',
       skuLimit: hasRawLimit ? storeProfile.skuLimit! : DEFAULT_TIER_LIMITS['growth'],
       isUnlimited: false,
+      isPastDue,
+      subscriptionStatus: subscription?.status,
     };
   }
 
@@ -157,6 +185,8 @@ export function resolveWorkspacePlanEntitlement(
       tier: 'Free Audit',
       skuLimit: hasRawLimit ? storeProfile.skuLimit! : DEFAULT_TIER_LIMITS['free audit'],
       isUnlimited: false,
+      isPastDue,
+      subscriptionStatus: subscription?.status,
     };
   }
 
@@ -167,6 +197,8 @@ export function resolveWorkspacePlanEntitlement(
       tier: rawTier || 'Custom',
       skuLimit: storeProfile.skuLimit!,
       isUnlimited: false,
+      isPastDue,
+      subscriptionStatus: subscription?.status,
     };
   }
 
@@ -237,9 +269,10 @@ export function calculateImportUsage(
 export function checkPlanQuota(
   storeProfile: StoreProfile | null | undefined,
   existingProducts: Product[],
-  additionalSkus: number
+  additionalSkus: number,
+  subscription?: SubscriptionRecord | null
 ): QuotaCheckResult {
-  const entitlement = resolveWorkspacePlanEntitlement(storeProfile);
+  const entitlement = resolveWorkspacePlanEntitlement(storeProfile, subscription);
   const currentUsage = countCatalogSkus(existingProducts);
   const projectedUsage = currentUsage + additionalSkus;
 
@@ -253,6 +286,19 @@ export function checkPlanQuota(
       tier: entitlement.tier,
       isUnlimited: false,
       error: entitlement.error || 'Invalid or missing workspace entitlement data',
+    };
+  }
+
+  if (entitlement.isPastDue && additionalSkus > 0) {
+    return {
+      allowed: false,
+      limit: entitlement.skuLimit,
+      currentUsage,
+      additionalUsage: additionalSkus,
+      projectedUsage,
+      tier: entitlement.tier,
+      isUnlimited: entitlement.isUnlimited,
+      error: `Subscription payment is past due for workspace on plan "${entitlement.tier}". Please update payment details before importing or adding new SKUs.`,
     };
   }
 

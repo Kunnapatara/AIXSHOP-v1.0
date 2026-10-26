@@ -71,8 +71,9 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       return await withWorkspaceLock(workspaceId, async () => {
         // Enforce authoritative plan quota on full catalog payload
         const store = await repo.getStoreByWorkspace(workspaceId);
+        const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
         const proposedSkus = countCatalogSkus(payload.products);
-        const quotaCheck = checkPlanQuota(store, [], proposedSkus);
+        const quotaCheck = checkPlanQuota(store, [], proposedSkus, subscription);
         if (!quotaCheck.allowed) {
           return res.status(403).json({
             error: quotaCheck.error,
@@ -220,6 +221,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       return await withWorkspaceLock(workspaceId, async () => {
         // Authoritative server-side store & catalog resolution (ignoring any client-supplied body params)
         const store = await repo.getStoreByWorkspace(workspaceId);
+        const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
         const catalog = await repo.loadWorkspaceCatalog(workspaceId);
         const existingProducts = catalog?.products || [];
 
@@ -227,7 +229,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         const { additionalSkus } = calculateImportUsage(candidates, existingProducts);
 
         // Authoritative server-side quota validation
-        const quotaCheck = checkPlanQuota(store, existingProducts, additionalSkus);
+        const quotaCheck = checkPlanQuota(store, existingProducts, additionalSkus, subscription);
         if (!quotaCheck.allowed) {
           return res.status(403).json({
             error: quotaCheck.error,
@@ -271,6 +273,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
 
       return await withWorkspaceLock(workspaceId, async () => {
         const currentStore = await repo.getStoreByWorkspace(workspaceId);
+        const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
 
         const demoSkus = countCatalogSkus(initialProducts);
         const storeProfile = currentStore || {
@@ -284,7 +287,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           connectors: [],
         };
 
-        const quotaCheck = checkPlanQuota(currentStore, [], demoSkus);
+        const quotaCheck = checkPlanQuota(currentStore, [], demoSkus, subscription);
         if (!quotaCheck.allowed) {
           return res.status(403).json({
             error: quotaCheck.error,

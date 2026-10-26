@@ -26,6 +26,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
+import { SubscriptionRecord, BillingEventRecord } from '../billing/types';
 import { 
   initialProducts, 
   initialFindings, 
@@ -52,6 +53,8 @@ export class MemoryRepository implements DatabaseRepository {
   private sessions: Map<string, SessionRecord> = new Map(); // tokenHash -> record
   private stores: Map<string, StoreProfile> = new Map(); // workspaceId -> store
   private catalogs: Map<string, StoragePayloadV1> = new Map(); // workspaceId -> catalog
+  private subscriptions: Map<string, SubscriptionRecord> = new Map(); // workspaceId -> subscription
+  private billingEvents: Map<string, BillingEventRecord> = new Map(); // eventId -> event
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -656,6 +659,38 @@ export class MemoryRepository implements DatabaseRepository {
 
       return importRes;
     });
+  }
+
+  // Billing & Subscriptions
+  async getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null> {
+    const sub = this.subscriptions.get(workspaceId);
+    return sub ? JSON.parse(JSON.stringify(sub)) : null;
+  }
+
+  async saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord> {
+    const cloned = JSON.parse(JSON.stringify(subscription));
+    this.subscriptions.set(subscription.workspaceId, cloned);
+    return JSON.parse(JSON.stringify(cloned));
+  }
+
+  async getBillingEventById(eventId: string): Promise<BillingEventRecord | null> {
+    const evt = this.billingEvents.get(eventId);
+    return evt ? JSON.parse(JSON.stringify(evt)) : null;
+  }
+
+  async saveBillingEvent(event: BillingEventRecord): Promise<void> {
+    this.billingEvents.set(event.eventId, JSON.parse(JSON.stringify(event)));
+  }
+
+  clear(): void {
+    this.users.clear();
+    this.workspaces.clear();
+    this.memberships.clear();
+    this.sessions.clear();
+    this.stores.clear();
+    this.catalogs.clear();
+    this.subscriptions.clear();
+    this.billingEvents.clear();
   }
 }
 

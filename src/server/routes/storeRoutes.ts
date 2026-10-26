@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { DatabaseRepository } from '../db/repository';
-import { createAuthMiddleware } from '../middleware/auth';
+import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { applyConnectorToggle, validateAndApplyProfileUpdate } from '../../domain/settings/settingsService';
 
@@ -25,16 +25,19 @@ export function createStoreRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // PUT /api/store/profile
-  router.put('/profile', requireAuth, async (req: AuthRequest, res) => {
+  // PUT /api/store/profile — Only workspace owners and admins may modify store settings
+  router.put('/profile', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const rawUpdates = req.body || {};
       const updates = { ...rawUpdates };
-      // Authoritative security boundary: never allow client requests to mutate plan tier or SKU limits
+      // Authoritative security boundary: never allow client requests to mutate plan tier, SKU limits, or identities
+      delete updates.id;
+      delete updates.workspaceId;
       delete updates.tier;
       delete updates.skuLimit;
       delete updates.skuCount;
+      delete updates.role;
 
       const currentStore = await repo.getStoreByWorkspace(workspaceId);
       if (!currentStore) {
@@ -59,7 +62,7 @@ export function createStoreRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/store/connectors/:id/toggle
-  router.post('/connectors/:id/toggle', requireAuth, async (req: AuthRequest, res) => {
+  router.post('/connectors/:id/toggle', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const connectorId = req.params.id;
