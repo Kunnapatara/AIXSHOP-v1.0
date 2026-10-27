@@ -12,8 +12,19 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   const app = express();
   const repo = customRepo || getDatabaseRepository();
 
-  // Basic middleware
-  app.use(express.json({ limit: '10mb' }));
+  // Narrowly scoped raw-body capture for billing webhook route
+  // Preserves exact original request bytes for HMAC signature verification
+  // All other application routes receive standard express.json() parsing
+  app.use((req, res, next) => {
+    if (req.path === '/api/billing/webhook' || req.originalUrl?.split('?')[0] === '/api/billing/webhook') {
+      return express.raw({ type: '*/*', limit: '5mb' })(req, res, (err) => {
+        if (err) return next(err);
+        (req as any).rawBody = req.body;
+        next();
+      });
+    }
+    return express.json({ limit: '10mb' })(req, res, next);
+  });
   app.use(cookieParser());
   app.use(csrfProtection);
 

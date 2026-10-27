@@ -45,24 +45,51 @@ export class BillingService {
       throw new Error(`Workspace store not found for ${workspaceId}`);
     }
 
+    const existingSub = await this.repo.getSubscriptionByWorkspace(workspaceId);
+    const customerId = existingSub?.customerId;
+
     return this.provider.createCheckoutSession({
       workspaceId,
       tier,
       successUrl,
       cancelUrl,
+      customerId,
     });
   }
 
   async createPortalSession(workspaceId: string, returnUrl: string) {
     const subscription = await this.repo.getSubscriptionByWorkspace(workspaceId);
-    const customerId = subscription?.customerId || `cust_${workspaceId}`;
-    return this.provider.createPortalSession(workspaceId, customerId, returnUrl);
+    const customerId = subscription?.customerId;
+    if (!customerId && this.provider.providerName === 'stripe') {
+      throw new Error(`[Billing] Workspace "${workspaceId}" does not have an active customer or subscription record.`);
+    }
+    return this.provider.createPortalSession(workspaceId, customerId || `cust_${workspaceId}`, returnUrl);
   }
 
   async handleWebhook(rawBody: string | Buffer, signatureHeader: string): Promise<WebhookProcessingResult> {
-    // 1. Verify cryptographic webhook signature
-    const secret = process.env.STRIPE_WEBHOOK_SECRET || process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123';
-    const isValidSignature = this.provider.verifyWebhookSignature(rawBody, signatureHeader, secret);
+    // 1. Resolve webhook secret safely without insecure production fallback
+    let secret = '';
+    if (this.provider.providerName === 'stripe') {
+      secret = (this.provider as any).getWebhookSecret?.() || process.env.STRIPE_WEBHOOK_SECRET || '';
+    } else {
+      secret = (this.provider as any).getWebhookSecret?.() || process.env.BILLING_WEBHOOK_SECRET || '';
+      if (!secret && process.env.NODE_ENV !== 'production') {
+        secret = 'sandbox_test_webhook_secret_key_123';
+      }
+    }
+
+    if (!secret) {
+      const err: any = new Error(
+        process.env.NODE_ENV === 'production'
+          ? 'Production billing webhook secret is not configured.'
+          : 'Billing webhook secret is not configured.'
+      );
+      err.statusCode = 500;
+      throw err;
+    }
+
+    // 2. Verify cryptographic webhook signature against original raw request bytes
+    const isValidSignature = await this.provider.verifyWebhookSignature(rawBody, signatureHeader, secret);
 
     if (!isValidSignature) {
       const err: any = new Error('Invalid webhook signature verification failed.');
@@ -70,7 +97,7 @@ export class BillingService {
       throw err;
     }
 
-    // 2. Parse event payload safely
+    // 3. Parse event payload safely
     const event = this.provider.parseWebhookEvent(rawBody);
 
     // 3. Idempotency Check: Prevent duplicate processing or status regression

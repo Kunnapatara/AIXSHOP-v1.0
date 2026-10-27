@@ -88,6 +88,7 @@ export interface CheckoutSessionOptions {
   successUrl: string;
   cancelUrl: string;
   customerEmail?: string;
+  customerId?: string;
 }
 
 export interface CheckoutSessionResult {
@@ -114,6 +115,8 @@ export interface IBillingProvider {
   readonly providerName: string;
   createCheckoutSession(options: CheckoutSessionOptions): Promise<CheckoutSessionResult>;
   createPortalSession(workspaceId: string, customerId: string, returnUrl: string): Promise<CustomerPortalSessionResult>;
-  verifyWebhookSignature(rawBody: string | Buffer, signature: string, secret: string): boolean;
+  verifyWebhookSignature(rawBody: string | Buffer, signature: string, secret: string): boolean | Promise<boolean>;
   parseWebhookEvent(rawBody: string | Buffer): WebhookEventPayload;
+  getWebhookSecret?(): string;
 }
+

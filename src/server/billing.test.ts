@@ -1,9 +1,10 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'http';
+import crypto from 'crypto';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
-import { SandboxBillingProvider, StripeBillingProvider } from './billing/providerAdapter';
+import { SandboxBillingProvider, StripeBillingProvider, setBillingProvider } from './billing/providerAdapter';
 import { BillingService } from './services/billingService';
 import { AUTHORITATIVE_PLANS } from './billing/types';
 import { checkPlanQuota, countCatalogSkus } from './services/entitlementService';
@@ -22,6 +23,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
   before(async () => {
     repo = new MemoryRepository(false);
     sandboxProvider = new SandboxBillingProvider('test_webhook_secret_key_abc123');
+    setBillingProvider(sandboxProvider);
     billingService = new BillingService(repo, sandboxProvider);
 
     const app = createApp(repo);
@@ -83,6 +85,43 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
     });
   });
 
+  // Helper to create test double for Stripe client
+  function createMockStripeClient(overrides?: {
+    checkoutSessionCreate?: (params: any) => Promise<any>;
+    portalSessionCreate?: (params: any) => Promise<any>;
+  }) {
+    return {
+      checkout: {
+        sessions: {
+          create: overrides?.checkoutSessionCreate || (async (params: any) => ({
+            id: 'cs_real_stripe_api_id_123',
+            url: `https://checkout.stripe.com/c/pay/cs_real_stripe_api_id_123?workspace=${params.client_reference_id}`,
+            ...params,
+          })),
+        },
+      },
+      billingPortal: {
+        sessions: {
+          create: overrides?.portalSessionCreate || (async (params: any) => ({
+            id: 'bps_real_stripe_portal_456',
+            url: `https://billing.stripe.com/p/session/bps_real_stripe_portal_456?customer=${params.customer}`,
+            ...params,
+          })),
+        },
+      },
+      webhooks: {
+        signature: {
+          verifyHeaderAsync: async (_payload: string, sig: string, secret: string) => {
+            if (sig.includes('invalid') || secret === 'wrong_secret') {
+              throw new Error('Signature verification failed');
+            }
+            return true;
+          },
+        },
+      },
+    } as unknown as any;
+  }
+
   // ==========================================
   // 1. Authoritative Plans & Provider Adapters
   // ==========================================
@@ -109,19 +148,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       assert.ok(result.checkoutUrl.includes('tier=Growth'));
     });
 
-    test('1.3 Stripe provider creates formatted checkout session when API key is set', async () => {
-      const stripeProvider = new StripeBillingProvider('sk_test_mock_stripe_key_123', 'whsec_test');
-      const result = await stripeProvider.createCheckoutSession({
-        workspaceId: 'ws_stripe_test',
-        tier: 'Starter',
-        successUrl: 'https://example.com/success',
-        cancelUrl: 'https://example.com/cancel',
-      });
-      assert.ok(result.sessionId.startsWith('cs_'));
-      assert.ok(result.checkoutUrl.startsWith('https://checkout.stripe.com/'));
-    });
-
-    test('1.4 Stripe provider rejects checkout creation when secret key is missing', async () => {
+    test('1.3 Stripe provider rejects checkout creation when secret key is missing', async () => {
       const unconfiguredStripe = new StripeBillingProvider('', '');
       await assert.rejects(
         async () => {
@@ -134,6 +161,240 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
         },
         /STRIPE_SECRET_KEY is not configured/
       );
+    });
+
+    test('1.4 Stripe provider rejects checkout creation when price ID is missing (no silent fallback)', async () => {
+      const mockStripe = createMockStripeClient();
+      // Provider configured with API key but empty price map
+      const providerWithoutPrices = new StripeBillingProvider('sk_test_valid', 'whsec_test', mockStripe, {});
+      await assert.rejects(
+        async () => {
+          await providerWithoutPrices.createCheckoutSession({
+            workspaceId: 'ws_stripe_test',
+            tier: 'Growth',
+            successUrl: 'https://example.com/success',
+            cancelUrl: 'https://example.com/cancel',
+          });
+        },
+        /Stripe Price ID is not configured for plan tier "Growth"/
+      );
+    });
+
+    test('1.5 Stripe provider correctly constructs Checkout Session parameters and returns actual Stripe session', async () => {
+      let capturedParams: any = null;
+      const mockStripe = createMockStripeClient({
+        checkoutSessionCreate: async (params) => {
+          capturedParams = params;
+          return {
+            id: 'cs_real_stripe_api_id_789',
+            url: 'https://checkout.stripe.com/c/pay/cs_real_stripe_api_id_789',
+          };
+        },
+      });
+
+      const stripeProvider = new StripeBillingProvider(
+        'sk_test_valid_key',
+        'whsec_valid_secret',
+        mockStripe,
+        { Starter: 'price_starter_configured_123' }
+      );
+
+      const result = await stripeProvider.createCheckoutSession({
+        workspaceId: 'ws_target_123',
+        tier: 'Starter',
+        successUrl: 'https://example.com/checkout/success',
+        cancelUrl: 'https://example.com/checkout/cancel',
+        customerId: 'cus_existing_stripe_customer_1',
+      });
+
+      // Verify exact parameter construction
+      assert.equal(capturedParams.mode, 'subscription');
+      assert.equal(capturedParams.line_items[0].price, 'price_starter_configured_123');
+      assert.equal(capturedParams.line_items[0].quantity, 1);
+      assert.equal(capturedParams.client_reference_id, 'ws_target_123');
+      assert.equal(capturedParams.metadata.workspaceId, 'ws_target_123');
+      assert.equal(capturedParams.metadata.tier, 'Starter');
+      assert.equal(capturedParams.subscription_data.metadata.tier, 'Starter');
+      assert.equal(capturedParams.customer, 'cus_existing_stripe_customer_1');
+      assert.equal(capturedParams.success_url, 'https://example.com/checkout/success');
+      assert.equal(capturedParams.cancel_url, 'https://example.com/checkout/cancel');
+
+      // Verify returned data matches real Stripe API response
+      assert.equal(result.sessionId, 'cs_real_stripe_api_id_789');
+      assert.equal(result.checkoutUrl, 'https://checkout.stripe.com/c/pay/cs_real_stripe_api_id_789');
+      assert.equal(result.provider, 'stripe');
+    });
+
+    test('1.6 Stripe provider handles Stripe API errors during checkout creation safely', async () => {
+      const errorStripe = createMockStripeClient({
+        checkoutSessionCreate: async () => {
+          throw new Error('No such price: price_starter_configured_123');
+        },
+      });
+
+      const stripeProvider = new StripeBillingProvider(
+        'sk_test_valid_key',
+        'whsec_valid_secret',
+        errorStripe,
+        { Starter: 'price_starter_configured_123' }
+      );
+
+      await assert.rejects(
+        async () => {
+          await stripeProvider.createCheckoutSession({
+            workspaceId: 'ws_target_123',
+            tier: 'Starter',
+            successUrl: 'https://example.com/checkout/success',
+            cancelUrl: 'https://example.com/checkout/cancel',
+          });
+        },
+        /Stripe checkout session creation failed: No such price/
+      );
+    });
+
+    test('1.7 Stripe provider handles malformed responses during checkout creation safely', async () => {
+      const malformedStripe = createMockStripeClient({
+        checkoutSessionCreate: async () => ({ id: 'cs_missing_url' }), // missing url
+      });
+
+      const stripeProvider = new StripeBillingProvider(
+        'sk_test_valid_key',
+        'whsec_valid_secret',
+        malformedStripe,
+        { Starter: 'price_starter_configured_123' }
+      );
+
+      await assert.rejects(
+        async () => {
+          await stripeProvider.createCheckoutSession({
+            workspaceId: 'ws_target_123',
+            tier: 'Starter',
+            successUrl: 'https://example.com/checkout/success',
+            cancelUrl: 'https://example.com/checkout/cancel',
+          });
+        },
+        /Stripe checkout session response was malformed or missing URL/
+      );
+    });
+
+    test('1.8 Customer portal session creation constructs correct parameters and returns portal URL', async () => {
+      let capturedPortalParams: any = null;
+      const mockStripe = createMockStripeClient({
+        portalSessionCreate: async (params) => {
+          capturedPortalParams = params;
+          return {
+            id: 'bps_test_real_portal_session',
+            url: 'https://billing.stripe.com/p/session/bps_test_real_portal_session',
+          };
+        },
+      });
+
+      const stripeProvider = new StripeBillingProvider('sk_test_key', 'whsec_secret', mockStripe);
+      const result = await stripeProvider.createPortalSession(
+        'ws_portal_test',
+        'cus_stripe_real_customer_456',
+        'https://example.com/settings?tab=subscription'
+      );
+
+      assert.equal(capturedPortalParams.customer, 'cus_stripe_real_customer_456');
+      assert.equal(capturedPortalParams.return_url, 'https://example.com/settings?tab=subscription');
+      assert.equal(result.portalUrl, 'https://billing.stripe.com/p/session/bps_test_real_portal_session');
+      assert.equal(result.provider, 'stripe');
+    });
+
+    test('1.9 Customer portal rejects workspace without valid Stripe customer ID (starts with cus_)', async () => {
+      const mockStripe = createMockStripeClient();
+      const stripeProvider = new StripeBillingProvider('sk_test_key', 'whsec_secret', mockStripe);
+
+      await assert.rejects(
+        async () => {
+          await stripeProvider.createPortalSession('ws_portal_test', 'cust_fake_workspace_id', 'https://example.com');
+        },
+        /does not have a valid Stripe customer mapping/
+      );
+    });
+
+    test('1.10 Customer portal handles Stripe API errors safely', async () => {
+      const errorStripe = createMockStripeClient({
+        portalSessionCreate: async () => {
+          throw new Error('Customer portal configuration has not been created.');
+        },
+      });
+
+      const stripeProvider = new StripeBillingProvider('sk_test_key', 'whsec_secret', errorStripe);
+      await assert.rejects(
+        async () => {
+          await stripeProvider.createPortalSession('ws_portal_test', 'cus_valid_123', 'https://example.com');
+        },
+        /Stripe customer portal session creation failed/
+      );
+    });
+
+    test('1.11 Provider selection: In production, fails closed when STRIPE_SECRET_KEY is missing', async () => {
+      const { getBillingProvider, setBillingProvider } = await import('./billing/providerAdapter');
+      const origEnv = process.env.NODE_ENV;
+      const origKey = process.env.STRIPE_SECRET_KEY;
+      const origProvider = process.env.BILLING_PROVIDER;
+
+      try {
+        setBillingProvider(null);
+        process.env.NODE_ENV = 'production';
+        delete process.env.STRIPE_SECRET_KEY;
+        delete process.env.BILLING_PROVIDER;
+
+        assert.throws(
+          () => getBillingProvider(),
+          /Production billing requires STRIPE_SECRET_KEY to be configured/
+        );
+      } finally {
+        process.env.NODE_ENV = origEnv;
+        if (origKey) process.env.STRIPE_SECRET_KEY = origKey;
+        if (origProvider) process.env.BILLING_PROVIDER = origProvider;
+        setBillingProvider(sandboxProvider);
+      }
+    });
+
+    test('1.12 Provider selection: In production, strictly rejects explicit sandbox provider', async () => {
+      const { getBillingProvider, setBillingProvider } = await import('./billing/providerAdapter');
+      const origEnv = process.env.NODE_ENV;
+      const origProvider = process.env.BILLING_PROVIDER;
+
+      try {
+        setBillingProvider(null);
+        process.env.NODE_ENV = 'production';
+        process.env.BILLING_PROVIDER = 'sandbox';
+
+        assert.throws(
+          () => getBillingProvider(),
+          /Sandbox billing provider is strictly prohibited in production mode/
+        );
+      } finally {
+        process.env.NODE_ENV = origEnv;
+        if (origProvider) process.env.BILLING_PROVIDER = origProvider;
+        setBillingProvider(sandboxProvider);
+      }
+    });
+
+    test('1.13 Provider selection: In development/test, safely defaults to sandbox when unconfigured', async () => {
+      const { getBillingProvider, setBillingProvider } = await import('./billing/providerAdapter');
+      const origEnv = process.env.NODE_ENV;
+      const origKey = process.env.STRIPE_SECRET_KEY;
+      const origProvider = process.env.BILLING_PROVIDER;
+
+      try {
+        setBillingProvider(null);
+        process.env.NODE_ENV = 'development';
+        delete process.env.STRIPE_SECRET_KEY;
+        delete process.env.BILLING_PROVIDER;
+
+        const provider = getBillingProvider();
+        assert.equal(provider.providerName, 'sandbox');
+      } finally {
+        process.env.NODE_ENV = origEnv;
+        if (origKey) process.env.STRIPE_SECRET_KEY = origKey;
+        if (origProvider) process.env.BILLING_PROVIDER = origProvider;
+        setBillingProvider(sandboxProvider);
+      }
     });
   });
 
@@ -182,10 +443,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
         },
       };
 
-      const { payload, signature } = sandboxProvider.generateSignedPayload(
-        eventPayload,
-        process.env.STRIPE_WEBHOOK_SECRET || process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123'
-      );
+      const { payload, signature } = sandboxProvider.generateSignedPayload(eventPayload);
 
       const res = await fetch(`${baseUrl}/api/billing/webhook`, {
         method: 'POST',
@@ -229,10 +487,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
         },
       };
 
-      const { payload, signature } = sandboxProvider.generateSignedPayload(
-        eventPayload,
-        process.env.STRIPE_WEBHOOK_SECRET || process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123'
-      );
+      const { payload, signature } = sandboxProvider.generateSignedPayload(eventPayload);
 
       // Attempt 1: Processed
       const res1 = await fetch(`${baseUrl}/api/billing/webhook`, {
@@ -260,6 +515,134 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       assert.ok(eventRecord);
       assert.equal(eventRecord?.status, 'processed');
     });
+
+    test('2.5 In production mode, webhook rejects safely with HTTP 500 when signing secret is missing (no fallback)', async () => {
+      const origEnv = process.env.NODE_ENV;
+      const origSecret = process.env.STRIPE_WEBHOOK_SECRET;
+      const origBillingSecret = process.env.BILLING_WEBHOOK_SECRET;
+
+      try {
+        process.env.NODE_ENV = 'production';
+        delete process.env.STRIPE_WEBHOOK_SECRET;
+        delete process.env.BILLING_WEBHOOK_SECRET;
+
+        // Set active provider to Stripe without webhook secret
+        setBillingProvider(new StripeBillingProvider('sk_test_dummy_key', ''));
+
+        const res = await fetch(`${baseUrl}/api/billing/webhook`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'stripe-signature': 't=1234567,v1=dummy_signature',
+          },
+          body: JSON.stringify({ id: 'evt_prod_no_secret', type: 'ping' }),
+        });
+
+        assert.equal(res.status, 500);
+        const body = await res.json();
+        assert.match(body.error, /Production billing webhook secret is not configured/);
+      } finally {
+        process.env.NODE_ENV = origEnv;
+        if (origSecret) process.env.STRIPE_WEBHOOK_SECRET = origSecret;
+        if (origBillingSecret) process.env.BILLING_WEBHOOK_SECRET = origBillingSecret;
+        setBillingProvider(sandboxProvider);
+      }
+    });
+
+    test('2.6 Raw-body integrity: Payload whose raw bytes differ from reserialized JSON succeeds verification', async () => {
+      // Craft a payload with unique indentation, newlines, and space formatting
+      const rawBodyString = '{\n  "id": "evt_raw_diff_' + Date.now() + '",\n  "type": "checkout.session.completed",\n  "data": {\n    "object": {\n      "workspaceId": "' + workspaceId + '",\n      "tier": "Enterprise",\n      "customerId": "cus_raw_bytes_test",\n      "subscriptionId": "sub_raw_bytes_test"\n    }\n  }\n}';
+
+      // Assert that JSON.stringify(JSON.parse(rawBodyString)) produces DIFFERENT bytes
+      const reserialized = JSON.stringify(JSON.parse(rawBodyString));
+      assert.notEqual(reserialized, rawBodyString, 'Test precondition: raw bytes must differ from canonical JSON.stringify output');
+
+      // Sign the EXACT raw body bytes using test secret
+      const secret = sandboxProvider.getWebhookSecret();
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const hmac = crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBodyString}`).digest('hex');
+      const signature = `t=${timestamp},v1=${hmac}`;
+
+      // Dispatch raw body string over HTTP
+      const res = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'stripe-signature': signature,
+        },
+        body: rawBodyString,
+      });
+
+      assert.equal(res.status, 200);
+      const resData = await res.json();
+      assert.equal(resData.received, true);
+      assert.equal(resData.action, 'processed');
+
+      // Verify that the workspace tier was updated to Enterprise
+      const sub = await repo.getSubscriptionByWorkspace(workspaceId);
+      assert.equal(sub?.tier, 'Enterprise');
+    });
+
+    test('2.7 Unverified event (invalid signature) causes zero state mutation', async () => {
+      // Record baseline state
+      const beforeSub = await repo.getSubscriptionByWorkspace(workspaceId);
+      const beforeStore = await repo.getStoreByWorkspace(workspaceId);
+      const beforeEventsCount = (repo as any).billingEvents ? (repo as any).billingEvents.size : 0;
+
+      const unverifiedEventId = `evt_unverified_${Date.now()}`;
+      const fakeEvent = {
+        id: unverifiedEventId,
+        type: 'checkout.session.completed',
+        data: {
+          object: {
+            workspaceId,
+            tier: 'Growth',
+            customerId: 'cus_unverified',
+          },
+        },
+      };
+
+      const res = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'stripe-signature': 't=1234567,v1=tampered_signature_that_fails_verification',
+        },
+        body: JSON.stringify(fakeEvent),
+      });
+
+      assert.equal(res.status, 400);
+
+      // Verify ZERO mutation
+      const afterSub = await repo.getSubscriptionByWorkspace(workspaceId);
+      const afterStore = await repo.getStoreByWorkspace(workspaceId);
+      const afterEventsCount = (repo as any).billingEvents ? (repo as any).billingEvents.size : 0;
+
+      assert.deepEqual(afterSub?.tier, beforeSub?.tier);
+      assert.deepEqual(afterStore?.tier, beforeStore?.tier);
+      assert.equal(afterEventsCount, beforeEventsCount, 'No billing event audit rows must be created for unverified requests');
+    });
+
+    test('2.8 Malformed JSON payload with valid signature header is rejected safely with HTTP 400', async () => {
+      const malformedPayload = '{"id": "evt_broken", "type": '; // Invalid JSON syntax
+      const secret = sandboxProvider.getWebhookSecret();
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const hmac = crypto.createHmac('sha256', secret).update(`${timestamp}.${malformedPayload}`).digest('hex');
+      const signature = `t=${timestamp},v1=${hmac}`;
+
+      const res = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'stripe-signature': signature,
+        },
+        body: malformedPayload,
+      });
+
+      assert.equal(res.status, 400);
+      const data = await res.json();
+      assert.match(data.error, /malformed|json/i);
+    });
   });
 
   // ==========================================
@@ -277,10 +660,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
           },
         },
       };
-      const { payload, signature } = sandboxProvider.generateSignedPayload(
-        eventPayload,
-        process.env.STRIPE_WEBHOOK_SECRET || process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123'
-      );
+      const { payload, signature } = sandboxProvider.generateSignedPayload(eventPayload);
 
       const res = await fetch(`${baseUrl}/api/billing/webhook`, {
         method: 'POST',
@@ -310,10 +690,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
           },
         },
       };
-      const { payload, signature } = sandboxProvider.generateSignedPayload(
-        eventPayload,
-        process.env.STRIPE_WEBHOOK_SECRET || process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123'
-      );
+      const { payload, signature } = sandboxProvider.generateSignedPayload(eventPayload);
 
       const res = await fetch(`${baseUrl}/api/billing/webhook`, {
         method: 'POST',
@@ -351,10 +728,7 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
           },
         },
       };
-      const { payload, signature } = sandboxProvider.generateSignedPayload(
-        eventPayload,
-        process.env.STRIPE_WEBHOOK_SECRET || process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123'
-      );
+      const { payload, signature } = sandboxProvider.generateSignedPayload(eventPayload);
 
       const res = await fetch(`${baseUrl}/api/billing/webhook`, {
         method: 'POST',
@@ -452,5 +826,28 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       assert.equal(dataOwner.success, true);
       assert.ok(dataOwner.portalUrl);
     });
+
+    test('4.5 POST /api/billing/checkout-session rejects untrusted external redirect URLs', async () => {
+      const res = await fetch(`${baseUrl}/api/billing/checkout-session`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${ownerToken}`,
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          tier: 'Growth',
+          successUrl: 'https://attacker-controlled-phishing.com/steal-creds',
+          cancelUrl: 'https://evil.org/attack',
+        }),
+      });
+      assert.equal(res.status, 200);
+      const data = await res.json();
+      assert.equal(data.success, true);
+      // Ensure the generated checkout URL does NOT contain the untrusted attacker domain
+      assert.ok(!data.checkoutUrl.includes('attacker-controlled-phishing.com'));
+      assert.ok(!data.checkoutUrl.includes('evil.org'));
+    });
   });
 });
+

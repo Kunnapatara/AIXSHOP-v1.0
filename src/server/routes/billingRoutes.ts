@@ -4,13 +4,54 @@ import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { getBillingProvider } from '../billing/providerAdapter';
 import { BillingService } from '../services/billingService';
-import { AUTHORITATIVE_PLANS } from '../billing/types';
+import { AUTHORITATIVE_PLANS, IBillingProvider } from '../billing/types';
 
-export function createBillingRoutes(repo: DatabaseRepository): Router {
+/**
+ * Derives trusted base URL from application configuration (APP_URL)
+ * or falls back to verified request origin / host for local development.
+ */
+function getTrustedBaseUrl(req: Request): string {
+  if (process.env.APP_URL) {
+    return process.env.APP_URL.replace(/\/$/, '');
+  }
+  const host = req.headers.host || 'localhost:3000';
+  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  return `${protocol}://${host}`;
+}
+
+/**
+ * Validates and resolves redirect URLs against trusted application base URL.
+ * Arbitrary third-party redirect URLs are rejected to prevent open redirect vulnerabilities.
+ */
+function resolveTrustedRedirectUrl(baseUrl: string, clientUrl: string | undefined, defaultPath: string): string {
+  if (!clientUrl || typeof clientUrl !== 'string') {
+    return `${baseUrl}${defaultPath}`;
+  }
+
+  // Safe relative paths (e.g. /settings?tab=subscription) are appended to trusted baseUrl
+  if (clientUrl.startsWith('/')) {
+    return `${baseUrl}${clientUrl}`;
+  }
+
+  try {
+    const parsedClient = new URL(clientUrl);
+    const parsedBase = new URL(baseUrl);
+    // Only accept absolute URLs whose origin strictly matches the trusted application origin
+    if (parsedClient.origin === parsedBase.origin) {
+      return clientUrl;
+    }
+  } catch {
+    // Malformed URL, fall back to trusted default
+  }
+
+  return `${baseUrl}${defaultPath}`;
+}
+
+export function createBillingRoutes(repo: DatabaseRepository, customProvider?: IBillingProvider): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
-  const provider = getBillingProvider();
-  const billingService = new BillingService(repo, provider);
+  const getProvider = () => customProvider || getBillingProvider();
+  const getBillingService = () => new BillingService(repo, getProvider());
 
   // GET /api/billing/plans — Returns authoritative server-defined plans and capacities
   router.get('/plans', (req, res) => {
@@ -53,10 +94,19 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Plan tier is required' });
       }
 
-      const defaultBaseUrl = req.headers.origin || `http://${req.headers.host || 'localhost:3000'}`;
-      const effectiveSuccessUrl = successUrl || `${defaultBaseUrl}/settings?tab=subscription&session_id={CHECKOUT_SESSION_ID}`;
-      const effectiveCancelUrl = cancelUrl || `${defaultBaseUrl}/settings?tab=subscription`;
+      const trustedBaseUrl = getTrustedBaseUrl(req);
+      const effectiveSuccessUrl = resolveTrustedRedirectUrl(
+        trustedBaseUrl,
+        successUrl,
+        '/settings?tab=subscription&session_id={CHECKOUT_SESSION_ID}'
+      );
+      const effectiveCancelUrl = resolveTrustedRedirectUrl(
+        trustedBaseUrl,
+        cancelUrl,
+        '/settings?tab=subscription'
+      );
 
+      const billingService = getBillingService();
       const session = await billingService.createCheckoutSession(
         workspaceId,
         tier as any,
@@ -71,7 +121,7 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
         provider: session.provider,
       });
     } catch (err: any) {
-      console.error('[AIXSHOP Billing] Error creating checkout session:', err);
+      console.error('[AIXSHOP Billing] Error creating checkout session:', err?.message || err);
       return res.status(400).json({ error: err.message || 'Failed to create checkout session' });
     }
   });
@@ -82,9 +132,14 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
       const workspaceId = req.workspace!.id;
       const { returnUrl } = req.body || {};
 
-      const defaultBaseUrl = req.headers.origin || `http://${req.headers.host || 'localhost:3000'}`;
-      const effectiveReturnUrl = returnUrl || `${defaultBaseUrl}/settings?tab=subscription`;
+      const trustedBaseUrl = getTrustedBaseUrl(req);
+      const effectiveReturnUrl = resolveTrustedRedirectUrl(
+        trustedBaseUrl,
+        returnUrl,
+        '/settings?tab=subscription'
+      );
 
+      const billingService = getBillingService();
       const portal = await billingService.createPortalSession(workspaceId, effectiveReturnUrl);
 
       return res.json({
@@ -93,7 +148,7 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
         provider: portal.provider,
       });
     } catch (err: any) {
-      console.error('[AIXSHOP Billing] Error creating portal session:', err);
+      console.error('[AIXSHOP Billing] Error creating portal session:', err?.message || err);
       return res.status(400).json({ error: err.message || 'Failed to create customer portal session' });
     }
   });
@@ -112,9 +167,10 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Missing webhook signature header' });
       }
 
-      // Convert body to string if already parsed by express.json()
-      const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+      // Preserves original raw request bytes captured by scoped raw-body middleware
+      const rawBody = (req as any).rawBody || req.body;
 
+      const billingService = getBillingService();
       const result = await billingService.handleWebhook(rawBody, signature);
 
       return res.status(200).json({
@@ -124,7 +180,7 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
       });
     } catch (err: any) {
       console.error('[AIXSHOP Billing] Webhook processing error:', err.message || err);
-      const statusCode = err.statusCode || 400;
+      const statusCode = typeof err.statusCode === 'number' ? err.statusCode : 400;
       return res.status(statusCode).json({
         error: err.message || 'Webhook processing failed',
       });
@@ -133,3 +189,4 @@ export function createBillingRoutes(repo: DatabaseRepository): Router {
 
   return router;
 }
+
