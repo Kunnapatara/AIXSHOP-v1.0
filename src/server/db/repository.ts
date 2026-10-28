@@ -18,7 +18,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord } from '../billing/types';
+import { SubscriptionRecord, BillingEventRecord, PlanTier } from '../billing/types';
 
 export interface CreateUserData {
   id: string;
@@ -128,7 +128,17 @@ export interface DatabaseRepository {
 
   // Billing & Subscriptions
   getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null>;
+  getSubscriptionBySubscriptionId(subscriptionId: string): Promise<SubscriptionRecord | null>;
   saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord>;
   getBillingEventById(eventId: string): Promise<BillingEventRecord | null>;
   saveBillingEvent(event: BillingEventRecord): Promise<void>;
+  claimBillingEvent(event: BillingEventRecord): Promise<{ claimed: boolean; event: BillingEventRecord | null }>;
+  updateBillingEventStatus(eventId: string, status: 'processing' | 'processed' | 'failed' | 'ignored', payload?: any): Promise<void>;
+  applyBillingTransition(params: {
+    eventId: string;
+    subscription: SubscriptionRecord;
+    storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
+    markProcessed?: boolean;
+  }): Promise<void>;
 }
+

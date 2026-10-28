@@ -26,7 +26,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord } from '../billing/types';
+import { SubscriptionRecord, BillingEventRecord, PlanTier } from '../billing/types';
 import { 
   initialProducts, 
   initialFindings, 
@@ -667,6 +667,15 @@ export class MemoryRepository implements DatabaseRepository {
     return sub ? JSON.parse(JSON.stringify(sub)) : null;
   }
 
+  async getSubscriptionBySubscriptionId(subscriptionId: string): Promise<SubscriptionRecord | null> {
+    for (const sub of this.subscriptions.values()) {
+      if (sub.subscriptionId === subscriptionId) {
+        return JSON.parse(JSON.stringify(sub));
+      }
+    }
+    return null;
+  }
+
   async saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord> {
     const cloned = JSON.parse(JSON.stringify(subscription));
     this.subscriptions.set(subscription.workspaceId, cloned);
@@ -680,6 +689,103 @@ export class MemoryRepository implements DatabaseRepository {
 
   async saveBillingEvent(event: BillingEventRecord): Promise<void> {
     this.billingEvents.set(event.eventId, JSON.parse(JSON.stringify(event)));
+  }
+
+  async claimBillingEvent(event: BillingEventRecord): Promise<{ claimed: boolean; event: BillingEventRecord | null }> {
+    const existing = this.billingEvents.get(event.eventId);
+    const now = Date.now();
+
+    if (!existing) {
+      const record: BillingEventRecord = {
+        ...JSON.parse(JSON.stringify(event)),
+        status: 'processing',
+        processedAt: new Date(now).toISOString(),
+        createdAt: new Date(now).toISOString(),
+        updatedAt: new Date(now).toISOString(),
+      };
+      this.billingEvents.set(event.eventId, record);
+      return { claimed: true, event: JSON.parse(JSON.stringify(record)) };
+    }
+
+    const processedTime = new Date(existing.processedAt).getTime();
+    const isStale = existing.status === 'processing' && (now - processedTime > 5 * 60 * 1000);
+    const isFailed = existing.status === 'failed';
+
+    if (isFailed || isStale) {
+      existing.status = 'processing';
+      existing.processedAt = new Date(now).toISOString();
+      existing.updatedAt = new Date(now).toISOString();
+      if (event.payload) {
+        existing.payload = JSON.parse(JSON.stringify(event.payload));
+      }
+      return { claimed: true, event: JSON.parse(JSON.stringify(existing)) };
+    }
+
+    return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+  }
+
+  async updateBillingEventStatus(
+    eventId: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    payload?: any
+  ): Promise<void> {
+    const existing = this.billingEvents.get(eventId);
+    if (existing) {
+      existing.status = status;
+      existing.updatedAt = new Date().toISOString();
+      if (payload !== undefined) {
+        existing.payload = JSON.parse(JSON.stringify(payload));
+      }
+    }
+  }
+
+  async applyBillingTransition(params: {
+    eventId: string;
+    subscription: SubscriptionRecord;
+    storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
+    markProcessed?: boolean;
+  }): Promise<void> {
+    // Snapshot state for atomic rollback simulation
+    const prevSub = this.subscriptions.get(params.subscription.workspaceId);
+    const prevStore = this.stores.get(params.subscription.workspaceId);
+    const prevEvent = this.billingEvents.get(params.eventId);
+
+    try {
+      // 1. Save subscription
+      this.subscriptions.set(params.subscription.workspaceId, JSON.parse(JSON.stringify(params.subscription)));
+
+      // 2. Update store profile if requested
+      if (params.storeProfileUpdate) {
+        const store = this.stores.get(params.subscription.workspaceId);
+        if (store) {
+          const updatedStore: StoreProfile = {
+            ...store,
+            tier: params.storeProfileUpdate.tier,
+            skuLimit: params.storeProfileUpdate.skuLimit,
+          };
+          this.stores.set(params.subscription.workspaceId, updatedStore);
+          const cat = this.catalogs.get(params.subscription.workspaceId);
+          if (cat) {
+            cat.storeProfile = { ...updatedStore };
+          }
+        }
+      }
+
+      // 3. Update billing event
+      if (params.markProcessed !== false && prevEvent) {
+        prevEvent.status = 'processed';
+        prevEvent.processedAt = new Date().toISOString();
+        prevEvent.updatedAt = new Date().toISOString();
+      }
+    } catch (err) {
+      // Rollback
+      if (prevSub) this.subscriptions.set(params.subscription.workspaceId, prevSub);
+      else this.subscriptions.delete(params.subscription.workspaceId);
+
+      if (prevStore) this.stores.set(params.subscription.workspaceId, prevStore);
+      if (prevEvent) this.billingEvents.set(params.eventId, prevEvent);
+      throw err;
+    }
   }
 
   clear(): void {

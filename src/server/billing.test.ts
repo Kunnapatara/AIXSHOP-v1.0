@@ -2,6 +2,8 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'http';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
 import { SandboxBillingProvider, StripeBillingProvider, setBillingProvider } from './billing/providerAdapter';
@@ -849,5 +851,493 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       assert.ok(!data.checkoutUrl.includes('evil.org'));
     });
   });
+
+  // 5. Production Billing Reliability & Stripe Test-Mode Readiness Tests
+  describe('Workstreams 1-4: Production Billing Reliability & Test-Mode Readiness', () => {
+    test('WS1.1: Migration 005_billing_subscriptions.sql exists and defines required tables and indexes', () => {
+      const migrationPath = path.resolve(process.cwd(), 'src/server/db/migrations/005_billing_subscriptions.sql');
+      assert.ok(fs.existsSync(migrationPath), 'Migration 005 must exist');
+      const sql = fs.readFileSync(migrationPath, 'utf8');
+      assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS subscriptions'), 'Defines subscriptions table');
+      assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS billing_events'), 'Defines billing_events table');
+      assert.ok(sql.includes('last_event_created'), 'Contains last_event_created column');
+      assert.ok(sql.includes('uq_billing_events_provider_event'), 'Contains provider+event unique constraint');
+      assert.ok(sql.includes('REFERENCES workspaces(id) ON DELETE CASCADE'), 'Maintains strict workspace referential integrity');
+    });
+
+    test('WS1.2: PostgresRepository checkSchemaReadiness fails when subscriptions or billing_events table is missing', async () => {
+      const { PostgresRepository } = await import('./db/postgresRepository');
+      const mockClient = {
+        query: async (sql: string) => {
+          if (sql.includes('SELECT current_schema()')) return { rows: [{ schema_name: 'public' }] };
+          if (sql.includes('information_schema.tables')) {
+            // Missing billing_events
+            return { rows: [{ table_name: 'users' }, { table_name: 'workspaces' }, { table_name: 'subscriptions' }] };
+          }
+          return { rows: [] };
+        },
+        release: () => {},
+      };
+      const mockPool: any = {
+        connect: async () => mockClient,
+        end: async () => {},
+      };
+      const pgRepo = new PostgresRepository(mockPool);
+      const readiness = await pgRepo.checkSchemaReadiness();
+      assert.equal(readiness.isReady, false);
+      assert.ok(readiness.missingTables?.includes('billing_events'), 'Reports missing billing_events table');
+    });
+
+    test('WS2.1: Stripe checkout.session.completed rejects invalid or manufactured customer ID', async () => {
+      const stripeProvider = new StripeBillingProvider('sk_test_fake_key_123', 'whsec_test_secret_123');
+      const stripeBillingService = new BillingService(repo, stripeProvider);
+
+      const invalidEvent = {
+        id: 'evt_checkout_invalid_cust_01',
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: workspaceId,
+            customer: 'invalid_non_stripe_cust_123', // Must start with cus_
+            subscription: 'sub_valid_123',
+            metadata: { tier: 'Growth' },
+            payment_status: 'paid',
+          },
+        },
+      };
+
+      await assert.rejects(
+        async () => {
+          await (stripeBillingService as any).processEvent(invalidEvent);
+        },
+        (err: any) => {
+          assert.match(err.message, /missing valid customer ID/i);
+          return true;
+        }
+      );
+    });
+
+    test('WS2.2: Stripe checkout.session.completed rejects invalid or manufactured subscription ID', async () => {
+      const stripeProvider = new StripeBillingProvider('sk_test_fake_key_123', 'whsec_test_secret_123');
+      const stripeBillingService = new BillingService(repo, stripeProvider);
+
+      const invalidEvent = {
+        id: 'evt_checkout_invalid_sub_01',
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: workspaceId,
+            customer: 'cus_valid_stripe_cust_123',
+            subscription: 'invalid_sub_id_not_stripe', // Must start with sub_
+            metadata: { tier: 'Growth' },
+            payment_status: 'paid',
+          },
+        },
+      };
+
+      await assert.rejects(
+        async () => {
+          await (stripeBillingService as any).processEvent(invalidEvent);
+        },
+        (err: any) => {
+          assert.match(err.message, /missing valid subscription ID/i);
+          return true;
+        }
+      );
+    });
+
+    test('WS2.3: Stripe checkout.session.completed rejects unknown or unassociated Price ID', async () => {
+      const stripeProvider = new StripeBillingProvider('sk_test_fake_key_123', 'whsec_test_secret_123');
+      const stripeBillingService = new BillingService(repo, stripeProvider);
+
+      const invalidPriceEvent = {
+        id: 'evt_checkout_invalid_price_01',
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: workspaceId,
+            customer: 'cus_valid_stripe_cust_123',
+            subscription: 'sub_valid_stripe_123',
+            priceId: 'price_unknown_unassociated_random_999',
+            payment_status: 'paid',
+          },
+        },
+      };
+
+      await assert.rejects(
+        async () => {
+          await (stripeBillingService as any).processEvent(invalidPriceEvent);
+        },
+        (err: any) => {
+          assert.match(err.message, /not associated with an authoritative plan/i);
+          return true;
+        }
+      );
+    });
+
+    test('WS2.4: checkout.session.completed with payment_status=unpaid creates incomplete sub and DOES NOT elevate store tier', async () => {
+      // Ensure store starts at Free Audit
+      await repo.saveStoreProfile(workspaceId, {
+        name: 'Unpaid Test Store',
+        domain: 'unpaid.myshopify.com',
+        currency: 'USD',
+        skuCount: 0,
+        skuLimit: 2500,
+        tier: 'Free Audit',
+        connectors: [],
+        catalogCompletenessAvg: 100,
+        truthBoundaryStrictness: 'standard',
+      });
+
+      const unpaidEvent = {
+        id: 'evt_checkout_unpaid_01',
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: workspaceId,
+            customer: 'cus_unpaid_123',
+            subscription: 'sub_unpaid_123',
+            metadata: { tier: 'Growth' },
+            payment_status: 'unpaid', // Unpaid payment status!
+          },
+        },
+      };
+
+      const result = await (billingService as any).processEvent(unpaidEvent);
+      assert.equal(result.success, true);
+      assert.equal(result.subscription.status, 'incomplete');
+
+      // Verify store was NOT upgraded to Growth
+      const store = await repo.getStoreByWorkspace(workspaceId);
+      assert.equal(store?.tier, 'Free Audit');
+      assert.equal(store?.skuLimit, 2500);
+    });
+
+    test('WS2.5: checkout.session.completed with payment_status=no_payment_required records trialing sub and grants tier', async () => {
+      const trialEvent = {
+        id: 'evt_checkout_trial_01',
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: workspaceId,
+            customer: 'cus_trial_123',
+            subscription: 'sub_trial_123',
+            metadata: { tier: 'Starter' },
+            payment_status: 'no_payment_required',
+          },
+        },
+      };
+
+      const result = await (billingService as any).processEvent(trialEvent);
+      assert.equal(result.success, true);
+      assert.equal(result.subscription.status, 'trialing');
+
+      // Store should reflect Starter tier
+      const store = await repo.getStoreByWorkspace(workspaceId);
+      assert.equal(store?.tier, 'Starter');
+      assert.equal(store?.skuLimit, 250);
+    });
+
+    test('WS3.1: Concurrent duplicate webhook deliveries are claimed exactly once; second is marked duplicate', async () => {
+      const eventPayload = {
+        id: 'evt_concurrent_race_test_01',
+        type: 'customer.subscription.updated',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            id: 'sub_concurrent_test_123',
+            customer: 'cus_race_123',
+            metadata: { workspaceId, tier: 'Growth' },
+            status: 'active',
+          },
+        },
+      };
+
+      const rawBody = JSON.stringify(eventPayload);
+      const secret = 'test_webhook_secret_key_abc123';
+      const sig = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+
+      // Fire two concurrent handleWebhook calls
+      const [res1, res2] = await Promise.all([
+        billingService.handleWebhook(rawBody, sig),
+        billingService.handleWebhook(rawBody, sig),
+      ]);
+
+      const actions = [res1.action, res2.action];
+      assert.ok(actions.includes('processed'), 'At least one worker processed the event');
+      assert.ok(actions.includes('duplicate'), 'Second worker received duplicate action');
+    });
+
+    test('WS3.2: Failed event can be retried and recovered', async () => {
+      const failedEventId = 'evt_retry_recovery_test_01';
+      // Seed a failed event in repo
+      await repo.saveBillingEvent({
+        id: `bevt_${failedEventId}`,
+        provider: 'sandbox',
+        eventId: failedEventId,
+        eventType: 'customer.subscription.updated',
+        idempotencyKey: failedEventId,
+        payload: {},
+        status: 'failed',
+        processedAt: new Date(Date.now() - 60000).toISOString(),
+      });
+
+      // Claiming a failed event succeeds for retry
+      const claim = await repo.claimBillingEvent({
+        id: `bevt_${failedEventId}`,
+        provider: 'sandbox',
+        eventId: failedEventId,
+        eventType: 'customer.subscription.updated',
+        idempotencyKey: failedEventId,
+        payload: { test: true },
+        status: 'processing',
+        processedAt: new Date().toISOString(),
+      });
+
+      assert.equal(claim.claimed, true, 'Failed event should be re-claimable for retry');
+    });
+
+    test('WS3.3: Stale processing event (>5 minutes old) is recovered by claimBillingEvent', async () => {
+      const staleEventId = 'evt_stale_recovery_test_01';
+      // Seed an event stuck in processing from 10 minutes ago
+      await repo.saveBillingEvent({
+        id: `bevt_${staleEventId}`,
+        provider: 'sandbox',
+        eventId: staleEventId,
+        eventType: 'customer.subscription.updated',
+        idempotencyKey: staleEventId,
+        payload: {},
+        status: 'processing',
+        processedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      });
+
+      const claim = await repo.claimBillingEvent({
+        id: `bevt_${staleEventId}`,
+        provider: 'sandbox',
+        eventId: staleEventId,
+        eventType: 'customer.subscription.updated',
+        idempotencyKey: staleEventId,
+        payload: { test: true },
+        status: 'processing',
+        processedAt: new Date().toISOString(),
+      });
+
+      assert.equal(claim.claimed, true, 'Stale processing event must be claimed by recovery worker');
+    });
+
+    test('WS4.1: customer.subscription.updated with cancel_at_period_end preserves active tier until period end', async () => {
+      const ws4Id = `ws_ws4_lifecycle_${Date.now()}`;
+      const owner = await repo.createUser({ id: `usr_${ws4Id}`, email: `${ws4Id}@example.com`, passwordHash: 'hash', fullName: 'WS4 Owner' });
+      await repo.createWorkspace({ id: ws4Id, name: 'Lifecycle WS', slug: `lifecycle-${ws4Id}` }, owner.id);
+      await repo.saveStoreProfile(ws4Id, {
+        name: 'Lifecycle Store',
+        domain: 'lifecycle.myshopify.com',
+        currency: 'USD',
+        skuCount: 0,
+        skuLimit: 2500,
+        tier: 'Free Audit',
+        connectors: [],
+        catalogCompletenessAvg: 100,
+        truthBoundaryStrictness: 'standard',
+      });
+
+      // First, set subscription to active Growth at t=1000
+      const activeEvent = {
+        id: 'evt_sub_active_growth_01',
+        type: 'customer.subscription.updated',
+        created: 1000,
+        data: {
+          object: {
+            id: 'sub_period_end_test_123',
+            customer: 'cus_period_end_123',
+            metadata: { workspaceId: ws4Id, tier: 'Growth' },
+            status: 'active',
+            cancel_at_period_end: false,
+          },
+        },
+      };
+      const activeRes = await (billingService as any).processEvent(activeEvent);
+      assert.equal(activeRes.success, true);
+
+      let store = await repo.getStoreByWorkspace(ws4Id);
+      assert.equal(store?.tier, 'Growth');
+      assert.equal(store?.skuLimit, 2500);
+
+      // Now set cancel_at_period_end: true at t=1001
+      const cancelAtPeriodEndEvent = {
+        id: 'evt_sub_cancel_at_period_end_01',
+        type: 'customer.subscription.updated',
+        created: 1001,
+        data: {
+          object: {
+            id: 'sub_period_end_test_123',
+            customer: 'cus_period_end_123',
+            metadata: { workspaceId: ws4Id, tier: 'Growth' },
+            status: 'active',
+            cancel_at_period_end: true, // User requested cancellation at end of billing cycle
+          },
+        },
+      };
+
+      const result = await (billingService as any).processEvent(cancelAtPeriodEndEvent);
+      assert.equal(result.success, true);
+      assert.equal(result.subscription.cancelAtPeriodEnd, true);
+      assert.equal(result.subscription.status, 'active');
+
+      // Store tier and limit MUST STILL BE Growth!
+      store = await repo.getStoreByWorkspace(ws4Id);
+      assert.equal(store?.tier, 'Growth', 'Store tier must not be downgraded early when cancel_at_period_end is true');
+      assert.equal(store?.skuLimit, 2500);
+    });
+
+    test('WS4.2: customer.subscription.deleted downgrades store to Free Audit without deleting catalog products', async () => {
+      const ws4Id = `ws_ws4_deleted_${Date.now()}`;
+      const owner = await repo.createUser({ id: `usr_${ws4Id}`, email: `${ws4Id}@example.com`, passwordHash: 'hash', fullName: 'WS4 Owner' });
+      await repo.createWorkspace({ id: ws4Id, name: 'Deleted WS', slug: `deleted-${ws4Id}` }, owner.id);
+      const storeProfile = await repo.saveStoreProfile(ws4Id, {
+        name: 'Deleted Store',
+        domain: 'deleted.myshopify.com',
+        currency: 'USD',
+        skuCount: 0,
+        skuLimit: 2500,
+        tier: 'Growth',
+        connectors: [],
+        catalogCompletenessAvg: 100,
+        truthBoundaryStrictness: 'standard',
+      });
+
+      // Save initial subscription at t=1000
+      await repo.saveSubscription({
+        id: `subrec_${ws4Id}`,
+        workspaceId: ws4Id,
+        provider: 'sandbox',
+        customerId: 'cus_deleted_test_123',
+        subscriptionId: 'sub_deleted_test_123',
+        tier: 'Growth',
+        status: 'active',
+        currentPeriodStart: new Date().toISOString(),
+        currentPeriodEnd: new Date(Date.now() + 86400000).toISOString(),
+        cancelAtPeriodEnd: false,
+        lastEventCreated: 1000,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      // Seed catalog products
+      const sampleVariant = {
+        id: 'var_01',
+        sku: 'SKU-KEEP-1',
+        title: 'Default Title',
+        barcode: '12345678',
+        price: 99.99,
+        inventoryCount: 10,
+        attributes: {},
+      };
+
+      await repo.saveWorkspaceCatalog(ws4Id, {
+        products: [
+          {
+            id: 'prod_preserve_01',
+            title: 'Valuable Catalog Product',
+            brand: 'Premium Brand',
+            category: 'Preserved',
+            description: 'Preserved item during downgrade',
+            image: '',
+            status: 'active',
+            completenessScore: 95,
+            evidenceCoverageScore: 80,
+            externalDiscoveryStatus: 'observed_in_sample',
+            attributes: {},
+            variants: [sampleVariant],
+            offers: [],
+            evidenceDocuments: [],
+            findingsCount: 0,
+            lastAudited: new Date().toISOString(),
+          },
+        ],
+        variants: [sampleVariant],
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+        storeProfile,
+      });
+
+      const deletedEvent = {
+        id: 'evt_sub_deleted_01',
+        type: 'customer.subscription.deleted',
+        created: 2000,
+        data: {
+          object: {
+            id: 'sub_deleted_test_123',
+            customer: 'cus_deleted_test_123',
+            metadata: { workspaceId: ws4Id },
+          },
+        },
+      };
+
+      const result = await (billingService as any).processEvent(deletedEvent);
+      assert.equal(result.success, true);
+
+      // Verify store profile is downgraded to Free Audit (2500 limit)
+      const store = await repo.getStoreByWorkspace(ws4Id);
+      assert.equal(store?.tier, 'Free Audit');
+      assert.equal(store?.skuLimit, 2500);
+
+      // CRITICAL: Catalog products MUST NOT be deleted!
+      const cat = await repo.loadWorkspaceCatalog(ws4Id);
+      assert.equal(cat?.products.length, 1);
+      assert.equal(cat?.products[0].id, 'prod_preserve_01');
+      assert.equal(cat?.products[0].title, 'Valuable Catalog Product');
+    });
+
+    test('WS4.3: Out-of-order stale event does not overwrite newer subscription state', async () => {
+      const ws4Id = `ws_ws4_order_${Date.now()}`;
+      const owner = await repo.createUser({ id: `usr_${ws4Id}`, email: `${ws4Id}@example.com`, passwordHash: 'hash', fullName: 'WS4 Owner' });
+      await repo.createWorkspace({ id: ws4Id, name: 'Order WS', slug: `order-${ws4Id}` }, owner.id);
+      await repo.saveSubscription({
+        id: `subrec_${ws4Id}`,
+        workspaceId: ws4Id,
+        provider: 'sandbox',
+        customerId: 'cus_order_test_123',
+        subscriptionId: 'sub_order_test_123',
+        tier: 'Growth',
+        status: 'canceled',
+        currentPeriodStart: new Date().toISOString(),
+        currentPeriodEnd: new Date().toISOString(),
+        cancelAtPeriodEnd: true,
+        lastEventCreated: 2000, // Newer event timestamp
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      // Stale event created at timestamp 1500 (< 2000)
+      const staleInvoiceEvent = {
+        id: 'evt_stale_invoice_01',
+        type: 'invoice.payment_succeeded',
+        created: 1500,
+        data: {
+          object: {
+            subscription: 'sub_order_test_123',
+            metadata: { workspaceId: ws4Id },
+          },
+        },
+      };
+
+      const result = await (billingService as any).processEvent(staleInvoiceEvent);
+      assert.equal(result.action, 'ignored');
+      assert.match(result.message, /stale.*safely ignored/i);
+
+      // Subscription remains canceled
+      const currentSub = await repo.getSubscriptionByWorkspace(ws4Id);
+      assert.equal(currentSub?.status, 'canceled');
+    });
+  });
 });
+
 

@@ -1178,7 +1178,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: [{ exists: true }] };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }, { id: '003_store_sku_limit.sql' }, { id: '004_backfill_store_sku_count.sql' }] };
+            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }, { id: '003_store_sku_limit.sql' }, { id: '004_backfill_store_sku_count.sql' }, { id: '005_billing_subscriptions.sql' }] };
           }
           return { rows: [] };
         },
@@ -1187,7 +1187,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const status = await checkMigrationStatus(pool);
       assert.equal(status.isUpToDate, true);
       assert.equal(status.pendingCount, 0);
-      assert.equal(status.appliedCount, 4);
+      assert.equal(status.appliedCount, 5);
 
       const queries = getExecutedQueries();
       assert.ok(!queries.some((q) => q.includes('BEGIN') || q.includes('INSERT') || q.includes('CREATE')), 'Must be strictly read-only');
@@ -1230,6 +1230,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       '002_tenant_referential_integrity.sql',
       '003_store_sku_limit.sql',
       '004_backfill_store_sku_count.sql',
+      '005_billing_subscriptions.sql',
     ];
 
     function createMockPostgresPool(options: {
@@ -1245,7 +1246,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const allRequiredTables = [
         'users', 'workspaces', 'workspace_memberships', 'sessions', 'stores',
         'products', 'variants', 'offers', 'evidence_documents', 'findings',
-        'action_items', 'schema_migrations',
+        'action_items', 'schema_migrations', 'subscriptions', 'billing_events',
       ];
 
       const defaultFkRows = [
@@ -1559,11 +1560,11 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 15. checkSchemaReadiness fails when 001_initial_schema.sql is recorded but 002_tenant_referential_integrity.sql is pending', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql'], // 002, 003, 004 are pending
+        appliedMigrations: ['001_initial_schema.sql'], // 002, 003, 004, 005 are pending
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql']);
+      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql']);
       assert.match(res.error!, /Required migration "002_tenant_referential_integrity\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1571,12 +1572,24 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 15b. checkSchemaReadiness fails when 004_backfill_store_sku_count.sql is pending', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql'], // 004 is missing/pending
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql'], // 004, 005 are missing/pending
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql']);
+      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql']);
       assert.match(res.error!, /Required migration "004_backfill_store_sku_count\.sql" has not been applied/);
+      assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
+    });
+
+    test('[Mock Unit Test] 15c. checkSchemaReadiness fails when 005_billing_subscriptions.sql is pending', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql'],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.deepEqual(res.pendingMigrations, ['005_billing_subscriptions.sql']);
+      assert.match(res.error!, /Required migration "005_billing_subscriptions\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
 
@@ -1739,7 +1752,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: [{ exists: true }] };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
-            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }, { id: '003_store_sku_limit.sql' }, { id: '004_backfill_store_sku_count.sql' }] };
+            return { rows: [{ id: '001_initial_schema.sql' }, { id: '002_tenant_referential_integrity.sql' }, { id: '003_store_sku_limit.sql' }, { id: '004_backfill_store_sku_count.sql' }, { id: '005_billing_subscriptions.sql' }] };
           }
           return { rows: [] };
         },
@@ -1752,7 +1765,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
       const status = await checkMigrationStatus(mockPool as unknown as Pool);
       assert.equal(status.isUpToDate, true);
-      assert.equal(status.appliedCount, 4);
+      assert.equal(status.appliedCount, 5);
 
       const tableCheckQuery = executedQueries.find(q => q.includes('information_schema.tables'));
       assert.ok(tableCheckQuery, 'Must query information_schema.tables');
@@ -1936,7 +1949,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       assert.equal(getReleaseCalled(), true);
     });
 
-    test('[Mock Unit Test] 26. checkSchemaReadiness reports all 7 referential constraints and 4 migrations in details', async () => {
+    test('[Mock Unit Test] 26. checkSchemaReadiness reports all 7 referential constraints and 5 migrations in details', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
         appliedMigrations: ALL_REQUIRED_MIGRATIONS,

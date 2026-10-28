@@ -1,6 +1,14 @@
 export type PlanTier = 'Free Audit' | 'Starter' | 'Growth' | 'Enterprise';
 
-export type SubscriptionStatus = 'pending' | 'active' | 'past_due' | 'canceled' | 'expired';
+export type SubscriptionStatus = 
+  | 'pending' 
+  | 'incomplete' 
+  | 'trialing' 
+  | 'active' 
+  | 'past_due' 
+  | 'unpaid' 
+  | 'canceled' 
+  | 'expired';
 
 export interface BillingPlanDefinition {
   id: string;
@@ -67,6 +75,7 @@ export interface SubscriptionRecord {
   currentPeriodStart: string;
   currentPeriodEnd: string;
   cancelAtPeriodEnd: boolean;
+  lastEventCreated?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -78,8 +87,10 @@ export interface BillingEventRecord {
   eventType: string;
   idempotencyKey: string;
   payload: any;
-  status: 'processed' | 'failed' | 'ignored';
+  status: 'processing' | 'processed' | 'failed' | 'ignored';
   processedAt: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface CheckoutSessionOptions {
@@ -118,5 +129,9 @@ export interface IBillingProvider {
   verifyWebhookSignature(rawBody: string | Buffer, signature: string, secret: string): boolean | Promise<boolean>;
   parseWebhookEvent(rawBody: string | Buffer): WebhookEventPayload;
   getWebhookSecret?(): string;
+  retrieveCheckoutSession?(sessionId: string): Promise<any>;
+  retrieveSubscription?(subscriptionId: string): Promise<any>;
+  getPlanPriceMap?(): Record<string, string> | undefined;
 }
+
 

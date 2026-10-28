@@ -7,6 +7,7 @@ import {
   CustomerPortalSessionResult, 
   WebhookEventPayload, 
   AUTHORITATIVE_PLANS,
+  BillingPlanDefinition,
   PlanTier 
 } from './types';
 
@@ -35,6 +36,22 @@ export function getPlanPriceId(tier: PlanTier, priceMap?: Record<string, string>
     default:
       return undefined;
   }
+}
+
+/**
+ * Looks up authoritative plan matching a given Stripe Price ID.
+ * Rejects unmapped Price IDs to prevent unauthorized tier elevation.
+ */
+export function findPlanByPriceId(priceId: string, priceMap?: Record<string, string>): BillingPlanDefinition | null {
+  if (!priceId) return null;
+  for (const plan of Object.values(AUTHORITATIVE_PLANS)) {
+    if (plan.priceCents <= 0) continue;
+    const configuredId = getPlanPriceId(plan.tier, priceMap);
+    if (configuredId && configuredId === priceId) {
+      return plan;
+    }
+  }
+  return null;
 }
 
 /**
@@ -71,6 +88,22 @@ export class StripeBillingProvider implements IBillingProvider {
 
   getWebhookSecret(): string {
     return this.webhookSecret;
+  }
+
+  getPlanPriceMap(): Record<string, string> | undefined {
+    return this.priceMap;
+  }
+
+  async retrieveCheckoutSession(sessionId: string): Promise<Stripe.Checkout.Session | null> {
+    if (!this.stripe || !sessionId) return null;
+    return await this.stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['line_items', 'subscription'],
+    });
+  }
+
+  async retrieveSubscription(subscriptionId: string): Promise<Stripe.Subscription | null> {
+    if (!this.stripe || !subscriptionId) return null;
+    return await this.stripe.subscriptions.retrieve(subscriptionId);
   }
 
   async createCheckoutSession(options: CheckoutSessionOptions): Promise<CheckoutSessionResult> {
@@ -248,6 +281,10 @@ export class SandboxBillingProvider implements IBillingProvider {
 
   getWebhookSecret(): string {
     return this.secret;
+  }
+
+  getPlanPriceMap(): Record<string, string> | undefined {
+    return undefined;
   }
 
   async createCheckoutSession(options: CheckoutSessionOptions): Promise<CheckoutSessionResult> {

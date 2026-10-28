@@ -27,7 +27,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord } from '../billing/types';
+import { SubscriptionRecord, BillingEventRecord, PlanTier } from '../billing/types';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
 import { 
   calculateImportUsage, 
@@ -74,6 +74,8 @@ export class PostgresRepository implements DatabaseRepository {
       'findings',
       'action_items',
       'schema_migrations',
+      'subscriptions',
+      'billing_events',
     ];
 
     try {
@@ -300,6 +302,7 @@ export class PostgresRepository implements DatabaseRepository {
           '002_tenant_referential_integrity.sql',
           '003_store_sku_limit.sql',
           '004_backfill_store_sku_count.sql',
+          '005_billing_subscriptions.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -1543,7 +1546,7 @@ export class PostgresRepository implements DatabaseRepository {
   // Billing & Subscriptions
   async getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null> {
     const res = await this.pool.query<any>(
-      `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", created_at AS "createdAt", updated_at AS "updatedAt"
+      `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM subscriptions
        WHERE workspace_id = $1`,
       [workspaceId]
@@ -1552,10 +1555,21 @@ export class PostgresRepository implements DatabaseRepository {
     return res.rows[0];
   }
 
+  async getSubscriptionBySubscriptionId(subscriptionId: string): Promise<SubscriptionRecord | null> {
+    const res = await this.pool.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM subscriptions
+       WHERE subscription_id = $1`,
+      [subscriptionId]
+    );
+    if (res.rows.length === 0) return null;
+    return res.rows[0];
+  }
+
   async saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord> {
     const res = await this.pool.query<any>(
-      `INSERT INTO subscriptions (id, workspace_id, provider, customer_id, subscription_id, tier, status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+      `INSERT INTO subscriptions (id, workspace_id, provider, customer_id, subscription_id, tier, status, current_period_start, current_period_end, cancel_at_period_end, last_event_created, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
        ON CONFLICT (workspace_id) DO UPDATE SET
          provider = EXCLUDED.provider,
          customer_id = EXCLUDED.customer_id,
@@ -1565,8 +1579,9 @@ export class PostgresRepository implements DatabaseRepository {
          current_period_start = EXCLUDED.current_period_start,
          current_period_end = EXCLUDED.current_period_end,
          cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+         last_event_created = EXCLUDED.last_event_created,
          updated_at = NOW()
-       RETURNING id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", created_at AS "createdAt", updated_at AS "updatedAt"`,
+       RETURNING id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated", created_at AS "createdAt", updated_at AS "updatedAt"`,
       [
         subscription.id,
         subscription.workspaceId,
@@ -1578,6 +1593,7 @@ export class PostgresRepository implements DatabaseRepository {
         subscription.currentPeriodStart,
         subscription.currentPeriodEnd,
         subscription.cancelAtPeriodEnd,
+        subscription.lastEventCreated || 0,
       ]
     );
     return res.rows[0];
@@ -1585,7 +1601,7 @@ export class PostgresRepository implements DatabaseRepository {
 
   async getBillingEventById(eventId: string): Promise<BillingEventRecord | null> {
     const res = await this.pool.query<any>(
-      `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey", payload_json AS "payload", status, processed_at AS "processedAt"
+      `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey", payload_json AS "payload", status, processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM billing_events
        WHERE event_id = $1`,
       [eventId]
@@ -1596,9 +1612,13 @@ export class PostgresRepository implements DatabaseRepository {
 
   async saveBillingEvent(event: BillingEventRecord): Promise<void> {
     await this.pool.query(
-      `INSERT INTO billing_events (id, provider, event_id, event_type, idempotency_key, payload_json, status, processed_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW())
-       ON CONFLICT (event_id) DO NOTHING`,
+      `INSERT INTO billing_events (id, provider, event_id, event_type, idempotency_key, payload_json, status, processed_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW(), NOW(), NOW())
+       ON CONFLICT (provider, event_id) DO UPDATE SET
+         status = EXCLUDED.status,
+         payload_json = EXCLUDED.payload_json,
+         processed_at = NOW(),
+         updated_at = NOW()`,
       [
         event.id,
         event.provider,
@@ -1610,4 +1630,137 @@ export class PostgresRepository implements DatabaseRepository {
       ]
     );
   }
+
+  async claimBillingEvent(event: BillingEventRecord): Promise<{ claimed: boolean; event: BillingEventRecord | null }> {
+    // Atomic insert-or-claim query:
+    // 1. If row does not exist, inserts with status = 'processing'.
+    // 2. If row exists and status is 'failed', or status is 'processing' older than 5 minutes (stale worker), claims it.
+    // 3. Otherwise does not update and returns 0 rows.
+    const res = await this.pool.query<any>(
+      `INSERT INTO billing_events (id, provider, event_id, event_type, idempotency_key, payload_json, status, processed_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', NOW(), NOW(), NOW())
+       ON CONFLICT (provider, event_id) DO UPDATE SET
+         status = 'processing',
+         processed_at = NOW(),
+         updated_at = NOW()
+       WHERE billing_events.status = 'failed'
+          OR (billing_events.status = 'processing' AND billing_events.processed_at < NOW() - INTERVAL '5 minutes')
+       RETURNING id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey", payload_json AS "payload", status, processed_at AS "processedAt"`,
+      [
+        event.id,
+        event.provider,
+        event.eventId,
+        event.eventType,
+        event.idempotencyKey,
+        JSON.stringify(event.payload || {}),
+      ]
+    );
+
+    if (res.rows.length > 0) {
+      return { claimed: true, event: res.rows[0] };
+    }
+
+    const existing = await this.getBillingEventById(event.eventId);
+    return { claimed: false, event: existing };
+  }
+
+  async updateBillingEventStatus(
+    eventId: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    payload?: any
+  ): Promise<void> {
+    if (payload !== undefined) {
+      await this.pool.query(
+        `UPDATE billing_events
+         SET status = $2, payload_json = $3::jsonb, updated_at = NOW()
+         WHERE event_id = $1`,
+        [eventId, status, JSON.stringify(payload)]
+      );
+    } else {
+      await this.pool.query(
+        `UPDATE billing_events
+         SET status = $2, updated_at = NOW()
+         WHERE event_id = $1`,
+        [eventId, status]
+      );
+    }
+  }
+
+  async applyBillingTransition(params: {
+    eventId: string;
+    subscription: SubscriptionRecord;
+    storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
+    markProcessed?: boolean;
+  }): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Upsert subscription record
+      await client.query(
+        `INSERT INTO subscriptions (id, workspace_id, provider, customer_id, subscription_id, tier, status, current_period_start, current_period_end, cancel_at_period_end, last_event_created, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+         ON CONFLICT (workspace_id) DO UPDATE SET
+           provider = EXCLUDED.provider,
+           customer_id = EXCLUDED.customer_id,
+           subscription_id = EXCLUDED.subscription_id,
+           tier = EXCLUDED.tier,
+           status = EXCLUDED.status,
+           current_period_start = EXCLUDED.current_period_start,
+           current_period_end = EXCLUDED.current_period_end,
+           cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+           last_event_created = EXCLUDED.last_event_created,
+           updated_at = NOW()`,
+        [
+          params.subscription.id,
+          params.subscription.workspaceId,
+          params.subscription.provider,
+          params.subscription.customerId,
+          params.subscription.subscriptionId,
+          params.subscription.tier,
+          params.subscription.status,
+          params.subscription.currentPeriodStart,
+          params.subscription.currentPeriodEnd,
+          params.subscription.cancelAtPeriodEnd,
+          params.subscription.lastEventCreated || 0,
+        ]
+      );
+
+      // 2. Update store profile if requested
+      if (params.storeProfileUpdate) {
+        await client.query(
+          `UPDATE stores
+           SET tier = $2,
+               sku_limit = $3,
+               updated_at = NOW()
+           WHERE workspace_id = $1`,
+          [
+            params.subscription.workspaceId,
+            params.storeProfileUpdate.tier,
+            params.storeProfileUpdate.skuLimit !== undefined ? params.storeProfileUpdate.skuLimit : null,
+          ]
+        );
+      }
+
+      // 3. Mark billing event processed
+      if (params.markProcessed !== false) {
+        await client.query(
+          `UPDATE billing_events
+           SET status = 'processed',
+               processed_at = NOW(),
+               updated_at = NOW()
+           WHERE event_id = $1`,
+          [params.eventId]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
+
