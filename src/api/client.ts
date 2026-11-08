@@ -164,6 +164,21 @@ class ApiClient {
       method: 'POST',
     });
   }
+
+  // Audit Endpoints
+  async runAudit(): Promise<{ success: boolean; auditRun: any; catalog: StoragePayloadV1 }> {
+    return this.request<{ success: boolean; auditRun: any; catalog: StoragePayloadV1 }>('/api/audit/run', {
+      method: 'POST',
+    });
+  }
+
+  async getLatestAuditRun(): Promise<{ workspaceId: string; auditRun: any | null }> {
+    return this.request<{ workspaceId: string; auditRun: any | null }>('/api/audit/latest');
+  }
+
+  async getAuditRun(id: string): Promise<{ workspaceId: string; auditRun: any }> {
+    return this.request<{ workspaceId: string; auditRun: any }>(`/api/audit/${encodeURIComponent(id)}`);
+  }
 }
 
 export const apiClient = new ApiClient();

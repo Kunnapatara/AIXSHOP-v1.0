@@ -17,13 +17,21 @@ import {
 } from 'lucide-react';
 
 export const AuditPage: React.FC = () => {
-  const { findings, navigateTo, viewProductDetail, addToast } = useApp();
+  const { findings, navigateTo, viewProductDetail, addToast, runAudit, storeProfile, products } = useApp();
 
   const [scopeFilter, setScopeFilter] = useState<'all' | FindingScope>('all');
   const [severityFilter, setSeverityFilter] = useState<'all' | FindingSeverity>('all');
   const [typeFilter, setTypeFilter] = useState<'all' | FindingType>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [isAuditing, setIsAuditing] = useState(false);
+  const [auditStatus, setAuditStatus] = useState<'IDLE' | 'RUNNING' | 'COMPLETED' | 'FAILED'>('IDLE');
+  const [lastAuditSummary, setLastAuditSummary] = useState<{
+    productsEvaluated?: number;
+    rulesEvaluated?: number;
+    findingsCount?: number;
+    completedAt?: string;
+  } | null>(null);
+
+  const isAuditing = auditStatus === 'RUNNING';
 
   const filteredFindings = useMemo(() => {
     return findings.filter(f => {
@@ -41,12 +49,22 @@ export const AuditPage: React.FC = () => {
     });
   }, [findings, scopeFilter, severityFilter, typeFilter, searchQuery]);
 
-  const handleRunFullAudit = () => {
-    setIsAuditing(true);
-    setTimeout(() => {
-      setIsAuditing(false);
-      addToast('Audit Synchronized', 'Store and catalog audit completed against current merchant feed.', 'success');
-    }, 800);
+  const handleRunFullAudit = async () => {
+    if (isAuditing) return;
+    setAuditStatus('RUNNING');
+
+    try {
+      const result = await runAudit();
+      setAuditStatus('COMPLETED');
+      setLastAuditSummary({
+        productsEvaluated: result?.productsEvaluated ?? products.length,
+        rulesEvaluated: result?.rulesEvaluated ?? 12,
+        findingsCount: result?.findingsCount ?? findings.length,
+        completedAt: new Date().toLocaleTimeString(),
+      });
+    } catch (err: any) {
+      setAuditStatus('FAILED');
+    }
   };
 
   return (
@@ -68,9 +86,42 @@ export const AuditPage: React.FC = () => {
           className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors min-h-[40px] shrink-0 disabled:opacity-60"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${isAuditing ? 'animate-spin' : ''}`} />
-          <span>{isAuditing ? 'Running Audit...' : 'Re-run Store Audit'}</span>
+          <span>{isAuditing ? 'Executing Catalog Audit...' : 'Re-run Store Audit'}</span>
         </button>
       </div>
+
+      {/* Audit Execution Status Indicator */}
+      {auditStatus === 'RUNNING' && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-900 flex items-center gap-3">
+          <RefreshCw className="w-4 h-4 animate-spin text-amber-600 shrink-0" />
+          <div>
+            <span className="font-semibold">Backend Audit In Progress:</span> Evaluating persisted catalog products against 12 GTIN, attribute, pricing, and schema consistency rules...
+          </div>
+        </div>
+      )}
+
+      {auditStatus === 'FAILED' && (
+        <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 text-xs text-rose-900 flex items-center gap-3">
+          <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+          <div>
+            <span className="font-semibold">Audit Execution Failed:</span> An error occurred while evaluating or persisting audit results. Your previous catalog state remains safe and uncorrupted.
+          </div>
+        </div>
+      )}
+
+      {lastAuditSummary && auditStatus === 'COMPLETED' && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-xs text-emerald-900 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>
+              <span className="font-semibold">Audit Completed & Persisted:</span> Evaluated {lastAuditSummary.productsEvaluated} products across {lastAuditSummary.rulesEvaluated} rule sets at {lastAuditSummary.completedAt}.
+            </span>
+          </div>
+          <span className="font-mono text-[11px] text-emerald-800">
+            {lastAuditSummary.findingsCount} findings identified
+          </span>
+        </div>
+      )}
 
       {/* Semantic Legend Strip */}
       <div className="bg-white border border-stone-200 rounded-xl p-4 text-xs text-stone-600 flex flex-wrap items-center justify-between gap-3 shadow-xs">

@@ -5,8 +5,12 @@ import {
   CreateSessionData,
   RegisterUserData,
   RegisterUserResult,
-  SchemaReadinessResult
+  SchemaReadinessResult,
+  AuditRunRecord,
+  CreateAuditRunData,
+  UpdateAuditRunData
 } from './repository';
+import { executeCatalogAudit } from '../../domain/audit/auditEngine';
 import { 
   UserRecord, 
   WorkspaceRecord, 
@@ -55,6 +59,7 @@ export class MemoryRepository implements DatabaseRepository {
   private catalogs: Map<string, StoragePayloadV1> = new Map(); // workspaceId -> catalog
   private subscriptions: Map<string, SubscriptionRecord> = new Map(); // workspaceId -> subscription
   private billingEvents: Map<string, BillingEventRecord> = new Map(); // eventId -> event
+  private auditRuns: Map<string, AuditRunRecord> = new Map(); // auditRunId -> record
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -797,6 +802,142 @@ export class MemoryRepository implements DatabaseRepository {
     this.catalogs.clear();
     this.subscriptions.clear();
     this.billingEvents.clear();
+    this.auditRuns.clear();
+  }
+
+  // Catalog Audit Runs
+  async createAuditRun(data: CreateAuditRunData): Promise<AuditRunRecord> {
+    const now = new Date().toISOString();
+    const record: AuditRunRecord = {
+      id: data.id,
+      workspaceId: data.workspaceId,
+      status: data.status,
+      productsEvaluated: data.productsEvaluated || 0,
+      rulesEvaluated: data.rulesEvaluated || 0,
+      findingsCount: data.findingsCount || 0,
+      summary: data.summary ? JSON.parse(JSON.stringify(data.summary)) : {},
+      metadata: data.metadata ? JSON.parse(JSON.stringify(data.metadata)) : {},
+      errorMessage: null,
+      startedAt: data.startedAt || now,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.auditRuns.set(record.id, record);
+    return JSON.parse(JSON.stringify(record));
+  }
+
+  async updateAuditRun(id: string, updates: UpdateAuditRunData): Promise<AuditRunRecord> {
+    const existing = this.auditRuns.get(id);
+    if (!existing) {
+      throw new Error(`Audit run ${id} not found`);
+    }
+    const updated: AuditRunRecord = {
+      ...existing,
+      ...(updates.status !== undefined ? { status: updates.status } : {}),
+      ...(updates.productsEvaluated !== undefined ? { productsEvaluated: updates.productsEvaluated } : {}),
+      ...(updates.rulesEvaluated !== undefined ? { rulesEvaluated: updates.rulesEvaluated } : {}),
+      ...(updates.findingsCount !== undefined ? { findingsCount: updates.findingsCount } : {}),
+      ...(updates.summary !== undefined ? { summary: JSON.parse(JSON.stringify(updates.summary)) } : {}),
+      ...(updates.metadata !== undefined ? { metadata: JSON.parse(JSON.stringify(updates.metadata)) } : {}),
+      ...(updates.errorMessage !== undefined ? { errorMessage: updates.errorMessage } : {}),
+      ...(updates.completedAt !== undefined ? { completedAt: updates.completedAt } : {}),
+      updatedAt: new Date().toISOString(),
+    };
+    this.auditRuns.set(id, updated);
+    return JSON.parse(JSON.stringify(updated));
+  }
+
+  async getAuditRunById(id: string, workspaceId: string): Promise<AuditRunRecord | null> {
+    const run = this.auditRuns.get(id);
+    if (!run || run.workspaceId !== workspaceId) return null;
+    return JSON.parse(JSON.stringify(run));
+  }
+
+  async getLatestAuditRunByWorkspace(workspaceId: string): Promise<AuditRunRecord | null> {
+    const runs = Array.from(this.auditRuns.values())
+      .filter(r => r.workspaceId === workspaceId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return runs.length > 0 ? JSON.parse(JSON.stringify(runs[0])) : null;
+  }
+
+  async executeWorkspaceAudit(workspaceId: string): Promise<{ auditRun: AuditRunRecord; catalog: StoragePayloadV1 }> {
+    return this.withWorkspaceLock(workspaceId, async () => {
+      const runId = `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+      let auditRun = await this.createAuditRun({
+        id: runId,
+        workspaceId,
+        status: 'RUNNING',
+        startedAt: new Date().toISOString(),
+      });
+
+      try {
+        let catalog = await this.loadWorkspaceCatalog(workspaceId);
+        const store = (await this.getStoreByWorkspace(workspaceId)) || {
+          name: 'Store',
+          domain: 'store.myshopify.com',
+          currency: 'USD',
+          skuCount: 0,
+          catalogCompletenessAvg: 0,
+          truthBoundaryStrictness: 'standard' as const,
+          tier: 'Free Audit',
+          connectors: [],
+        };
+
+        if (!catalog) {
+          catalog = {
+            products: [],
+            variants: [],
+            offers: [],
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: store,
+          };
+        }
+
+        // Execute domain rules on actual persisted catalog
+        const auditResult = executeCatalogAudit(catalog.products, catalog.storeProfile || store, catalog.actions);
+
+        // Update catalog with real evaluation results
+        const updatedCatalog: StoragePayloadV1 = {
+          ...catalog,
+          products: auditResult.updatedProducts,
+          findings: auditResult.findings,
+          actions: auditResult.actionItems,
+          storeProfile: auditResult.updatedStoreProfile,
+        };
+
+        // Persist updated catalog atomically
+        await this.saveWorkspaceCatalogInternal(workspaceId, updatedCatalog);
+
+        // Mark audit run as completed
+        auditRun = await this.updateAuditRun(runId, {
+          status: 'COMPLETED',
+          productsEvaluated: auditResult.summary.totalProducts,
+          rulesEvaluated: auditResult.summary.rulesEvaluated,
+          findingsCount: auditResult.summary.totalFindingsCount,
+          summary: auditResult.summary,
+          metadata: {
+            rules: Object.keys(auditResult.summary.ruleBreakdown),
+            completedAt: new Date().toISOString(),
+          },
+          completedAt: new Date().toISOString(),
+        });
+
+        return {
+          auditRun,
+          catalog: updatedCatalog,
+        };
+      } catch (err: any) {
+        await this.updateAuditRun(runId, {
+          status: 'FAILED',
+          errorMessage: err?.message || 'Catalog audit execution failed',
+          completedAt: new Date().toISOString(),
+        });
+        throw err;
+      }
+    });
   }
 }
 

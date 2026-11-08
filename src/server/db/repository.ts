@@ -140,5 +140,53 @@ export interface DatabaseRepository {
     storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
     markProcessed?: boolean;
   }): Promise<void>;
+
+  // Catalog Audit Runs
+  createAuditRun(data: CreateAuditRunData): Promise<AuditRunRecord>;
+  updateAuditRun(id: string, updates: UpdateAuditRunData): Promise<AuditRunRecord>;
+  getAuditRunById(id: string, workspaceId: string): Promise<AuditRunRecord | null>;
+  getLatestAuditRunByWorkspace(workspaceId: string): Promise<AuditRunRecord | null>;
+  executeWorkspaceAudit(workspaceId: string): Promise<{ auditRun: AuditRunRecord; catalog: StoragePayloadV1 }>;
+}
+
+export type AuditRunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+
+export interface AuditRunRecord {
+  id: string;
+  workspaceId: string;
+  status: AuditRunStatus;
+  productsEvaluated: number;
+  rulesEvaluated: number;
+  findingsCount: number;
+  summary: Record<string, any>;
+  metadata: Record<string, any>;
+  errorMessage?: string | null;
+  startedAt: string;
+  completedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateAuditRunData {
+  id: string;
+  workspaceId: string;
+  status: AuditRunStatus;
+  productsEvaluated?: number;
+  rulesEvaluated?: number;
+  findingsCount?: number;
+  summary?: Record<string, any>;
+  metadata?: Record<string, any>;
+  startedAt?: string;
+}
+
+export interface UpdateAuditRunData {
+  status?: AuditRunStatus;
+  productsEvaluated?: number;
+  rulesEvaluated?: number;
+  findingsCount?: number;
+  summary?: Record<string, any>;
+  metadata?: Record<string, any>;
+  errorMessage?: string | null;
+  completedAt?: string | null;
 }
 

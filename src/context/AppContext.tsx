@@ -31,6 +31,7 @@ import {
   validateAndApplyProfileUpdate, 
   applyConnectorToggle 
 } from '../domain/settings/settingsService';
+import { executeCatalogAudit } from '../domain/audit/auditEngine';
 import { useAuth } from './AuthContext';
 import { apiClient } from '../api/client';
 
@@ -75,6 +76,7 @@ interface AppContextType {
   updateStoreProfile: (updates: Partial<StoreProfile>) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
   toggleConnectorSync: (connectorId: string) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
   migrateDemoDataToCloud: () => Promise<boolean>;
+  runAudit: () => Promise<any>;
   addToast: (title: string, message: string, type?: ToastMessage['type']) => void;
   removeToast: (id: string) => void;
   resetToSeedData: () => void;
@@ -744,6 +746,64 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   };
 
+  const runAudit = async (): Promise<any> => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.runAudit();
+        if (res.success && res.catalog) {
+          setProducts(res.catalog.products);
+          setFindings(res.catalog.findings);
+          setActionItems(res.catalog.actions);
+          setStoreProfile(res.catalog.storeProfile);
+          addToast(
+            'Audit Completed',
+            `Audit evaluated ${res.auditRun.productsEvaluated} products across ${res.auditRun.rulesEvaluated} rule checks. Results durably persisted.`,
+            'success'
+          );
+          return res.auditRun;
+        }
+      } catch (err: any) {
+        addToast('Audit Failed', err.message || 'Failed to execute audit on server.', 'error');
+        throw err;
+      }
+    }
+
+    // Local / Demo Workspace Mode: Execute domain audit engine on local state
+    const auditResult = executeCatalogAudit(products, storeProfile, actionItems);
+    const updatedStoreProfile = auditResult.updatedStoreProfile;
+
+    const saveRes = persistState(
+      auditResult.updatedProducts,
+      auditResult.findings,
+      auditResult.actionItems,
+      updatedStoreProfile
+    );
+
+    if (!saveRes.success) {
+      addToast('Persistence Failed', `Could not persist audit results: ${saveRes.error}`, 'error');
+      throw new Error(saveRes.error || 'Failed to persist audit results');
+    }
+
+    setProducts(auditResult.updatedProducts);
+    setFindings(auditResult.findings);
+    setActionItems(auditResult.actionItems);
+    setStoreProfile(updatedStoreProfile);
+
+    addToast(
+      'Audit Synchronized',
+      `Audit completed against current catalog (${auditResult.summary.totalProducts} products, ${auditResult.summary.totalFindingsCount} findings indexed).`,
+      'success'
+    );
+
+    return {
+      status: 'COMPLETED',
+      productsEvaluated: auditResult.summary.totalProducts,
+      rulesEvaluated: auditResult.summary.rulesEvaluated,
+      findingsCount: auditResult.summary.totalFindingsCount,
+      summary: auditResult.summary,
+    };
+  };
+
   const resetToSeedData = () => {
     if (isReadOnlyMode) {
       addToast('Reset Unavailable', 'Catalog cannot be reset while read-only mode is active.', 'warning');
@@ -794,6 +854,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         updateStoreProfile,
         toggleConnectorSync,
         migrateDemoDataToCloud,
+        runAudit,
         addToast,
         removeToast,
         resetToSeedData,

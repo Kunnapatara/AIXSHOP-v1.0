@@ -6,8 +6,12 @@ import {
   CreateSessionData,
   RegisterUserData,
   RegisterUserResult,
-  SchemaReadinessResult
+  SchemaReadinessResult,
+  AuditRunRecord,
+  CreateAuditRunData,
+  UpdateAuditRunData
 } from './repository';
+import { executeCatalogAudit } from '../../domain/audit/auditEngine';
 import { 
   UserRecord, 
   WorkspaceRecord, 
@@ -1762,5 +1766,279 @@ export class PostgresRepository implements DatabaseRepository {
       client.release();
     }
   }
+
+  // Catalog Audit Runs
+  async createAuditRun(data: CreateAuditRunData): Promise<AuditRunRecord> {
+    const query = `
+      INSERT INTO audit_runs (id, workspace_id, status, products_evaluated, rules_evaluated, findings_count, summary_json, metadata_json, started_at, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, NOW(), NOW())
+      RETURNING id, workspace_id AS "workspaceId", status, products_evaluated AS "productsEvaluated", rules_evaluated AS "rulesEvaluated", findings_count AS "findingsCount", summary_json AS "summaryJson", metadata_json AS "metadataJson", error_message AS "errorMessage", started_at AS "startedAt", completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+    `;
+    const res = await this.pool.query(query, [
+      data.id,
+      data.workspaceId,
+      data.status,
+      data.productsEvaluated || 0,
+      data.rulesEvaluated || 0,
+      data.findingsCount || 0,
+      JSON.stringify(data.summary || {}),
+      JSON.stringify(data.metadata || {}),
+      data.startedAt || new Date().toISOString(),
+    ]);
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      status: r.status,
+      productsEvaluated: r.productsEvaluated,
+      rulesEvaluated: r.rulesEvaluated,
+      findingsCount: r.findingsCount,
+      summary: typeof r.summaryJson === 'string' ? JSON.parse(r.summaryJson) : r.summaryJson,
+      metadata: typeof r.metadataJson === 'string' ? JSON.parse(r.metadataJson) : r.metadataJson,
+      errorMessage: r.errorMessage,
+      startedAt: r.startedAt,
+      completedAt: r.completedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    };
+  }
+
+  async updateAuditRun(id: string, updates: UpdateAuditRunData): Promise<AuditRunRecord> {
+    const fields: string[] = ['updated_at = NOW()'];
+    const values: any[] = [id];
+    let idx = 2;
+
+    if (updates.status !== undefined) {
+      fields.push(`status = $${idx++}`);
+      values.push(updates.status);
+    }
+    if (updates.productsEvaluated !== undefined) {
+      fields.push(`products_evaluated = $${idx++}`);
+      values.push(updates.productsEvaluated);
+    }
+    if (updates.rulesEvaluated !== undefined) {
+      fields.push(`rules_evaluated = $${idx++}`);
+      values.push(updates.rulesEvaluated);
+    }
+    if (updates.findingsCount !== undefined) {
+      fields.push(`findings_count = $${idx++}`);
+      values.push(updates.findingsCount);
+    }
+    if (updates.summary !== undefined) {
+      fields.push(`summary_json = $${idx++}::jsonb`);
+      values.push(JSON.stringify(updates.summary));
+    }
+    if (updates.metadata !== undefined) {
+      fields.push(`metadata_json = $${idx++}::jsonb`);
+      values.push(JSON.stringify(updates.metadata));
+    }
+    if (updates.errorMessage !== undefined) {
+      fields.push(`error_message = $${idx++}`);
+      values.push(updates.errorMessage);
+    }
+    if (updates.completedAt !== undefined) {
+      fields.push(`completed_at = $${idx++}`);
+      values.push(updates.completedAt);
+    }
+
+    const query = `
+      UPDATE audit_runs
+      SET ${fields.join(', ')}
+      WHERE id = $1
+      RETURNING id, workspace_id AS "workspaceId", status, products_evaluated AS "productsEvaluated", rules_evaluated AS "rulesEvaluated", findings_count AS "findingsCount", summary_json AS "summaryJson", metadata_json AS "metadataJson", error_message AS "errorMessage", started_at AS "startedAt", completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+    `;
+    const res = await this.pool.query(query, values);
+    if (!res.rows[0]) throw new Error(`Audit run ${id} not found`);
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      status: r.status,
+      productsEvaluated: r.productsEvaluated,
+      rulesEvaluated: r.rulesEvaluated,
+      findingsCount: r.findingsCount,
+      summary: typeof r.summaryJson === 'string' ? JSON.parse(r.summaryJson) : r.summaryJson,
+      metadata: typeof r.metadataJson === 'string' ? JSON.parse(r.metadataJson) : r.metadataJson,
+      errorMessage: r.errorMessage,
+      startedAt: r.startedAt,
+      completedAt: r.completedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    };
+  }
+
+  async getAuditRunById(id: string, workspaceId: string): Promise<AuditRunRecord | null> {
+    const query = `
+      SELECT id, workspace_id AS "workspaceId", status, products_evaluated AS "productsEvaluated", rules_evaluated AS "rulesEvaluated", findings_count AS "findingsCount", summary_json AS "summaryJson", metadata_json AS "metadataJson", error_message AS "errorMessage", started_at AS "startedAt", completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+      FROM audit_runs
+      WHERE id = $1 AND workspace_id = $2
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [id, workspaceId]);
+    if (!res.rows[0]) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      status: r.status,
+      productsEvaluated: r.productsEvaluated,
+      rulesEvaluated: r.rulesEvaluated,
+      findingsCount: r.findingsCount,
+      summary: typeof r.summaryJson === 'string' ? JSON.parse(r.summaryJson) : r.summaryJson,
+      metadata: typeof r.metadataJson === 'string' ? JSON.parse(r.metadataJson) : r.metadataJson,
+      errorMessage: r.errorMessage,
+      startedAt: r.startedAt,
+      completedAt: r.completedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    };
+  }
+
+  async getLatestAuditRunByWorkspace(workspaceId: string): Promise<AuditRunRecord | null> {
+    const query = `
+      SELECT id, workspace_id AS "workspaceId", status, products_evaluated AS "productsEvaluated", rules_evaluated AS "rulesEvaluated", findings_count AS "findingsCount", summary_json AS "summaryJson", metadata_json AS "metadataJson", error_message AS "errorMessage", started_at AS "startedAt", completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+      FROM audit_runs
+      WHERE workspace_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    const res = await this.pool.query(query, [workspaceId]);
+    if (!res.rows[0]) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      status: r.status,
+      productsEvaluated: r.productsEvaluated,
+      rulesEvaluated: r.rulesEvaluated,
+      findingsCount: r.findingsCount,
+      summary: typeof r.summaryJson === 'string' ? JSON.parse(r.summaryJson) : r.summaryJson,
+      metadata: typeof r.metadataJson === 'string' ? JSON.parse(r.metadataJson) : r.metadataJson,
+      errorMessage: r.errorMessage,
+      startedAt: r.startedAt,
+      completedAt: r.completedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    };
+  }
+
+  async executeWorkspaceAudit(workspaceId: string): Promise<{ auditRun: AuditRunRecord; catalog: StoragePayloadV1 }> {
+    const runId = `audit_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    let auditRun = await this.createAuditRun({
+      id: runId,
+      workspaceId,
+      status: 'RUNNING',
+      startedAt: new Date().toISOString(),
+    });
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const storeId = `store_${workspaceId}`;
+
+      // Acquire exclusive row-level lock on store
+      const storeRes = await client.query<{
+        id: string;
+        name: string;
+        domain: string;
+        currency: string;
+        sku_count: number;
+        sku_limit: number | null;
+        catalog_completeness_avg: number;
+        truth_boundary_strictness: 'strict' | 'standard' | 'relaxed';
+        tier: string;
+        connectors_json: any;
+      }>(
+        `SELECT id, name, domain, currency, sku_count, sku_limit, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json
+         FROM stores
+         WHERE workspace_id = $1
+         FOR UPDATE`,
+        [workspaceId]
+      );
+
+      if (!storeRes.rows[0]) {
+        throw new Error(`Store for workspace ${workspaceId} not found`);
+      }
+
+      const rawStore = storeRes.rows[0];
+      const authoritativeStore: StoreProfile = {
+        name: rawStore.name,
+        domain: rawStore.domain,
+        currency: rawStore.currency,
+        skuCount: rawStore.sku_count,
+        skuLimit: (typeof rawStore.sku_limit === 'number' && !isNaN(rawStore.sku_limit)) ? rawStore.sku_limit : undefined,
+        tier: rawStore.tier,
+        connectors: typeof rawStore.connectors_json === 'string' ? JSON.parse(rawStore.connectors_json) : rawStore.connectors_json,
+        catalogCompletenessAvg: rawStore.catalog_completeness_avg,
+        truthBoundaryStrictness: rawStore.truth_boundary_strictness,
+      };
+
+      const catalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
+
+      // Execute domain rules on real catalog data
+      const auditResult = executeCatalogAudit(catalog.products, catalog.storeProfile || authoritativeStore, catalog.actions);
+
+      // Construct next catalog state
+      const nextCatalog: StoragePayloadV1 = {
+        ...catalog,
+        products: auditResult.updatedProducts,
+        findings: auditResult.findings,
+        actions: auditResult.actionItems,
+        storeProfile: auditResult.updatedStoreProfile,
+      };
+
+      // Save catalog rows atomically within this transaction
+      await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, auditResult.updatedStoreProfile);
+
+      // Mark audit run COMPLETED in database
+      await client.query(
+        `UPDATE audit_runs
+         SET status = 'COMPLETED',
+             products_evaluated = $2,
+             rules_evaluated = $3,
+             findings_count = $4,
+             summary_json = $5::jsonb,
+             metadata_json = $6::jsonb,
+             completed_at = NOW(),
+             updated_at = NOW()
+         WHERE id = $1`,
+        [
+          runId,
+          auditResult.summary.totalProducts,
+          auditResult.summary.rulesEvaluated,
+          auditResult.summary.totalFindingsCount,
+          JSON.stringify(auditResult.summary),
+          JSON.stringify({
+            rules: Object.keys(auditResult.summary.ruleBreakdown),
+            completedAt: new Date().toISOString(),
+          }),
+        ]
+      );
+
+      await client.query('COMMIT');
+
+      auditRun = (await this.getAuditRunById(runId, workspaceId))!;
+
+      return {
+        auditRun,
+        catalog: nextCatalog,
+      };
+    } catch (err: any) {
+      await client.query('ROLLBACK');
+      try {
+        await this.updateAuditRun(runId, {
+          status: 'FAILED',
+          errorMessage: err?.message || 'Catalog audit execution failed',
+          completedAt: new Date().toISOString(),
+        });
+      } catch {
+        // preserve primary error
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
+
 

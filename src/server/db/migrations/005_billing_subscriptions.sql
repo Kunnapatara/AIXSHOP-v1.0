@@ -47,3 +47,24 @@ ALTER TABLE billing_events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT N
 CREATE INDEX IF NOT EXISTS idx_billing_events_event_id ON billing_events(event_id);
 CREATE INDEX IF NOT EXISTS idx_billing_events_idempotency ON billing_events(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_billing_events_status ON billing_events(status);
+
+-- Catalog Audit Runs table (persists genuine audit executions, metrics, and summaries)
+CREATE TABLE IF NOT EXISTS audit_runs (
+  id VARCHAR(64) PRIMARY KEY,
+  workspace_id VARCHAR(64) NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+  products_evaluated INTEGER NOT NULL DEFAULT 0,
+  rules_evaluated INTEGER NOT NULL DEFAULT 0,
+  findings_count INTEGER NOT NULL DEFAULT 0,
+  summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+  error_message TEXT,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_runs_workspace ON audit_runs(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_runs_status ON audit_runs(status);
+
