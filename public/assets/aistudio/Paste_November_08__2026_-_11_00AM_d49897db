@@ -1,0 +1,821 @@
+# AIXSHOP v1.0 — Workstream B: Audit History & Evidence
+## Google AI Studio Build Mode Implementation Prompt
+
+### 1. Mission
+
+Implement a complete, workspace-isolated, persistent Audit History & Evidence system on top of the existing AIXSHOP v1.0 Phase 1 Real Audit Execution implementation.
+
+The objective is to allow merchants to:
+
+1. View their previous audit executions.
+2. Open any completed audit and inspect its historical findings.
+3. See the actual product information and evidence associated with each finding at the time of that audit.
+4. Understand which rules were executed and when.
+5. Review the original evidence provenance, including evidence type, issuer, URL, verification status, and verification date where available.
+6. Compare historical audit results with newer audit runs without changing the historical records.
+7. Retrieve historical records even after the current catalog has changed or been re-audited.
+
+**Core requirement: An audit result must remain historically accurate even when the current catalog changes.**
+
+This is a targeted extension of Phase 1, not a rebuild.
+
+**Zero Loss of Development Progress.**
+
+---
+
+### 2. Mandatory Repository Inspection Before Editing
+
+Inspect the current repository and active branch before making any changes.
+
+The following files were previously inspected on `main`. Re-read their current versions and verify the actual interfaces before implementation:
+
+- `src/domain/audit/auditEngine.ts`
+- `src/server/routes/auditRoutes.ts`
+- `src/server/db/repository.ts`
+- `src/server/db/postgresRepository.ts`
+- `src/server/db/memoryRepository.ts`
+- `src/server/db/migrations/005_billing_subscriptions.sql`
+- `src/domain/storage/storageTypes.ts`
+- `src/pages/AuditPage.tsx`
+- `src/server/audit.test.ts`
+
+Previously inspected source SHAs:
+
+| File | Previously inspected SHA |
+|---|---|
+| auditEngine.ts | `cb71a9c9a5dffc1111cda61151dd46bb408e157c` |
+| auditRoutes.ts | `4bf75f35afd8bfc12a7fec47b8a355d802a78176` |
+| repository.ts | `6d8dfd054cb47f36bccc2e9355142aa49527300d` |
+| postgresRepository.ts | `759f41f06bf859410f3056870461d12123764186` |
+| memoryRepository.ts | `7c895dd2182026706b7a09249dedfa7a1d207891` |
+| 005_billing_subscriptions.sql | `aeb90e00f99f3af995d6d6a0a44a7a99abc1e517` |
+| storageTypes.ts | `8a9bb52370342c736e299d5222eab68f63fe5422` |
+| AuditPage.tsx | `5b2092d7063dc048b60bca2b541ef0c421129636` |
+
+These are historical reference SHAs, not permission to assume that the files remain unchanged.
+
+Also inspect:
+- Existing database schema and migration runner.
+- Existing `findings` and `evidence_documents` table definitions.
+- Existing Product, Finding, ActionItem, and EvidenceDocument types.
+- Existing frontend navigation and routing.
+- Existing pagination and API response conventions, if any.
+- Existing tests for database transactions and workspace isolation.
+
+Before editing, provide a concise plan identifying the files to modify, new files, migration strategy, data model, API changes, frontend changes, and tests.
+
+Then proceed with implementation unless a genuine blocker prevents safe progress.
+
+---
+
+### 3. Existing Architecture — Preserve and Extend
+
+The existing system already has:
+
+- Real Audit Execution through `executeCatalogAudit()`.
+- The `audit_runs` database table.
+- `AuditRunRecord`, `CreateAuditRunData`, and `UpdateAuditRunData`.
+- Workspace-scoped audit execution.
+- PostgreSQL and MemoryRepository implementations.
+- Existing `GET /api/audit/latest`.
+- Existing `GET /api/audit/:id`.
+- Existing Finding, ActionItem, and EvidenceDocument models.
+- Existing catalog persistence.
+- Existing authentication and workspace authorization.
+
+Reuse these components.
+
+Do not create another Audit Engine.
+
+Do not replace the existing audit execution workflow.
+
+Do not duplicate the current authentication or workspace authorization systems.
+
+### 4. Important Existing Limitation to Solve
+
+The existing `audit_runs` table stores:
+
+- Audit status.
+- Products evaluated.
+- Rules evaluated.
+- Findings count.
+- Summary JSON.
+- Metadata JSON.
+- Execution timestamps.
+
+However, it does not currently provide a complete immutable per-run snapshot of the actual findings, product observations, and supporting evidence.
+
+The existing catalog persistence also replaces current workspace-level findings and evidence records when saving an updated catalog.
+
+Consequently, the current catalog records cannot be treated as a reliable historical record of previous audit executions.
+
+Workstream B must solve this problem.
+
+**Do not use the current catalog as a substitute for historical snapshots.**
+
+---
+
+### 5. Historical Audit Snapshot Architecture
+
+Implement persistent historical records associated with each individual Audit Run.
+
+The implementation must preserve the following information.
+
+#### 5.1 Audit Run Snapshot
+
+For every successfully completed audit, preserve:
+
+- Audit Run ID.
+- Workspace ID.
+- Execution timestamp.
+- Completion timestamp.
+- Audit status.
+- Number of products evaluated.
+- Number of variants evaluated, if available.
+- Number of rules evaluated.
+- Actual findings count.
+- Summary metrics.
+- Rule identifiers.
+- Rule version or version identifier.
+- Relevant audit metadata.
+- Catalog snapshot reference or reproducible source snapshot.
+
+Do not silently overwrite historical audit data when another audit executes.
+
+#### 5.2 Historical Finding Snapshot
+
+Preserve every actual finding produced by that audit execution.
+
+At minimum, capture:
+
+- Original Finding ID.
+- Audit Run ID.
+- Workspace ID.
+- Product ID.
+- Product title at the time of the audit.
+- Finding scope.
+- Finding type.
+- Severity.
+- Finding title.
+- Description.
+- Observed evidence.
+- Derived conclusion.
+- Merchant verification state at that time.
+- Why it matters.
+- Suggested correction.
+- Target field.
+- Current value observed during the audit.
+- Recommended value, when available.
+- Associated Action Item ID.
+- Rule identifier, when reliably available.
+- Snapshot creation timestamp.
+
+Historical findings must remain unchanged when:
+- The product is edited.
+- The merchant approves or dismisses a current action.
+- The current catalog is re-imported.
+- Another audit is executed.
+- A newer finding replaces an older current finding.
+
+Historical findings must represent what the audit actually observed at that time, not the current state.
+
+#### 5.3 Historical Product and Variant Evidence
+
+For each finding, preserve enough source information to explain the observation.
+
+Where applicable, capture:
+
+- Product title and product identifier.
+- Brand.
+- Category.
+- Description.
+- Relevant product attributes.
+- Relevant variant identifier.
+- SKU.
+- Barcode / GTIN.
+- Price.
+- Relevant source field.
+- Actual observed value.
+- Product or variant data snapshot timestamp.
+
+Do not unnecessarily duplicate the entire catalog for every finding if a more efficient, reliable snapshot design is available.
+
+However, the design must preserve sufficient information to reconstruct and explain the historical finding without relying on mutable current catalog records.
+
+#### 5.4 Historical Evidence Documents
+
+Preserve evidence documents associated with the audit.
+
+Use the existing EvidenceDocument model and existing evidence data.
+
+Capture the available original fields:
+
+- Evidence document ID.
+- Product ID.
+- Evidence title.
+- Evidence type.
+- Issuer.
+- Verification date.
+- Original URL.
+- Evidence status.
+- Evidence metadata, if already available.
+- Audit Run ID.
+- Workspace ID.
+
+Distinguish clearly between:
+
+1. Merchant-provided evidence.
+2. Evidence metadata stored by AIXSHOP.
+3. Evidence that has actually been verified.
+4. Evidence that remains unverified.
+5. Evidence that is missing.
+
+Never label a document as verified merely because it exists.
+
+Never invent a certificate, issuer, verification date, registry number, URL, or external source.
+
+Preserve the original evidence status at the time of the audit.
+
+#### 5.5 Evidence Provenance
+
+Each evidence record must retain its provenance.
+
+Where available, preserve:
+- Source type.
+- Source URL.
+- Original document identifier.
+- Issuer.
+- Product association.
+- Verification status.
+- Observation timestamp.
+- Relationship to the Finding and Audit Run.
+
+If the existing data does not contain a provenance field, introduce a compatible field only where necessary.
+
+Do not claim that a source was externally checked unless the system actually performed that verification.
+
+---
+
+### 6. Database Design and Migration
+
+Design the smallest safe, backward-compatible database extension.
+
+A possible design is:
+
+**A. audit_run_findings**
+
+Stores immutable Finding snapshots associated with an Audit Run.
+
+**B. audit_run_evidence**
+
+Stores immutable evidence snapshots associated with an Audit Run.
+
+**C. audit_run_product_snapshots**
+
+Optional, if required to preserve sufficient historical product and variant observations without excessive duplication.
+
+You may choose a more appropriate schema if it better fits the existing architecture.
+
+Requirements:
+
+- Every historical record must be associated with a valid Audit Run.
+- Every record must be scoped to a workspace.
+- Add appropriate indexes for workspace, audit_run_id, product_id, and finding_id where needed.
+- Enforce referential integrity.
+- Use JSONB for structured snapshots where appropriate.
+- Preserve the original source values.
+- Make historical records append-only through application-level permissions and repository design.
+- Prevent normal audit execution from modifying previous snapshots.
+- Support efficient retrieval of one audit and its associated findings and evidence.
+
+**Migration restrictions:**
+
+- Do not rewrite migration `005_billing_subscriptions.sql`.
+- Do not change the numbering or contents of an already-applied migration.
+- Create a new additive migration using the next available migration number after inspecting the current migration directory.
+- Do not drop or destructively modify existing tables.
+- Do not delete current catalog findings, actions, products, or evidence.
+- Ensure existing installations can upgrade without losing data.
+
+Legacy audit runs created before this feature must be handled honestly.
+
+If no historical snapshot exists for an older run, show:
+
+`Historical snapshot unavailable — this audit was created before Audit History & Evidence was implemented.`
+
+Do not reconstruct old historical findings from the current catalog and present them as original historical records.
+
+---
+
+### 7. Audit Execution Integration
+
+Extend the existing Phase 1 audit persistence workflow.
+
+When a new audit executes:
+
+1. Load the actual persisted catalog for the authenticated workspace.
+2. Execute the existing audit engine.
+3. Collect the actual resulting findings.
+4. Collect the relevant product and variant observations.
+5. Collect associated evidence documents and their original metadata.
+6. Persist the historical snapshots under the new Audit Run ID.
+7. Persist the audit summary and rule metadata.
+8. Complete the Audit Run only after all required snapshots have been persisted successfully.
+
+The current catalog may continue to be updated using the existing Phase 1 behavior.
+
+However, the historical snapshot must be preserved independently.
+
+#### Transactional requirements
+
+For PostgreSQL:
+
+- Use the existing transaction conventions.
+- Persist the snapshots and mark the audit run completed consistently.
+- Avoid a situation where the audit is marked COMPLETED but its required snapshots are missing.
+- Roll back the snapshot transaction if required persistence fails.
+- Ensure the audit cannot report success before required historical records are durable.
+
+For MemoryRepository:
+
+- Implement equivalent behavior.
+- Preserve isolation between workspaces.
+- Ensure previous snapshots remain unchanged.
+
+Do not break Phase 1's existing execution behavior.
+
+---
+
+### 8. Backend API
+
+Extend the existing `/api/audit` routes.
+
+Reuse the existing authentication middleware and workspace-scoped authorization.
+
+#### 8.1 Audit History List
+
+Implement:
+
+`GET /api/audit/history`
+
+Purpose:
+Retrieve historical Audit Runs belonging to the authenticated workspace.
+
+Requirements:
+- Pagination.
+- Stable ordering by execution timestamp.
+- Newest runs first.
+- Configurable page size with a safe maximum.
+- Cursor-based pagination preferred if consistent with existing architecture.
+- Return actual stored Audit Run metadata and summary.
+- Do not return other workspace data.
+
+Example response shape:
+
+```json
+{
+  "success": true,
+  "items": [
+    {
+      "id": "audit_example",
+      "status": "COMPLETED",
+      "productsEvaluated": 100,
+      "rulesEvaluated": 12,
+      "findingsCount": 24,
+      "startedAt": "2026-11-08T10:00:00.000Z",
+      "completedAt": "2026-11-08T10:00:05.000Z",
+      "snapshotAvailable": true
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+This is an illustrative response contract. Adapt it to the existing API conventions.
+
+Do not hardcode example records in production.
+
+#### 8.2 Audit Detail
+
+Extend:
+
+`GET /api/audit/:id`
+
+It must return:
+
+- Audit Run metadata.
+- Historical summary.
+- Historical rule information.
+- Historical findings snapshot.
+- Historical evidence snapshots.
+- Historical product observations needed to explain the findings.
+- Snapshot availability status.
+
+All results must be scoped to the authenticated workspace.
+
+Do not silently substitute current catalog findings when a historical snapshot is missing.
+
+#### 8.3 Evidence Detail
+
+If needed, add a workspace-scoped endpoint to retrieve evidence associated with a particular historical audit.
+
+Avoid unnecessary duplicate endpoints if the audit detail API can efficiently return the required evidence.
+
+#### 8.4 Error Handling
+
+Handle:
+- Unauthenticated requests.
+- Unauthorized workspace access.
+- Invalid audit IDs.
+- Missing audit runs.
+- Missing legacy snapshots.
+- Invalid pagination parameters.
+- Database failures.
+- Incomplete snapshot data.
+
+Use the existing error response conventions.
+
+---
+
+### 9. Frontend — Audit History & Evidence Workspace
+
+Integrate the new functionality into the existing AIXSHOP frontend.
+
+Inspect the existing navigation and UI architecture before deciding whether to:
+
+- Extend the existing AuditPage.
+- Add an Audit History section within the Audit workspace.
+- Create a dedicated Audit History page.
+
+Choose the smallest change consistent with the current application structure.
+
+#### 9.1 Audit History List
+
+Display historical audits with:
+
+- Audit Run ID.
+- Execution date and time.
+- Audit status.
+- Products evaluated.
+- Rules evaluated.
+- Findings count.
+- Snapshot availability.
+- Action to open the audit.
+
+Provide:
+- Loading state.
+- Empty state.
+- Error state.
+- Pagination.
+- Refresh behavior.
+
+Do not show fabricated historical records.
+
+#### 9.2 Historical Audit Detail
+
+When a merchant opens a historical audit, show:
+
+**Audit Overview**
+- Run ID.
+- Execution time.
+- Completion time.
+- Status.
+- Product count.
+- Rule count.
+- Finding count.
+- Summary metrics.
+
+**Historical Findings**
+- Severity.
+- Finding title.
+- Product name.
+- Observed evidence.
+- Derived conclusion.
+- Why it matters.
+- Suggested correction.
+- Actual observed value.
+- Rule identifier where available.
+
+**Historical Evidence**
+- Evidence title.
+- Evidence type.
+- Issuer.
+- Original URL.
+- Verification date.
+- Original verification status.
+- Associated product.
+- Associated finding, where the relationship is known.
+
+Clearly distinguish historical audit information from current catalog information.
+
+#### 9.3 Evidence Display Rules
+
+- Do not convert unverified evidence into verified evidence.
+- Do not display missing URLs as working links.
+- Do not invent issuer names or certificate numbers.
+- Display unavailable historical data honestly.
+- Preserve the original evidence status.
+- Clearly label the timestamp of historical observations.
+
+#### 9.4 Current vs Historical Context
+
+If the current product or finding differs from the historical snapshot:
+
+- Display the historical value from the snapshot.
+- Do not silently replace it with the current value.
+- If current data is shown alongside historical data, label each clearly.
+- Never imply that an old observation is still true today without a current verification.
+
+---
+
+### 10. Audit Comparison
+
+Add a basic historical comparison capability if it can be implemented safely using the saved snapshots.
+
+Allow comparison between two completed audit runs belonging to the same workspace.
+
+Show:
+
+- Findings that remain present.
+- Findings that are no longer present.
+- Newly identified findings.
+- Severity changes.
+- Changes in actual observed values, where the relevant product and field can be reliably matched.
+- Changes in audit summary metrics.
+
+Use stable matching based on product ID, rule identifier, target field, and other reliable identifiers.
+
+Do not match findings solely by their display titles if reliable identifiers are available.
+
+If a finding cannot be matched confidently, classify it as:
+
+`UNMATCHED`
+
+Do not claim that an issue is resolved solely because a finding is absent from a later snapshot unless the later audit actually evaluated the relevant rule and product.
+
+Do not build a complex analytics dashboard in this workstream.
+
+The goal is trustworthy historical comparison, not decorative charts.
+
+---
+
+### 11. Security and Multi-Tenant Isolation
+
+Workspace isolation is mandatory.
+
+Verify:
+
+1. A workspace can retrieve only its own Audit Runs.
+2. A workspace can retrieve only its own historical findings.
+3. A workspace can retrieve only its own historical evidence.
+4. A workspace cannot access another workspace's snapshot using a guessed Audit Run ID.
+5. Client-provided workspace IDs cannot override server-side authorization.
+6. Historical API queries always use the authenticated workspace scope.
+7. Evidence URLs and metadata do not expose unauthorized tenant information.
+8. Historical snapshots cannot be modified through ordinary catalog APIs.
+
+Reuse the existing authentication middleware and workspace authorization.
+
+Do not introduce a separate authorization architecture.
+
+---
+
+### 12. Required Automated Tests
+
+Add tests using the existing test framework.
+
+#### A. Historical Persistence
+
+- A completed audit stores its own historical findings.
+- Historical evidence is persisted with the correct Audit Run ID.
+- Product observations are preserved.
+- Audit summary and rule metadata are preserved.
+- Snapshot persistence and audit completion behave consistently.
+- A failed snapshot persistence does not produce a false COMPLETED status.
+
+#### B. Historical Immutability
+
+Critical tests:
+
+1. Run Audit A.
+2. Save and retrieve Audit A's historical snapshot.
+3. Modify the current catalog.
+4. Run Audit B.
+5. Retrieve Audit A again.
+6. Confirm that Audit A's historical findings, evidence, and observations are unchanged.
+
+Also verify:
+- Approving a current Action Item does not modify old audit snapshots.
+- Dismissing an Action Item does not modify old snapshots.
+- Re-running the audit does not overwrite earlier snapshots.
+- Updating current evidence does not rewrite previous evidence snapshots.
+
+#### C. Historical API
+
+- Retrieve audit history.
+- Retrieve a specific audit detail.
+- Retrieve findings associated with the correct audit.
+- Retrieve evidence associated with the correct audit.
+- Pagination returns stable, correctly ordered records.
+- Legacy audits without snapshots are reported honestly.
+- Invalid audit IDs are handled correctly.
+
+#### D. Workspace Isolation
+
+- Workspace A cannot access Workspace B's audit history.
+- Workspace A cannot access Workspace B's findings snapshots.
+- Workspace A cannot access Workspace B's evidence snapshots.
+- Cross-workspace access by Audit Run ID returns the existing appropriate not-found behavior.
+- Client-supplied workspace IDs cannot bypass authorization.
+
+#### E. Historical Comparison
+
+- Detect findings that remain present.
+- Detect findings absent from a later evaluated snapshot.
+- Detect newly identified findings.
+- Detect severity changes.
+- Handle unmatched findings safely.
+- Do not classify a finding as resolved when the relevant rule was not evaluated.
+
+#### F. Regression
+
+Re-run the existing Phase 1 tests.
+
+Verify that:
+- Real audit execution still works.
+- Existing domain rules still execute.
+- Current findings still display.
+- Action approval, dismissal, and recheck still work.
+- Workspace isolation remains intact.
+- Existing catalog persistence remains compatible.
+
+---
+
+### 13. Acceptance Criteria
+
+Workstream B is complete only when:
+
+1. Every newly completed audit has a durable historical snapshot.
+2. Historical findings can be retrieved independently of the current catalog.
+3. Historical evidence documents and provenance are preserved.
+4. Historical product observations are sufficient to explain findings.
+5. Audit History API supports pagination.
+6. Audit Detail API returns the correct historical snapshot.
+7. The frontend displays historical audits and details.
+8. Historical snapshots remain unchanged after subsequent audits and catalog modifications.
+9. Historical evidence retains its original verification status.
+10. Workspace isolation is verified by automated tests.
+11. Existing Phase 1 functionality continues to work.
+12. Database migrations are backward-compatible.
+
+If any criterion is incomplete, report it as incomplete.
+
+Do not claim Workstream B is complete merely because the history page renders or the audit_runs table contains records.
+
+---
+
+### 14. Strict Scope Boundaries
+
+This workstream is specifically Audit History & Evidence.
+
+Do not implement:
+
+- Shopify OAuth.
+- Shopify Admin GraphQL integration.
+- Full Shopify catalog synchronization.
+- Shopify write-back.
+- Automated product remediation.
+- Stripe checkout or subscription redesign.
+- Pricing changes.
+- New AI providers.
+- External certificate verification services.
+- Unrelated analytics dashboards.
+- Unrelated product redesign.
+
+Do not change the existing 12 audit rules unless a change is absolutely required for reliable historical identification.
+
+If rule identifiers or version metadata need to be added, make the smallest backward-compatible change.
+
+Do not proceed to Workstream C or other workstreams.
+
+---
+
+### 15. Strict Prohibitions
+
+- No full application rewrite.
+- No replacement of the existing Audit Engine.
+- No destructive database migrations.
+- No modification of previously applied migration files.
+- No deletion of existing customer data.
+- No overwriting of historical audit snapshots.
+- No reconstruction of old snapshots using current catalog data.
+- No fabricated evidence.
+- No fabricated historical findings.
+- No false verification status.
+- No fake comparison results.
+- No cross-workspace data access.
+- No unnecessary architecture replacement.
+- No unrelated refactoring.
+- No dependency upgrades unless strictly necessary and justified.
+- No Git commit or push without explicit authorization.
+
+Preserve all working Phase 1 features.
+
+---
+
+### 16. Final Verification and Report
+
+After implementation:
+
+1. Run the complete automated test suite.
+2. Run Phase 1 regression tests.
+3. Run type checking.
+4. Run linting if configured.
+5. Run the production build.
+6. Verify database migration behavior.
+7. Review the final code changes.
+8. Confirm that historical snapshots survive subsequent audits.
+9. Confirm that workspace isolation applies to all historical endpoints.
+
+Provide a final report with:
+
+**A. Files Changed**
+- Exact paths.
+- Purpose of each change.
+- Existing components reused.
+
+**B. Database Changes**
+- New tables and columns.
+- Migration number.
+- Indexes and constraints.
+- Backward compatibility.
+
+**C. Historical Snapshot Verification**
+- How findings are captured.
+- How product observations are preserved.
+- How evidence provenance is preserved.
+- How historical immutability is enforced.
+
+**D. API**
+- Endpoints implemented.
+- Pagination behavior.
+- Response structure.
+- Authorization behavior.
+
+**E. Frontend**
+- History list.
+- Audit detail.
+- Evidence display.
+- Historical comparison.
+- Legacy snapshot handling.
+
+**F. Test Results**
+- Exact commands executed.
+- Passed tests.
+- Failed tests.
+- Skipped tests and reasons.
+- Type-check result.
+- Lint result.
+- Build result.
+
+**G. Security**
+- Workspace isolation evidence.
+- Historical snapshot access control.
+- Evidence access control.
+
+**H. Remaining Limitations**
+Separate:
+- Implemented and verified.
+- Implemented but not fully verified.
+- Not implemented.
+- Blocked by external requirements.
+
+**I. Production Readiness**
+
+Do not claim production readiness based solely on local tests.
+
+Production verification still requires applying the migration in the target environment, verifying database persistence, and testing with actual customer workspace data.
+
+---
+
+### Final Instruction
+
+Implement Workstream B on top of the existing AIXSHOP v1.0 Phase 1 implementation.
+
+The expected outcome is a genuine historical audit record that a merchant can retrieve and trust even after the underlying catalog changes.
+
+**AIXSHOP must be able to answer:**
+
+- What did the system inspect?
+- What did it find?
+- What evidence did it use?
+- What was the original state of the product?
+- When did the audit happen?
+- What changed in subsequent audits?
+- Can the merchant retrieve the original result without it being altered?
+
+The historical record must be based on actual persisted data, not reconstructed from the latest catalog.
+
+Prioritize historical accuracy, evidence provenance, data integrity, workspace isolation, and preservation of Phase 1 functionality.
+
+Do not proceed to Workstream C until Workstream B has been implemented and verified.

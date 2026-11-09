@@ -176,8 +176,21 @@ class ApiClient {
     return this.request<{ workspaceId: string; auditRun: any | null }>('/api/audit/latest');
   }
 
-  async getAuditRun(id: string): Promise<{ workspaceId: string; auditRun: any }> {
-    return this.request<{ workspaceId: string; auditRun: any }>(`/api/audit/${encodeURIComponent(id)}`);
+  async getAuditHistory(options?: { limit?: number; cursor?: string }): Promise<import('../domain/audit/historicalTypes').AuditHistoryResponse> {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set('limit', String(options.limit));
+    if (options?.cursor) params.set('cursor', options.cursor);
+    const query = params.toString() ? `?${params.toString()}` : '';
+    return this.request<import('../domain/audit/historicalTypes').AuditHistoryResponse>(`/api/audit/history${query}`);
+  }
+
+  async getAuditRun(id: string): Promise<import('../domain/audit/historicalTypes').HistoricalAuditSnapshot> {
+    return this.request<import('../domain/audit/historicalTypes').HistoricalAuditSnapshot>(`/api/audit/${encodeURIComponent(id)}`);
+  }
+
+  async compareAudits(baseId: string, targetId: string): Promise<{ success: boolean; comparison: import('../domain/audit/historicalTypes').AuditComparisonResult }> {
+    const params = new URLSearchParams({ baseId, targetId });
+    return this.request<{ success: boolean; comparison: import('../domain/audit/historicalTypes').AuditComparisonResult }>(`/api/audit/compare?${params.toString()}`);
   }
 }
 

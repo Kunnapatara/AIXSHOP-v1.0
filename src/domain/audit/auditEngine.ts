@@ -107,6 +107,7 @@ export function executeCatalogAudit(
           currentValue: '(empty)',
           recommendedValue: '',
           actionItemId: actionId,
+          ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -151,6 +152,7 @@ export function executeCatalogAudit(
           currentValue: barcode,
           recommendedValue: '',
           actionItemId: actionId,
+          ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -200,6 +202,7 @@ export function executeCatalogAudit(
           currentValue: String(v.price),
           recommendedValue: '0.00',
           actionItemId: actionId,
+          ruleCode: 'RULE_VARIANT_PRICE_PRESENCE',
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -247,6 +250,7 @@ export function executeCatalogAudit(
         targetField: 'description',
         currentValue: p.description || '(empty)',
         actionItemId: actionId,
+        ruleCode: 'RULE_PRODUCT_DESCRIPTION_LENGTH',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -293,6 +297,7 @@ export function executeCatalogAudit(
         targetField: 'brand',
         currentValue: p.brand || '(empty)',
         actionItemId: actionId,
+        ruleCode: 'RULE_PRODUCT_BRAND_SPECIFICATION',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -339,6 +344,7 @@ export function executeCatalogAudit(
         targetField: 'category',
         currentValue: p.category || '(empty)',
         actionItemId: actionId,
+        ruleCode: 'RULE_PRODUCT_CATEGORY_TAXONOMY',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -385,6 +391,7 @@ export function executeCatalogAudit(
         targetField: 'image',
         currentValue: '(none)',
         actionItemId: actionId,
+        ruleCode: 'RULE_PRODUCT_IMAGE_ASSET',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -437,6 +444,7 @@ export function executeCatalogAudit(
           currentValue: microwave || 'Unspecified',
           recommendedValue: 'True (Tested up to 900W)',
           actionItemId: actionId,
+          ruleCode: 'RULE_DISHWASHER_MICROWAVE_SAFETY',
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -487,6 +495,7 @@ export function executeCatalogAudit(
         currentValue: p.attributes?.oekoTexCertified || 'Standard 100 (Unverified)',
         recommendedValue: 'OEKO-TEX Certificate #21.HLT.84920 (Verified)',
         actionItemId: actionId,
+        ruleCode: 'RULE_UNVERIFIED_EVIDENCE_CLAIMS',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -536,6 +545,7 @@ export function executeCatalogAudit(
         currentValue: p.attributes?.recommendedBrewMethods || '(none)',
         recommendedValue: '["V60", "Chemex", "Pour-Over", "Aeropress"]',
         actionItemId: actionId,
+        ruleCode: 'RULE_STRUCTURED_BREW_METHODS',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -586,6 +596,7 @@ export function executeCatalogAudit(
         currentValue: '60-hour claim vs 45-50h spec',
         recommendedValue: 'Up to 50 hours (Tested burn rate)',
         actionItemId: actionId,
+        ruleCode: 'RULE_MARKETING_BURN_TIME_CONFLICT',
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -643,6 +654,7 @@ export function executeCatalogAudit(
       currentValue: 'Mixed single-system units',
       recommendedValue: 'Dual-unit standard: Metric (Imperial)',
       actionItemId: actionId,
+      ruleCode: 'RULE_DUAL_UNIT_MEASUREMENT_POLICY',
     });
 
     actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -686,6 +698,7 @@ export function executeCatalogAudit(
       currentValue: '3-5 business days',
       recommendedValue: '2 business days',
       actionItemId: actionId,
+      ruleCode: 'RULE_SHIPPING_SLA_RECONCILIATION',
     });
 
     actionItems.push(prevAction ? { ...prevAction, findingId } : {

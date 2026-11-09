@@ -1990,7 +1990,106 @@ export class PostgresRepository implements DatabaseRepository {
       // Save catalog rows atomically within this transaction
       await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, auditResult.updatedStoreProfile);
 
-      // Mark audit run COMPLETED in database
+      // Workstream B: Persist immutable historical snapshots in PostgreSQL transaction
+      // 1. audit_run_findings
+      for (const f of auditResult.findings) {
+        await client.query(
+          `INSERT INTO audit_run_findings (
+            id, audit_run_id, workspace_id, original_finding_id, scope, product_id, product_title,
+            finding_type, severity, title, description, observed_evidence, derived_conclusion,
+            merchant_verified, why_it_matters, suggested_correction, target_field, current_value,
+            recommended_value, action_item_id, rule_code, snapshot_created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, NOW())`,
+          [
+            `hfind_${runId}_${f.id}`,
+            runId,
+            workspaceId,
+            f.id,
+            f.scope,
+            f.productId || null,
+            f.productTitle || null,
+            f.type,
+            f.severity,
+            f.title,
+            f.description,
+            f.observedEvidence,
+            f.derivedConclusion,
+            f.merchantVerified,
+            f.whyItMatters,
+            f.suggestedCorrection || null,
+            f.targetField || null,
+            f.currentValue || null,
+            f.recommendedValue || null,
+            f.actionItemId || null,
+            f.ruleCode || null,
+          ]
+        );
+      }
+
+      // 2. audit_run_evidence
+      const allEvidence: EvidenceDocument[] = [...(catalog.evidence || [])];
+      for (const p of catalog.products) {
+        if (p.evidenceDocuments && p.evidenceDocuments.length > 0) {
+          allEvidence.push(...p.evidenceDocuments);
+        }
+      }
+      const evidenceMap = new Map<string, EvidenceDocument>();
+      for (const e of allEvidence) {
+        if (e.id) evidenceMap.set(e.id, e);
+      }
+
+      for (const e of evidenceMap.values()) {
+        await client.query(
+          `INSERT INTO audit_run_evidence (
+            id, audit_run_id, workspace_id, original_evidence_id, product_id, title,
+            evidence_type, issuer, date_verified, url, status, source_type, metadata_json, snapshot_created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, NOW())`,
+          [
+            `hevid_${runId}_${e.id}`,
+            runId,
+            workspaceId,
+            e.id,
+            null,
+            e.title,
+            e.type,
+            e.issuer,
+            e.dateVerified,
+            e.url || null,
+            e.status || 'unverified',
+            'catalog_evidence',
+            JSON.stringify({}),
+          ]
+        );
+      }
+
+      // 3. audit_run_products
+      for (const p of auditResult.updatedProducts) {
+        await client.query(
+          `INSERT INTO audit_run_products (
+            id, audit_run_id, workspace_id, product_id, title, brand, category,
+            description, image, completeness_score, attributes_json, variants_json, offers_json,
+            findings_count, snapshot_created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14, NOW())`,
+          [
+            `hprod_${runId}_${p.id}`,
+            runId,
+            workspaceId,
+            p.id,
+            p.title,
+            p.brand,
+            p.category,
+            p.description,
+            p.image,
+            p.completenessScore,
+            JSON.stringify(p.attributes || {}),
+            JSON.stringify(p.variants || []),
+            JSON.stringify(p.offers || []),
+            p.findingsCount,
+          ]
+        );
+      }
+
+      // Mark audit run COMPLETED in database ONLY AFTER all historical snapshots are written
       await client.query(
         `UPDATE audit_runs
          SET status = 'COMPLETED',
@@ -2011,6 +2110,7 @@ export class PostgresRepository implements DatabaseRepository {
           JSON.stringify({
             rules: Object.keys(auditResult.summary.ruleBreakdown),
             completedAt: new Date().toISOString(),
+            snapshotAvailable: true,
           }),
         ]
       );
@@ -2038,6 +2138,194 @@ export class PostgresRepository implements DatabaseRepository {
     } finally {
       client.release();
     }
+  }
+
+  async getAuditRunsHistory(
+    workspaceId: string,
+    options?: { limit?: number; cursor?: string }
+  ): Promise<{ items: Array<AuditRunRecord & { snapshotAvailable: boolean }>; nextCursor: string | null; totalCount: number }> {
+    const limit = Math.min(Math.max(options?.limit || 20, 1), 100);
+
+    // Get total count of runs for workspace
+    const countRes = await this.pool.query<{ count: string }>(
+      'SELECT COUNT(*) AS count FROM audit_runs WHERE workspace_id = $1',
+      [workspaceId]
+    );
+    const totalCount = parseInt(countRes.rows[0]?.count || '0', 10);
+
+    let query = `
+      SELECT 
+        ar.id,
+        ar.workspace_id AS "workspaceId",
+        ar.status,
+        ar.products_evaluated AS "productsEvaluated",
+        ar.rules_evaluated AS "rulesEvaluated",
+        ar.findings_count AS "findingsCount",
+        ar.summary_json AS "summaryJson",
+        ar.metadata_json AS "metadataJson",
+        ar.error_message AS "errorMessage",
+        ar.started_at AS "startedAt",
+        ar.completed_at AS "completedAt",
+        ar.created_at AS "createdAt",
+        ar.updated_at AS "updatedAt",
+        EXISTS (
+          SELECT 1 FROM audit_run_findings arf WHERE arf.audit_run_id = ar.id LIMIT 1
+        ) AS "snapshotAvailable"
+      FROM audit_runs ar
+      WHERE ar.workspace_id = $1
+    `;
+    const params: any[] = [workspaceId];
+
+    if (options?.cursor) {
+      // Fetch cursor record's created_at for stable keyset pagination
+      const cursorRes = await this.pool.query<{ created_at: Date }>(
+        'SELECT created_at FROM audit_runs WHERE id = $1 AND workspace_id = $2',
+        [options.cursor, workspaceId]
+      );
+      if (cursorRes.rows[0]) {
+        params.push(cursorRes.rows[0].created_at);
+        query += ` AND ar.created_at < $${params.length}`;
+      }
+    }
+
+    params.push(limit + 1);
+    query += ` ORDER BY ar.created_at DESC LIMIT $${params.length}`;
+
+    const res = await this.pool.query(query, params);
+    const hasNext = res.rows.length > limit;
+    const rows = hasNext ? res.rows.slice(0, limit) : res.rows;
+    const nextCursor = hasNext && rows.length > 0 ? rows[rows.length - 1].id : null;
+
+    const items = rows.map(r => ({
+      id: r.id,
+      workspaceId: r.workspaceId,
+      status: r.status,
+      productsEvaluated: r.productsEvaluated,
+      rulesEvaluated: r.rulesEvaluated,
+      findingsCount: r.findingsCount,
+      summary: typeof r.summaryJson === 'string' ? JSON.parse(r.summaryJson) : r.summaryJson,
+      metadata: typeof r.metadataJson === 'string' ? JSON.parse(r.metadataJson) : r.metadataJson,
+      errorMessage: r.errorMessage,
+      startedAt: r.startedAt,
+      completedAt: r.completedAt,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+      snapshotAvailable: Boolean(r.snapshotAvailable),
+    }));
+
+    return {
+      items,
+      nextCursor,
+      totalCount,
+    };
+  }
+
+  async getHistoricalAuditSnapshot(
+    workspaceId: string,
+    auditRunId: string
+  ): Promise<import('../../domain/audit/historicalTypes').HistoricalAuditSnapshot | null> {
+    const auditRun = await this.getAuditRunById(auditRunId, workspaceId);
+    if (!auditRun) return null;
+
+    // Check if snapshots exist
+    const findingsRes = await this.pool.query<any>(
+      `SELECT 
+        id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
+        original_finding_id AS "originalFindingId", scope, product_id AS "productId",
+        product_title AS "productTitle", finding_type AS "findingType", severity,
+        title, description, observed_evidence AS "observedEvidence",
+        derived_conclusion AS "derivedConclusion", merchant_verified AS "merchantVerified",
+        why_it_matters AS "whyItMatters", suggested_correction AS "suggestedCorrection",
+        target_field AS "targetField", current_value AS "currentValue",
+        recommended_value AS "recommendedValue", action_item_id AS "actionItemId",
+        rule_code AS "ruleCode", snapshot_created_at AS "snapshotCreatedAt"
+       FROM audit_run_findings
+       WHERE audit_run_id = $1 AND workspace_id = $2
+       ORDER BY snapshot_created_at ASC`,
+      [auditRunId, workspaceId]
+    );
+
+    if (findingsRes.rows.length === 0) {
+      // Legacy audit run without snapshots
+      return {
+        auditRun,
+        findings: [],
+        evidence: [],
+        products: [],
+        snapshotAvailable: false,
+        message: 'Historical snapshot unavailable — this audit was created before Audit History & Evidence was implemented.',
+      };
+    }
+
+    const evidenceRes = await this.pool.query<any>(
+      `SELECT 
+        id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
+        original_evidence_id AS "originalEvidenceId", product_id AS "productId",
+        title, evidence_type AS "evidenceType", issuer, date_verified AS "dateVerified",
+        url, status, source_type AS "sourceType", metadata_json AS "metadata",
+        snapshot_created_at AS "snapshotCreatedAt"
+       FROM audit_run_evidence
+       WHERE audit_run_id = $1 AND workspace_id = $2
+       ORDER BY snapshot_created_at ASC`,
+      [auditRunId, workspaceId]
+    );
+
+    const productsRes = await this.pool.query<any>(
+      `SELECT 
+        id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
+        product_id AS "productId", title, brand, category, description, image,
+        completeness_score AS "completenessScore", attributes_json AS "attributes",
+        variants_json AS "variants", offers_json AS "offers",
+        findings_count AS "findingsCount", snapshot_created_at AS "snapshotCreatedAt"
+       FROM audit_run_products
+       WHERE audit_run_id = $1 AND workspace_id = $2
+       ORDER BY snapshot_created_at ASC`,
+      [auditRunId, workspaceId]
+    );
+
+    const findings: import('../../domain/audit/historicalTypes').HistoricalFindingRecord[] = findingsRes.rows.map(r => ({
+      ...r,
+      merchantVerified: Boolean(r.merchantVerified),
+    }));
+
+    const evidence: import('../../domain/audit/historicalTypes').HistoricalEvidenceRecord[] = evidenceRes.rows.map(r => ({
+      ...r,
+      metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata || {},
+    }));
+
+    const products: import('../../domain/audit/historicalTypes').HistoricalProductRecord[] = productsRes.rows.map(r => ({
+      ...r,
+      attributes: typeof r.attributes === 'string' ? JSON.parse(r.attributes) : r.attributes || {},
+      variants: typeof r.variants === 'string' ? JSON.parse(r.variants) : r.variants || [],
+      offers: typeof r.offers === 'string' ? JSON.parse(r.offers) : r.offers || [],
+    }));
+
+    return {
+      auditRun,
+      findings,
+      evidence,
+      products,
+      snapshotAvailable: true,
+    };
+  }
+
+  async compareHistoricalAudits(
+    workspaceId: string,
+    baseAuditId: string,
+    targetAuditId: string
+  ): Promise<import('../../domain/audit/historicalTypes').AuditComparisonResult | null> {
+    const baseSnapshot = await this.getHistoricalAuditSnapshot(workspaceId, baseAuditId);
+    const targetSnapshot = await this.getHistoricalAuditSnapshot(workspaceId, targetAuditId);
+
+    if (!baseSnapshot || !targetSnapshot) return null;
+
+    const { compareHistoricalAudits } = await import('../../domain/audit/comparisonService');
+    return compareHistoricalAudits(
+      baseSnapshot.auditRun,
+      baseSnapshot.findings,
+      targetSnapshot.auditRun,
+      targetSnapshot.findings
+    );
   }
 }
 

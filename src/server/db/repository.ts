@@ -147,6 +147,23 @@ export interface DatabaseRepository {
   getAuditRunById(id: string, workspaceId: string): Promise<AuditRunRecord | null>;
   getLatestAuditRunByWorkspace(workspaceId: string): Promise<AuditRunRecord | null>;
   executeWorkspaceAudit(workspaceId: string): Promise<{ auditRun: AuditRunRecord; catalog: StoragePayloadV1 }>;
+
+  // Workstream B: Audit History & Evidence Snapshots
+  getAuditRunsHistory(
+    workspaceId: string, 
+    options?: { limit?: number; cursor?: string }
+  ): Promise<{ items: Array<AuditRunRecord & { snapshotAvailable: boolean }>; nextCursor: string | null; totalCount: number }>;
+
+  getHistoricalAuditSnapshot(
+    workspaceId: string, 
+    auditRunId: string
+  ): Promise<import('../../domain/audit/historicalTypes').HistoricalAuditSnapshot | null>;
+
+  compareHistoricalAudits(
+    workspaceId: string,
+    baseAuditId: string,
+    targetAuditId: string
+  ): Promise<import('../../domain/audit/historicalTypes').AuditComparisonResult | null>;
 }
 
 export type AuditRunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';

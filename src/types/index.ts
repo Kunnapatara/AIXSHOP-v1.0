@@ -86,6 +86,7 @@ export interface Finding {
   currentValue?: string;
   recommendedValue?: string;
   actionItemId?: string;
+  ruleCode?: string;
 }
 
 export type ActionStatus = 'pending_review' | 'approved' | 'applied_externally' | 'dismissed';

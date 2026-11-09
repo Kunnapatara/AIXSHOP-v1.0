@@ -27,6 +27,67 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     }
   });
 
+  // GET /api/audit/history — Retrieve historical Audit Runs with pagination (workspace scoped)
+  router.get('/history', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const limitRaw = req.query.limit ? parseInt(String(req.query.limit), 10) : 20;
+      const limit = isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 100);
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+
+      const history = await repo.getAuditRunsHistory(workspaceId, { limit, cursor });
+
+      return res.status(200).json({
+        success: true,
+        workspaceId,
+        items: history.items,
+        nextCursor: history.nextCursor,
+        totalCount: history.totalCount,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Audit History Error]:', err);
+      return res.status(500).json({
+        error: 'Failed to retrieve audit history',
+      });
+    }
+  });
+
+  // GET /api/audit/compare — Compare two historical audit runs (workspace scoped)
+  router.get('/compare', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const baseId = typeof req.query.baseId === 'string' ? req.query.baseId.trim() : '';
+      const targetId = typeof req.query.targetId === 'string' ? req.query.targetId.trim() : '';
+
+      if (!baseId || !targetId) {
+        return res.status(400).json({
+          error: 'Both baseId and targetId query parameters are required for audit comparison',
+          code: 'COMPARISON_PARAMS_REQUIRED',
+        });
+      }
+
+      const comparison = await repo.compareHistoricalAudits(workspaceId, baseId, targetId);
+
+      if (!comparison) {
+        return res.status(404).json({
+          error: 'One or both audit runs could not be found or do not belong to your workspace',
+          code: 'AUDIT_RUNS_NOT_FOUND',
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        workspaceId,
+        comparison,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Audit Compare Error]:', err);
+      return res.status(500).json({
+        error: 'Failed to compare historical audit runs',
+      });
+    }
+  });
+
   // GET /api/audit/latest — Get the latest audit run for authenticated workspace
   router.get('/latest', requireAuth, async (req: AuthRequest, res) => {
     try {
@@ -45,7 +106,7 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // GET /api/audit/:id — Get a specific audit run by ID (workspace scoped)
+  // GET /api/audit/:id — Get a specific audit run by ID with historical snapshots (workspace scoped)
   router.get('/:id', requireAuth, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
@@ -55,9 +116,9 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Audit run ID is required' });
       }
 
-      const auditRun = await repo.getAuditRunById(auditRunId, workspaceId);
+      const snapshot = await repo.getHistoricalAuditSnapshot(workspaceId, auditRunId);
 
-      if (!auditRun) {
+      if (!snapshot) {
         return res.status(404).json({
           error: 'Audit run not found or does not belong to your workspace',
           code: 'AUDIT_NOT_FOUND',
@@ -65,8 +126,14 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
       }
 
       return res.status(200).json({
+        success: true,
         workspaceId,
-        auditRun,
+        auditRun: snapshot.auditRun,
+        findings: snapshot.findings,
+        evidence: snapshot.evidence,
+        products: snapshot.products,
+        snapshotAvailable: snapshot.snapshotAvailable,
+        message: snapshot.message,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit Fetch Error]:', err);

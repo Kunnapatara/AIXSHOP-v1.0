@@ -7,6 +7,9 @@ import {
   ActionItem, 
   StoreProfile 
 } from '../../types';
+import type { AuditRunRecord, AuditRunStatus } from '../../server/db/repository';
+
+export type { AuditRunRecord, AuditRunStatus };
 
 export interface StoragePayloadV1 {
   products: Product[];

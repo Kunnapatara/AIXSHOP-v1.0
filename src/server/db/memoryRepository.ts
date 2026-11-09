@@ -60,6 +60,9 @@ export class MemoryRepository implements DatabaseRepository {
   private subscriptions: Map<string, SubscriptionRecord> = new Map(); // workspaceId -> subscription
   private billingEvents: Map<string, BillingEventRecord> = new Map(); // eventId -> event
   private auditRuns: Map<string, AuditRunRecord> = new Map(); // auditRunId -> record
+  private auditRunFindings: Map<string, import('../../domain/audit/historicalTypes').HistoricalFindingRecord[]> = new Map(); // auditRunId -> findings
+  private auditRunEvidence: Map<string, import('../../domain/audit/historicalTypes').HistoricalEvidenceRecord[]> = new Map(); // auditRunId -> evidence
+  private auditRunProducts: Map<string, import('../../domain/audit/historicalTypes').HistoricalProductRecord[]> = new Map(); // auditRunId -> products
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -911,7 +914,90 @@ export class MemoryRepository implements DatabaseRepository {
         // Persist updated catalog atomically
         await this.saveWorkspaceCatalogInternal(workspaceId, updatedCatalog);
 
-        // Mark audit run as completed
+        // Workstream B: Create immutable historical snapshots for this Audit Run
+        const snapshotTime = new Date().toISOString();
+
+        // 1. Snapshot findings
+        const historicalFindings: import('../../domain/audit/historicalTypes').HistoricalFindingRecord[] = auditResult.findings.map(f => ({
+          id: `hfind_${runId}_${f.id}`,
+          auditRunId: runId,
+          workspaceId,
+          originalFindingId: f.id,
+          scope: f.scope,
+          productId: f.productId || null,
+          productTitle: f.productTitle || null,
+          findingType: f.type,
+          severity: f.severity,
+          title: f.title,
+          description: f.description,
+          observedEvidence: f.observedEvidence,
+          derivedConclusion: f.derivedConclusion,
+          merchantVerified: f.merchantVerified,
+          whyItMatters: f.whyItMatters,
+          suggestedCorrection: f.suggestedCorrection || null,
+          targetField: f.targetField || null,
+          currentValue: f.currentValue || null,
+          recommendedValue: f.recommendedValue || null,
+          actionItemId: f.actionItemId || null,
+          ruleCode: f.ruleCode || null,
+          snapshotCreatedAt: snapshotTime,
+        }));
+
+        // 2. Snapshot evidence documents
+        const allEvidence: EvidenceDocument[] = [...(catalog.evidence || [])];
+        for (const p of catalog.products) {
+          if (p.evidenceDocuments && p.evidenceDocuments.length > 0) {
+            allEvidence.push(...p.evidenceDocuments);
+          }
+        }
+        // Deduplicate evidence by ID
+        const evidenceMap = new Map<string, EvidenceDocument>();
+        for (const e of allEvidence) {
+          if (e.id) evidenceMap.set(e.id, e);
+        }
+
+        const historicalEvidence: import('../../domain/audit/historicalTypes').HistoricalEvidenceRecord[] = Array.from(evidenceMap.values()).map(e => ({
+          id: `hevid_${runId}_${e.id}`,
+          auditRunId: runId,
+          workspaceId,
+          originalEvidenceId: e.id,
+          productId: null,
+          title: e.title,
+          evidenceType: e.type,
+          issuer: e.issuer,
+          dateVerified: e.dateVerified,
+          url: e.url || null,
+          status: e.status || 'unverified',
+          sourceType: 'catalog_evidence',
+          metadata: {},
+          snapshotCreatedAt: snapshotTime,
+        }));
+
+        // 3. Snapshot products and variants
+        const historicalProducts: import('../../domain/audit/historicalTypes').HistoricalProductRecord[] = auditResult.updatedProducts.map(p => ({
+          id: `hprod_${runId}_${p.id}`,
+          auditRunId: runId,
+          workspaceId,
+          productId: p.id,
+          title: p.title,
+          brand: p.brand,
+          category: p.category,
+          description: p.description,
+          image: p.image,
+          completenessScore: p.completenessScore,
+          attributes: JSON.parse(JSON.stringify(p.attributes || {})),
+          variants: JSON.parse(JSON.stringify(p.variants || [])),
+          offers: JSON.parse(JSON.stringify(p.offers || [])),
+          findingsCount: p.findingsCount,
+          snapshotCreatedAt: snapshotTime,
+        }));
+
+        // Store immutable snapshots
+        this.auditRunFindings.set(runId, JSON.parse(JSON.stringify(historicalFindings)));
+        this.auditRunEvidence.set(runId, JSON.parse(JSON.stringify(historicalEvidence)));
+        this.auditRunProducts.set(runId, JSON.parse(JSON.stringify(historicalProducts)));
+
+        // Mark audit run as completed only AFTER required snapshots have been saved successfully
         auditRun = await this.updateAuditRun(runId, {
           status: 'COMPLETED',
           productsEvaluated: auditResult.summary.totalProducts,
@@ -921,6 +1007,7 @@ export class MemoryRepository implements DatabaseRepository {
           metadata: {
             rules: Object.keys(auditResult.summary.ruleBreakdown),
             completedAt: new Date().toISOString(),
+            snapshotAvailable: true,
           },
           completedAt: new Date().toISOString(),
         });
@@ -938,6 +1025,93 @@ export class MemoryRepository implements DatabaseRepository {
         throw err;
       }
     });
+  }
+
+  async getAuditRunsHistory(
+    workspaceId: string,
+    options?: { limit?: number; cursor?: string }
+  ): Promise<{ items: Array<AuditRunRecord & { snapshotAvailable: boolean }>; nextCursor: string | null; totalCount: number }> {
+    const limit = Math.min(Math.max(options?.limit || 20, 1), 100);
+    const runs = Array.from(this.auditRuns.values())
+      .filter(r => r.workspaceId === workspaceId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    const totalCount = runs.length;
+
+    let startIndex = 0;
+    if (options?.cursor) {
+      const idx = runs.findIndex(r => r.id === options.cursor);
+      if (idx !== -1) {
+        startIndex = idx + 1;
+      }
+    }
+
+    const pagedRuns = runs.slice(startIndex, startIndex + limit);
+    const nextCursor = startIndex + limit < runs.length ? pagedRuns[pagedRuns.length - 1].id : null;
+
+    const items = pagedRuns.map(run => {
+      const hasSnapshot = this.auditRunFindings.has(run.id);
+      return {
+        ...JSON.parse(JSON.stringify(run)),
+        snapshotAvailable: hasSnapshot,
+      };
+    });
+
+    return {
+      items,
+      nextCursor,
+      totalCount,
+    };
+  }
+
+  async getHistoricalAuditSnapshot(
+    workspaceId: string,
+    auditRunId: string
+  ): Promise<import('../../domain/audit/historicalTypes').HistoricalAuditSnapshot | null> {
+    const auditRun = await this.getAuditRunById(auditRunId, workspaceId);
+    if (!auditRun) return null;
+
+    const findings = this.auditRunFindings.get(auditRunId);
+    const evidence = this.auditRunEvidence.get(auditRunId);
+    const products = this.auditRunProducts.get(auditRunId);
+
+    if (!findings || !evidence || !products) {
+      return {
+        auditRun,
+        findings: [],
+        evidence: [],
+        products: [],
+        snapshotAvailable: false,
+        message: 'Historical snapshot unavailable — this audit was created before Audit History & Evidence was implemented.',
+      };
+    }
+
+    return {
+      auditRun,
+      findings: JSON.parse(JSON.stringify(findings)),
+      evidence: JSON.parse(JSON.stringify(evidence)),
+      products: JSON.parse(JSON.stringify(products)),
+      snapshotAvailable: true,
+    };
+  }
+
+  async compareHistoricalAudits(
+    workspaceId: string,
+    baseAuditId: string,
+    targetAuditId: string
+  ): Promise<import('../../domain/audit/historicalTypes').AuditComparisonResult | null> {
+    const baseSnapshot = await this.getHistoricalAuditSnapshot(workspaceId, baseAuditId);
+    const targetSnapshot = await this.getHistoricalAuditSnapshot(workspaceId, targetAuditId);
+
+    if (!baseSnapshot || !targetSnapshot) return null;
+
+    const { compareHistoricalAudits } = await import('../../domain/audit/comparisonService');
+    return compareHistoricalAudits(
+      baseSnapshot.auditRun,
+      baseSnapshot.findings,
+      targetSnapshot.auditRun,
+      targetSnapshot.findings
+    );
   }
 }
 
