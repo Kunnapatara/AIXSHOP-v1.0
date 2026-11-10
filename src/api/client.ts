@@ -192,6 +192,53 @@ class ApiClient {
     const params = new URLSearchParams({ baseId, targetId });
     return this.request<{ success: boolean; comparison: import('../domain/audit/historicalTypes').AuditComparisonResult }>(`/api/audit/compare?${params.toString()}`);
   }
+
+  // Shopify Endpoints
+  async getShopifyStatus(): Promise<ShopifyStatusResponse> {
+    return this.request<ShopifyStatusResponse>('/api/shopify/status');
+  }
+
+  async syncShopify(): Promise<{ success: boolean; result: any; skuCount: number }> {
+    return this.request<{ success: boolean; result: any; skuCount: number }>('/api/shopify/sync', {
+      method: 'POST',
+    });
+  }
+
+  async disconnectShopify(): Promise<{ success: boolean; message: string }> {
+    return this.request<{ success: boolean; message: string }>('/api/shopify/disconnect', {
+      method: 'POST',
+    });
+  }
+}
+
+export interface ShopifyStatusResponse {
+  configured: boolean;
+  connected: boolean;
+  status: 'connected' | 'disconnected' | 'revoked' | 'error' | 'not_configured';
+  shopDomain: string | null;
+  grantedScopes: string[];
+  installedAt: string | null;
+  lastVerifiedAt: string | null;
+  lastSync: {
+    status: string;
+    completedAt: string | null;
+    productsDiscovered: number;
+    productsImported: number;
+    variantsImported: number;
+    excludedByPlan: number;
+    error: string | null;
+  } | null;
+  entitlement?: {
+    tier: string;
+    skuLimit: number;
+    currentUsage: number;
+    remainingQuota: number;
+    isUnlimited: boolean;
+  };
+  webhooks?: {
+    subscribedTopics: string[];
+    processedCount: number;
+  };
 }
 
 export const apiClient = new ApiClient();

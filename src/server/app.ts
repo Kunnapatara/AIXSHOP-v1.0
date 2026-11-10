@@ -7,17 +7,24 @@ import { createCatalogRoutes } from './routes/catalogRoutes';
 import { createStoreRoutes } from './routes/storeRoutes';
 import { createBillingRoutes } from './routes/billingRoutes';
 import { createAuditRoutes } from './routes/auditRoutes';
+import { createShopifyRoutes } from './routes/shopifyRoutes';
 import { csrfProtection } from './middleware/auth';
 
 export function createApp(customRepo?: DatabaseRepository): Express {
   const app = express();
   const repo = customRepo || getDatabaseRepository();
 
-  // Narrowly scoped raw-body capture for billing webhook route
+  // Narrowly scoped raw-body capture for billing and Shopify webhook routes
   // Preserves exact original request bytes for HMAC signature verification
   // All other application routes receive standard express.json() parsing
   app.use((req, res, next) => {
-    if (req.path === '/api/billing/webhook' || req.originalUrl?.split('?')[0] === '/api/billing/webhook') {
+    const isWebhook =
+      req.path === '/api/billing/webhook' ||
+      req.originalUrl?.split('?')[0] === '/api/billing/webhook' ||
+      req.path === '/api/shopify/webhooks' ||
+      req.originalUrl?.split('?')[0] === '/api/shopify/webhooks';
+
+    if (isWebhook) {
       return express.raw({ type: '*/*', limit: '5mb' })(req, res, (err) => {
         if (err) return next(err);
         (req as any).rawBody = req.body;
@@ -154,6 +161,7 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   app.use('/api/store', createStoreRoutes(repo));
   app.use('/api/billing', createBillingRoutes(repo));
   app.use('/api/audit', createAuditRoutes(repo));
+  app.use('/api/shopify', createShopifyRoutes(repo));
 
   // Global error handler
   app.use((err: any, req: any, res: any, next: any) => {

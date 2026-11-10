@@ -80,6 +80,7 @@ interface AppContextType {
   addToast: (title: string, message: string, type?: ToastMessage['type']) => void;
   removeToast: (id: string) => void;
   resetToSeedData: () => void;
+  reloadWorkspaceCatalog: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -818,6 +819,20 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     addToast('Catalog Reset', 'Reset all catalog data to default Solstice seed fixtures.', 'info');
   };
 
+  const reloadWorkspaceCatalog = async () => {
+    if (isCloudWorkspace) {
+      try {
+        const res = await apiClient.getCatalog();
+        setProducts(res.catalog.products);
+        setFindings(res.catalog.findings);
+        setActionItems(res.catalog.actions);
+        setStoreProfile(res.catalog.storeProfile);
+      } catch (err: any) {
+        console.error('[AIXSHOP] Failed to reload workspace catalog:', err);
+      }
+    }
+  };
+
   return (
     <AppContext.Provider
       value={{
@@ -858,6 +873,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         addToast,
         removeToast,
         resetToSeedData,
+        reloadWorkspaceCatalog,
       }}
     >
       {children}

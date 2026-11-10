@@ -768,6 +768,145 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
       assert.ok(persistentItem);
       assert.equal(persistentItem.status, 'PERSISTENT');
     });
+
+    test('Zero-findings audit correctly marks snapshotAvailable: true via completion manifest', async () => {
+      const cleanTenant = await registerTenant('clean_catalog_user@example.com', 'Clean Catalog Store');
+      const storeRes = await fetch(`${baseUrl}/api/store/profile`, {
+        headers: { 'Authorization': `Bearer ${cleanTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      const store = await storeRes.json();
+
+      // Seed with 0 products (clean catalog produces 0 findings)
+      await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${cleanTenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            products: [],
+            variants: [],
+            offers: [],
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: store,
+          },
+        }),
+      });
+
+      // Execute audit
+      const runRes = await fetch(`${baseUrl}/api/audit/run`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${cleanTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(runRes.status, 200);
+      const runData = await runRes.json();
+      assert.equal(runData.auditRun.findingsCount, 0);
+
+      // Verify history list reports snapshotAvailable: true
+      const histRes = await fetch(`${baseUrl}/api/audit/history`, {
+        headers: { 'Authorization': `Bearer ${cleanTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(histRes.status, 200);
+      const histData = await histRes.json();
+      const latestItem = histData.items.find((i: any) => i.id === runData.auditRun.id);
+      assert.ok(latestItem, 'Must find clean audit in history');
+      assert.equal(latestItem.snapshotAvailable, true, 'Clean audit with 0 findings must report snapshotAvailable: true');
+
+      // Verify audit detail reports snapshotAvailable: true
+      const detailRes = await fetch(`${baseUrl}/api/audit/${runData.auditRun.id}`, {
+        headers: { 'Authorization': `Bearer ${cleanTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(detailRes.status, 200);
+      const detailData = await detailRes.json();
+      assert.equal(detailData.snapshotAvailable, true);
+      assert.deepEqual(detailData.findings, []);
+    });
+
+    test('Evidence documents retain their associated productId in historical snapshots', async () => {
+      const evidenceTenant = await registerTenant('evidence_test_user@example.com', 'Evidence Test Store');
+      const storeRes = await fetch(`${baseUrl}/api/store/profile`, {
+        headers: { 'Authorization': `Bearer ${evidenceTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      const store = await storeRes.json();
+
+      const productWithEvidence: Product = {
+        id: 'p_organic_tea',
+        title: 'Artisan Organic Herbal Tea 100g',
+        brand: 'Nature Farm',
+        category: 'Food & Beverage',
+        description: 'Certified 100% organic herbal tea harvested sustainably.',
+        image: 'https://example.com/tea.jpg',
+        status: 'active',
+        completenessScore: 85,
+        evidenceCoverageScore: 100,
+        externalDiscoveryStatus: 'observed_in_sample',
+        attributes: {},
+        variants: [
+          { id: 'v_tea_1', sku: 'TEA-ORG-01', title: '100g Bag', barcode: '9780201379624', price: 15.0, inventoryCount: 50, attributes: {} },
+        ],
+        offers: [],
+        evidenceDocuments: [
+          {
+            id: 'ev_usda_cert_456',
+            title: 'USDA Organic Official Certificate',
+            type: 'organic_certificate',
+            issuer: 'USDA National Organic Program',
+            dateVerified: '2026-05-01T00:00:00.000Z',
+            url: 'https://example.com/cert/usda-456.pdf',
+            status: 'verified',
+          },
+        ],
+        findingsCount: 0,
+        lastAudited: '',
+      };
+
+      await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${evidenceTenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            products: [productWithEvidence],
+            variants: productWithEvidence.variants,
+            offers: [],
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: store,
+          },
+        }),
+      });
+
+      // Execute audit
+      const runRes = await fetch(`${baseUrl}/api/audit/run`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${evidenceTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(runRes.status, 200);
+      const runData = await runRes.json();
+
+      // Retrieve detail
+      const detailRes = await fetch(`${baseUrl}/api/audit/${runData.auditRun.id}`, {
+        headers: { 'Authorization': `Bearer ${evidenceTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(detailRes.status, 200);
+      const detailData = await detailRes.json();
+      assert.equal(detailData.snapshotAvailable, true);
+
+      // Verify evidence retains productId
+      const ev = detailData.evidence.find((e: any) => e.originalEvidenceId === 'ev_usda_cert_456');
+      assert.ok(ev, 'Must find historical evidence record');
+      assert.equal(ev.productId, 'p_organic_tea', 'Historical evidence must preserve associated productId');
+      assert.equal(ev.issuer, 'USDA National Organic Program');
+      assert.equal(ev.status, 'verified');
+    });
   });
 });
 

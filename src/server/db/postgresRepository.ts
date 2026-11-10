@@ -80,6 +80,13 @@ export class PostgresRepository implements DatabaseRepository {
       'schema_migrations',
       'subscriptions',
       'billing_events',
+      'audit_run_manifests',
+      'audit_run_findings',
+      'audit_run_evidence',
+      'audit_run_products',
+      'shopify_connections',
+      'shopify_sync_runs',
+      'shopify_webhook_events',
     ];
 
     try {
@@ -307,6 +314,8 @@ export class PostgresRepository implements DatabaseRepository {
           '003_store_sku_limit.sql',
           '004_backfill_store_sku_count.sql',
           '005_billing_subscriptions.sql',
+          '006_audit_history_snapshots.sql',
+          '007_shopify_integration.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -2026,19 +2035,31 @@ export class PostgresRepository implements DatabaseRepository {
         );
       }
 
-      // 2. audit_run_evidence
-      const allEvidence: EvidenceDocument[] = [...(catalog.evidence || [])];
-      for (const p of catalog.products) {
-        if (p.evidenceDocuments && p.evidenceDocuments.length > 0) {
-          allEvidence.push(...p.evidenceDocuments);
+      // 2. audit_run_evidence (preserve product association where evidence belongs to a product)
+      const allEvidenceWithProduct: Array<{ evidence: EvidenceDocument; productId: string | null }> = [];
+      if (catalog.evidence) {
+        for (const e of catalog.evidence) {
+          allEvidenceWithProduct.push({ evidence: e, productId: null });
         }
       }
-      const evidenceMap = new Map<string, EvidenceDocument>();
-      for (const e of allEvidence) {
-        if (e.id) evidenceMap.set(e.id, e);
+      for (const p of catalog.products) {
+        if (p.evidenceDocuments && p.evidenceDocuments.length > 0) {
+          for (const e of p.evidenceDocuments) {
+            allEvidenceWithProduct.push({ evidence: e, productId: p.id });
+          }
+        }
+      }
+      const evidenceMap = new Map<string, { evidence: EvidenceDocument; productId: string | null }>();
+      for (const item of allEvidenceWithProduct) {
+        if (item.evidence.id) {
+          const existing = evidenceMap.get(item.evidence.id);
+          if (!existing || (!existing.productId && item.productId)) {
+            evidenceMap.set(item.evidence.id, item);
+          }
+        }
       }
 
-      for (const e of evidenceMap.values()) {
+      for (const { evidence: e, productId } of evidenceMap.values()) {
         await client.query(
           `INSERT INTO audit_run_evidence (
             id, audit_run_id, workspace_id, original_evidence_id, product_id, title,
@@ -2049,7 +2070,7 @@ export class PostgresRepository implements DatabaseRepository {
             runId,
             workspaceId,
             e.id,
-            null,
+            productId || null,
             e.title,
             e.type,
             e.issuer,
@@ -2088,6 +2109,26 @@ export class PostgresRepository implements DatabaseRepository {
           ]
         );
       }
+
+      // 4. audit_run_manifests (durable manifest record of snapshot completion)
+      await client.query(
+        `INSERT INTO audit_run_manifests (
+          audit_run_id, workspace_id, status, products_count, findings_count, evidence_count, created_at, updated_at
+        ) VALUES ($1, $2, 'COMPLETED', $3, $4, $5, NOW(), NOW())
+        ON CONFLICT (audit_run_id) DO UPDATE SET
+          status = 'COMPLETED',
+          products_count = EXCLUDED.products_count,
+          findings_count = EXCLUDED.findings_count,
+          evidence_count = EXCLUDED.evidence_count,
+          updated_at = NOW()`,
+        [
+          runId,
+          workspaceId,
+          auditResult.updatedProducts.length,
+          auditResult.findings.length,
+          evidenceMap.size,
+        ]
+      );
 
       // Mark audit run COMPLETED in database ONLY AFTER all historical snapshots are written
       await client.query(
@@ -2168,8 +2209,9 @@ export class PostgresRepository implements DatabaseRepository {
         ar.completed_at AS "completedAt",
         ar.created_at AS "createdAt",
         ar.updated_at AS "updatedAt",
-        EXISTS (
-          SELECT 1 FROM audit_run_findings arf WHERE arf.audit_run_id = ar.id LIMIT 1
+        (
+          EXISTS (SELECT 1 FROM audit_run_manifests arm WHERE arm.audit_run_id = ar.id LIMIT 1)
+          OR (ar.metadata_json->>'snapshotAvailable')::boolean = true
         ) AS "snapshotAvailable"
       FROM audit_runs ar
       WHERE ar.workspace_id = $1
@@ -2177,7 +2219,6 @@ export class PostgresRepository implements DatabaseRepository {
     const params: any[] = [workspaceId];
 
     if (options?.cursor) {
-      // Fetch cursor record's created_at for stable keyset pagination
       const cursorRes = await this.pool.query<{ created_at: Date }>(
         'SELECT created_at FROM audit_runs WHERE id = $1 AND workspace_id = $2',
         [options.cursor, workspaceId]
@@ -2227,7 +2268,13 @@ export class PostgresRepository implements DatabaseRepository {
     const auditRun = await this.getAuditRunById(auditRunId, workspaceId);
     if (!auditRun) return null;
 
-    // Check if snapshots exist
+    // Check if snapshot manifest or completion record exists
+    const manifestRes = await this.pool.query<{ status: string }>(
+      'SELECT status FROM audit_run_manifests WHERE audit_run_id = $1 AND workspace_id = $2',
+      [auditRunId, workspaceId]
+    );
+    const hasManifest = manifestRes.rows.length > 0 || (auditRun.metadata && auditRun.metadata.snapshotAvailable === true);
+
     const findingsRes = await this.pool.query<any>(
       `SELECT 
         id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
@@ -2245,7 +2292,20 @@ export class PostgresRepository implements DatabaseRepository {
       [auditRunId, workspaceId]
     );
 
-    if (findingsRes.rows.length === 0) {
+    const productsRes = await this.pool.query<any>(
+      `SELECT 
+        id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
+        product_id AS "productId", title, brand, category, description, image,
+        completeness_score AS "completenessScore", attributes_json AS "attributes",
+        variants_json AS "variants", offers_json AS "offers",
+        findings_count AS "findingsCount", snapshot_created_at AS "snapshotCreatedAt"
+       FROM audit_run_products
+       WHERE audit_run_id = $1 AND workspace_id = $2
+       ORDER BY snapshot_created_at ASC`,
+      [auditRunId, workspaceId]
+    );
+
+    if (!hasManifest && findingsRes.rows.length === 0 && productsRes.rows.length === 0) {
       // Legacy audit run without snapshots
       return {
         auditRun,
@@ -2265,19 +2325,6 @@ export class PostgresRepository implements DatabaseRepository {
         url, status, source_type AS "sourceType", metadata_json AS "metadata",
         snapshot_created_at AS "snapshotCreatedAt"
        FROM audit_run_evidence
-       WHERE audit_run_id = $1 AND workspace_id = $2
-       ORDER BY snapshot_created_at ASC`,
-      [auditRunId, workspaceId]
-    );
-
-    const productsRes = await this.pool.query<any>(
-      `SELECT 
-        id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
-        product_id AS "productId", title, brand, category, description, image,
-        completeness_score AS "completenessScore", attributes_json AS "attributes",
-        variants_json AS "variants", offers_json AS "offers",
-        findings_count AS "findingsCount", snapshot_created_at AS "snapshotCreatedAt"
-       FROM audit_run_products
        WHERE audit_run_id = $1 AND workspace_id = $2
        ORDER BY snapshot_created_at ASC`,
       [auditRunId, workspaceId]
@@ -2325,6 +2372,307 @@ export class PostgresRepository implements DatabaseRepository {
       baseSnapshot.findings,
       targetSnapshot.auditRun,
       targetSnapshot.findings
+    );
+  }
+
+  // ==========================================
+  // Workstream C: Shopify Integration Methods
+  // ==========================================
+
+  async getShopifyConnection(workspaceId: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
+    const res = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+        access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
+        token_expires_at AS "tokenExpiresAt", granted_scopes AS "grantedScopes",
+        key_version AS "keyVersion", status, installed_at AS "installedAt",
+        last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_connections
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      ...r,
+      tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
+      installedAt: new Date(r.installedAt).toISOString(),
+      lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
+  async getShopifyConnectionByShop(shopDomain: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
+    const normShop = shopDomain.trim().toLowerCase();
+    const res = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+        access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
+        token_expires_at AS "tokenExpiresAt", granted_scopes AS "grantedScopes",
+        key_version AS "keyVersion", status, installed_at AS "installedAt",
+        last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_connections
+       WHERE LOWER(shop_domain) = $1`,
+      [normShop]
+    );
+
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      ...r,
+      tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
+      installedAt: new Date(r.installedAt).toISOString(),
+      lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
+  async saveShopifyConnection(conn: import('../shopify/types').ShopifyConnectionRecord): Promise<import('../shopify/types').ShopifyConnectionRecord> {
+    await this.pool.query(
+      `INSERT INTO shopify_connections (
+        id, workspace_id, shop_domain, access_token_encrypted, refresh_token_encrypted,
+        token_expires_at, granted_scopes, key_version, status, installed_at,
+        last_verified_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+      ON CONFLICT (workspace_id) DO UPDATE SET
+        shop_domain = EXCLUDED.shop_domain,
+        access_token_encrypted = EXCLUDED.access_token_encrypted,
+        refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
+        token_expires_at = EXCLUDED.token_expires_at,
+        granted_scopes = EXCLUDED.granted_scopes,
+        key_version = EXCLUDED.key_version,
+        status = EXCLUDED.status,
+        last_verified_at = EXCLUDED.last_verified_at,
+        updated_at = NOW()`,
+      [
+        conn.id,
+        conn.workspaceId,
+        conn.shopDomain,
+        conn.accessTokenEncrypted,
+        conn.refreshTokenEncrypted || null,
+        conn.tokenExpiresAt || null,
+        conn.grantedScopes,
+        conn.keyVersion,
+        conn.status,
+        conn.installedAt,
+        conn.lastVerifiedAt,
+      ]
+    );
+
+    return (await this.getShopifyConnection(conn.workspaceId))!;
+  }
+
+  async deleteShopifyConnection(workspaceId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE shopify_connections
+       SET status = 'disconnected',
+           access_token_encrypted = '',
+           refresh_token_encrypted = NULL,
+           updated_at = NOW()
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+  }
+
+  async saveShopifyOAuthState(state: { id: string; workspaceId: string; shopDomain: string; expiresAt: string }): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO shopify_oauth_states (id, workspace_id, shop_domain, expires_at, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         shop_domain = EXCLUDED.shop_domain,
+         expires_at = EXCLUDED.expires_at`,
+      [state.id, state.workspaceId, state.shopDomain, state.expiresAt]
+    );
+  }
+
+  async getAndConsumeShopifyOAuthState(stateId: string): Promise<{ id: string; workspaceId: string; shopDomain: string; expiresAt: string } | null> {
+    const res = await this.pool.query<any>(
+      `DELETE FROM shopify_oauth_states
+       WHERE id = $1
+       RETURNING id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", expires_at AS "expiresAt"`,
+      [stateId]
+    );
+
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      shopDomain: r.shopDomain,
+      expiresAt: new Date(r.expiresAt).toISOString(),
+    };
+  }
+
+  async createShopifySyncRun(run: import('../shopify/types').ShopifySyncRunRecord): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+    await this.pool.query(
+      `INSERT INTO shopify_sync_runs (
+        id, workspace_id, shop_domain, status, products_discovered, products_imported,
+        variants_imported, excluded_by_plan, cursor_resumed, error_message, started_at, completed_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())`,
+      [
+        run.id,
+        run.workspaceId,
+        run.shopDomain,
+        run.status,
+        run.productsDiscovered,
+        run.productsImported,
+        run.variantsImported,
+        run.excludedByPlan,
+        run.cursorResumed || null,
+        run.errorMessage || null,
+        run.startedAt,
+        run.completedAt || null,
+      ]
+    );
+
+    return run;
+  }
+
+  async updateShopifySyncRun(id: string, updates: Partial<import('../shopify/types').ShopifySyncRunRecord>): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+    const setClauses: string[] = ['updated_at = NOW()'];
+    const params: any[] = [id];
+
+    if (updates.status !== undefined) {
+      params.push(updates.status);
+      setClauses.push(`status = $${params.length}`);
+    }
+    if (updates.productsDiscovered !== undefined) {
+      params.push(updates.productsDiscovered);
+      setClauses.push(`products_discovered = $${params.length}`);
+    }
+    if (updates.productsImported !== undefined) {
+      params.push(updates.productsImported);
+      setClauses.push(`products_imported = $${params.length}`);
+    }
+    if (updates.variantsImported !== undefined) {
+      params.push(updates.variantsImported);
+      setClauses.push(`variants_imported = $${params.length}`);
+    }
+    if (updates.excludedByPlan !== undefined) {
+      params.push(updates.excludedByPlan);
+      setClauses.push(`excluded_by_plan = $${params.length}`);
+    }
+    if (updates.errorMessage !== undefined) {
+      params.push(updates.errorMessage);
+      setClauses.push(`error_message = $${params.length}`);
+    }
+    if (updates.completedAt !== undefined) {
+      params.push(updates.completedAt);
+      setClauses.push(`completed_at = $${params.length}`);
+    }
+
+    const res = await this.pool.query<any>(
+      `UPDATE shopify_sync_runs
+       SET ${setClauses.join(', ')}
+       WHERE id = $1
+       RETURNING 
+         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+         variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+         cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+         started_at AS "startedAt", completed_at AS "completedAt",
+         created_at AS "createdAt", updated_at AS "updatedAt"`,
+      params
+    );
+
+    if (res.rows.length === 0) {
+      throw new Error(`ShopifySyncRun ${id} not found.`);
+    }
+
+    const r = res.rows[0];
+    return {
+      ...r,
+      startedAt: new Date(r.startedAt).toISOString(),
+      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
+  async getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+    const res = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        started_at AS "startedAt", completed_at AS "completedAt",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_sync_runs
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [workspaceId]
+    );
+
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      ...r,
+      startedAt: new Date(r.startedAt).toISOString(),
+      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
+  async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
+    try {
+      const res = await this.pool.query<any>(
+        `INSERT INTO shopify_webhook_events (
+          id, workspace_id, shop_domain, event_id, topic, delivery_id,
+          payload_json, status, retry_count, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, NOW(), NOW())
+        ON CONFLICT (shop_domain, topic, event_id) DO NOTHING
+        RETURNING id`,
+        [
+          event.id,
+          event.workspaceId,
+          event.shopDomain,
+          event.eventId,
+          event.topic,
+          event.deliveryId || null,
+          JSON.stringify(event.payload || {}),
+          event.status,
+          event.retryCount,
+        ]
+      );
+
+      if (res.rowCount === 0) {
+        // Event already exists
+        const existingRes = await this.pool.query<any>(
+          `SELECT 
+            id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+            event_id AS "eventId", topic, delivery_id AS "deliveryId",
+            payload_json AS "payload", status, retry_count AS "retryCount",
+            last_error AS "lastError", processed_at AS "processedAt",
+            created_at AS "createdAt", updated_at AS "updatedAt"
+           FROM shopify_webhook_events
+           WHERE shop_domain = $1 AND topic = $2 AND event_id = $3`,
+          [event.shopDomain, event.topic, event.eventId]
+        );
+        return { claimed: false, event: existingRes.rows[0] || null };
+      }
+
+      return { claimed: true, event };
+    } catch (err: any) {
+      console.error('[AIXSHOP PostgresRepository] Error claiming webhook event:', err);
+      return { claimed: false, event: null };
+    }
+  }
+
+  async updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE shopify_webhook_events
+       SET status = $4,
+           last_error = $5,
+           processed_at = CASE WHEN $4 = 'processed' THEN NOW() ELSE processed_at END,
+           updated_at = NOW()
+       WHERE shop_domain = $1 AND topic = $2 AND event_id = $3`,
+      [shopDomain, topic, eventId, status, error || null]
     );
   }
 }

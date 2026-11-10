@@ -63,6 +63,13 @@ export class MemoryRepository implements DatabaseRepository {
   private auditRunFindings: Map<string, import('../../domain/audit/historicalTypes').HistoricalFindingRecord[]> = new Map(); // auditRunId -> findings
   private auditRunEvidence: Map<string, import('../../domain/audit/historicalTypes').HistoricalEvidenceRecord[]> = new Map(); // auditRunId -> evidence
   private auditRunProducts: Map<string, import('../../domain/audit/historicalTypes').HistoricalProductRecord[]> = new Map(); // auditRunId -> products
+  private auditRunManifests: Map<string, { auditRunId: string; workspaceId: string; status: string; productsCount: number; findingsCount: number; evidenceCount: number; createdAt: string }> = new Map();
+
+  // Workstream C: Shopify Integration Storage
+  private shopifyConnections: Map<string, import('../shopify/types').ShopifyConnectionRecord> = new Map(); // workspaceId -> record
+  private shopifyOAuthStates: Map<string, { id: string; workspaceId: string; shopDomain: string; expiresAt: string; createdAt: string }> = new Map(); // stateNonce -> state
+  private shopifySyncRuns: Map<string, import('../shopify/types').ShopifySyncRunRecord> = new Map(); // id -> run
+  private shopifyWebhookEvents: Map<string, import('../shopify/types').ShopifyWebhookEventRecord> = new Map(); // deliveryKey -> event
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -943,25 +950,37 @@ export class MemoryRepository implements DatabaseRepository {
           snapshotCreatedAt: snapshotTime,
         }));
 
-        // 2. Snapshot evidence documents
-        const allEvidence: EvidenceDocument[] = [...(catalog.evidence || [])];
-        for (const p of catalog.products) {
-          if (p.evidenceDocuments && p.evidenceDocuments.length > 0) {
-            allEvidence.push(...p.evidenceDocuments);
+        // 2. Snapshot evidence documents with preserved product associations
+        const allEvidenceWithProduct: Array<{ evidence: EvidenceDocument; productId: string | null }> = [];
+        if (catalog.evidence) {
+          for (const e of catalog.evidence) {
+            allEvidenceWithProduct.push({ evidence: e, productId: null });
           }
         }
-        // Deduplicate evidence by ID
-        const evidenceMap = new Map<string, EvidenceDocument>();
-        for (const e of allEvidence) {
-          if (e.id) evidenceMap.set(e.id, e);
+        for (const p of catalog.products) {
+          if (p.evidenceDocuments && p.evidenceDocuments.length > 0) {
+            for (const e of p.evidenceDocuments) {
+              allEvidenceWithProduct.push({ evidence: e, productId: p.id });
+            }
+          }
+        }
+        // Deduplicate evidence by ID, preferring non-null productId
+        const evidenceMap = new Map<string, { evidence: EvidenceDocument; productId: string | null }>();
+        for (const item of allEvidenceWithProduct) {
+          if (item.evidence.id) {
+            const existing = evidenceMap.get(item.evidence.id);
+            if (!existing || (!existing.productId && item.productId)) {
+              evidenceMap.set(item.evidence.id, item);
+            }
+          }
         }
 
-        const historicalEvidence: import('../../domain/audit/historicalTypes').HistoricalEvidenceRecord[] = Array.from(evidenceMap.values()).map(e => ({
+        const historicalEvidence: import('../../domain/audit/historicalTypes').HistoricalEvidenceRecord[] = Array.from(evidenceMap.values()).map(({ evidence: e, productId }) => ({
           id: `hevid_${runId}_${e.id}`,
           auditRunId: runId,
           workspaceId,
           originalEvidenceId: e.id,
-          productId: null,
+          productId: productId || null,
           title: e.title,
           evidenceType: e.type,
           issuer: e.issuer,
@@ -996,6 +1015,15 @@ export class MemoryRepository implements DatabaseRepository {
         this.auditRunFindings.set(runId, JSON.parse(JSON.stringify(historicalFindings)));
         this.auditRunEvidence.set(runId, JSON.parse(JSON.stringify(historicalEvidence)));
         this.auditRunProducts.set(runId, JSON.parse(JSON.stringify(historicalProducts)));
+        this.auditRunManifests.set(runId, {
+          auditRunId: runId,
+          workspaceId,
+          status: 'COMPLETED',
+          productsCount: historicalProducts.length,
+          findingsCount: historicalFindings.length,
+          evidenceCount: historicalEvidence.length,
+          createdAt: snapshotTime,
+        });
 
         // Mark audit run as completed only AFTER required snapshots have been saved successfully
         auditRun = await this.updateAuditRun(runId, {
@@ -1050,10 +1078,10 @@ export class MemoryRepository implements DatabaseRepository {
     const nextCursor = startIndex + limit < runs.length ? pagedRuns[pagedRuns.length - 1].id : null;
 
     const items = pagedRuns.map(run => {
-      const hasSnapshot = this.auditRunFindings.has(run.id);
+      const hasSnapshot = this.auditRunManifests.has(run.id) || run.metadata?.snapshotAvailable === true;
       return {
         ...JSON.parse(JSON.stringify(run)),
-        snapshotAvailable: hasSnapshot,
+        snapshotAvailable: Boolean(hasSnapshot),
       };
     });
 
@@ -1071,11 +1099,12 @@ export class MemoryRepository implements DatabaseRepository {
     const auditRun = await this.getAuditRunById(auditRunId, workspaceId);
     if (!auditRun) return null;
 
+    const hasManifest = this.auditRunManifests.has(auditRunId) || auditRun.metadata?.snapshotAvailable === true;
     const findings = this.auditRunFindings.get(auditRunId);
     const evidence = this.auditRunEvidence.get(auditRunId);
     const products = this.auditRunProducts.get(auditRunId);
 
-    if (!findings || !evidence || !products) {
+    if (!hasManifest && (!findings || findings.length === 0) && (!products || products.length === 0)) {
       return {
         auditRun,
         findings: [],
@@ -1088,9 +1117,9 @@ export class MemoryRepository implements DatabaseRepository {
 
     return {
       auditRun,
-      findings: JSON.parse(JSON.stringify(findings)),
-      evidence: JSON.parse(JSON.stringify(evidence)),
-      products: JSON.parse(JSON.stringify(products)),
+      findings: findings ? JSON.parse(JSON.stringify(findings)) : [],
+      evidence: evidence ? JSON.parse(JSON.stringify(evidence)) : [],
+      products: products ? JSON.parse(JSON.stringify(products)) : [],
       snapshotAvailable: true,
     };
   }
@@ -1112,6 +1141,105 @@ export class MemoryRepository implements DatabaseRepository {
       targetSnapshot.auditRun,
       targetSnapshot.findings
     );
+  }
+
+  // ==========================================
+  // Workstream C: Shopify Integration Methods
+  // ==========================================
+
+  async getShopifyConnection(workspaceId: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
+    const conn = this.shopifyConnections.get(workspaceId);
+    return conn ? JSON.parse(JSON.stringify(conn)) : null;
+  }
+
+  async getShopifyConnectionByShop(shopDomain: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
+    const normShop = shopDomain.trim().toLowerCase();
+    for (const conn of this.shopifyConnections.values()) {
+      if (conn.shopDomain.toLowerCase() === normShop) {
+        return JSON.parse(JSON.stringify(conn));
+      }
+    }
+    return null;
+  }
+
+  async saveShopifyConnection(conn: import('../shopify/types').ShopifyConnectionRecord): Promise<import('../shopify/types').ShopifyConnectionRecord> {
+    const copy = JSON.parse(JSON.stringify(conn));
+    copy.updatedAt = new Date().toISOString();
+    this.shopifyConnections.set(conn.workspaceId, copy);
+    return JSON.parse(JSON.stringify(copy));
+  }
+
+  async deleteShopifyConnection(workspaceId: string): Promise<void> {
+    const conn = this.shopifyConnections.get(workspaceId);
+    if (conn) {
+      conn.status = 'disconnected';
+      conn.accessTokenEncrypted = '';
+      conn.refreshTokenEncrypted = null;
+      conn.updatedAt = new Date().toISOString();
+    }
+  }
+
+  async saveShopifyOAuthState(state: { id: string; workspaceId: string; shopDomain: string; expiresAt: string }): Promise<void> {
+    this.shopifyOAuthStates.set(state.id, {
+      ...state,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  async getAndConsumeShopifyOAuthState(stateId: string): Promise<{ id: string; workspaceId: string; shopDomain: string; expiresAt: string } | null> {
+    const state = this.shopifyOAuthStates.get(stateId);
+    if (!state) return null;
+    this.shopifyOAuthStates.delete(stateId);
+    return state;
+  }
+
+  async createShopifySyncRun(run: import('../shopify/types').ShopifySyncRunRecord): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+    const copy = JSON.parse(JSON.stringify(run));
+    this.shopifySyncRuns.set(run.id, copy);
+    return JSON.parse(JSON.stringify(copy));
+  }
+
+  async updateShopifySyncRun(id: string, updates: Partial<import('../shopify/types').ShopifySyncRunRecord>): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+    const existing = this.shopifySyncRuns.get(id);
+    if (!existing) {
+      throw new Error(`ShopifySyncRun ${id} not found.`);
+    }
+    const updated = {
+      ...existing,
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    this.shopifySyncRuns.set(id, updated);
+    return JSON.parse(JSON.stringify(updated));
+  }
+
+  async getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+    const runs = Array.from(this.shopifySyncRuns.values())
+      .filter(r => r.workspaceId === workspaceId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return runs[0] ? JSON.parse(JSON.stringify(runs[0])) : null;
+  }
+
+  async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
+    const key = `${event.shopDomain}:${event.topic}:${event.eventId}`;
+    const existing = this.shopifyWebhookEvents.get(key);
+    if (existing) {
+      return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+    }
+    const copy = JSON.parse(JSON.stringify(event));
+    this.shopifyWebhookEvents.set(key, copy);
+    return { claimed: true, event: JSON.parse(JSON.stringify(copy)) };
+  }
+
+  async updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void> {
+    const key = `${shopDomain}:${topic}:${eventId}`;
+    const existing = this.shopifyWebhookEvents.get(key);
+    if (existing) {
+      existing.status = status;
+      if (error) existing.lastError = error;
+      if (status === 'processed') existing.processedAt = new Date().toISOString();
+      existing.updatedAt = new Date().toISOString();
+    }
   }
 }
 

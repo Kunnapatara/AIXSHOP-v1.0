@@ -1,0 +1,1100 @@
+# AIXSHOP v1.0 — Workstream B Gap Closure + Workstream C Shopify Integration
+
+## PRIMARY DIRECTIVE
+
+You are working on the existing AIXSHOP v1.0 repository:
+
+https://github.com/Kunnapatara/AIXSHOP-v1.0
+
+This is an existing multi-tenant B2B Shopify Catalog Health & Operations SaaS.
+
+Your task is to complete the remaining Workstream B persistence gaps and implement a real, secure, production-oriented Shopify integration.
+
+This is an incremental engineering task, NOT a rewrite.
+
+**NON-NEGOTIABLE: ZERO LOSS OF DEVELOPMENT PROGRESS.**
+
+Preserve all existing functionality, architecture, domain rules, audit workflows, authentication, workspace isolation, billing, entitlement logic, catalog operations, UI, and tests.
+
+Do not replace existing systems with simplified alternatives.
+
+Do not create a demo-only Shopify connector and describe it as a live integration.
+
+Do not claim a real Shopify Store has been connected or tested unless the actual external authorization and API calls have succeeded.
+
+---
+
+# PART 0 — READ-ONLY REPOSITORY AUDIT BEFORE IMPLEMENTATION
+
+Before editing any file:
+
+1. Inspect the latest repository state and current default branch.
+2. Re-read the existing implementation rather than relying on previous reports.
+3. Inspect at minimum:
+
+- `src/domain/ingestion/storeIngestion.ts`
+- `src/pages/SettingsPage.tsx`
+- `src/server/app.ts`
+- `src/server/db/repository.ts`
+- `src/server/db/postgresRepository.ts`
+- `src/server/db/memoryRepository.ts`
+- `src/server/db/migrations/`
+- `src/server/routes/auditRoutes.ts`
+- `src/server/routes/storeRoutes.ts`
+- `src/server/services/entitlementService.ts`
+- `src/domain/audit/`
+- Existing catalog types and storage models
+- Existing tests and frontend API clients
+- Environment configuration and deployment configuration
+
+4. Identify what has already been implemented for Workstream B.
+5. Identify existing migration numbering and database constraints.
+6. Identify all existing integration and connector abstractions.
+7. Identify the actual Shopify-related code paths and their callers.
+
+Produce a concise internal implementation map before changing code.
+
+Do not delete or replace existing implementation merely because a new architecture seems easier.
+
+If the current repository differs from this specification, adapt to the actual code while preserving the required behavior.
+
+---
+
+# PART 1 — WORKSTREAM B GAP CLOSURE: AUDIT HISTORY & EVIDENCE
+
+## 1.1 PostgreSQL migration gap
+
+Previous inspection found PostgreSQL code referencing:
+
+- `audit_run_findings`
+- `audit_run_evidence`
+- `audit_run_products`
+
+However, the migration directory contained only migrations 001–005, with no verified migration creating these historical snapshot tables.
+
+Verify the current state again.
+
+If these tables are still missing, create the next available additive migration, normally:
+
+`006_audit_history_snapshots.sql`
+
+Do not assume migration 006 is available without checking.
+
+The migration must create all required snapshot tables and constraints.
+
+Requirements:
+
+- Correct foreign keys to audit runs and workspaces.
+- Workspace ownership consistency.
+- Appropriate indexes for audit_run_id, workspace_id, and lookup operations.
+- JSONB fields where the existing model requires structured data.
+- Unambiguous uniqueness constraints to prevent duplicate snapshot records.
+- Appropriate delete behavior that does not accidentally remove historical data during ordinary catalog edits.
+- No destructive modification of existing migrations.
+- No deletion or recreation of existing customer tables.
+- No data loss.
+
+Update schema readiness checks to verify all tables and important constraints required by Workstream B.
+
+A PostgreSQL database must not report itself ready for Audit History when the required snapshot tables are missing.
+
+## 1.2 Snapshot availability correctness
+
+Inspect `getAuditRunsHistory()` and `getHistoricalAuditSnapshot()` in both repositories.
+
+The current PostgreSQL implementation appears to determine snapshot availability by checking only `audit_run_findings`.
+
+This is insufficient.
+
+A completed audit may legitimately contain zero findings but still have product snapshots and evidence snapshots.
+
+Implement a reliable snapshot availability rule.
+
+Prefer an explicit snapshot manifest or equivalent completion record that records:
+
+- Audit Run ID
+- Workspace ID
+- Snapshot completion status
+- Finding count
+- Evidence count
+- Product count
+- Snapshot creation timestamp
+
+The snapshot must only be reported as available when the required snapshot operation completed successfully.
+
+Do not infer successful snapshots solely from the existence of findings.
+
+Apply equivalent semantics to MemoryRepository.
+
+## 1.3 Evidence relationship correctness
+
+Inspect how evidence documents are associated with products.
+
+The existing PostgreSQL snapshot implementation may assign `productId: null` to all historical evidence records.
+
+Correct this where the original domain relationship identifies a product.
+
+Preserve:
+
+- Original evidence ID
+- Product ID where available
+- Evidence title and type
+- Issuer
+- Verification date
+- URL
+- Verification status
+- Provenance and metadata
+
+Do not fabricate evidence or verification status.
+
+## 1.4 Historical immutability
+
+Historical snapshots must remain independent from mutable current catalog records.
+
+Required test:
+
+1. Create Audit A.
+2. Save its findings, products, variants, and evidence snapshots.
+3. Modify or delete current catalog data.
+4. Create Audit B.
+5. Retrieve Audit A.
+6. Verify Audit A still returns its original product data, findings, and evidence.
+
+Historical snapshots must not be reconstructed from the current catalog.
+
+Preserve legacy behavior for old audits without snapshots:
+
+"Historical snapshot unavailable — this audit was created before Audit History & Evidence was implemented."
+
+Do not invent historical values.
+
+## 1.5 PostgreSQL transaction integrity
+
+Verify that the following operations are consistent:
+
+- Audit execution
+- Current catalog updates
+- Historical snapshot persistence
+- Snapshot manifest completion
+- Audit Run COMPLETED status
+
+Use a PostgreSQL transaction for all operations that must succeed together.
+
+If any required snapshot write fails:
+
+- Roll back the transaction.
+- Do not report the audit as COMPLETED.
+- Record a truthful failure status where possible.
+- Preserve the original error.
+
+Do not leave partially written snapshots presented as complete.
+
+## 1.6 API and frontend
+
+Preserve existing routes and behavior.
+
+Verify:
+
+- `GET /api/audit/history`
+- `GET /api/audit/latest`
+- `GET /api/audit/:id`
+- `GET /api/audit/compare`
+
+Ensure workspace-scoped access and stable pagination.
+
+Make snapshot availability and legacy behavior accurate in the UI.
+
+Do not introduce an unrelated redesign.
+
+## 1.7 Workstream B acceptance gate
+
+Before starting Workstream C, all of these must pass:
+
+- Migration exists and applies cleanly.
+- PostgreSQL repository uses the migrated tables correctly.
+- MemoryRepository behavior matches the intended semantics.
+- Zero-findings audit still reports snapshot availability correctly.
+- Product/evidence relationships are preserved.
+- Audit A → catalog modification → Audit B → reopen Audit A passes.
+- Workspace isolation tests pass.
+- Legacy audit behavior passes.
+- Existing Phase 1 audit execution tests pass.
+- Existing tests and type checking remain intact.
+
+If this gate fails, fix Workstream B first.
+
+Do not silently skip it or proceed to C while claiming B is complete.
+
+---
+
+# PART 2 — WORKSTREAM C: REAL SHOPIFY INTEGRATION
+
+## 2.1 Integration objective
+
+Implement a real Shopify integration that allows an authenticated AIXSHOP workspace owner to authorize their Shopify store and import/synchronize catalog data through the Shopify Admin GraphQL API.
+
+The integration must be suitable for actual paying merchants.
+
+It must not depend on:
+
+- Public `/products.json` feeds for authenticated catalog synchronization.
+- Demo fixtures.
+- Hardcoded sample products.
+- Simulated OAuth.
+- Fake Connected statuses.
+- Fake webhook events.
+- Client-side Shopify access tokens.
+
+The integration is initially READ-ONLY.
+
+Do not implement product write-back or Shopify product mutations in this workstream.
+
+The merchant's Shopify store remains the source of truth.
+
+## 2.2 Shopify authentication strategy
+
+AIXSHOP is an external web application rather than an application that necessarily runs inside Shopify Admin.
+
+Use Shopify's Authorization Code Grant flow for merchant installation and authorization.
+
+Do not use Client Credentials Grant as a substitute for authorizing ordinary third-party merchant stores.
+
+Implement:
+
+1. Connect initiation endpoint.
+2. Secure authorization state generation.
+3. Server-side persistence of pending authorization state.
+4. Shopify authorization redirect.
+5. OAuth callback endpoint.
+6. Callback HMAC verification using Shopify's current documented procedure.
+7. State and nonce verification.
+8. Shop domain validation.
+9. Authorization code exchange.
+10. Granted-scope validation.
+11. Secure token persistence.
+12. Authenticated Admin GraphQL API connection.
+13. Connection verification before reporting Connected.
+
+Use the official Shopify documentation and current supported authentication procedure.
+
+For public apps, implement expiring offline access tokens and refresh-token handling according to Shopify's current requirements.
+
+Do not assume token lifetimes. Read expiration values returned by Shopify.
+
+Handle refresh-token rotation safely and atomically.
+
+Do not store tokens in:
+
+- Browser localStorage
+- Browser sessionStorage
+- Frontend state persisted to disk
+- URLs
+- Logs
+- Error messages
+- Plaintext database columns
+
+## 2.3 Required Shopify scopes
+
+Start with the minimum required permission:
+
+`read_products`
+
+Only request additional scopes if an actual required feature needs them.
+
+Do not request customer, order, payment, or unrelated permissions.
+
+Display the permissions being requested to the merchant.
+
+If Shopify grants fewer scopes than required, report the missing scope and do not claim that the integration is fully operational.
+
+## 2.4 Secure access token storage
+
+Create a dedicated server-side Shopify credential storage abstraction.
+
+Use the existing database and repository architecture.
+
+Implement encryption at rest using authenticated encryption such as AES-256-GCM.
+
+Encryption keys must come from environment secrets, never from frontend code or source control.
+
+Requirements:
+
+- Store encrypted access tokens.
+- Store encrypted refresh tokens when provided.
+- Store key version metadata to support future key rotation.
+- Store Shopify shop domain and granted scopes.
+- Store token expiration timestamps.
+- Store connection status.
+- Store workspace ownership.
+- Store installation and last verification timestamps.
+
+Do not expose token values through API responses.
+
+Do not include secrets in application diagnostics.
+
+Handle missing encryption configuration as a secure configuration error. Never silently fall back to plaintext storage.
+
+Ensure one workspace cannot access another workspace's Shopify credentials.
+
+Ensure unique shop installation behavior is explicitly designed and tested.
+
+## 2.5 Shopify GraphQL Admin API client
+
+Implement a reusable server-side Shopify Admin GraphQL API client.
+
+Requirements:
+
+- Use a pinned supported Shopify API version configured centrally.
+- Verify that the selected API version is currently supported during implementation.
+- Do not scatter API version strings across the codebase.
+- Use `X-Shopify-Access-Token` on server-side requests.
+- Use HTTPS only.
+- Validate the shop hostname against the expected `*.myshopify.com` format.
+- Prevent arbitrary URL injection and SSRF.
+- Validate GraphQL HTTP errors and GraphQL-level errors separately.
+- Validate partial GraphQL responses.
+- Never interpret HTTP 200 as proof that a GraphQL operation succeeded.
+
+Support:
+
+- Connection verification.
+- Product queries.
+- Variant queries.
+- Image/media data.
+- Cursor pagination.
+- Query cost inspection.
+- Rate-limit-aware execution.
+- Token refresh and retry where safe.
+
+Do not expose the Shopify API client directly to the browser.
+
+## 2.6 Full catalog pagination
+
+Replace the current authenticated integration dependency on:
+
+`/products.json?limit=25`
+
+Use Shopify Admin GraphQL Product connections with cursor-based pagination.
+
+Implement `first`, `after`, `pageInfo.hasNextPage`, and `pageInfo.endCursor` correctly.
+
+Continue until the complete permitted catalog scope has been processed.
+
+Avoid duplicate products and variants across pages.
+
+Persist sync progress so a failed import can resume safely.
+
+Do not silently stop at the first page.
+
+For large catalogs, evaluate Shopify Bulk Operations for large read jobs where appropriate.
+
+If Bulk Operations are used:
+
+- Start the operation through the supported GraphQL API.
+- Track operation status.
+- Retrieve and process the result safely.
+- Handle failed and canceled operations.
+- Do not report completion before all result data has been processed.
+- Preserve idempotency.
+
+Cursor pagination remains required for normal paginated reads and any workflow that uses it.
+
+## 2.7 Products and variants
+
+Retrieve the fields needed by the existing AIXSHOP domain model, including:
+
+Product:
+
+- Shopify product ID (GID)
+- Title
+- Description / descriptionHtml as appropriate
+- Vendor
+- Product type
+- Handle
+- Status
+- Tags where useful
+- Product category where available
+- Created and updated timestamps
+- Product images/media
+
+Variants:
+
+- Shopify variant ID (GID)
+- Parent product ID
+- Title
+- SKU
+- Barcode
+- Price
+- Compare-at price where supported by the current domain model
+- Inventory item identity where needed
+- Selected options
+- Relevant availability information
+
+Do not assume that every Shopify product has a non-empty SKU, barcode, image, or GTIN.
+
+Missing values must remain missing and must be represented accurately for existing AIXSHOP validation rules.
+
+Do not fabricate GTIN values.
+
+Preserve Shopify source IDs in stable domain attributes so subsequent syncs can identify the same records.
+
+## 2.8 Domain model mapping
+
+Reuse existing `Product`, `Variant`, `Offer`, and related storage types.
+
+Inspect the actual model before mapping.
+
+Do not create a parallel Shopify-specific catalog model that duplicates the existing domain model.
+
+Preserve:
+
+- Stable source product IDs
+- Stable source variant IDs
+- SKU
+- Barcode
+- Price precision
+- Vendor/brand
+- Product type/category
+- Description
+- Image URL
+- Variant options
+- Product attributes
+- Source timestamps
+
+Correct the existing public-feed mapping issue where product image is assigned an empty string.
+
+For Shopify Admin GraphQL imports, map actual image/media URLs returned by Shopify.
+
+If multiple images are available, preserve the primary image and any additional image references supported by the current domain model.
+
+Do not invent image URLs.
+
+Use the existing price validation and decimal conversion utilities. Avoid floating-point corruption.
+
+## 2.9 Plan entitlements and SKU limits
+
+Reuse the existing entitlement service.
+
+Do not create a second billing or entitlement engine.
+
+Before committing imported data, calculate actual SKU usage using the existing definition of one variant = one SKU.
+
+Respect the workspace's actual plan limits.
+
+Required behavior:
+
+- Check plan entitlement before importing.
+- Never silently exceed the plan SKU limit.
+- Never silently report a partial import as a complete catalog sync.
+- Report products and variants discovered.
+- Report products and variants imported.
+- Report records excluded by plan limits.
+- Report invalid or rejected records.
+- Report conflicts and duplicates.
+- Explain how the merchant can proceed when the catalog exceeds the plan limit.
+
+Do not confuse Shopify API pagination limits with AIXSHOP plan entitlements.
+
+A Shopify catalog may contain more records than the workspace is permitted to import.
+
+In that case, preserve accurate discovered/imported/excluded counts and mark the sync as partial or plan-limited.
+
+Do not silently discard data.
+
+Use a consistent and deterministic policy for selecting eligible records when the plan limit is reached.
+
+## 2.10 Safe catalog synchronization
+
+Implement an idempotent import/sync process.
+
+Use Shopify source IDs as primary matching references.
+
+Do not rely on product titles alone.
+
+Reuse existing ingestion conflict detection and catalog mutation logic where appropriate.
+
+Protect merchant-edited catalog fields.
+
+If incoming Shopify data conflicts with existing merchant-edited values:
+
+- Identify the conflict.
+- Preserve the current catalog value according to existing conflict rules.
+- Record the source value.
+- Do not silently overwrite approved merchant changes.
+
+Avoid deleting current catalog records merely because a partial sync failed.
+
+For full synchronization, distinguish:
+
+- Sync started
+- Fetching
+- Importing
+- Completed
+- Partially completed
+- Failed
+- Disconnected
+
+Use durable sync metadata where supported by the existing architecture.
+
+## 2.11 Product webhooks
+
+Implement verified Shopify webhook processing for:
+
+- `products/create`
+- `products/update`
+- `products/delete`
+- `app/uninstalled`
+
+Use Shopify's supported webhook registration mechanism and current API version.
+
+Implement webhook registration after successful installation.
+
+Requirements:
+
+- Verify Shopify webhook HMAC against the exact raw request body.
+- Use constant-time comparison.
+- Reject invalid signatures.
+- Preserve raw request bytes before JSON parsing.
+- Handle webhook delivery IDs.
+- Implement idempotency.
+- Persist event receipt and processing status.
+- Handle duplicate deliveries safely.
+- Handle out-of-order events safely.
+- Associate each webhook with the correct Shopify shop and workspace.
+- Never trust a workspace ID supplied in an unverified webhook payload.
+
+Webhook events must not bypass catalog validation, plan entitlements, or workspace isolation.
+
+For product deletion, only remove or archive the corresponding source record according to a safe, explicit domain policy.
+
+Do not delete unrelated products.
+
+For app uninstall, mark the integration disconnected and remove/revoke stored credentials according to Shopify's current requirements.
+
+Do not leave the UI showing Connected after uninstall.
+
+## 2.12 Webhook persistence and reliability
+
+Add an additive migration for webhook event persistence and Shopify integration records as needed.
+
+Use the next available migration number after verifying the current repository.
+
+Potential tables may include:
+
+- `shopify_connections`
+- `shopify_sync_runs`
+- `shopify_webhook_events`
+- Supporting OAuth state or token metadata tables if required
+
+These are design suggestions, not permission to duplicate existing tables.
+
+Inspect existing schema first.
+
+Implement:
+
+- Event ID uniqueness.
+- Shop/workspace association.
+- Event topic.
+- Receipt timestamp.
+- Processing status.
+- Retry count.
+- Last error.
+- Processed timestamp.
+
+Do not acknowledge an event as successfully processed before durable receipt has been recorded.
+
+Use safe retry behavior.
+
+## 2.13 Rate limits and retry strategy
+
+Shopify GraphQL Admin API uses calculated query cost and throttle information.
+
+Inspect the returned `extensions.cost.throttleStatus` data.
+
+Implement:
+
+- Cost-aware request scheduling.
+- Backoff when throttled.
+- Retry handling for HTTP 429 and transient server failures.
+- Respect `Retry-After` where provided.
+- Exponential backoff with jitter.
+- Maximum retry count.
+- Request timeout.
+- Cancellation support where practical.
+- Clear permanent versus transient error classification.
+
+Do not retry invalid authorization, missing scopes, invalid GraphQL queries, or permanent validation failures indefinitely.
+
+Do not create uncontrolled parallel requests that exhaust the app/store query-cost bucket.
+
+Persist enough state to recover interrupted long-running sync jobs.
+
+Do not claim successful sync if some pages or records failed.
+
+## 2.14 Disconnect and revoke authorization
+
+Implement an authenticated Disconnect action.
+
+Requirements:
+
+- Confirm the workspace owns the connection.
+- Stop or cancel pending sync work where safe.
+- Unregister webhooks when supported and appropriate.
+- Revoke or invalidate Shopify authorization according to Shopify's current supported procedure.
+- Delete encrypted credentials and refresh tokens after successful lifecycle handling.
+- Mark connection status as disconnected.
+- Record disconnect timestamp.
+- Preserve audit history and previously imported catalog records.
+- Do not delete merchant catalog data merely because the Shopify connection was disconnected.
+
+Also handle Shopify app uninstall webhooks.
+
+A disconnected or revoked integration must not continue making API calls with stale credentials.
+
+## 2.15 Backend routes and service boundaries
+
+Integrate with the existing Express architecture.
+
+Create Shopify-specific routes and services only where needed.
+
+Potential endpoints:
+
+- `GET /api/shopify/connect`
+- `GET /api/shopify/callback`
+- `GET /api/shopify/status`
+- `POST /api/shopify/sync`
+- `GET /api/shopify/sync/:id`
+- `POST /api/shopify/disconnect`
+- `POST /api/shopify/webhooks`
+
+Adapt names and structure to existing conventions.
+
+All user-facing routes must require authentication and derive workspace identity from trusted server-side authentication middleware.
+
+Never trust a client-supplied workspace ID.
+
+Webhook endpoints must use their own signature verification and must not be treated as normal browser-authenticated requests.
+
+Preserve the existing billing webhook raw-body behavior.
+
+Add Shopify raw-body handling without breaking existing JSON parsing or billing webhook signature verification.
+
+## 2.16 Settings UI
+
+Update the existing Connectors & Feeds section in `SettingsPage.tsx`.
+
+Replace simulated connector behavior with real backend connection status.
+
+Required UI states:
+
+- Not connected
+- Authorization pending
+- Connected
+- Syncing
+- Sync completed
+- Sync partially completed
+- Sync failed
+- Reauthorization required
+- Disconnected
+
+Display:
+
+- Connected Shopify store domain
+- Granted scopes
+- Last successful sync
+- Last sync status
+- Products discovered
+- Products imported
+- Variants/SKUs imported
+- Records excluded by plan limit
+- Errors or warnings requiring action
+
+Actions:
+
+- Connect Shopify
+- Sync Catalog
+- Disconnect Shopify
+
+Do not allow a UI toggle to create a fake Connected state.
+
+Never display access tokens or client secrets.
+
+Show accurate explanations when Shopify configuration is missing.
+
+The application must distinguish a real connected store from demo fixtures and public-feed samples.
+
+## 2.17 Existing Public Feed behavior
+
+Do not abruptly delete existing public-feed functionality if it remains useful for a clearly labeled unauthenticated preview or health check.
+
+However:
+
+- It must not be treated as authenticated Shopify synchronization.
+- It must not be treated as a full catalog import.
+- Its 25-product limitation must be explicit.
+- It must not overwrite an authenticated Shopify catalog.
+- It must not display a Connected status.
+- It must not be used as evidence of OAuth or Admin API integration.
+
+Keep demo fixtures isolated from real merchant data.
+
+---
+
+# PART 3 — SECURITY REQUIREMENTS
+
+Implement and test:
+
+1. OAuth state/CSRF protection.
+2. Shopify callback HMAC verification.
+3. Shop hostname validation.
+4. Secure token encryption and key management.
+5. Workspace/tenant isolation.
+6. No token exposure in API responses.
+7. No secret exposure in logs.
+8. Webhook HMAC verification over raw request bytes.
+9. Webhook idempotency.
+10. SSRF prevention.
+11. Authentication and authorization for connection management.
+12. Safe disconnect and uninstall handling.
+13. Scope validation.
+14. Rate limiting on sensitive OAuth initiation endpoints.
+15. Safe error messages.
+
+Do not weaken existing authentication, CSRF, billing, or workspace security controls.
+
+Do not expose internal secrets through diagnostics.
+
+---
+
+# PART 4 — TESTING REQUIREMENTS
+
+Create automated tests using the existing project test framework.
+
+Do not replace existing tests.
+
+## Workstream B tests
+
+- Migration and schema readiness.
+- Snapshot persistence in PostgreSQL.
+- Snapshot persistence in MemoryRepository.
+- Zero-findings snapshot availability.
+- Evidence/product association.
+- Audit A → mutate catalog → Audit B → retrieve Audit A.
+- Legacy audits without snapshots.
+- Snapshot transaction rollback.
+- Workspace isolation.
+- Pagination and ordering.
+- Comparison behavior.
+- Existing audit execution regression tests.
+
+## Shopify tests
+
+OAuth:
+
+- Valid OAuth initiation.
+- Invalid/missing shop domain.
+- Invalid state.
+- Invalid callback HMAC.
+- Valid callback.
+- Token exchange failure.
+- Missing required scope.
+- Token encryption/decryption.
+- Token refresh.
+- Refresh-token rotation.
+- Workspace isolation.
+
+GraphQL:
+
+- Valid connection.
+- GraphQL errors despite HTTP 200.
+- Invalid/expired token.
+- Cursor pagination across multiple pages.
+- Duplicate page/retry handling.
+- Empty catalog.
+- Product without image.
+- Product with multiple images.
+- Variant without SKU.
+- Variant without barcode.
+- Price normalization.
+- Query-cost throttling.
+- Transient network failure.
+- Partial response failure.
+
+Catalog:
+
+- Stable Shopify product/variant ID mapping.
+- Idempotent repeated sync.
+- Conflict protection.
+- Duplicate detection.
+- Plan SKU limit.
+- Partial sync reporting.
+- Failed sync recovery.
+- No accidental catalog deletion.
+
+Webhooks:
+
+- Valid HMAC.
+- Invalid HMAC.
+- Duplicate delivery.
+- Product create.
+- Product update.
+- Product delete.
+- App uninstall.
+- Unknown shop.
+- Out-of-order event.
+- Processing retry.
+- Workspace isolation.
+
+Disconnect:
+
+- Successful disconnect.
+- Invalid workspace ownership.
+- Revocation failure.
+- Reauthorization required.
+- Existing catalog and historical audit preservation.
+
+Use mocked Shopify HTTP responses for deterministic automated tests, but clearly label them as mocked tests.
+
+Mocked tests are not real Shopify Store integration tests.
+
+---
+
+# PART 5 — REAL SHOPIFY STORE VERIFICATION
+
+A real Shopify integration must be tested against an actual Shopify development/test store with valid app credentials.
+
+Use environment variables for all credentials and secrets.
+
+Never hardcode credentials.
+
+The test procedure must verify:
+
+1. Merchant opens AIXSHOP.
+2. Merchant selects Connect Shopify.
+3. Shopify authorization page opens.
+4. Merchant approves requested scopes.
+5. Shopify redirects to AIXSHOP callback.
+6. Callback HMAC and state validation succeed.
+7. Token exchange succeeds.
+8. Credentials are encrypted and stored.
+9. AIXSHOP verifies the Shopify connection.
+10. Settings displays the real connected store.
+11. Full catalog pagination retrieves products and variants.
+12. Images, SKU, barcode, and other available fields are mapped.
+13. Catalog import respects the actual plan entitlement.
+14. Audit Engine can evaluate the imported catalog.
+15. Product create/update/delete webhooks are received and processed.
+16. Duplicate webhook delivery does not create duplicate mutations.
+17. Disconnect removes authorization safely.
+18. Reconnecting works correctly.
+
+Record actual test evidence:
+
+- Store domain (do not expose secrets)
+- Shopify API version
+- Granted scopes
+- Number of products discovered
+- Number of variants discovered
+- Number imported
+- Number excluded by plan
+- Number of pages or Bulk Operation results
+- Number of webhook events received
+- Test outcomes
+- Errors and unresolved limitations
+
+If real Shopify credentials or a development store are unavailable:
+
+- Complete automated mocked tests.
+- Prepare the real-store test procedure.
+- Clearly report that external verification is BLOCKED.
+- List exactly which environment variables and external setup are required.
+- Do not claim that live OAuth, live GraphQL, or live webhooks have been verified.
+
+Do not invent test results.
+
+---
+
+# PART 6 — ENVIRONMENT CONFIGURATION
+
+Inspect existing configuration conventions and add only necessary environment variables.
+
+Potential configuration includes:
+
+- `SHOPIFY_API_KEY`
+- `SHOPIFY_API_SECRET`
+- `SHOPIFY_APP_URL`
+- `SHOPIFY_REDIRECT_URI`
+- `SHOPIFY_API_VERSION`
+- `SHOPIFY_SCOPES`
+- `SHOPIFY_TOKEN_ENCRYPTION_KEY`
+
+Use the project's established environment loading and validation patterns.
+
+Never put actual secret values in source control.
+
+Provide an updated `.env.example` with placeholders only.
+
+Document Shopify Dev Dashboard setup, callback URL configuration, app scopes, webhook configuration, and required production environment variables.
+
+Do not expose secrets in build-time frontend variables.
+
+---
+
+# PART 7 — PRESERVE EXISTING PRODUCT AND BUSINESS LOGIC
+
+Do not rebuild or replace:
+
+- Authentication and sessions
+- Workspace and membership system
+- Catalog domain models
+- Audit Engine
+- Audit History
+- Evidence models
+- Catalog import/conflict rules
+- Entitlement service
+- Billing and subscription services
+- Existing database repository architecture
+- Existing UI navigation
+
+Reuse the existing implementation wherever possible.
+
+Do not change the existing audit rules unless a strictly necessary integration mapping correction is identified and tested.
+
+Do not implement Shopify write-back in this workstream.
+
+Do not add AI provider dependencies.
+
+Do not introduce unnecessary paid external services.
+
+Do not redesign unrelated screens.
+
+Do not change pricing or billing logic.
+
+---
+
+# PART 8 — QUALITY GATES
+
+Run the actual project commands:
+
+- `npm test`
+- `npm run lint`
+- `npm run build`
+
+Run database migration tests where the environment supports them.
+
+Run PostgreSQL-specific tests against a real test PostgreSQL instance when available.
+
+Do not report tests as passed unless the commands actually ran and exited successfully.
+
+Report:
+
+- Tests passed
+- Tests failed
+- Tests skipped
+- Tests blocked by unavailable services
+- Build result
+- Typecheck result
+- Migration result
+
+A MemoryRepository test is not proof of PostgreSQL correctness.
+
+A mocked Shopify response is not proof of live Shopify integration.
+
+A successful build is not proof of production readiness.
+
+---
+
+# PART 9 — FINAL IMPLEMENTATION REPORT
+
+When implementation is finished, provide a structured report containing:
+
+## A. Initial repository findings
+
+What existed before changes and what gaps were found.
+
+## B. Workstream B Gap Closure
+
+- Migration added
+- Tables and constraints
+- Snapshot manifest/availability behavior
+- Evidence relationship handling
+- PostgreSQL transaction behavior
+- MemoryRepository behavior
+- Tests and results
+
+## C. Shopify Integration
+
+- OAuth flow
+- Token encryption/storage
+- Token refresh
+- Admin GraphQL client
+- API version
+- Pagination/Bulk Operations
+- Product/variant/image mapping
+- Entitlement enforcement
+- Webhook registration and processing
+- Retry/rate-limit handling
+- Disconnect/revocation
+- Settings UI
+
+## D. Files changed
+
+List every changed and new file with its purpose.
+
+## E. Database changes
+
+List each additive migration and the schema it introduces.
+
+## F. Security verification
+
+Report actual security tests and any unresolved issues.
+
+## G. Test results
+
+Include exact command results and counts.
+
+## H. Real Shopify Store verification
+
+Clearly distinguish:
+
+- Automated mocked tests
+- PostgreSQL integration tests
+- Actual Shopify development-store tests
+- Production verification
+
+## I. Remaining limitations
+
+List every feature that remains incomplete or blocked.
+
+## J. Final readiness assessment
+
+Assess separately:
+
+- Workstream B readiness
+- Shopify OAuth readiness
+- GraphQL catalog import readiness
+- Webhook readiness
+- Disconnect readiness
+- Real-store verification
+- Production readiness
+
+Do not assign a production-ready status to a component that has not passed its required real-world verification.
+
+---
+
+# FINAL EXECUTION RULES
+
+1. Start with read-only inspection.
+2. Close Workstream B gaps first.
+3. Verify Workstream B acceptance criteria.
+4. Implement Workstream C incrementally.
+5. Preserve existing development progress.
+6. Keep changes additive and scoped.
+7. Never use demo fixtures as live integration evidence.
+8. Never fabricate Shopify test results.
+9. Never expose secrets.
+10. Do not commit or push changes unless explicitly authorized.
+11. Do not stop after writing a plan: implement the work that can actually be completed in the available environment.
+12. If an external dependency prevents completion, finish the parts that can be safely implemented and report the exact blocker.
+
+**The required outcome is a real, secure Shopify integration that can be verified against an actual merchant development store, while preserving the existing AIXSHOP application and its completed development work.**
