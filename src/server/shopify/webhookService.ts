@@ -1,6 +1,6 @@
 import { DatabaseRepository } from '../db/repository';
 import { verifyShopifyWebhookHmac } from '../security/encryption';
-import { getShopifyOAuthEnv, disconnectShopify } from './oauthService';
+import { getShopifyOAuthEnv, disconnectShopify, getValidShopifyAccessToken } from './oauthService';
 import { normalizeShopDomain, executeShopifyGraphQL } from './client';
 import { Product, Variant } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
@@ -159,6 +159,108 @@ export async function getShopifyWebhookSubscriptions(
   } catch (err: any) {
     console.warn(`[AIXSHOP Webhooks] Failed to fetch webhook subscriptions for ${shopDomain}:`, err.message);
     return [];
+  }
+}
+
+export interface WebhookVerificationResult {
+  verified: boolean;
+  status: 'active' | 'registered_unverified' | 'not_configured' | 'partially_registered' | 'verification_failed';
+  requiredTopics: string[];
+  activeTopics: string[];
+  missingTopics: string[];
+  liveSubscriptions: Array<{ id: string; topic: string; callbackUrl?: string }>;
+  verifiedAt: string;
+  message: string;
+}
+
+/**
+ * Actively queries Shopify Admin GraphQL API to verify existing webhook subscriptions.
+ * Distinguishes between active, partially registered, registered unverified, and failed states.
+ */
+export async function verifyShopifyWebhookSubscriptionsLive(
+  repo: DatabaseRepository,
+  workspaceId: string,
+  options: { customFetch?: typeof fetch } = {}
+): Promise<WebhookVerificationResult> {
+  const connection = await repo.getShopifyConnection(workspaceId);
+  const nowIso = new Date().toISOString();
+
+  if (!connection || connection.status !== 'connected') {
+    return {
+      verified: false,
+      status: 'not_configured',
+      requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      activeTopics: [],
+      missingTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      liveSubscriptions: [],
+      verifiedAt: nowIso,
+      message: 'Shopify is not currently connected to this workspace.',
+    };
+  }
+
+  try {
+    const accessToken = await getValidShopifyAccessToken(repo, workspaceId, { customFetch: options.customFetch });
+    const liveSubs = await getShopifyWebhookSubscriptions(connection.shopDomain, accessToken, options);
+
+    const activeTopicsSet = new Set(liveSubs.map(s => s.topic.toUpperCase().replace(/\//g, '_')));
+    const activeTopics: string[] = [];
+    const missingTopics: string[] = [];
+
+    for (const requiredTopic of DEFAULT_SHOPIFY_WEBHOOK_TOPICS) {
+      if (activeTopicsSet.has(requiredTopic)) {
+        activeTopics.push(requiredTopic);
+      } else {
+        missingTopics.push(requiredTopic);
+      }
+    }
+
+    const verified = missingTopics.length === 0;
+    const status = verified
+      ? 'active'
+      : activeTopics.length > 0
+      ? 'partially_registered'
+      : 'registered_unverified';
+
+    const message = verified
+      ? `All ${activeTopics.length} required webhook subscriptions are actively verified on Shopify Admin API.`
+      : activeTopics.length > 0
+      ? `Partially verified: ${activeTopics.length} of ${DEFAULT_SHOPIFY_WEBHOOK_TOPICS.length} webhooks active on Shopify. Missing: ${missingTopics.join(', ')}.`
+      : `No matching webhooks found active on Shopify Admin API. Required topics: ${DEFAULT_SHOPIFY_WEBHOOK_TOPICS.join(', ')}.`;
+
+    // Persist verified live subscriptions and verification timestamp in repository
+    await repo.saveShopifyConnection({
+      ...connection,
+      webhookSubscriptions: liveSubs.map(s => ({
+        id: s.id,
+        topic: s.topic,
+        callbackUrl: s.callbackUrl,
+        active: true,
+      })),
+      lastVerifiedAt: nowIso,
+      updatedAt: nowIso,
+    });
+
+    return {
+      verified,
+      status,
+      requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      activeTopics,
+      missingTopics,
+      liveSubscriptions: liveSubs,
+      verifiedAt: nowIso,
+      message,
+    };
+  } catch (err: any) {
+    return {
+      verified: false,
+      status: 'verification_failed',
+      requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      activeTopics: [],
+      missingTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      liveSubscriptions: [],
+      verifiedAt: nowIso,
+      message: `Failed to verify Shopify webhook subscriptions: ${err?.message || 'Admin API error'}`,
+    };
   }
 }
 

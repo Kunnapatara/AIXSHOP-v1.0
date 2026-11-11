@@ -198,8 +198,56 @@ class ApiClient {
     return this.request<ShopifyStatusResponse>('/api/shopify/status');
   }
 
-  async syncShopify(): Promise<{ success: boolean; result: any; skuCount: number }> {
-    return this.request<{ success: boolean; result: any; skuCount: number }>('/api/shopify/sync', {
+  async syncShopify(options?: { maxPages?: number; pageSize?: number; resumeCursor?: string }): Promise<{
+    success: boolean;
+    syncRun: any;
+    productsDiscovered: number;
+    productsImported: number;
+    variantsImported: number;
+    excludedByPlan: number;
+    status: string;
+    message: string;
+  }> {
+    return this.request('/api/shopify/sync', {
+      method: 'POST',
+      body: JSON.stringify(options || {}),
+    });
+  }
+
+  async resumeShopifySync(options?: { syncRunId?: string; maxPages?: number; pageSize?: number }): Promise<{
+    success: boolean;
+    syncRun: any;
+    productsDiscovered: number;
+    productsImported: number;
+    variantsImported: number;
+    excludedByPlan: number;
+    status: string;
+    message: string;
+  }> {
+    return this.request('/api/shopify/sync/resume', {
+      method: 'POST',
+      body: JSON.stringify(options || {}),
+    });
+  }
+
+  async registerShopifyWebhooks(): Promise<{ success: boolean; results: any[]; activeWebhooks: string[] }> {
+    return this.request('/api/shopify/webhooks/register', {
+      method: 'POST',
+    });
+  }
+
+  async verifyShopifyWebhooks(): Promise<{
+    success: boolean;
+    verified: boolean;
+    status: string;
+    requiredTopics: string[];
+    activeTopics: string[];
+    missingTopics: string[];
+    liveSubscriptions: any[];
+    verifiedAt: string;
+    message: string;
+  }> {
+    return this.request('/api/shopify/webhooks/verify', {
       method: 'POST',
     });
   }
@@ -212,14 +260,28 @@ class ApiClient {
 }
 
 export interface ShopifyStatusResponse {
-  configured: boolean;
+  configured?: boolean;
   connected: boolean;
-  status: 'connected' | 'disconnected' | 'revoked' | 'error' | 'not_configured';
+  status: 'connected' | 'disconnected' | 'revoked' | 'error' | 'not_connected' | 'not_configured' | 'reauth_required' | 'reauthorization_required';
   shopDomain: string | null;
   grantedScopes: string[];
   installedAt: string | null;
   lastVerifiedAt: string | null;
-  lastSync: {
+  canResumeSync?: boolean;
+  webhookStatus?: 'active' | 'not_configured' | 'pending' | 'inactive' | 'partially_registered' | 'registered_unverified' | 'verification_failed';
+  activeWebhooks?: string[];
+  latestSync?: {
+    id?: string;
+    status: string;
+    completedAt?: string | null;
+    productsDiscovered: number;
+    productsImported: number;
+    variantsImported: number;
+    excludedByPlan: number;
+    cursorResumed?: string | null;
+    errorMessage?: string | null;
+  } | null;
+  lastSync?: {
     status: string;
     completedAt: string | null;
     productsDiscovered: number;

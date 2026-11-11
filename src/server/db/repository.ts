@@ -177,6 +177,7 @@ export interface DatabaseRepository {
   getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
   claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }>;
   updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void>;
+  withShopifyRefreshLock<T>(workspaceId: string, fn: (connection: import('../shopify/types').ShopifyConnectionRecord) => Promise<T>): Promise<T>;
 }
 
 export type AuditRunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';

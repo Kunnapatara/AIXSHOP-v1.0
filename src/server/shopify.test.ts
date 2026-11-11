@@ -25,12 +25,16 @@ import {
 } from './shopify/oauthService';
 import { 
   mapShopifyProductNodeToDomain, 
-  syncShopifyCatalog 
+  syncShopifyCatalog,
+  resumeShopifySync 
 } from './shopify/syncService';
 import { 
   processShopifyWebhook,
-  registerShopifyWebhookSubscriptions 
+  registerShopifyWebhookSubscriptions,
+  verifyShopifyWebhookSubscriptionsLive,
+  DEFAULT_SHOPIFY_WEBHOOK_TOPICS
 } from './shopify/webhookService';
+import { fetchProductsPage } from './shopify/client';
 import { ShopifyGraphQLProductNode } from './shopify/types';
 
 describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => {
@@ -892,6 +896,389 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       assert.equal(results.length, 3);
       assert.ok(results.every(r => r.success));
       assert.deepEqual(registeredTopics, ['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE']);
+    });
+  });
+
+  // 10. Workstream D: Production Hardening, Distributed Concurrency & Resumable Sync
+  describe('10. Workstream D: Distributed Concurrency, Variant Pagination & Resumable Sync', () => {
+    test('refreshShopifyToken re-checks fresh token under lock to eliminate redundant refresh calls across instances', async () => {
+      const tenant = await registerTestUser(`refresh-lock-${Date.now()}@test.com`, 'Refresh Lock Store');
+      let shopifyHttpRefreshCount = 0;
+
+      const mockFetch = async (url: any, init: any): Promise<any> => {
+        if (url.includes('/admin/oauth/access_token')) {
+          shopifyHttpRefreshCount++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              access_token: `shpat_fresh_token_${shopifyHttpRefreshCount}`,
+              refresh_token: `shprt_fresh_token_${shopifyHttpRefreshCount}`,
+              expires_in: 3600, // 1 hour
+              refresh_token_expires_in: 86400 * 30,
+            }),
+          };
+        }
+        throw new Error('Unexpected network call');
+      };
+
+      // Set initial connection with an already-expired token
+      const nowIso = new Date().toISOString();
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: 'concurrency-test.myshopify.com',
+        accessTokenEncrypted: encryptCredential('initial_old_token'),
+        refreshTokenEncrypted: encryptCredential('initial_old_refresh_token'),
+        tokenExpiresAt: new Date(Date.now() - 60000).toISOString(), // expired 1 min ago
+        refreshTokenExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: nowIso,
+        lastVerifiedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      // Instance A executes refresh
+      const resultA = await refreshShopifyToken(repo, tenant.workspace.id, {
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(shopifyHttpRefreshCount, 1);
+      assert.equal(resultA.accessToken, 'shpat_fresh_token_1');
+
+      // Instance B executes refresh immediately after without force
+      // Since the token is now fresh (1 hour expiry), it re-checks under the lock and skips the network call
+      const resultB = await refreshShopifyToken(repo, tenant.workspace.id, {
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(shopifyHttpRefreshCount, 1, 'Should NOT perform a second network refresh when token is already fresh');
+      assert.equal(resultB.accessToken, 'shpat_fresh_token_1');
+    });
+
+    test('variant pagination loop terminates on non-advancing cursors and deduplicates variant IDs', async () => {
+      let variantPageCalls = 0;
+
+      const mockFetch = async (url: any, init: any): Promise<any> => {
+        const body = JSON.parse(init.body);
+        if (body.query.includes('getProductVariants')) {
+          variantPageCalls++;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: {
+                product: {
+                  variants: {
+                    pageInfo: {
+                      hasNextPage: true, // Claims next page exists
+                      endCursor: 'stuck_cursor_never_advances', // Same cursor repeated
+                    },
+                    edges: [
+                      {
+                        cursor: 'stuck_cursor_never_advances',
+                        node: {
+                          id: 'gid://shopify/ProductVariant/dup_variant_99',
+                          title: 'Repeating Variant',
+                          sku: 'REP-99',
+                          price: '29.99',
+                          compareAtPrice: null,
+                          inventoryQuantity: 5,
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            }),
+          };
+        }
+
+        // Single product page with >100 variants trigger
+        if (body.query.includes('getProducts')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: {
+                products: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  edges: [
+                    {
+                      cursor: 'p_cursor_1',
+                      node: {
+                        id: 'gid://shopify/Product/123999',
+                        title: 'Apparel with Many Variants',
+                        handle: 'apparel-product',
+                        variants: {
+                          pageInfo: {
+                            hasNextPage: true,
+                            endCursor: 'stuck_cursor_never_advances',
+                          },
+                          edges: [
+                            {
+                              cursor: 'c0',
+                              node: {
+                                id: 'gid://shopify/ProductVariant/dup_variant_99',
+                                title: 'Initial Variant',
+                                sku: 'REP-99',
+                                price: '29.99',
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            }),
+          };
+        }
+
+        throw new Error('Unexpected query');
+      };
+
+      const result = await fetchProductsPage('test-apparel.myshopify.com', 'dummy_token', null, 10, {
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(result.products.length, 1);
+      // Ensure it did not loop 50 times because cursor repeated
+      assert.equal(variantPageCalls, 1, 'Must break pagination immediately when cursor fails to advance');
+      // Ensure variant deduplication prevented adding duplicate variant ID
+      assert.equal(result.products[0].variants?.edges.length, 1, 'Duplicate variant IDs must be deduplicated');
+    });
+
+    test('resumes partially completed catalog sync from stored cursor without duplicate products', async () => {
+      const tenant = await registerTestUser(`resumesync-${Date.now()}@test.com`, 'Resume Sync Store');
+      const nowIso = new Date().toISOString();
+
+      // Configure active shopify connection
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: 'resumable-store.myshopify.com',
+        accessTokenEncrypted: encryptCredential('valid_token'),
+        tokenExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: nowIso,
+        lastVerifiedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      const pagesRequested: string[] = [];
+
+      const mockFetch = async (_url: any, init: any): Promise<any> => {
+        const body = JSON.parse(init.body);
+        const afterCursor = body.variables?.after;
+        pagesRequested.push(afterCursor || 'PAGE_1');
+
+        if (!afterCursor) {
+          // Page 1
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: {
+                products: {
+                  pageInfo: { hasNextPage: true, endCursor: 'page_1_end_cursor' },
+                  edges: [
+                    {
+                      cursor: 'cursor_p1',
+                      node: {
+                        id: 'gid://shopify/Product/1001',
+                        title: 'Product One',
+                        handle: 'product-one',
+                        status: 'ACTIVE',
+                        variants: {
+                          edges: [{
+                            node: { id: 'gid://shopify/ProductVariant/v1001', sku: 'SKU-1001', price: '19.99' },
+                          }],
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            }),
+          };
+        } else if (afterCursor === 'page_1_end_cursor') {
+          // Page 2 (Final page)
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: {
+                products: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  edges: [
+                    {
+                      cursor: 'cursor_p2',
+                      node: {
+                        id: 'gid://shopify/Product/1002',
+                        title: 'Product Two',
+                        handle: 'product-two',
+                        status: 'ACTIVE',
+                        variants: {
+                          edges: [{
+                            node: { id: 'gid://shopify/ProductVariant/v1002', sku: 'SKU-1002', price: '29.99' },
+                          }],
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            }),
+          };
+        }
+
+        throw new Error(`Unexpected cursor: ${afterCursor}`);
+      };
+
+      // Run initial sync restricted to 1 page -> partially completed
+      const initialSync = await syncShopifyCatalog(repo, tenant.workspace.id, {
+        maxPages: 1,
+        pageSize: 1,
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(initialSync.status, 'partially_completed');
+      assert.equal(initialSync.productsImported, 1);
+      assert.equal(initialSync.syncRun.cursorResumed, 'page_1_end_cursor');
+
+      // Verify catalog currently has 1 product
+      const catalogAfterPart1 = await repo.loadWorkspaceCatalog(tenant.workspace.id);
+      assert.equal(catalogAfterPart1?.products.length, 1);
+
+      // Now resume sync from stored cursor
+      const resumedSync = await resumeShopifySync(repo, tenant.workspace.id, {
+        maxPages: 5,
+        pageSize: 1,
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(resumedSync.status, 'completed');
+      assert.equal(pagesRequested[1], 'page_1_end_cursor', 'Resume must use the cursor saved from previous run');
+
+      // Verify catalog now has both products without duplicates
+      const catalogAfterResume = await repo.loadWorkspaceCatalog(tenant.workspace.id);
+      assert.equal(catalogAfterResume?.products.length, 2);
+      const titles = catalogAfterResume?.products.map(p => p.title).sort();
+      assert.deepEqual(titles, ['Product One', 'Product Two']);
+    });
+
+    test('verifyShopifyWebhookSubscriptionsLive queries Shopify GraphQL and reports accurate status', async () => {
+      const tenant = await registerTestUser(`live-webhooks-${Date.now()}@test.com`, 'Live Webhooks Store');
+      const nowIso = new Date().toISOString();
+
+      let activeReturnedWebhooks = [
+        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/2', topic: 'PRODUCTS_UPDATE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/3', topic: 'PRODUCTS_DELETE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/4', topic: 'APP_UNINSTALLED', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+      ];
+
+      const mockFetch = async (_url: any, init: any): Promise<any> => {
+        const body = JSON.parse(init.body);
+        if (body.query.includes('webhookSubscriptions')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: {
+                webhookSubscriptions: {
+                  edges: activeReturnedWebhooks.map(w => ({ node: w })),
+                },
+              },
+            }),
+          };
+        }
+        throw new Error('Unexpected query');
+      };
+
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: 'live-webhook-store.myshopify.com',
+        accessTokenEncrypted: encryptCredential('valid_token'),
+        tokenExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: nowIso,
+        lastVerifiedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      // 1. All 4 webhooks active -> reports active & verified true
+      const fullResult = await verifyShopifyWebhookSubscriptionsLive(repo, tenant.workspace.id, {
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(fullResult.verified, true);
+      assert.equal(fullResult.status, 'active');
+      assert.equal(fullResult.activeTopics.length, 4);
+      assert.equal(fullResult.missingTopics.length, 0);
+
+      // 2. Remove 2 webhooks -> reports partially_registered
+      activeReturnedWebhooks = [
+        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+      ];
+
+      const partialResult = await verifyShopifyWebhookSubscriptionsLive(repo, tenant.workspace.id, {
+        customFetch: mockFetch as any,
+      });
+
+      assert.equal(partialResult.verified, false);
+      assert.equal(partialResult.status, 'partially_registered');
+      assert.deepEqual(partialResult.activeTopics, ['PRODUCTS_CREATE']);
+      assert.ok(partialResult.missingTopics.includes('PRODUCTS_UPDATE'));
+    });
+
+    test('HTTP endpoints POST /api/shopify/sync/resume and POST /api/shopify/webhooks/verify', async () => {
+      const tenant = await registerTestUser(`http-ws-d-${Date.now()}@test.com`, 'HTTP WS D Store');
+      const nowIso = new Date().toISOString();
+
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: 'http-test-store.myshopify.com',
+        accessTokenEncrypted: encryptCredential('valid_token'),
+        tokenExpiresAt: new Date(Date.now() + 86400000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: nowIso,
+        lastVerifiedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      // Test GET /api/shopify/status reflects canResumeSync: false initially
+      const statusRes1 = await fetch(`${baseUrl}/api/shopify/status`, {
+        headers: { Authorization: `Bearer ${tenant.token}` },
+      });
+      assert.equal(statusRes1.status, 200);
+      const status1 = await statusRes1.json();
+      assert.equal(status1.canResumeSync, false);
+
+      // Verify POST /api/shopify/webhooks/verify endpoint
+      const verifyRes = await fetch(`${baseUrl}/api/shopify/webhooks/verify`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tenant.token}`, 'Content-Type': 'application/json' },
+      });
+      assert.equal(verifyRes.status, 200);
+      const verifyData = await verifyRes.json();
+      assert.equal(verifyData.success, true);
     });
   });
 });

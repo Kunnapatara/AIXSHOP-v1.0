@@ -68,8 +68,9 @@ export interface ShopifyPublicStatus {
   latestSync: ShopifySyncRunRecord | null;
   tokenExpiresAt?: string | null;
   refreshTokenExpiresAt?: string | null;
-  webhookStatus?: 'active' | 'not_configured' | 'pending' | 'inactive';
+  webhookStatus?: 'active' | 'not_configured' | 'pending' | 'inactive' | 'partially_registered' | 'registered_unverified' | 'verification_failed';
   activeWebhooks?: string[];
+  canResumeSync?: boolean;
 }
 
 /**

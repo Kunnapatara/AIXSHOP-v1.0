@@ -9,8 +9,12 @@ import {
   getShopifyOAuthEnv,
   getValidShopifyAccessToken
 } from '../shopify/oauthService';
-import { syncShopifyCatalog } from '../shopify/syncService';
-import { processShopifyWebhook, registerShopifyWebhookSubscriptions } from '../shopify/webhookService';
+import { syncShopifyCatalog, resumeShopifySync } from '../shopify/syncService';
+import { 
+  processShopifyWebhook, 
+  registerShopifyWebhookSubscriptions,
+  verifyShopifyWebhookSubscriptionsLive 
+} from '../shopify/webhookService';
 import { ShopifyPublicStatus } from '../shopify/types';
 
 export function createShopifyRoutes(repo: DatabaseRepository): Router {
@@ -23,6 +27,10 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
       const workspaceId = req.workspace!.id;
       const connection = await repo.getShopifyConnection(workspaceId);
       const latestSync = await repo.getLatestShopifySyncRun(workspaceId);
+
+      const canResumeSync = Boolean(
+        latestSync?.status === 'partially_completed' && latestSync?.cursorResumed
+      );
 
       if (!connection || connection.status === 'disconnected') {
         const status: ShopifyPublicStatus = {
@@ -37,9 +45,14 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           webhookStatus: 'inactive',
           activeWebhooks: [],
           latestSync,
+          canResumeSync,
         };
         return res.json(status);
       }
+
+      const activeWebhooks = (connection.webhookSubscriptions || []).map(w => 
+        typeof w === 'string' ? w : w.topic
+      );
 
       const status: ShopifyPublicStatus = {
         connected: connection.status === 'connected',
@@ -50,9 +63,10 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         lastVerifiedAt: connection.lastVerifiedAt,
         tokenExpiresAt: connection.tokenExpiresAt || null,
         refreshTokenExpiresAt: connection.refreshTokenExpiresAt || null,
-        webhookStatus: (connection.webhookSubscriptions && connection.webhookSubscriptions.length > 0) ? 'active' : 'inactive',
-        activeWebhooks: (connection.webhookSubscriptions || []).map(w => typeof w === 'string' ? w : w.topic),
+        webhookStatus: (activeWebhooks.length > 0) ? 'active' : 'inactive',
+        activeWebhooks,
         latestSync,
+        canResumeSync,
       };
 
       return res.json(status);
@@ -146,6 +160,33 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     }
   });
 
+  // 4a. POST /api/shopify/sync/resume — Resumes partially completed sync from stored cursor
+  router.post('/sync/resume', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const { maxPages, pageSize, syncRunId } = req.body || {};
+      const result = await resumeShopifySync(repo, workspaceId, {
+        syncRunId: typeof syncRunId === 'string' ? syncRunId : undefined,
+        maxPages: typeof maxPages === 'number' ? maxPages : undefined,
+        pageSize: typeof pageSize === 'number' ? pageSize : undefined,
+      });
+
+      return res.json({
+        success: true,
+        syncRun: result.syncRun,
+        productsDiscovered: result.productsDiscovered,
+        productsImported: result.productsImported,
+        variantsImported: result.variantsImported,
+        excludedByPlan: result.excludedByPlan,
+        status: result.status,
+        message: result.message,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Shopify Routes] Error resuming catalog sync:', err);
+      return res.status(500).json({ error: err.message || 'Resuming synchronization failed' });
+    }
+  });
+
   // 4b. POST /api/shopify/webhooks/register — Registers real webhooks via GraphQL
   router.post('/webhooks/register', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
     try {
@@ -180,6 +221,22 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Webhooks] Registration error:', err);
       return res.status(500).json({ error: err.message || 'Failed to register webhooks' });
+    }
+  });
+
+  // 4c. POST /api/shopify/webhooks/verify — Verifies live Shopify webhook subscriptions via Admin API
+  router.post('/webhooks/verify', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const result = await verifyShopifyWebhookSubscriptionsLive(repo, workspaceId);
+
+      return res.json({
+        success: true,
+        ...result,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Shopify Webhooks] Verification error:', err);
+      return res.status(500).json({ error: err.message || 'Failed to verify webhooks' });
     }
   });
 

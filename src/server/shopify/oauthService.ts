@@ -11,6 +11,7 @@ export interface ShopifyOAuthEnv {
   apiSecret: string;
   appUrl: string;
   redirectUri: string;
+  webhookUrl: string;
   scopes: string;
 }
 
@@ -22,9 +23,10 @@ export function getShopifyOAuthEnv(): ShopifyOAuthEnv {
   const apiSecret = process.env.SHOPIFY_API_SECRET || '';
   const appUrl = process.env.SHOPIFY_APP_URL || 'http://localhost:3000';
   const redirectUri = process.env.SHOPIFY_REDIRECT_URI || `${appUrl}/api/shopify/callback`;
+  const webhookUrl = process.env.SHOPIFY_WEBHOOK_URL || `${appUrl}/api/shopify/webhooks`;
   const scopes = process.env.SHOPIFY_SCOPES || DEFAULT_SHOPIFY_SCOPES;
 
-  return { apiKey, apiSecret, appUrl, redirectUri, scopes };
+  return { apiKey, apiSecret, appUrl, redirectUri, webhookUrl, scopes };
 }
 
 /**
@@ -306,95 +308,104 @@ export async function refreshShopifyToken(
   workspaceId: string,
   options: RefreshTokenOptions = {}
 ): Promise<{ accessToken: string; expiresAt: string | null }> {
-  // Prevent concurrent refresh calls for the same workspace
+  // Prevent concurrent refresh calls within this process
   const activeLock = refreshLocks.get(workspaceId);
   if (activeLock) {
     return activeLock;
   }
 
   const refreshPromise = (async () => {
-    const connection = await repo.getShopifyConnection(workspaceId);
-    if (!connection) {
-      throw new Error(`[AIXSHOP Shopify Refresh] No Shopify connection found for workspace ${workspaceId}.`);
-    }
+    return repo.withShopifyRefreshLock(workspaceId, async (connection) => {
+      // Distributed re-check under the database/repository lock:
+      // If another instance/worker refreshed the token while we were waiting for the lock,
+      // return the freshly rotated token without performing a duplicate HTTP request.
+      const tokenExpiresAt = connection.tokenExpiresAt ? new Date(connection.tokenExpiresAt).getTime() : null;
+      const isStillExpiring = !tokenExpiresAt || (tokenExpiresAt - Date.now() < 5 * 60 * 1000);
+      if (!options.force && !isStillExpiring) {
+        return {
+          accessToken: decryptCredential(connection.accessTokenEncrypted),
+          expiresAt: connection.tokenExpiresAt || null,
+        };
+      }
 
-    if (!connection.refreshTokenEncrypted) {
-      connection.status = 'reauthorization_required';
-      await repo.saveShopifyConnection(connection);
-      throw new Error(
-        `[AIXSHOP Shopify Refresh] No refresh token available for store ${connection.shopDomain}. Reauthorization required.`
-      );
-    }
-
-    const { apiKey, apiSecret } = getShopifyOAuthEnv();
-    if (!apiKey || !apiSecret) {
-      throw new Error('[AIXSHOP Shopify Refresh] Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in environment.');
-    }
-
-    const refreshToken = decryptCredential(connection.refreshTokenEncrypted);
-    const tokenUrl = `https://${connection.shopDomain}/admin/oauth/access_token`;
-    const fetchFn = options.customFetch || fetch;
-
-    const response = await fetchFn(tokenUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify({
-        client_id: apiKey,
-        client_secret: apiSecret,
-        refresh_token: refreshToken,
-        grant_type: 'refresh_token',
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = typeof response.text === 'function' ? await response.text() : '';
-      if (response.status === 400 || response.status === 401) {
+      if (!connection.refreshTokenEncrypted) {
         connection.status = 'reauthorization_required';
         await repo.saveShopifyConnection(connection);
         throw new Error(
-          `[AIXSHOP Shopify Refresh] Merchant reauthorization required: refresh token expired or revoked for ${connection.shopDomain}.`
+          `[AIXSHOP Shopify Refresh] No refresh token available for store ${connection.shopDomain}. Reauthorization required.`
         );
       }
-      throw new Error(`[AIXSHOP Shopify Refresh] Token refresh failed with HTTP ${response.status}: ${errText.slice(0, 300)}`);
-    }
 
-    const tokenData = await response.json();
-    const newAccessToken = tokenData.access_token;
-    if (!newAccessToken || typeof newAccessToken !== 'string') {
-      throw new Error('[AIXSHOP Shopify Refresh] Invalid refresh response: missing access_token.');
-    }
+      const { apiKey, apiSecret } = getShopifyOAuthEnv();
+      if (!apiKey || !apiSecret) {
+        throw new Error('[AIXSHOP Shopify Refresh] Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in environment.');
+      }
 
-    // Refresh-token rotation: Shopify issues a new refresh token on refresh
-    const newRefreshToken = tokenData.refresh_token || refreshToken;
-    const now = Date.now();
-    const newExpiresAt = tokenData.expires_in
-      ? new Date(now + tokenData.expires_in * 1000).toISOString()
-      : null;
-    const newRefreshExpiresAt = tokenData.refresh_token_expires_in
-      ? new Date(now + tokenData.refresh_token_expires_in * 1000).toISOString()
-      : connection.refreshTokenExpiresAt || null;
+      const refreshToken = decryptCredential(connection.refreshTokenEncrypted);
+      const tokenUrl = `https://${connection.shopDomain}/admin/oauth/access_token`;
+      const fetchFn = options.customFetch || fetch;
 
-    const updatedConn: ShopifyConnectionRecord = {
-      ...connection,
-      accessTokenEncrypted: encryptCredential(newAccessToken),
-      refreshTokenEncrypted: encryptCredential(newRefreshToken),
-      tokenExpiresAt: newExpiresAt,
-      refreshTokenExpiresAt: newRefreshExpiresAt,
-      lastRefreshedAt: new Date(now).toISOString(),
-      lastVerifiedAt: new Date(now).toISOString(),
-      status: 'connected',
-      updatedAt: new Date(now).toISOString(),
-    };
+      const response = await fetchFn(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          client_id: apiKey,
+          client_secret: apiSecret,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token',
+        }),
+      });
 
-    await repo.saveShopifyConnection(updatedConn);
+      if (!response.ok) {
+        const errText = typeof response.text === 'function' ? await response.text() : '';
+        if (response.status === 400 || response.status === 401) {
+          connection.status = 'reauthorization_required';
+          await repo.saveShopifyConnection(connection);
+          throw new Error(
+            `[AIXSHOP Shopify Refresh] Merchant reauthorization required: refresh token expired or revoked for ${connection.shopDomain}.`
+          );
+        }
+        throw new Error(`[AIXSHOP Shopify Refresh] Token refresh failed with HTTP ${response.status}: ${errText.slice(0, 300)}`);
+      }
 
-    return {
-      accessToken: newAccessToken,
-      expiresAt: newExpiresAt,
-    };
+      const tokenData = await response.json();
+      const newAccessToken = tokenData.access_token;
+      if (!newAccessToken || typeof newAccessToken !== 'string') {
+        throw new Error('[AIXSHOP Shopify Refresh] Invalid refresh response: missing access_token.');
+      }
+
+      // Refresh-token rotation: Shopify issues a new refresh token on refresh
+      const newRefreshToken = tokenData.refresh_token || refreshToken;
+      const now = Date.now();
+      const newExpiresAt = tokenData.expires_in
+        ? new Date(now + tokenData.expires_in * 1000).toISOString()
+        : null;
+      const newRefreshExpiresAt = tokenData.refresh_token_expires_in
+        ? new Date(now + tokenData.refresh_token_expires_in * 1000).toISOString()
+        : connection.refreshTokenExpiresAt || null;
+
+      const updatedConn: ShopifyConnectionRecord = {
+        ...connection,
+        accessTokenEncrypted: encryptCredential(newAccessToken),
+        refreshTokenEncrypted: encryptCredential(newRefreshToken),
+        tokenExpiresAt: newExpiresAt,
+        refreshTokenExpiresAt: newRefreshExpiresAt,
+        lastRefreshedAt: new Date(now).toISOString(),
+        lastVerifiedAt: new Date(now).toISOString(),
+        status: 'connected',
+        updatedAt: new Date(now).toISOString(),
+      };
+
+      await repo.saveShopifyConnection(updatedConn);
+
+      return {
+        accessToken: newAccessToken,
+        expiresAt: newExpiresAt,
+      };
+    });
   })();
 
   refreshLocks.set(workspaceId, refreshPromise);

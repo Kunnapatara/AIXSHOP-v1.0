@@ -1241,5 +1241,35 @@ export class MemoryRepository implements DatabaseRepository {
       existing.updatedAt = new Date().toISOString();
     }
   }
+
+  private shopifyRefreshLocks = new Map<string, Promise<any>>();
+
+  async withShopifyRefreshLock<T>(
+    workspaceId: string,
+    fn: (connection: import('../shopify/types').ShopifyConnectionRecord) => Promise<T>
+  ): Promise<T> {
+    const prevLock = this.shopifyRefreshLocks.get(workspaceId) || Promise.resolve();
+    let releaseCurrent: () => void;
+    const currentPromise = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+
+    const chainTail = prevLock.catch(() => {}).then(() => currentPromise);
+    this.shopifyRefreshLocks.set(workspaceId, chainTail);
+
+    try {
+      await prevLock.catch(() => {});
+      const connection = await this.getShopifyConnection(workspaceId);
+      if (!connection) {
+        throw new Error(`[AIXSHOP Shopify Refresh] No Shopify connection found for workspace ${workspaceId}.`);
+      }
+      return await fn(connection);
+    } finally {
+      releaseCurrent!();
+      if (this.shopifyRefreshLocks.get(workspaceId) === chainTail) {
+        this.shopifyRefreshLocks.delete(workspaceId);
+      }
+    }
+  }
 }
 

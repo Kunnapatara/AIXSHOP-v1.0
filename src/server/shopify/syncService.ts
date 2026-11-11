@@ -225,6 +225,8 @@ export async function syncShopifyCatalog(
       let pageCount = 0;
       const maxPages = options.maxPages ?? 200; // Safe pagination ceiling
       const pageSize = options.pageSize ?? 50;
+      const seenCursors = new Set<string>();
+      if (cursor) seenCursors.add(cursor);
 
       let totalDiscoveredProducts = 0;
       let totalDiscoveredVariants = 0;
@@ -295,7 +297,12 @@ export async function syncShopifyCatalog(
         }
 
         hasNextPage = pageResult.hasNextPage;
+        if (pageResult.endCursor && seenCursors.has(pageResult.endCursor)) {
+          // Guard against non-advancing or repeating cursors
+          break;
+        }
         cursor = pageResult.endCursor;
+        if (cursor) seenCursors.add(cursor);
       }
 
       // Merge new and preserved products into final catalog
@@ -375,5 +382,47 @@ export async function syncShopifyCatalog(
       });
       throw err;
     }
+  });
+}
+
+export interface ResumeSyncOptions {
+  syncRunId?: string;
+  maxPages?: number;
+  pageSize?: number;
+  customFetch?: typeof fetch;
+}
+
+/**
+ * Resumes a partially completed Shopify catalog synchronization from its persisted cursor.
+ * Verifies that the previous run was partially completed and has a valid resumption cursor,
+ * and seamlessly merges remaining products into the catalog without duplicating existing items.
+ */
+export async function resumeShopifySync(
+  repo: DatabaseRepository,
+  workspaceId: string,
+  options: ResumeSyncOptions = {}
+): Promise<SyncCatalogResult> {
+  const latestRun = await repo.getLatestShopifySyncRun(workspaceId);
+  if (!latestRun) {
+    throw new Error(`[AIXSHOP Shopify Sync] No previous sync run found for workspace ${workspaceId} to resume.`);
+  }
+
+  if (latestRun.status !== 'partially_completed') {
+    throw new Error(
+      `[AIXSHOP Shopify Sync] Latest sync run is '${latestRun.status}', not 'partially_completed'. Start a new sync instead.`
+    );
+  }
+
+  if (!latestRun.cursorResumed) {
+    throw new Error(
+      '[AIXSHOP Shopify Sync] Previous sync run does not contain a resumption cursor.'
+    );
+  }
+
+  return syncShopifyCatalog(repo, workspaceId, {
+    resumeCursor: latestRun.cursorResumed,
+    maxPages: options.maxPages,
+    pageSize: options.pageSize,
+    customFetch: options.customFetch,
   });
 }

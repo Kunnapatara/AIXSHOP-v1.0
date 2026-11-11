@@ -381,6 +381,10 @@ export async function fetchProductsPage(
       let vHasNext = true;
       let vCursor: string | null = product.variants.pageInfo.endCursor;
       let vSafetyPages = 0;
+      const seenVariantCursors = new Set<string>();
+      if (vCursor) seenVariantCursors.add(vCursor);
+      const seenVariantIds = new Set(product.variants.edges.map(e => e.node.id));
+
       while (vHasNext && vCursor && vSafetyPages < 50) {
         vSafetyPages++;
         const more = await fetchRemainingProductVariants(
@@ -390,7 +394,20 @@ export async function fetchProductsPage(
           vCursor,
           options
         );
-        product.variants.edges.push(...more.variants);
+
+        for (const vEdge of more.variants) {
+          if (!seenVariantIds.has(vEdge.node.id)) {
+            seenVariantIds.add(vEdge.node.id);
+            product.variants.edges.push(vEdge);
+          }
+        }
+
+        if (!more.endCursor || seenVariantCursors.has(more.endCursor)) {
+          // Guard against non-advancing or repeating cursors
+          break;
+        }
+
+        seenVariantCursors.add(more.endCursor);
         vHasNext = more.hasNextPage;
         vCursor = more.endCursor;
       }

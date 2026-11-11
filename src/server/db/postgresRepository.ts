@@ -2743,6 +2743,74 @@ export class PostgresRepository implements DatabaseRepository {
       [shopDomain, topic, eventId, status, error || null]
     );
   }
+
+  async withShopifyRefreshLock<T>(
+    workspaceId: string,
+    fn: (connection: import('../shopify/types').ShopifyConnectionRecord) => Promise<T>
+  ): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const res = await client.query<any>(
+        `SELECT 
+          id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+          access_token_encrypted AS "accessTokenEncrypted",
+          refresh_token_encrypted AS "refreshTokenEncrypted",
+          token_expires_at AS "tokenExpiresAt",
+          refresh_token_expires_at AS "refreshTokenExpiresAt",
+          last_refreshed_at AS "lastRefreshedAt",
+          webhook_subscriptions_json AS "webhookSubscriptions",
+          granted_scopes AS "grantedScopes",
+          key_version AS "keyVersion",
+          status, installed_at AS "installedAt",
+          last_verified_at AS "lastVerifiedAt",
+          created_at AS "createdAt", updated_at AS "updatedAt"
+        FROM shopify_connections
+        WHERE workspace_id = $1
+        FOR UPDATE`,
+        [workspaceId]
+      );
+
+      if (res.rows.length === 0) {
+        throw new Error(`[AIXSHOP Shopify Refresh] No Shopify connection found for workspace ${workspaceId}.`);
+      }
+
+      const r = res.rows[0];
+      const lockedConn: import('../shopify/types').ShopifyConnectionRecord = {
+        id: r.id,
+        workspaceId: r.workspaceId,
+        shopDomain: r.shopDomain,
+        accessTokenEncrypted: r.accessTokenEncrypted,
+        refreshTokenEncrypted: r.refreshTokenEncrypted,
+        tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
+        refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
+        lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
+        webhookSubscriptions: Array.isArray(r.webhookSubscriptions)
+          ? r.webhookSubscriptions
+          : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : []),
+        grantedScopes: r.grantedScopes,
+        keyVersion: r.keyVersion,
+        status: r.status,
+        installedAt: new Date(r.installedAt).toISOString(),
+        lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
+        createdAt: new Date(r.createdAt).toISOString(),
+        updatedAt: new Date(r.updatedAt).toISOString(),
+      };
+
+      const result = await fn(lockedConn);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('[AIXSHOP PostgresRepository] Rollback error in withShopifyRefreshLock:', rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 }
 
 
