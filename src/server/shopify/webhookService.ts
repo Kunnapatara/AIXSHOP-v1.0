@@ -1,13 +1,166 @@
 import { DatabaseRepository } from '../db/repository';
 import { verifyShopifyWebhookHmac } from '../security/encryption';
 import { getShopifyOAuthEnv, disconnectShopify } from './oauthService';
-import { normalizeShopDomain } from './client';
+import { normalizeShopDomain, executeShopifyGraphQL } from './client';
 import { Product, Variant } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { parseSourcePrice } from '../../domain/validation/price';
 import { calculateProductCompleteness } from '../../domain/catalog/completeness';
 import { resolveWorkspacePlanEntitlement, countCatalogSkus, withWorkspaceLock } from '../services/entitlementService';
 import { detectProductConflict } from '../../domain/ingestion/storeIngestion';
+
+export const DEFAULT_SHOPIFY_WEBHOOK_TOPICS = [
+  'PRODUCTS_CREATE',
+  'PRODUCTS_UPDATE',
+  'PRODUCTS_DELETE',
+  'APP_UNINSTALLED',
+];
+
+export interface WebhookRegistrationResult {
+  topic: string;
+  success: boolean;
+  id?: string;
+  error?: string;
+}
+
+/**
+ * Registers webhook subscriptions on Shopify via Admin GraphQL webhookSubscriptionCreate mutation.
+ */
+export async function registerShopifyWebhookSubscriptions(
+  shopDomain: string,
+  accessToken: string,
+  callbackUrl: string,
+  topics: string[] = DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+  options: { customFetch?: typeof fetch } = {}
+): Promise<WebhookRegistrationResult[]> {
+  const results: WebhookRegistrationResult[] = [];
+
+  const mutation = `
+    mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+      webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+        userErrors {
+          field
+          message
+        }
+        webhookSubscription {
+          id
+          topic
+          endpoint {
+            __typename
+            ... on WebhookHttpEndpoint {
+              callbackUrl
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  for (const rawTopic of topics) {
+    const formattedTopic = rawTopic.toUpperCase().replace(/\//g, '_');
+    try {
+      const response = await executeShopifyGraphQL<{
+        webhookSubscriptionCreate: {
+          userErrors: Array<{ field: string[]; message: string }>;
+          webhookSubscription: { id: string; topic: string } | null;
+        };
+      }>(
+        shopDomain,
+        accessToken,
+        mutation,
+        {
+          topic: formattedTopic,
+          webhookSubscription: {
+            callbackUrl,
+            format: 'JSON',
+          },
+        },
+        options
+      );
+
+      const payload = response.data?.webhookSubscriptionCreate;
+      if (payload?.userErrors && payload.userErrors.length > 0) {
+        const errMsg = payload.userErrors.map(e => e.message).join('; ');
+        results.push({
+          topic: formattedTopic,
+          success: errMsg.toLowerCase().includes('already taken') || errMsg.toLowerCase().includes('already exists'),
+          error: errMsg,
+        });
+      } else if (payload?.webhookSubscription) {
+        results.push({
+          topic: formattedTopic,
+          success: true,
+          id: payload.webhookSubscription.id,
+        });
+      } else {
+        results.push({
+          topic: formattedTopic,
+          success: false,
+          error: 'No subscription created in response',
+        });
+      }
+    } catch (err: any) {
+      results.push({
+        topic: formattedTopic,
+        success: false,
+        error: err?.message || 'Failed to register webhook',
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Queries active webhook subscriptions from Shopify Admin API.
+ */
+export async function getShopifyWebhookSubscriptions(
+  shopDomain: string,
+  accessToken: string,
+  options: { customFetch?: typeof fetch } = {}
+): Promise<Array<{ id: string; topic: string; callbackUrl?: string }>> {
+  const query = `
+    query getWebhooks {
+      webhookSubscriptions(first: 25) {
+        edges {
+          node {
+            id
+            topic
+            endpoint {
+              __typename
+              ... on WebhookHttpEndpoint {
+                callbackUrl
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const response = await executeShopifyGraphQL<{
+      webhookSubscriptions: {
+        edges: Array<{
+          node: {
+            id: string;
+            topic: string;
+            endpoint?: { callbackUrl?: string };
+          };
+        }>;
+      };
+    }>(shopDomain, accessToken, query, {}, options);
+
+    return (response.data?.webhookSubscriptions?.edges || []).map(e => ({
+      id: e.node.id,
+      topic: e.node.topic,
+      callbackUrl: e.node.endpoint?.callbackUrl,
+    }));
+  } catch (err: any) {
+    console.warn(`[AIXSHOP Webhooks] Failed to fetch webhook subscriptions for ${shopDomain}:`, err.message);
+    return [];
+  }
+}
 
 export interface WebhookProcessResult {
   processed: boolean;
@@ -67,6 +220,7 @@ export function mapWebhookPayloadToDomainProduct(payload: any, currency = 'USD')
       shopifyGid: `gid://shopify/Product/${numericId}`,
       shopifyHandle: payload.handle || '',
       shopifyStatus: payload.status || 'active',
+      shopifyUpdatedAt: payload.updated_at || new Date().toISOString(),
       provenance: 'shopify_webhook',
     },
     variants,
@@ -215,8 +369,26 @@ export async function processShopifyWebhook(
         );
 
         if (existingIdx >= 0) {
-          // Update: preserve merchant edits
+          // Update: preserve merchant edits and check for out-of-order delivery
           const existing = currentProducts[existingIdx];
+
+          // Out-of-order delivery protection: discard older updates
+          if (payload.updated_at && existing.attributes?.shopifyUpdatedAt) {
+            const incomingTime = new Date(payload.updated_at).getTime();
+            const existingTime = new Date(existing.attributes.shopifyUpdatedAt).getTime();
+            if (!isNaN(incomingTime) && !isNaN(existingTime) && incomingTime < existingTime) {
+              console.warn(`[AIXSHOP Webhook] Out-of-order webhook event discarded for product ${incomingProduct.id}. Incoming: ${payload.updated_at}, Existing: ${existing.attributes.shopifyUpdatedAt}`);
+              await repo.updateShopifyWebhookEventStatus(
+                eventId,
+                shop,
+                topic,
+                'ignored',
+                'Stale out-of-order event skipped: payload updated_at is older than existing product state.'
+              );
+              return;
+            }
+          }
+
           const conflict = detectProductConflict(incomingProduct, existing);
           const updatedProduct: Product = {
             ...incomingProduct,

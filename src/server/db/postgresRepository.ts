@@ -80,6 +80,7 @@ export class PostgresRepository implements DatabaseRepository {
       'schema_migrations',
       'subscriptions',
       'billing_events',
+      'audit_runs',
       'audit_run_manifests',
       'audit_run_findings',
       'audit_run_evidence',
@@ -87,6 +88,7 @@ export class PostgresRepository implements DatabaseRepository {
       'shopify_connections',
       'shopify_sync_runs',
       'shopify_webhook_events',
+      'shopify_oauth_states',
     ];
 
     try {
@@ -316,6 +318,7 @@ export class PostgresRepository implements DatabaseRepository {
           '005_billing_subscriptions.sql',
           '006_audit_history_snapshots.sql',
           '007_shopify_integration.sql',
+          '008_audit_composite_integrity_and_shopify_hardening.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -391,6 +394,23 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
+        // 4.1b Verify unique constraint on audit_runs(workspace_id, id)
+        const expectedAuditRunCols = ['workspace_id', 'id'];
+        const auditRunUniqueConstraint = catalogRows.find(
+          r =>
+            (r.source_schema || activeSchema) === activeSchema &&
+            r.source_table === 'audit_runs' &&
+            ['u', 'p'].includes(r.constraint_type) &&
+            arraysEqual(parseCols(r.source_columns), expectedAuditRunCols)
+        );
+
+        if (!auditRunUniqueConstraint) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: audit_runs table missing unique key on (workspace_id, id). Run "npm run db:migrate".',
+          };
+        }
+
         // 4.2 Verify required composite foreign keys with exact ordinal mapping and active schema scoping
         const requiredCompositeFks = [
           {
@@ -435,6 +455,34 @@ export class PostgresRepository implements DatabaseRepository {
             targetColumns: ['workspace_id', 'id'],
             description: 'action_items(workspace_id, product_id) -> products(workspace_id, id)',
           },
+          {
+            sourceTable: 'audit_run_manifests',
+            sourceColumns: ['workspace_id', 'audit_run_id'],
+            targetTable: 'audit_runs',
+            targetColumns: ['workspace_id', 'id'],
+            description: 'audit_run_manifests(workspace_id, audit_run_id) -> audit_runs(workspace_id, id)',
+          },
+          {
+            sourceTable: 'audit_run_findings',
+            sourceColumns: ['workspace_id', 'audit_run_id'],
+            targetTable: 'audit_runs',
+            targetColumns: ['workspace_id', 'id'],
+            description: 'audit_run_findings(workspace_id, audit_run_id) -> audit_runs(workspace_id, id)',
+          },
+          {
+            sourceTable: 'audit_run_evidence',
+            sourceColumns: ['workspace_id', 'audit_run_id'],
+            targetTable: 'audit_runs',
+            targetColumns: ['workspace_id', 'id'],
+            description: 'audit_run_evidence(workspace_id, audit_run_id) -> audit_runs(workspace_id, id)',
+          },
+          {
+            sourceTable: 'audit_run_products',
+            sourceColumns: ['workspace_id', 'audit_run_id'],
+            targetTable: 'audit_runs',
+            targetColumns: ['workspace_id', 'id'],
+            description: 'audit_run_products(workspace_id, audit_run_id) -> audit_runs(workspace_id, id)',
+          },
         ];
 
         for (const reqFk of requiredCompositeFks) {
@@ -476,6 +524,7 @@ export class PostgresRepository implements DatabaseRepository {
             appliedMigrations,
             verifiedConstraints: [
               'stores(workspace_id, id) UNIQUE',
+              'audit_runs(workspace_id, id) UNIQUE',
               ...requiredCompositeFks.map(f => f.description),
               'products(workspace_id) -> workspaces(id)',
             ],
@@ -2384,8 +2433,9 @@ export class PostgresRepository implements DatabaseRepository {
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
         access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
-        token_expires_at AS "tokenExpiresAt", granted_scopes AS "grantedScopes",
-        key_version AS "keyVersion", status, installed_at AS "installedAt",
+        token_expires_at AS "tokenExpiresAt", refresh_token_expires_at AS "refreshTokenExpiresAt",
+        last_refreshed_at AS "lastRefreshedAt", webhook_subscriptions_json AS "webhookSubscriptions",
+        granted_scopes AS "grantedScopes", key_version AS "keyVersion", status, installed_at AS "installedAt",
         last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_connections
        WHERE workspace_id = $1`,
@@ -2397,6 +2447,9 @@ export class PostgresRepository implements DatabaseRepository {
     return {
       ...r,
       tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
+      refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
+      lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
+      webhookSubscriptions: Array.isArray(r.webhookSubscriptions) ? r.webhookSubscriptions : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : undefined),
       installedAt: new Date(r.installedAt).toISOString(),
       lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
       createdAt: new Date(r.createdAt).toISOString(),
@@ -2410,8 +2463,9 @@ export class PostgresRepository implements DatabaseRepository {
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
         access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
-        token_expires_at AS "tokenExpiresAt", granted_scopes AS "grantedScopes",
-        key_version AS "keyVersion", status, installed_at AS "installedAt",
+        token_expires_at AS "tokenExpiresAt", refresh_token_expires_at AS "refreshTokenExpiresAt",
+        last_refreshed_at AS "lastRefreshedAt", webhook_subscriptions_json AS "webhookSubscriptions",
+        granted_scopes AS "grantedScopes", key_version AS "keyVersion", status, installed_at AS "installedAt",
         last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_connections
        WHERE LOWER(shop_domain) = $1`,
@@ -2423,6 +2477,9 @@ export class PostgresRepository implements DatabaseRepository {
     return {
       ...r,
       tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
+      refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
+      lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
+      webhookSubscriptions: Array.isArray(r.webhookSubscriptions) ? r.webhookSubscriptions : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : undefined),
       installedAt: new Date(r.installedAt).toISOString(),
       lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
       createdAt: new Date(r.createdAt).toISOString(),
@@ -2434,14 +2491,18 @@ export class PostgresRepository implements DatabaseRepository {
     await this.pool.query(
       `INSERT INTO shopify_connections (
         id, workspace_id, shop_domain, access_token_encrypted, refresh_token_encrypted,
-        token_expires_at, granted_scopes, key_version, status, installed_at,
+        token_expires_at, refresh_token_expires_at, last_refreshed_at, webhook_subscriptions_json,
+        granted_scopes, key_version, status, installed_at,
         last_verified_at, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
       ON CONFLICT (workspace_id) DO UPDATE SET
         shop_domain = EXCLUDED.shop_domain,
         access_token_encrypted = EXCLUDED.access_token_encrypted,
         refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
         token_expires_at = EXCLUDED.token_expires_at,
+        refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
+        last_refreshed_at = EXCLUDED.last_refreshed_at,
+        webhook_subscriptions_json = EXCLUDED.webhook_subscriptions_json,
         granted_scopes = EXCLUDED.granted_scopes,
         key_version = EXCLUDED.key_version,
         status = EXCLUDED.status,
@@ -2454,6 +2515,9 @@ export class PostgresRepository implements DatabaseRepository {
         conn.accessTokenEncrypted,
         conn.refreshTokenEncrypted || null,
         conn.tokenExpiresAt || null,
+        conn.refreshTokenExpiresAt || null,
+        conn.lastRefreshedAt || null,
+        conn.webhookSubscriptions ? JSON.stringify(conn.webhookSubscriptions) : null,
         conn.grantedScopes,
         conn.keyVersion,
         conn.status,
@@ -2562,6 +2626,10 @@ export class PostgresRepository implements DatabaseRepository {
     if (updates.completedAt !== undefined) {
       params.push(updates.completedAt);
       setClauses.push(`completed_at = $${params.length}`);
+    }
+    if (updates.cursorResumed !== undefined) {
+      params.push(updates.cursorResumed);
+      setClauses.push(`cursor_resumed = $${params.length}`);
     }
 
     const res = await this.pool.query<any>(

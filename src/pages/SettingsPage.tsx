@@ -520,7 +520,7 @@ export const SettingsPage: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <h3 className="text-sm font-bold text-stone-900">Official Shopify Admin Integration</h3>
                     <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-stone-100 text-stone-600 font-semibold border border-stone-200">
-                      GraphQL 2025-01
+                      GraphQL 2026-10
                     </span>
                   </div>
                   <p className="text-xs text-stone-500 mt-0.5">
@@ -747,10 +747,10 @@ export const SettingsPage: React.FC = () => {
                   <div className="p-3 bg-stone-50 rounded-xl border border-stone-200/80 space-y-1">
                     <span className="font-bold text-stone-900 flex items-center gap-1.5">
                       <Layers className="w-3.5 h-3.5 text-blue-600" />
-                      <span>Admin GraphQL 2025-01</span>
+                      <span>Admin GraphQL 2026-10</span>
                     </span>
                     <p className="text-stone-600 text-[11px] leading-relaxed">
-                      Queries are pinned to API version 2025-01 with cursor-based pagination and dynamic throttle backoff to respect Shopify rate limits.
+                      Queries are pinned to latest stable API version 2026-10 with cursor-based pagination, expiring offline OAuth token lifecycle, and throttle backoff.
                     </p>
                   </div>
 

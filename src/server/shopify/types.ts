@@ -5,9 +5,12 @@ export interface ShopifyConnectionRecord {
   accessTokenEncrypted: string;
   refreshTokenEncrypted?: string | null;
   tokenExpiresAt?: string | null;
+  refreshTokenExpiresAt?: string | null;
+  lastRefreshedAt?: string | null;
+  webhookSubscriptions?: Array<string | { id?: string; topic: string; callbackUrl?: string; active?: boolean }>;
   grantedScopes: string;
   keyVersion: string;
-  status: 'connected' | 'disconnected' | 'reauth_required';
+  status: 'connected' | 'disconnected' | 'reauth_required' | 'reauthorization_required';
   installedAt: string;
   lastVerifiedAt: string;
   createdAt: string;
@@ -57,12 +60,16 @@ export interface ShopifyOAuthStateRecord {
 
 export interface ShopifyPublicStatus {
   connected: boolean;
-  status: 'not_connected' | 'connected' | 'reauth_required' | 'disconnected';
+  status: 'not_connected' | 'connected' | 'reauth_required' | 'reauthorization_required' | 'disconnected';
   shopDomain: string | null;
   grantedScopes: string[];
   installedAt: string | null;
   lastVerifiedAt: string | null;
   latestSync: ShopifySyncRunRecord | null;
+  tokenExpiresAt?: string | null;
+  refreshTokenExpiresAt?: string | null;
+  webhookStatus?: 'active' | 'not_configured' | 'pending' | 'inactive';
+  activeWebhooks?: string[];
 }
 
 /**
@@ -77,6 +84,7 @@ export interface ShopifyGraphQLImageEdge {
 }
 
 export interface ShopifyGraphQLVariantEdge {
+  cursor?: string;
   node: {
     id: string;
     title: string;
@@ -105,6 +113,10 @@ export interface ShopifyGraphQLProductNode {
     edges: ShopifyGraphQLImageEdge[];
   };
   variants?: {
+    pageInfo?: {
+      hasNextPage: boolean;
+      endCursor: string | null;
+    };
     edges: ShopifyGraphQLVariantEdge[];
   };
 }

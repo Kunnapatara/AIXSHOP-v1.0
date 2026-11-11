@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { DatabaseRepository } from '../db/repository';
 import { ShopifyConnectionRecord } from './types';
 import { isValidShopDomain, normalizeShopDomain, verifyShopifyConnection } from './client';
-import { encryptCredential, verifyHmacSha256 } from '../security/encryption';
+import { encryptCredential, decryptCredential, verifyHmacSha256 } from '../security/encryption';
 
 export const DEFAULT_SHOPIFY_SCOPES = 'read_products';
 
@@ -167,7 +167,7 @@ export async function handleShopifyCallback(
     throw new Error('[AIXSHOP Shopify OAuth] Missing authorization code in callback.');
   }
 
-  // 3. Exchange authorization code for access token
+  // 3. Exchange authorization code for access token with expiring=1 for expiring offline token flow
   const tokenUrl = `https://${shop}/admin/oauth/access_token`;
   const fetchFn = options.customFetch || fetch;
 
@@ -181,6 +181,7 @@ export async function handleShopifyCallback(
       client_id: apiKey,
       client_secret: apiSecret,
       code,
+      expiring: 1,
     }),
   });
 
@@ -218,12 +219,16 @@ export async function handleShopifyCallback(
     ? encryptCredential(tokenData.refresh_token)
     : null;
 
+  const now = new Date();
   const tokenExpiresAt = tokenData.expires_in
-    ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString()
+    ? new Date(now.getTime() + tokenData.expires_in * 1000).toISOString()
+    : null;
+  const refreshTokenExpiresAt = tokenData.refresh_token_expires_in
+    ? new Date(now.getTime() + tokenData.refresh_token_expires_in * 1000).toISOString()
     : null;
 
   const connectionId = `conn_shopify_${workspaceId}`;
-  const now = new Date().toISOString();
+  const nowIso = now.toISOString();
 
   const connection: ShopifyConnectionRecord = {
     id: connectionId,
@@ -232,13 +237,16 @@ export async function handleShopifyCallback(
     accessTokenEncrypted,
     refreshTokenEncrypted,
     tokenExpiresAt,
+    refreshTokenExpiresAt,
+    lastRefreshedAt: null,
+    webhookSubscriptions: [],
     grantedScopes,
     keyVersion: 'v1',
     status: 'connected',
-    installedAt: now,
-    lastVerifiedAt: now,
-    createdAt: now,
-    updatedAt: now,
+    installedAt: nowIso,
+    lastVerifiedAt: nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
   };
 
   const savedConnection = await repo.saveShopifyConnection(connection);
@@ -254,7 +262,7 @@ export async function handleShopifyCallback(
       type: 'shopify' as const,
       status: 'connected' as const,
       productCountSynced: storeProfile.skuCount || 0,
-      lastSync: now,
+      lastSync: nowIso,
       writeBackAuthorized: false,
     };
 
@@ -280,11 +288,158 @@ export async function handleShopifyCallback(
   };
 }
 
+export interface RefreshTokenOptions {
+  customFetch?: typeof fetch;
+  force?: boolean;
+}
+
+const refreshLocks = new Map<string, Promise<any>>();
+
+/**
+ * Dedicated server-side token refresh service for expiring offline tokens.
+ * Handles rotated refresh tokens, encrypts both tokens before persistence,
+ * serializes concurrent refresh calls with a workspace lock, and marks reauthorization_required
+ * if the refresh token has expired or been revoked.
+ */
+export async function refreshShopifyToken(
+  repo: DatabaseRepository,
+  workspaceId: string,
+  options: RefreshTokenOptions = {}
+): Promise<{ accessToken: string; expiresAt: string | null }> {
+  // Prevent concurrent refresh calls for the same workspace
+  const activeLock = refreshLocks.get(workspaceId);
+  if (activeLock) {
+    return activeLock;
+  }
+
+  const refreshPromise = (async () => {
+    const connection = await repo.getShopifyConnection(workspaceId);
+    if (!connection) {
+      throw new Error(`[AIXSHOP Shopify Refresh] No Shopify connection found for workspace ${workspaceId}.`);
+    }
+
+    if (!connection.refreshTokenEncrypted) {
+      connection.status = 'reauthorization_required';
+      await repo.saveShopifyConnection(connection);
+      throw new Error(
+        `[AIXSHOP Shopify Refresh] No refresh token available for store ${connection.shopDomain}. Reauthorization required.`
+      );
+    }
+
+    const { apiKey, apiSecret } = getShopifyOAuthEnv();
+    if (!apiKey || !apiSecret) {
+      throw new Error('[AIXSHOP Shopify Refresh] Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET in environment.');
+    }
+
+    const refreshToken = decryptCredential(connection.refreshTokenEncrypted);
+    const tokenUrl = `https://${connection.shopDomain}/admin/oauth/access_token`;
+    const fetchFn = options.customFetch || fetch;
+
+    const response = await fetchFn(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: apiKey,
+        client_secret: apiSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = typeof response.text === 'function' ? await response.text() : '';
+      if (response.status === 400 || response.status === 401) {
+        connection.status = 'reauthorization_required';
+        await repo.saveShopifyConnection(connection);
+        throw new Error(
+          `[AIXSHOP Shopify Refresh] Merchant reauthorization required: refresh token expired or revoked for ${connection.shopDomain}.`
+        );
+      }
+      throw new Error(`[AIXSHOP Shopify Refresh] Token refresh failed with HTTP ${response.status}: ${errText.slice(0, 300)}`);
+    }
+
+    const tokenData = await response.json();
+    const newAccessToken = tokenData.access_token;
+    if (!newAccessToken || typeof newAccessToken !== 'string') {
+      throw new Error('[AIXSHOP Shopify Refresh] Invalid refresh response: missing access_token.');
+    }
+
+    // Refresh-token rotation: Shopify issues a new refresh token on refresh
+    const newRefreshToken = tokenData.refresh_token || refreshToken;
+    const now = Date.now();
+    const newExpiresAt = tokenData.expires_in
+      ? new Date(now + tokenData.expires_in * 1000).toISOString()
+      : null;
+    const newRefreshExpiresAt = tokenData.refresh_token_expires_in
+      ? new Date(now + tokenData.refresh_token_expires_in * 1000).toISOString()
+      : connection.refreshTokenExpiresAt || null;
+
+    const updatedConn: ShopifyConnectionRecord = {
+      ...connection,
+      accessTokenEncrypted: encryptCredential(newAccessToken),
+      refreshTokenEncrypted: encryptCredential(newRefreshToken),
+      tokenExpiresAt: newExpiresAt,
+      refreshTokenExpiresAt: newRefreshExpiresAt,
+      lastRefreshedAt: new Date(now).toISOString(),
+      lastVerifiedAt: new Date(now).toISOString(),
+      status: 'connected',
+      updatedAt: new Date(now).toISOString(),
+    };
+
+    await repo.saveShopifyConnection(updatedConn);
+
+    return {
+      accessToken: newAccessToken,
+      expiresAt: newExpiresAt,
+    };
+  })();
+
+  refreshLocks.set(workspaceId, refreshPromise);
+  try {
+    return await refreshPromise;
+  } finally {
+    refreshLocks.delete(workspaceId);
+  }
+}
+
+/**
+ * Returns a valid, non-expired decrypted Shopify access token for a workspace.
+ * Automatically refreshes expiring tokens (within 5 minutes of expiry) or on-demand when expired.
+ */
+export async function getValidShopifyAccessToken(
+  repo: DatabaseRepository,
+  workspaceId: string,
+  options: RefreshTokenOptions = {}
+): Promise<string> {
+  const connection = await repo.getShopifyConnection(workspaceId);
+  if (!connection || connection.status === 'disconnected') {
+    throw new Error(`[AIXSHOP Shopify] Workspace ${workspaceId} is not connected to Shopify.`);
+  }
+
+  if (connection.status === 'reauthorization_required' || connection.status === 'reauth_required') {
+    throw new Error(`[AIXSHOP Shopify] Connection for ${connection.shopDomain} requires merchant reauthorization.`);
+  }
+
+  const tokenExpiresAt = connection.tokenExpiresAt ? new Date(connection.tokenExpiresAt).getTime() : null;
+  const isExpiringSoon = tokenExpiresAt && (tokenExpiresAt - Date.now() < 5 * 60 * 1000);
+
+  if (options.force || isExpiringSoon) {
+    const refreshed = await refreshShopifyToken(repo, workspaceId, options);
+    return refreshed.accessToken;
+  }
+
+  return decryptCredential(connection.accessTokenEncrypted);
+}
+
 /**
  * Disconnects the workspace's Shopify connection:
- * - Deletes encrypted tokens.
+ * - Deletes encrypted tokens locally.
  * - Marks connection status as 'disconnected'.
  * - Preserves previously imported catalog products and audit history.
+ * - Truthfully reports that credentials were removed locally without claiming Shopify-side app deletion.
  */
 export async function disconnectShopify(
   repo: DatabaseRepository,
@@ -311,6 +466,6 @@ export async function disconnectShopify(
 
   return {
     success: true,
-    message: `Successfully disconnected Shopify store ${connection.shopDomain}. Catalog data and audit history preserved.`,
+    message: `Successfully removed stored credentials and disconnected Shopify store ${connection.shopDomain} locally. Catalog data and audit history preserved. To completely remove AIXSHOP permissions, uninstall the app from Shopify Admin > Apps settings.`,
   };
 }

@@ -6,10 +6,11 @@ import {
   initiateShopifyConnect, 
   handleShopifyCallback, 
   disconnectShopify,
-  getShopifyOAuthEnv
+  getShopifyOAuthEnv,
+  getValidShopifyAccessToken
 } from '../shopify/oauthService';
 import { syncShopifyCatalog } from '../shopify/syncService';
-import { processShopifyWebhook } from '../shopify/webhookService';
+import { processShopifyWebhook, registerShopifyWebhookSubscriptions } from '../shopify/webhookService';
 import { ShopifyPublicStatus } from '../shopify/types';
 
 export function createShopifyRoutes(repo: DatabaseRepository): Router {
@@ -31,6 +32,10 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           grantedScopes: [],
           installedAt: null,
           lastVerifiedAt: null,
+          tokenExpiresAt: null,
+          refreshTokenExpiresAt: null,
+          webhookStatus: 'inactive',
+          activeWebhooks: [],
           latestSync,
         };
         return res.json(status);
@@ -43,6 +48,10 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         grantedScopes: connection.grantedScopes.split(',').map(s => s.trim()).filter(Boolean),
         installedAt: connection.installedAt,
         lastVerifiedAt: connection.lastVerifiedAt,
+        tokenExpiresAt: connection.tokenExpiresAt || null,
+        refreshTokenExpiresAt: connection.refreshTokenExpiresAt || null,
+        webhookStatus: (connection.webhookSubscriptions && connection.webhookSubscriptions.length > 0) ? 'active' : 'inactive',
+        activeWebhooks: (connection.webhookSubscriptions || []).map(w => typeof w === 'string' ? w : w.topic),
         latestSync,
       };
 
@@ -114,7 +123,12 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
   router.post('/sync', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
-      const result = await syncShopifyCatalog(repo, workspaceId);
+      const { maxPages, pageSize, resumeCursor } = req.body || {};
+      const result = await syncShopifyCatalog(repo, workspaceId, {
+        maxPages: typeof maxPages === 'number' ? maxPages : undefined,
+        pageSize: typeof pageSize === 'number' ? pageSize : undefined,
+        resumeCursor: typeof resumeCursor === 'string' ? resumeCursor : undefined,
+      });
 
       return res.json({
         success: true,
@@ -129,6 +143,43 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Routes] Error syncing catalog:', err);
       return res.status(500).json({ error: err.message || 'Catalog synchronization failed' });
+    }
+  });
+
+  // 4b. POST /api/shopify/webhooks/register — Registers real webhooks via GraphQL
+  router.post('/webhooks/register', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const connection = await repo.getShopifyConnection(workspaceId);
+      if (!connection || connection.status !== 'connected') {
+        return res.status(400).json({ error: 'Shopify is not currently connected' });
+      }
+
+      const { appUrl } = getShopifyOAuthEnv();
+      const callbackUrl = `${appUrl}/api/shopify/webhooks`;
+      const accessToken = await getValidShopifyAccessToken(repo, workspaceId);
+
+      const results = await registerShopifyWebhookSubscriptions(
+        connection.shopDomain,
+        accessToken,
+        callbackUrl
+      );
+
+      const successfulTopics = results.filter(r => r.success).map(r => r.topic);
+      await repo.saveShopifyConnection({
+        ...connection,
+        webhookSubscriptions: successfulTopics,
+        updatedAt: new Date().toISOString(),
+      });
+
+      return res.json({
+        success: true,
+        results,
+        activeWebhooks: successfulTopics,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Shopify Webhooks] Registration error:', err);
+      return res.status(500).json({ error: err.message || 'Failed to register webhooks' });
     }
   });
 

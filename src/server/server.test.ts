@@ -1187,6 +1187,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
                 { id: '005_billing_subscriptions.sql' },
                 { id: '006_audit_history_snapshots.sql' },
                 { id: '007_shopify_integration.sql' },
+                { id: '008_audit_composite_integrity_and_shopify_hardening.sql' },
               ],
             };
           }
@@ -1197,7 +1198,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const status = await checkMigrationStatus(pool);
       assert.equal(status.isUpToDate, true);
       assert.equal(status.pendingCount, 0);
-      assert.equal(status.appliedCount, 7);
+      assert.equal(status.appliedCount, 8);
 
       const queries = getExecutedQueries();
       assert.ok(!queries.some((q) => q.includes('BEGIN') || q.includes('INSERT') || q.includes('CREATE')), 'Must be strictly read-only');
@@ -1243,6 +1244,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       '005_billing_subscriptions.sql',
       '006_audit_history_snapshots.sql',
       '007_shopify_integration.sql',
+      '008_audit_composite_integrity_and_shopify_hardening.sql',
     ];
 
     function createMockPostgresPool(options: {
@@ -1259,8 +1261,8 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         'users', 'workspaces', 'workspace_memberships', 'sessions', 'stores',
         'products', 'variants', 'offers', 'evidence_documents', 'findings',
         'action_items', 'schema_migrations', 'subscriptions', 'billing_events',
-        'audit_run_manifests', 'audit_run_findings', 'audit_run_evidence', 'audit_run_products',
-        'shopify_connections', 'shopify_sync_runs', 'shopify_webhook_events',
+        'audit_runs', 'audit_run_manifests', 'audit_run_findings', 'audit_run_evidence', 'audit_run_products',
+        'shopify_connections', 'shopify_sync_runs', 'shopify_webhook_events', 'shopify_oauth_states',
       ];
 
       const defaultFkRows = [
@@ -1282,6 +1284,16 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           target_schema: '',
           target_table: '',
           constraint_name: 'uq_stores_workspace_id',
+          constraint_type: 'u',
+          source_columns: 'workspace_id,id',
+          target_columns: '',
+        },
+        {
+          source_schema: options.currentSchema || 'public',
+          source_table: 'audit_runs',
+          target_schema: '',
+          target_table: '',
+          constraint_name: 'uq_audit_runs_workspace_id',
           constraint_type: 'u',
           source_columns: 'workspace_id,id',
           target_columns: '',
@@ -1346,6 +1358,46 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           source_columns: 'workspace_id,product_id',
           target_columns: 'workspace_id,id',
         },
+        {
+          source_schema: options.currentSchema || 'public',
+          source_table: 'audit_run_manifests',
+          target_schema: options.currentSchema || 'public',
+          target_table: 'audit_runs',
+          constraint_name: 'fk_manifests_run_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,audit_run_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_schema: options.currentSchema || 'public',
+          source_table: 'audit_run_findings',
+          target_schema: options.currentSchema || 'public',
+          target_table: 'audit_runs',
+          constraint_name: 'fk_findings_run_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,audit_run_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_schema: options.currentSchema || 'public',
+          source_table: 'audit_run_evidence',
+          target_schema: options.currentSchema || 'public',
+          target_table: 'audit_runs',
+          constraint_name: 'fk_evidence_run_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,audit_run_id',
+          target_columns: 'workspace_id,id',
+        },
+        {
+          source_schema: options.currentSchema || 'public',
+          source_table: 'audit_run_products',
+          target_schema: options.currentSchema || 'public',
+          target_table: 'audit_runs',
+          constraint_name: 'fk_products_run_workspace',
+          constraint_type: 'f',
+          source_columns: 'workspace_id,audit_run_id',
+          target_columns: 'workspace_id,id',
+        },
       ];
 
       const executedQueries: string[] = [];
@@ -1371,7 +1423,12 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
             return { rows: options.fkRows !== undefined ? options.fkRows : defaultFkRows };
           }
           if (sql.includes('pg_constraint')) {
-            return { rows: options.catalogConstraints !== undefined ? options.catalogConstraints : defaultConstraints };
+            if (options.catalogConstraints !== undefined) {
+              const hasAuditRunConstraint = options.catalogConstraints.some((c: any) => c.source_table?.startsWith('audit_run'));
+              const extraConstraints = hasAuditRunConstraint ? [] : defaultConstraints.filter((c: any) => c.source_table.startsWith('audit_run'));
+              return { rows: [...options.catalogConstraints, ...extraConstraints] };
+            }
+            return { rows: defaultConstraints };
           }
           if (sql.includes('SELECT id FROM schema_migrations')) {
             return { rows: (options.appliedMigrations || ALL_REQUIRED_MIGRATIONS).map(id => ({ id })) };
@@ -1574,11 +1631,11 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 15. checkSchemaReadiness fails when 001_initial_schema.sql is recorded but 002_tenant_referential_integrity.sql is pending', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql'], // 002, 003, 004, 005, 006, 007 are pending
+        appliedMigrations: ['001_initial_schema.sql'], // 002 through 008 are pending
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql']);
+      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql']);
       assert.match(res.error!, /Required migration "002_tenant_referential_integrity\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1586,11 +1643,11 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     test('[Mock Unit Test] 15b. checkSchemaReadiness fails when 004_backfill_store_sku_count.sql is pending', async () => {
       const { repo, getReleaseCalled } = createMockPostgresPool({
         columnRows: validColumns,
-        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql'], // 004, 005, 006, 007 are missing/pending
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql'], // 004 through 008 are missing/pending
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql']);
+      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql']);
       assert.match(res.error!, /Required migration "004_backfill_store_sku_count\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1602,7 +1659,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql']);
+      assert.deepEqual(res.pendingMigrations, ['005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql']);
       assert.match(res.error!, /Required migration "005_billing_subscriptions\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1614,7 +1671,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['006_audit_history_snapshots.sql', '007_shopify_integration.sql']);
+      assert.deepEqual(res.pendingMigrations, ['006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql']);
       assert.match(res.error!, /Required migration "006_audit_history_snapshots\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1626,8 +1683,20 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['007_shopify_integration.sql']);
+      assert.deepEqual(res.pendingMigrations, ['007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql']);
       assert.match(res.error!, /Required migration "007_shopify_integration\.sql" has not been applied/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 15f. checkSchemaReadiness fails when 008_audit_composite_integrity_and_shopify_hardening.sql is pending', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: ['001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql'],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.deepEqual(res.pendingMigrations, ['008_audit_composite_integrity_and_shopify_hardening.sql']);
+      assert.match(res.error!, /Required migration "008_audit_composite_integrity_and_shopify_hardening\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
 
@@ -1803,7 +1872,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
       const status = await checkMigrationStatus(mockPool as unknown as Pool);
       assert.equal(status.isUpToDate, true);
-      assert.equal(status.appliedCount, 7);
+      assert.equal(status.appliedCount, 8);
 
       const tableCheckQuery = executedQueries.find(q => q.includes('information_schema.tables'));
       assert.ok(tableCheckQuery, 'Must query information_schema.tables');

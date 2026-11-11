@@ -4,6 +4,7 @@ import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { ShopifyGraphQLProductNode, ShopifySyncRunRecord } from './types';
 import { fetchProductsPage, isValidShopDomain, normalizeShopDomain } from './client';
 import { decryptCredential } from '../security/encryption';
+import { getValidShopifyAccessToken } from './oauthService';
 import { parseSourcePrice } from '../../domain/validation/price';
 import { calculateProductCompleteness } from '../../domain/catalog/completeness';
 import { 
@@ -128,6 +129,7 @@ export interface SyncCatalogOptions {
   customFetch?: typeof fetch;
   maxPages?: number;
   pageSize?: number;
+  resumeCursor?: string;
 }
 
 export interface SyncCatalogResult {
@@ -161,7 +163,8 @@ export async function syncShopifyCatalog(
       throw new Error(`[AIXSHOP Shopify Sync] Stored shop domain "${connection.shopDomain}" is invalid.`);
     }
 
-    const accessToken = decryptCredential(connection.accessTokenEncrypted);
+    // Resolves fresh access token, auto-refreshing if expiring or expired
+    const accessToken = await getValidShopifyAccessToken(repo, workspaceId, { customFetch: options.customFetch });
     const storeProfile = await repo.getStoreByWorkspace(workspaceId);
     const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
 
@@ -218,7 +221,7 @@ export async function syncShopifyCatalog(
       const skuLimit = entitlement.skuLimit;
 
       let hasNextPage = true;
-      let cursor: string | null = null;
+      let cursor: string | null = options.resumeCursor || null;
       let pageCount = 0;
       const maxPages = options.maxPages ?? 200; // Safe pagination ceiling
       const pageSize = options.pageSize ?? 50;
@@ -300,9 +303,12 @@ export async function syncShopifyCatalog(
       const untouchedExisting = existingProducts.filter(p => !finalProductIds.has(p.id));
       const finalCatalogProducts = [...untouchedExisting, ...mergedProducts];
 
-      const finalStatus = planLimitHit ? 'partially_completed' : 'completed';
+      const isPartiallyCompleted = planLimitHit || (hasNextPage && pageCount >= maxPages);
+      const finalStatus = isPartiallyCompleted ? 'partially_completed' : 'completed';
       const message = planLimitHit
         ? `Imported ${importedProductsCount} products (${importedVariantsCount} SKUs). Reached ${entitlement.tier} plan limit of ${skuLimit} SKUs. ${excludedSkusCount} SKU(s) excluded.`
+        : (hasNextPage && pageCount >= maxPages)
+        ? `Partially completed import of ${importedProductsCount} products (${importedVariantsCount} variants) from ${shop}. Pagination ceiling reached (${maxPages} pages); pass cursor '${cursor}' to resume.`
         : `Successfully imported ${importedProductsCount} products and ${importedVariantsCount} variants from ${shop}.`;
 
       // Persist updated catalog
@@ -319,8 +325,9 @@ export async function syncShopifyCatalog(
         productsImported: importedProductsCount,
         variantsImported: importedVariantsCount,
         excludedByPlan: excludedSkusCount,
+        cursorResumed: isPartiallyCompleted ? (cursor ?? undefined) : undefined,
         completedAt: new Date().toISOString(),
-        errorMessage: planLimitHit ? message : null,
+        errorMessage: isPartiallyCompleted ? message : null,
       });
 
       // Update connector on store profile

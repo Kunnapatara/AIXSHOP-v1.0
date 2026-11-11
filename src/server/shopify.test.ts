@@ -19,13 +19,18 @@ import {
   initiateShopifyConnect, 
   verifyShopifyCallbackHmac, 
   handleShopifyCallback, 
-  disconnectShopify 
+  disconnectShopify,
+  refreshShopifyToken,
+  getValidShopifyAccessToken
 } from './shopify/oauthService';
 import { 
   mapShopifyProductNodeToDomain, 
   syncShopifyCatalog 
 } from './shopify/syncService';
-import { processShopifyWebhook } from './shopify/webhookService';
+import { 
+  processShopifyWebhook,
+  registerShopifyWebhookSubscriptions 
+} from './shopify/webhookService';
 import { ShopifyGraphQLProductNode } from './shopify/types';
 
 describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => {
@@ -140,8 +145,8 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       assert.equal(normalizeShopDomain('my-store.myshopify.com:443'), 'my-store.myshopify.com');
     });
 
-    test('Shopify Admin GraphQL client is pinned to 2025-01', () => {
-      assert.equal(SHOPIFY_API_VERSION, '2025-01');
+    test('Shopify Admin GraphQL client is pinned to 2026-10', () => {
+      assert.equal(SHOPIFY_API_VERSION, '2026-10');
     });
   });
 
@@ -199,20 +204,25 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       const mockFetch = async (url: any, init: any): Promise<any> => {
         const urlStr = String(url);
         if (urlStr.includes('/admin/oauth/access_token')) {
+          const body = JSON.parse(init.body);
+          assert.equal(body.expiring, 1, 'Token exchange must request expiring offline tokens (expiring: 1)');
           return {
             ok: true,
             status: 200,
             json: async () => ({
               access_token: 'shpat_live_merchant_token_abc123',
+              refresh_token: 'shprt_refresh_token_xyz987',
               scope: 'read_products',
               expires_in: 86400,
+              refresh_token_expires_in: 7776000,
             }),
           };
         }
-        if (urlStr.includes('/admin/api/2025-01/graphql.json')) {
+        if (urlStr.includes('/admin/api/2026-10/graphql.json')) {
           return {
             ok: true,
             status: 200,
+            headers: new Headers({ 'X-Shopify-API-Version': '2026-10' }),
             json: async () => ({
               data: {
                 shop: {
@@ -605,6 +615,283 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       const dataB = await resB.json();
       assert.equal(dataB.connected, false);
       assert.equal(dataB.shopDomain, null);
+    });
+  });
+
+  // 7. Expiring Offline Access Tokens, Refresh Token Rotation & Mutex
+  describe('7. Expiring Offline Access Tokens & Refresh Rotation', () => {
+    test('refreshShopifyToken rotates refresh token and updates encrypted credentials', async () => {
+      const tenant = await registerTestUser('refresh_user_1@example.com', 'Refresh Test Store');
+      const initialToken = 'shpat_initial_token_111';
+      const initialRefresh = 'shprt_initial_refresh_222';
+
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: TEST_SHOP,
+        accessTokenEncrypted: encryptCredential(initialToken),
+        refreshTokenEncrypted: encryptCredential(initialRefresh),
+        tokenExpiresAt: new Date(Date.now() + 60 * 1000).toISOString(),
+        refreshTokenExpiresAt: new Date(Date.now() + 30 * 86400 * 1000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: new Date().toISOString(),
+        lastVerifiedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      let refreshPayloadSent: any = null;
+      const mockFetch = async (url: any, init: any): Promise<any> => {
+        const urlStr = String(url);
+        if (urlStr.includes('/admin/oauth/access_token')) {
+          refreshPayloadSent = JSON.parse(init.body);
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              access_token: 'shpat_refreshed_access_token_333',
+              refresh_token: 'shprt_rotated_refresh_token_444',
+              expires_in: 86400,
+              refresh_token_expires_in: 7776000,
+            }),
+          };
+        }
+        throw new Error(`Unexpected mock URL ${urlStr}`);
+      };
+
+      const refreshed = await refreshShopifyToken(repo, tenant.workspace.id, { customFetch: mockFetch as any });
+      assert.equal(refreshed.accessToken, 'shpat_refreshed_access_token_333');
+      assert.equal(refreshPayloadSent.client_id, TEST_API_KEY);
+      assert.equal(refreshPayloadSent.client_secret, TEST_API_SECRET);
+      assert.equal(refreshPayloadSent.refresh_token, initialRefresh);
+
+      const stored = await repo.getShopifyConnection(tenant.workspace.id);
+      assert.ok(stored);
+      assert.equal(decryptCredential(stored.accessTokenEncrypted), 'shpat_refreshed_access_token_333');
+      assert.equal(decryptCredential(stored.refreshTokenEncrypted!), 'shprt_rotated_refresh_token_444');
+      assert.ok(stored.lastRefreshedAt);
+    });
+
+    test('concurrent refresh calls are serialized via workspace mutex without duplicate HTTP requests', async () => {
+      const tenant = await registerTestUser('refresh_user_2@example.com', 'Concurrent Refresh Store');
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: TEST_SHOP,
+        accessTokenEncrypted: encryptCredential('old_token'),
+        refreshTokenEncrypted: encryptCredential('old_refresh'),
+        tokenExpiresAt: new Date(Date.now() - 1000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: new Date().toISOString(),
+        lastVerifiedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      let httpCallCount = 0;
+      const mockFetch = async (): Promise<any> => {
+        httpCallCount++;
+        await new Promise(r => setTimeout(r, 20));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            access_token: 'shpat_concurrent_res_token',
+            refresh_token: 'shprt_concurrent_res_refresh',
+            expires_in: 86400,
+          }),
+        };
+      };
+
+      const [r1, r2, r3] = await Promise.all([
+        refreshShopifyToken(repo, tenant.workspace.id, { customFetch: mockFetch as any }),
+        refreshShopifyToken(repo, tenant.workspace.id, { customFetch: mockFetch as any }),
+        refreshShopifyToken(repo, tenant.workspace.id, { customFetch: mockFetch as any }),
+      ]);
+
+      assert.equal(r1.accessToken, 'shpat_concurrent_res_token');
+      assert.equal(r2.accessToken, 'shpat_concurrent_res_token');
+      assert.equal(r3.accessToken, 'shpat_concurrent_res_token');
+      assert.equal(httpCallCount, 1, 'Concurrent refreshes must coalesce into exactly 1 HTTP token request');
+    });
+
+    test('rejection on refresh (invalid_grant) transitions connection to reauthorization_required', async () => {
+      const tenant = await registerTestUser('refresh_user_3@example.com', 'Revoked Store');
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: TEST_SHOP,
+        accessTokenEncrypted: encryptCredential('invalid_token'),
+        refreshTokenEncrypted: encryptCredential('invalid_refresh'),
+        tokenExpiresAt: new Date(Date.now() - 1000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: new Date().toISOString(),
+        lastVerifiedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const mockFetch = async (): Promise<any> => {
+        return {
+          ok: false,
+          status: 400,
+          json: async () => ({ error: 'invalid_grant', error_description: 'The refresh token has been revoked' }),
+        };
+      };
+
+      await assert.rejects(async () => {
+        await refreshShopifyToken(repo, tenant.workspace.id, { customFetch: mockFetch as any });
+      }, /Merchant reauthorization required/);
+
+      const conn = await repo.getShopifyConnection(tenant.workspace.id);
+      assert.equal(conn?.status, 'reauthorization_required');
+    });
+
+    test('getValidShopifyAccessToken auto-refreshes when token is within 5-minute expiry window', async () => {
+      const tenant = await registerTestUser('auto_refresh_user@example.com', 'Auto Refresh Store');
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: TEST_SHOP,
+        accessTokenEncrypted: encryptCredential('expiring_soon_token'),
+        refreshTokenEncrypted: encryptCredential('valid_refresh_token'),
+        tokenExpiresAt: new Date(Date.now() + 2 * 60 * 1000).toISOString(),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: new Date().toISOString(),
+        lastVerifiedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const mockFetch = async (): Promise<any> => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            access_token: 'shpat_fresh_auto_refreshed_token',
+            refresh_token: 'shprt_fresh_auto_refresh',
+            expires_in: 86400,
+          }),
+        };
+      };
+
+      const token = await getValidShopifyAccessToken(repo, tenant.workspace.id, { customFetch: mockFetch as any });
+      assert.equal(token, 'shpat_fresh_auto_refreshed_token');
+    });
+  });
+
+  // 8. Out-of-Order Webhook Delivery Protection
+  describe('8. Out-of-Order Webhook Delivery Protection', () => {
+    test('discards older webhook update when existing product has newer timestamp', async () => {
+      const tenant = await registerTestUser('webhook_ordering@example.com', 'Webhook Ordering Store');
+      const shop = 'ordering-test.myshopify.com';
+      await repo.saveShopifyConnection({
+        id: `conn_${tenant.workspace.id}`,
+        workspaceId: tenant.workspace.id,
+        shopDomain: shop,
+        accessTokenEncrypted: encryptCredential('token'),
+        grantedScopes: 'read_products',
+        keyVersion: 'v1',
+        status: 'connected',
+        installedAt: new Date().toISOString(),
+        lastVerifiedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const newerPayload = {
+        id: 777111,
+        title: 'Newest Version of Product',
+        vendor: 'Ceramics',
+        product_type: 'Home',
+        updated_at: '2026-11-10T12:00:00Z',
+        variants: [{ id: 888111, title: 'Default', sku: 'SKU-NEW', price: '20.00' }],
+      };
+      const rawNewer = Buffer.from(JSON.stringify(newerPayload));
+      const hmacNewer = crypto.createHmac('sha256', TEST_API_SECRET).update(rawNewer).digest('base64');
+
+      await processShopifyWebhook(repo, rawNewer, {
+        'x-shopify-topic': 'products/update',
+        'x-shopify-shop-domain': shop,
+        'x-shopify-delivery-id': 'deliv_newer_1',
+        'x-shopify-hmac-sha256': hmacNewer,
+      });
+
+      const catalog1 = await repo.loadWorkspaceCatalog(tenant.workspace.id);
+      const prod1 = catalog1?.products.find(p => p.id === 'p_shopify_777111');
+      assert.equal(prod1?.title, 'Newest Version of Product');
+
+      const olderPayload = {
+        id: 777111,
+        title: 'Old Stale Version of Product',
+        vendor: 'Ceramics',
+        product_type: 'Home',
+        updated_at: '2026-11-09T08:00:00Z',
+        variants: [{ id: 888111, title: 'Default', sku: 'SKU-OLD', price: '15.00' }],
+      };
+      const rawOlder = Buffer.from(JSON.stringify(olderPayload));
+      const hmacOlder = crypto.createHmac('sha256', TEST_API_SECRET).update(rawOlder).digest('base64');
+
+      await processShopifyWebhook(repo, rawOlder, {
+        'x-shopify-topic': 'products/update',
+        'x-shopify-shop-domain': shop,
+        'x-shopify-delivery-id': 'deliv_stale_2',
+        'x-shopify-hmac-sha256': hmacOlder,
+      });
+
+      const catalog2 = await repo.loadWorkspaceCatalog(tenant.workspace.id);
+      const prod2 = catalog2?.products.find(p => p.id === 'p_shopify_777111');
+      assert.equal(prod2?.title, 'Newest Version of Product', 'Stale out-of-order webhook delivery must not overwrite newer catalog data');
+    });
+  });
+
+  // 9. Webhook Registration & GraphQL Mutations
+  describe('9. Webhook Registration via Admin GraphQL', () => {
+    test('registerShopifyWebhookSubscriptions calls webhookSubscriptionCreate for topics', async () => {
+      let registeredTopics: string[] = [];
+
+      const mockFetch = async (_url: any, init: any): Promise<any> => {
+        const body = JSON.parse(init.body);
+        if (body.query.includes('webhookSubscriptionCreate')) {
+          registeredTopics.push(body.variables.topic);
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              data: {
+                webhookSubscriptionCreate: {
+                  userErrors: [],
+                  webhookSubscription: {
+                    id: `gid://shopify/WebhookSubscription/${Math.random().toString(36).substring(7)}`,
+                    topic: body.variables.topic,
+                  },
+                },
+              },
+            }),
+          };
+        }
+        throw new Error('Unexpected mutation');
+      };
+
+      const results = await registerShopifyWebhookSubscriptions(
+        TEST_SHOP,
+        'dummy_token',
+        'https://example.com/api/shopify/webhooks',
+        ['products/create', 'products/update', 'products/delete'],
+        { customFetch: mockFetch as any }
+      );
+
+      assert.equal(results.length, 3);
+      assert.ok(results.every(r => r.success));
+      assert.deepEqual(registeredTopics, ['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE']);
     });
   });
 });

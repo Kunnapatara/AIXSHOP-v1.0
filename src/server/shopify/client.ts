@@ -3,7 +3,18 @@ import {
   ShopifyGraphQLProductNode
 } from './types';
 
-export const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-01';
+/**
+ * SAFE QUARTERLY SHOPIFY API VERSION UPGRADE PROCEDURE:
+ * 1. Shopify releases stable Admin GraphQL versions quarterly (YYYY-01, YYYY-04, YYYY-07, YYYY-10).
+ * 2. Each stable version is officially supported for 12 months.
+ * 3. AIXSHOP pins to the latest stable release (currently 2026-10).
+ * 4. To upgrade:
+ *    a) Verify schema changes in Shopify API Release Notes: https://shopify.dev/docs/api/usage/versioning
+ *    b) Update SHOPIFY_API_VERSION in .env / environment configurations.
+ *    c) Run `npm test` and `npm run lint` to verify query compatibility.
+ *    d) Inspect the X-Shopify-API-Version response header in production diagnostics to verify pinning.
+ */
+export const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-10';
 
 /**
  * Validates that the provided hostname matches the required Shopify format:
@@ -58,6 +69,8 @@ export interface GraphQLExecutionResult<T> {
   data: T;
   cost?: GraphQLCostExtension;
   extensions?: any;
+  apiVersionReturned?: string | null;
+  versionFallForwardDetected?: boolean;
 }
 
 export interface GraphQLClientOptions {
@@ -69,7 +82,7 @@ export interface GraphQLClientOptions {
 
 /**
  * Executes an authenticated GraphQL query or mutation against the Shopify Admin API.
- * Pinned to official supported version (2025-01).
+ * Pinned to official supported version (2026-10).
  * Features query cost and throttle inspection, rate limit backoff with jitter, and retries.
  */
 export async function executeShopifyGraphQL<T>(
@@ -190,10 +203,23 @@ export async function executeShopifyGraphQL<T>(
         }
       }
 
+      // Inspect actual API version returned by Shopify
+      const apiVersionReturned = response.headers?.get
+        ? (response.headers.get('x-shopify-api-version') || response.headers.get('X-Shopify-API-Version'))
+        : null;
+      const versionFallForwardDetected = Boolean(apiVersionReturned && apiVersionReturned !== SHOPIFY_API_VERSION);
+      if (versionFallForwardDetected) {
+        console.warn(
+          `[AIXSHOP Shopify Client Warning] API version mismatch/fall-forward: requested "${SHOPIFY_API_VERSION}", but Shopify returned "${apiVersionReturned}".`
+        );
+      }
+
       return {
         data: json.data as T,
         cost,
         extensions: json.extensions,
+        apiVersionReturned: apiVersionReturned || null,
+        versionFallForwardDetected,
       };
     } catch (err: any) {
       if (timer) clearTimeout(timer);
@@ -305,7 +331,12 @@ export async function fetchProductsPage(
               }
             }
             variants(first: 100) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
               edges {
+                cursor
                 node {
                   id
                   title
@@ -344,10 +375,95 @@ export async function fetchProductsPage(
   const products = productEdges.map(e => e.node);
   const pageInfo = res.data?.products?.pageInfo;
 
+  // Retrieve complete variants for products exceeding the single-page limit (100 variants)
+  for (const product of products) {
+    if (product.variants?.pageInfo?.hasNextPage && product.variants.pageInfo.endCursor) {
+      let vHasNext = true;
+      let vCursor: string | null = product.variants.pageInfo.endCursor;
+      let vSafetyPages = 0;
+      while (vHasNext && vCursor && vSafetyPages < 50) {
+        vSafetyPages++;
+        const more = await fetchRemainingProductVariants(
+          shopDomain,
+          accessToken,
+          product.id,
+          vCursor,
+          options
+        );
+        product.variants.edges.push(...more.variants);
+        vHasNext = more.hasNextPage;
+        vCursor = more.endCursor;
+      }
+    }
+  }
+
   return {
     products,
     hasNextPage: Boolean(pageInfo?.hasNextPage),
     endCursor: pageInfo?.endCursor || null,
     cost: res.cost,
+  };
+}
+
+/**
+ * Paginates remaining product variants for large catalogs where a single product
+ * has more than 100 variants (e.g. apparel, size/color matrices).
+ */
+export async function fetchRemainingProductVariants(
+  shopDomain: string,
+  accessToken: string,
+  productId: string,
+  afterCursor: string,
+  options?: GraphQLClientOptions
+): Promise<{
+  variants: import('./types').ShopifyGraphQLVariantEdge[];
+  hasNextPage: boolean;
+  endCursor: string | null;
+}> {
+  const query = `
+    query getProductVariants($id: ID!, $after: String) {
+      product(id: $id) {
+        variants(first: 100, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            cursor
+            node {
+              id
+              title
+              sku
+              barcode
+              price
+              compareAtPrice
+              inventoryQuantity
+              selectedOptions {
+                name
+                value
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await executeShopifyGraphQL<{
+    product?: {
+      variants?: {
+        pageInfo?: { hasNextPage: boolean; endCursor: string | null };
+        edges?: import('./types').ShopifyGraphQLVariantEdge[];
+      };
+    };
+  }>(shopDomain, accessToken, query, { id: productId, after: afterCursor }, options);
+
+  const edges = res.data?.product?.variants?.edges || [];
+  const pageInfo = res.data?.product?.variants?.pageInfo;
+
+  return {
+    variants: edges,
+    hasNextPage: Boolean(pageInfo?.hasNextPage),
+    endCursor: pageInfo?.endCursor || null,
   };
 }
