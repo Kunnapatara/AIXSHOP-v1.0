@@ -2687,6 +2687,56 @@ export class PostgresRepository implements DatabaseRepository {
     };
   }
 
+  async getShopifySyncRunById(id: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+    const res = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        started_at AS "startedAt", completed_at AS "completedAt",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_sync_runs
+       WHERE id = $1`,
+      [id]
+    );
+
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      ...r,
+      startedAt: new Date(r.startedAt).toISOString(),
+      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
+  async getShopifySyncRuns(workspaceId: string, limit = 20): Promise<import('../shopify/types').ShopifySyncRunRecord[]> {
+    const res = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        started_at AS "startedAt", completed_at AS "completedAt",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_sync_runs
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [workspaceId, limit]
+    );
+
+    return res.rows.map(r => ({
+      ...r,
+      startedAt: new Date(r.startedAt).toISOString(),
+      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    }));
+  }
+
   async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
     try {
       const res = await this.pool.query<any>(
@@ -2746,7 +2796,10 @@ export class PostgresRepository implements DatabaseRepository {
 
   async withShopifyRefreshLock<T>(
     workspaceId: string,
-    fn: (connection: import('../shopify/types').ShopifyConnectionRecord) => Promise<T>
+    fn: (
+      connection: import('../shopify/types').ShopifyConnectionRecord,
+      saveConnection: (conn: import('../shopify/types').ShopifyConnectionRecord) => Promise<import('../shopify/types').ShopifyConnectionRecord>
+    ) => Promise<T>
   ): Promise<T> {
     const client = await this.pool.connect();
     try {
@@ -2797,7 +2850,48 @@ export class PostgresRepository implements DatabaseRepository {
         updatedAt: new Date(r.updatedAt).toISOString(),
       };
 
-      const result = await fn(lockedConn);
+      const saveConnection = async (conn: import('../shopify/types').ShopifyConnectionRecord): Promise<import('../shopify/types').ShopifyConnectionRecord> => {
+        await client.query(
+          `INSERT INTO shopify_connections (
+            id, workspace_id, shop_domain, access_token_encrypted, refresh_token_encrypted,
+            token_expires_at, refresh_token_expires_at, last_refreshed_at, webhook_subscriptions_json,
+            granted_scopes, key_version, status, installed_at,
+            last_verified_at, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+          ON CONFLICT (workspace_id) DO UPDATE SET
+            shop_domain = EXCLUDED.shop_domain,
+            access_token_encrypted = EXCLUDED.access_token_encrypted,
+            refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
+            token_expires_at = EXCLUDED.token_expires_at,
+            refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
+            last_refreshed_at = EXCLUDED.last_refreshed_at,
+            webhook_subscriptions_json = EXCLUDED.webhook_subscriptions_json,
+            granted_scopes = EXCLUDED.granted_scopes,
+            key_version = EXCLUDED.key_version,
+            status = EXCLUDED.status,
+            last_verified_at = EXCLUDED.last_verified_at,
+            updated_at = NOW()`,
+          [
+            conn.id,
+            conn.workspaceId,
+            conn.shopDomain,
+            conn.accessTokenEncrypted,
+            conn.refreshTokenEncrypted || null,
+            conn.tokenExpiresAt || null,
+            conn.refreshTokenExpiresAt || null,
+            conn.lastRefreshedAt || null,
+            conn.webhookSubscriptions ? JSON.stringify(conn.webhookSubscriptions) : null,
+            conn.grantedScopes,
+            conn.keyVersion,
+            conn.status,
+            conn.installedAt,
+            conn.lastVerifiedAt,
+          ]
+        );
+        return conn;
+      };
+
+      const result = await fn(lockedConn, saveConnection);
       await client.query('COMMIT');
       return result;
     } catch (err) {

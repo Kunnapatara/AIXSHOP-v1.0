@@ -174,10 +174,18 @@ export interface DatabaseRepository {
   getAndConsumeShopifyOAuthState(stateId: string): Promise<{ id: string; workspaceId: string; shopDomain: string; expiresAt: string } | null>;
   createShopifySyncRun(run: import('../shopify/types').ShopifySyncRunRecord): Promise<import('../shopify/types').ShopifySyncRunRecord>;
   updateShopifySyncRun(id: string, updates: Partial<import('../shopify/types').ShopifySyncRunRecord>): Promise<import('../shopify/types').ShopifySyncRunRecord>;
+  getShopifySyncRunById(id: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
   getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
+  getShopifySyncRuns(workspaceId: string, limit?: number): Promise<import('../shopify/types').ShopifySyncRunRecord[]>;
   claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }>;
   updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void>;
-  withShopifyRefreshLock<T>(workspaceId: string, fn: (connection: import('../shopify/types').ShopifyConnectionRecord) => Promise<T>): Promise<T>;
+  withShopifyRefreshLock<T>(
+    workspaceId: string,
+    fn: (
+      connection: import('../shopify/types').ShopifyConnectionRecord,
+      saveConnection: (conn: import('../shopify/types').ShopifyConnectionRecord) => Promise<import('../shopify/types').ShopifyConnectionRecord>
+    ) => Promise<T>
+  ): Promise<T>;
 }
 
 export type AuditRunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';

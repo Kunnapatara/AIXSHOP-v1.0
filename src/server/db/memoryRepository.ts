@@ -1213,11 +1213,24 @@ export class MemoryRepository implements DatabaseRepository {
     return JSON.parse(JSON.stringify(updated));
   }
 
+  async getShopifySyncRunById(id: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+    const run = this.shopifySyncRuns.get(id);
+    return run ? JSON.parse(JSON.stringify(run)) : null;
+  }
+
   async getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
     const runs = Array.from(this.shopifySyncRuns.values())
       .filter(r => r.workspaceId === workspaceId)
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     return runs[0] ? JSON.parse(JSON.stringify(runs[0])) : null;
+  }
+
+  async getShopifySyncRuns(workspaceId: string, limit = 20): Promise<import('../shopify/types').ShopifySyncRunRecord[]> {
+    const runs = Array.from(this.shopifySyncRuns.values())
+      .filter(r => r.workspaceId === workspaceId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(0, limit);
+    return JSON.parse(JSON.stringify(runs));
   }
 
   async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
@@ -1246,7 +1259,10 @@ export class MemoryRepository implements DatabaseRepository {
 
   async withShopifyRefreshLock<T>(
     workspaceId: string,
-    fn: (connection: import('../shopify/types').ShopifyConnectionRecord) => Promise<T>
+    fn: (
+      connection: import('../shopify/types').ShopifyConnectionRecord,
+      saveConnection: (conn: import('../shopify/types').ShopifyConnectionRecord) => Promise<import('../shopify/types').ShopifyConnectionRecord>
+    ) => Promise<T>
   ): Promise<T> {
     const prevLock = this.shopifyRefreshLocks.get(workspaceId) || Promise.resolve();
     let releaseCurrent: () => void;
@@ -1263,7 +1279,10 @@ export class MemoryRepository implements DatabaseRepository {
       if (!connection) {
         throw new Error(`[AIXSHOP Shopify Refresh] No Shopify connection found for workspace ${workspaceId}.`);
       }
-      return await fn(connection);
+      const saveConnection = async (conn: import('../shopify/types').ShopifyConnectionRecord) => {
+        return this.saveShopifyConnection(conn);
+      };
+      return await fn(connection, saveConnection);
     } finally {
       releaseCurrent!();
       if (this.shopifyRefreshLocks.get(workspaceId) === chainTail) {
