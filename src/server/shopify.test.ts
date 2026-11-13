@@ -106,8 +106,9 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       const plaintextToken = 'shpat_genuine_token_123';
       const encrypted = encryptCredential(plaintextToken);
       const parts = encrypted.split(':');
-      // Tamper with ciphertext
-      parts[3] = parts[3].replace(/a/g, 'b');
+      // Deterministically flip the first hex nibble of ciphertext (case-insensitive safe)
+      const flipped = parts[3][0].toLowerCase() === 'a' ? 'b' : 'a';
+      parts[3] = flipped + parts[3].slice(1);
       const tampered = parts.join(':');
 
       assert.throws(() => {
@@ -1180,10 +1181,10 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       const nowIso = new Date().toISOString();
 
       let activeReturnedWebhooks = [
-        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
-        { id: 'gid://shopify/WebhookSubscription/2', topic: 'PRODUCTS_UPDATE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
-        { id: 'gid://shopify/WebhookSubscription/3', topic: 'PRODUCTS_DELETE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
-        { id: 'gid://shopify/WebhookSubscription/4', topic: 'APP_UNINSTALLED', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: `${baseUrl}/api/shopify/webhooks` } },
+        { id: 'gid://shopify/WebhookSubscription/2', topic: 'PRODUCTS_UPDATE', endpoint: { callbackUrl: `${baseUrl}/api/shopify/webhooks` } },
+        { id: 'gid://shopify/WebhookSubscription/3', topic: 'PRODUCTS_DELETE', endpoint: { callbackUrl: `${baseUrl}/api/shopify/webhooks` } },
+        { id: 'gid://shopify/WebhookSubscription/4', topic: 'APP_UNINSTALLED', endpoint: { callbackUrl: `${baseUrl}/api/shopify/webhooks` } },
       ];
 
       const mockFetch = async (_url: any, init: any): Promise<any> => {
@@ -1196,6 +1197,7 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
               data: {
                 webhookSubscriptions: {
                   edges: activeReturnedWebhooks.map(w => ({ node: w })),
+                  pageInfo: { hasNextPage: false, endCursor: null },
                 },
               },
             }),
@@ -1219,7 +1221,7 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
         updatedAt: nowIso,
       });
 
-      // 1. All 4 webhooks active -> reports active & verified true
+      // 1. All 4 webhooks active with matching callbackUrl -> reports active & verified true
       const fullResult = await verifyShopifyWebhookSubscriptionsLive(repo, tenant.workspace.id, {
         customFetch: mockFetch as any,
       });
@@ -1229,9 +1231,22 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       assert.equal(fullResult.activeTopics.length, 4);
       assert.equal(fullResult.missingTopics.length, 0);
 
-      // 2. Remove 2 webhooks -> reports partially_registered
+      // 2. Wrong callbackUrl -> reports mismatch
       activeReturnedWebhooks = [
-        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: 'https://app.com/api/shopify/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: 'https://wrong-host.example.com/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/2', topic: 'PRODUCTS_UPDATE', endpoint: { callbackUrl: 'https://wrong-host.example.com/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/3', topic: 'PRODUCTS_DELETE', endpoint: { callbackUrl: 'https://wrong-host.example.com/webhooks' } },
+        { id: 'gid://shopify/WebhookSubscription/4', topic: 'APP_UNINSTALLED', endpoint: { callbackUrl: 'https://wrong-host.example.com/webhooks' } },
+      ];
+      const mismatchResult = await verifyShopifyWebhookSubscriptionsLive(repo, tenant.workspace.id, {
+        customFetch: mockFetch as any,
+      });
+      assert.equal(mismatchResult.verified, false);
+      assert.equal(mismatchResult.status, 'mismatch');
+
+      // 3. Remove 3 webhooks -> reports partially_registered
+      activeReturnedWebhooks = [
+        { id: 'gid://shopify/WebhookSubscription/1', topic: 'PRODUCTS_CREATE', endpoint: { callbackUrl: `${baseUrl}/api/shopify/webhooks` } },
       ];
 
       const partialResult = await verifyShopifyWebhookSubscriptionsLive(repo, tenant.workspace.id, {

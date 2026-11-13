@@ -139,12 +139,16 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 |:---|:---|:---|:---|
 | **TypeScript Build** | Zero type errors | `npm run lint` / `tsc --noEmit` | **PASS** |
 | **Vite Bundle Build** | Zero bundling errors | `npm run build` | **PASS** |
-| **Unit & Integration Suite** | 330+ automated tests passing | `npm test` | **PASS** (339 passed, 0 failed) |
+| **Unit & Integration Suite** | All unit & integration tests passing | `npm test` | **PASS** (347 passed, 0 failed, 3 external Postgres skipped) |
 | **Composite Snapshot Integrity** | Foreign key on (audit_run_id, workspace_id) | Migration 006 / 008 checks | **PASS** |
 | **AES-256-GCM Encryption** | No plaintext tokens stored | `src/server/security/encryption.ts` | **PASS** |
-| **Multi-Instance Refresh Lock** | `withShopifyRefreshLock` serialized | `src/server/shopify.test.ts` | **PASS** |
-| **Variant Loop Hardening** | Break on repeating cursor & deduplicate | `src/server/shopify/client.ts` | **PASS** |
-| **Resumable Sync Workflow** | Resume from `cursorResumed` | `syncService.ts` / API / UI | **PASS** |
-| **Live Webhook Verification** | Query Admin GraphQL for subscriptions | `webhookService.ts` / API / UI | **PASS** |
+| **Multi-Instance Refresh Lock** | Transaction-scoped `saveConnection` inside `withShopifyRefreshLock` | `oauthService.ts` / `postgresRepository.ts` / `shopify.test.ts` | **PASS** |
+| **Variant Loop Hardening** | Explicit `VariantCompletenessStatus` & `partially_completed` enforcement | `client.ts` / `syncService.ts` / `workstreams.test.ts` | **PASS** |
+| **Durable Sync Run Lineage** | Workspace-scoped `resumeShopifySync`, `parentSyncRunId`, `attemptNumber` | Migration 009 / `syncService.ts` / `SettingsPage.tsx` | **PASS** |
+| **Live Webhook Verification** | GraphQL pagination + callback URL matching (`active`, `mismatch`, `partially_registered`) | `webhookService.ts` / `shopify.test.ts` / `workstreams.test.ts` | **PASS** |
+| **AI Discovery & Business Hub** | 8-dimension deterministic scoring, Business Profile CRUD, Hub Checklist | `discoveryEngine.ts` / `discoveryRoutes.ts` / `businessProfileRoutes.ts` | **PASS** |
+| **Feed Readiness & Safe Audit** | GMC, Meta, Schema.org validators, CSV/JSON export, `needsMerchantInput` safety | `feedValidationEngine.ts` / `auditEngine.ts` / `workstreams.test.ts` | **PASS** |
+| **AI Visibility Monitoring** | `DATA_SOURCE_NOT_CONNECTED` empty state & CSV ingestion deduplication | `visibilityRoutes.ts` / `AiVisibilityPage.tsx` / `workstreams.test.ts` | **PASS** |
+| **Billing & Stale Event Recovery** | Stripe webhook idempotency & >5m `processing` lock reclaim | `billingService.ts` / `postgresRepository.ts` / `workstreams.test.ts` | **PASS** |
 | **Real Shopify Store Live OAuth** | Live Admin GraphQL exchange with Shopify | Live merchant install flow | **BLOCKED — AWAITING CREDENTIALS** (Requires live Shopify store & partner app secrets) |
-| **Live PostgreSQL Production DB** | Production Cloud SQL instance | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository in dev/test) |
+| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–009) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |

@@ -108,6 +108,7 @@ export function executeCatalogAudit(
           recommendedValue: '',
           actionItemId: actionId,
           ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
+          needsMerchantInput: true,
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -119,6 +120,7 @@ export function executeCatalogAudit(
           severity: 'critical',
           status: 'pending_review',
           evidenceRequired: true,
+          needsMerchantInput: true,
           evidenceProvided: 'GS1-allocated barcode verification required.',
           proposedChange: {
             field: `variants[${vIdx}].barcode`,
@@ -153,6 +155,7 @@ export function executeCatalogAudit(
           recommendedValue: '',
           actionItemId: actionId,
           ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
+          needsMerchantInput: true,
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -164,6 +167,7 @@ export function executeCatalogAudit(
           severity: 'critical',
           status: 'pending_review',
           evidenceRequired: true,
+          needsMerchantInput: true,
           proposedChange: {
             field: `variants[${vIdx}].barcode`,
             from: barcode,
@@ -197,12 +201,13 @@ export function executeCatalogAudit(
           derivedConclusion: 'Unpriced products cannot be purchased or listed on merchant feeds.',
           merchantVerified: prevAction?.status === 'approved',
           whyItMatters: 'Prices must be explicit, positive decimal numbers.',
-          suggestedCorrection: 'Provide a valid positive retail price.',
+          suggestedCorrection: 'Merchant input required: provide an authentic positive retail price.',
           targetField: `variants[${vIdx}].price`,
           currentValue: String(v.price),
-          recommendedValue: '0.00',
+          recommendedValue: '',
           actionItemId: actionId,
           ruleCode: 'RULE_VARIANT_PRICE_PRESENCE',
+          needsMerchantInput: true,
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -214,10 +219,11 @@ export function executeCatalogAudit(
           severity: 'high',
           status: 'pending_review',
           evidenceRequired: false,
+          needsMerchantInput: true,
           proposedChange: {
             field: `variants[${vIdx}].price`,
             from: String(v.price),
-            to: '0.00',
+            to: '',
           },
           verificationStatus: 'unverified',
           auditLog: [],
@@ -246,11 +252,12 @@ export function executeCatalogAudit(
         derivedConclusion: 'Thin product descriptions lower semantic relevance for conversational product search.',
         merchantVerified: prevAction?.status === 'approved',
         whyItMatters: 'Rich descriptions enable AI agents to match natural language consumer intent.',
-        suggestedCorrection: 'Expand product description with materials, dimensions, and usage instructions.',
+        suggestedCorrection: 'Merchant input required: expand description with verified materials, dimensions, and usage instructions.',
         targetField: 'description',
         currentValue: p.description || '(empty)',
         actionItemId: actionId,
         ruleCode: 'RULE_PRODUCT_DESCRIPTION_LENGTH',
+        needsMerchantInput: true,
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -262,10 +269,11 @@ export function executeCatalogAudit(
         severity: 'medium',
         status: 'pending_review',
         evidenceRequired: false,
+        needsMerchantInput: true,
         proposedChange: {
-          field: 'title / marketing claims',
+          field: 'description',
           from: p.description || '',
-          to: `${p.title} - High quality artisan product with verified specifications.`,
+          to: '',
         },
         verificationStatus: 'unverified',
         auditLog: [],
@@ -293,11 +301,12 @@ export function executeCatalogAudit(
         derivedConclusion: 'Shopping engines require canonical brand metadata to cluster product offers.',
         merchantVerified: prevAction?.status === 'approved',
         whyItMatters: 'Brand is a mandatory field across all Google and Meta catalog specs.',
-        suggestedCorrection: 'Specify legitimate manufacturer or store brand.',
+        suggestedCorrection: 'Merchant input required: specify legitimate manufacturer or authentic brand name.',
         targetField: 'brand',
         currentValue: p.brand || '(empty)',
         actionItemId: actionId,
         ruleCode: 'RULE_PRODUCT_BRAND_SPECIFICATION',
+        needsMerchantInput: true,
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -309,10 +318,11 @@ export function executeCatalogAudit(
         severity: 'high',
         status: 'pending_review',
         evidenceRequired: false,
+        needsMerchantInput: true,
         proposedChange: {
-          field: 'title / marketing claims',
+          field: 'brand',
           from: p.brand || '',
-          to: storeProfile.name || 'Merchant Brand',
+          to: '',
         },
         verificationStatus: 'unverified',
         auditLog: [],
@@ -340,11 +350,12 @@ export function executeCatalogAudit(
         derivedConclusion: 'Unstructured categories hinder contextual feed filtering.',
         merchantVerified: prevAction?.status === 'approved',
         whyItMatters: 'Precise taxonomy improves catalog discovery and ad campaign targeting.',
-        suggestedCorrection: 'Assign standard hierarchical taxonomy path.',
+        suggestedCorrection: 'Merchant input required: assign standard hierarchical taxonomy path.',
         targetField: 'category',
         currentValue: p.category || '(empty)',
         actionItemId: actionId,
         ruleCode: 'RULE_PRODUCT_CATEGORY_TAXONOMY',
+        needsMerchantInput: true,
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -356,10 +367,11 @@ export function executeCatalogAudit(
         severity: 'medium',
         status: 'pending_review',
         evidenceRequired: false,
+        needsMerchantInput: true,
         proposedChange: {
-          field: 'title / marketing claims',
+          field: 'category',
           from: p.category || '',
-          to: 'Home & Living / Artisan Goods',
+          to: '',
         },
         verificationStatus: 'unverified',
         auditLog: [],
@@ -387,11 +399,12 @@ export function executeCatalogAudit(
         derivedConclusion: 'Image-less products are rejected by visual and multimodal search engines.',
         merchantVerified: prevAction?.status === 'approved',
         whyItMatters: 'Visual shopping feeds mandate at least one high-resolution hero photo.',
-        suggestedCorrection: 'Upload a clear product photography asset.',
+        suggestedCorrection: 'Merchant input required: upload an authentic product photography asset.',
         targetField: 'image',
         currentValue: '(none)',
         actionItemId: actionId,
         ruleCode: 'RULE_PRODUCT_IMAGE_ASSET',
+        needsMerchantInput: true,
       });
 
       actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -403,10 +416,11 @@ export function executeCatalogAudit(
         severity: 'high',
         status: 'pending_review',
         evidenceRequired: false,
+        needsMerchantInput: true,
         proposedChange: {
-          field: 'title / marketing claims',
+          field: 'image',
           from: '',
-          to: '/assets/products/placeholder.jpg',
+          to: '',
         },
         verificationStatus: 'unverified',
         auditLog: [],
@@ -439,12 +453,13 @@ export function executeCatalogAudit(
           derivedConclusion: 'Conversational shopping queries filter on microwave suitability.',
           merchantVerified: prevAction?.status === 'approved',
           whyItMatters: 'Conversational shopping queries filter on microwave capability; missing specs result in dropped recommendations.',
-          suggestedCorrection: 'Set `microwaveSafe` attribute to "True (Tested up to 900W)".',
+          suggestedCorrection: 'Merchant input required: verify and document thermal/microwave safety test results before specifying.',
           targetField: 'attributes.microwaveSafe',
           currentValue: microwave || 'Unspecified',
-          recommendedValue: 'True (Tested up to 900W)',
+          recommendedValue: '',
           actionItemId: actionId,
           ruleCode: 'RULE_DISHWASHER_MICROWAVE_SAFETY',
+          needsMerchantInput: true,
         });
 
         actionItems.push(prevAction ? { ...prevAction, findingId } : {
@@ -455,11 +470,12 @@ export function executeCatalogAudit(
           title: 'Specify Microwave Safety in Structured Attributes',
           severity: 'high',
           status: 'pending_review',
-          evidenceRequired: false,
+          evidenceRequired: true,
+          needsMerchantInput: true,
           proposedChange: {
             field: 'attributes.microwaveSafe',
             from: microwave || 'Unspecified',
-            to: 'True (Tested up to 900W)',
+            to: '',
           },
           verificationStatus: 'unverified',
           auditLog: [],

@@ -300,6 +300,7 @@ export async function fetchProductsPage(
   hasNextPage: boolean;
   endCursor: string | null;
   cost?: GraphQLCostExtension;
+  variantCompleteness?: Record<string, import('./types').ProductVariantCompleteness>;
 }> {
   const query = `
     query getProducts($first: Int!, $after: String) {
@@ -374,44 +375,126 @@ export async function fetchProductsPage(
   const productEdges = res.data?.products?.edges || [];
   const products = productEdges.map(e => e.node);
   const pageInfo = res.data?.products?.pageInfo;
+  const variantCompleteness: Record<string, import('./types').ProductVariantCompleteness> = {};
 
   // Retrieve complete variants for products exceeding the single-page limit (100 variants)
   for (const product of products) {
-    if (product.variants?.pageInfo?.hasNextPage && product.variants.pageInfo.endCursor) {
-      let vHasNext = true;
-      let vCursor: string | null = product.variants.pageInfo.endCursor;
-      let vSafetyPages = 0;
-      const seenVariantCursors = new Set<string>();
-      if (vCursor) seenVariantCursors.add(vCursor);
-      const seenVariantIds = new Set(product.variants.edges.map(e => e.node.id));
+    const initialEdges = product.variants?.edges || [];
+    const hasNext = Boolean(product.variants?.pageInfo?.hasNextPage);
+    const endCursor = product.variants?.pageInfo?.endCursor || null;
 
-      while (vHasNext && vCursor && vSafetyPages < 50) {
-        vSafetyPages++;
-        const more = await fetchRemainingProductVariants(
+    if (!hasNext) {
+      variantCompleteness[product.id] = {
+        productId: product.id,
+        productTitle: product.title || 'Untitled',
+        isComplete: true,
+        status: 'complete',
+        variantsFetched: initialEdges.length,
+        uniqueVariantsCount: initialEdges.length,
+        pagesFetched: 1,
+        lastCursor: endCursor,
+        hasNextPage: false,
+      };
+      continue;
+    }
+
+    if (hasNext && !endCursor) {
+      variantCompleteness[product.id] = {
+        productId: product.id,
+        productTitle: product.title || 'Untitled',
+        isComplete: false,
+        status: 'incomplete_missing_cursor',
+        variantsFetched: initialEdges.length,
+        uniqueVariantsCount: initialEdges.length,
+        pagesFetched: 1,
+        lastCursor: null,
+        hasNextPage: true,
+        reason: 'Shopify reported hasNextPage=true on variants but endCursor was null.',
+      };
+      continue;
+    }
+
+    let vHasNext = true;
+    let vCursor: string | null = endCursor;
+    let vSafetyPages = 1;
+    let terminationStatus: import('./types').VariantCompletenessStatus = 'complete';
+    let terminationReason: string | undefined;
+    let errorDetail: string | undefined;
+
+    const seenVariantCursors = new Set<string>();
+    if (vCursor) seenVariantCursors.add(vCursor);
+    const seenVariantIds = new Set(initialEdges.map(e => e.node.id));
+
+    while (vHasNext && vCursor && vSafetyPages < 50) {
+      vSafetyPages++;
+      let more: { variants: import('./types').ShopifyGraphQLVariantEdge[]; hasNextPage: boolean; endCursor: string | null };
+      try {
+        more = await fetchRemainingProductVariants(
           shopDomain,
           accessToken,
           product.id,
           vCursor,
           options
         );
-
-        for (const vEdge of more.variants) {
-          if (!seenVariantIds.has(vEdge.node.id)) {
-            seenVariantIds.add(vEdge.node.id);
-            product.variants.edges.push(vEdge);
-          }
-        }
-
-        if (!more.endCursor || seenVariantCursors.has(more.endCursor)) {
-          // Guard against non-advancing or repeating cursors
-          break;
-        }
-
-        seenVariantCursors.add(more.endCursor);
-        vHasNext = more.hasNextPage;
-        vCursor = more.endCursor;
+      } catch (err: any) {
+        terminationStatus = 'failed_api_error';
+        terminationReason = `GraphQL API error during variant pagination: ${err?.message || 'unknown error'}`;
+        errorDetail = err?.message;
+        break;
       }
+
+      for (const vEdge of more.variants) {
+        if (!seenVariantIds.has(vEdge.node.id)) {
+          seenVariantIds.add(vEdge.node.id);
+          product.variants?.edges.push(vEdge);
+        }
+      }
+
+      if (more.hasNextPage && !more.endCursor) {
+        terminationStatus = 'incomplete_missing_cursor';
+        terminationReason = 'Shopify variant page reported hasNextPage=true but endCursor was null.';
+        break;
+      }
+
+      if (more.endCursor && seenVariantCursors.has(more.endCursor)) {
+        terminationStatus = 'incomplete_repeated_cursor';
+        terminationReason = `Variant pagination repeated cursor ${more.endCursor}.`;
+        break;
+      }
+
+      if (more.endCursor && more.endCursor === vCursor) {
+        terminationStatus = 'incomplete_non_advancing_cursor';
+        terminationReason = `Variant cursor did not advance from ${vCursor}.`;
+        break;
+      }
+
+      if (vSafetyPages >= 50 && more.hasNextPage) {
+        terminationStatus = 'incomplete_page_limit';
+        terminationReason = 'Exhausted safety page limit (50 pages) while variants remained.';
+        break;
+      }
+
+      if (more.endCursor) {
+        seenVariantCursors.add(more.endCursor);
+      }
+      vHasNext = more.hasNextPage;
+      vCursor = more.endCursor;
     }
+
+    const isComplete = terminationStatus === 'complete' && !vHasNext;
+    variantCompleteness[product.id] = {
+      productId: product.id,
+      productTitle: product.title || 'Untitled',
+      isComplete,
+      status: isComplete ? 'complete' : terminationStatus,
+      variantsFetched: product.variants?.edges?.length || 0,
+      uniqueVariantsCount: seenVariantIds.size,
+      pagesFetched: vSafetyPages,
+      lastCursor: vCursor,
+      hasNextPage: vHasNext,
+      reason: terminationReason,
+      error: errorDetail,
+    };
   }
 
   return {
@@ -419,6 +502,7 @@ export async function fetchProductsPage(
     hasNextPage: Boolean(pageInfo?.hasNextPage),
     endCursor: pageInfo?.endCursor || null,
     cost: res.cost,
+    variantCompleteness,
   };
 }
 

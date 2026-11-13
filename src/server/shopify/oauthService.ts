@@ -315,7 +315,7 @@ export async function refreshShopifyToken(
   }
 
   const refreshPromise = (async () => {
-    return repo.withShopifyRefreshLock(workspaceId, async (connection) => {
+    return repo.withShopifyRefreshLock(workspaceId, async (connection, saveConnection) => {
       // Distributed re-check under the database/repository lock:
       // If another instance/worker refreshed the token while we were waiting for the lock,
       // return the freshly rotated token without performing a duplicate HTTP request.
@@ -330,7 +330,7 @@ export async function refreshShopifyToken(
 
       if (!connection.refreshTokenEncrypted) {
         connection.status = 'reauthorization_required';
-        await repo.saveShopifyConnection(connection);
+        await saveConnection(connection);
         throw new Error(
           `[AIXSHOP Shopify Refresh] No refresh token available for store ${connection.shopDomain}. Reauthorization required.`
         );
@@ -363,7 +363,7 @@ export async function refreshShopifyToken(
         const errText = typeof response.text === 'function' ? await response.text() : '';
         if (response.status === 400 || response.status === 401) {
           connection.status = 'reauthorization_required';
-          await repo.saveShopifyConnection(connection);
+          await saveConnection(connection);
           throw new Error(
             `[AIXSHOP Shopify Refresh] Merchant reauthorization required: refresh token expired or revoked for ${connection.shopDomain}.`
           );
@@ -399,7 +399,7 @@ export async function refreshShopifyToken(
         updatedAt: new Date(now).toISOString(),
       };
 
-      await repo.saveShopifyConnection(updatedConn);
+      await saveConnection(updatedConn);
 
       return {
         accessToken: newAccessToken,

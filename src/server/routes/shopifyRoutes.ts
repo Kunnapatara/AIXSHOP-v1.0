@@ -54,6 +54,20 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         typeof w === 'string' ? w : w.topic
       );
 
+      const lastVerifiedTime = connection.lastVerifiedAt ? new Date(connection.lastVerifiedAt).getTime() : 0;
+      const isVerificationFresh = (Date.now() - lastVerifiedTime) < (24 * 60 * 60 * 1000);
+
+      let derivedWebhookStatus: import('../shopify/types').WebhookStatusCategory = 'unverified';
+      if (!connection.webhookSubscriptions || connection.webhookSubscriptions.length === 0) {
+        derivedWebhookStatus = 'not_configured';
+      } else if (!isVerificationFresh) {
+        derivedWebhookStatus = 'unverified';
+      } else if (activeWebhooks.length >= 4) {
+        derivedWebhookStatus = 'active';
+      } else if (activeWebhooks.length > 0) {
+        derivedWebhookStatus = 'partially_registered';
+      }
+
       const status: ShopifyPublicStatus = {
         connected: connection.status === 'connected',
         status: connection.status,
@@ -63,7 +77,7 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         lastVerifiedAt: connection.lastVerifiedAt,
         tokenExpiresAt: connection.tokenExpiresAt || null,
         refreshTokenExpiresAt: connection.refreshTokenExpiresAt || null,
-        webhookStatus: (activeWebhooks.length >= 4) ? 'active' : (activeWebhooks.length > 0) ? 'partially_registered' : 'unverified',
+        webhookStatus: derivedWebhookStatus,
         activeWebhooks,
         latestSync,
         canResumeSync,
@@ -196,8 +210,8 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Shopify is not currently connected' });
       }
 
-      const { appUrl } = getShopifyOAuthEnv();
-      const callbackUrl = `${appUrl}/api/shopify/webhooks`;
+      const { webhookUrl } = getShopifyOAuthEnv();
+      const callbackUrl = webhookUrl;
       const accessToken = await getValidShopifyAccessToken(repo, workspaceId);
 
       const results = await registerShopifyWebhookSubscriptions(
@@ -237,6 +251,19 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Webhooks] Verification error:', err);
       return res.status(500).json({ error: err.message || 'Failed to verify webhooks' });
+    }
+  });
+
+  // 4d. GET /api/shopify/sync/runs — Lists recent sync runs for UI operational monitoring
+  router.get('/sync/runs', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
+      const runs = await repo.getShopifySyncRuns(workspaceId, limit);
+      return res.json({ success: true, syncRuns: runs, runs });
+    } catch (err: any) {
+      console.error('[AIXSHOP Shopify Routes] Error fetching sync runs:', err);
+      return res.status(500).json({ error: 'Failed to retrieve sync runs' });
     }
   });
 

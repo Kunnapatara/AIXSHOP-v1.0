@@ -15,6 +15,10 @@ import { ProductsPage } from './pages/ProductsPage';
 import { ProductDetailPage } from './pages/ProductDetailPage';
 import { ActionsPage } from './pages/ActionsPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { AiDiscoveryPage } from './pages/AiDiscoveryPage';
+import { FeedReadinessPage } from './pages/FeedReadinessPage';
+import { BusinessProfilePage } from './pages/BusinessProfilePage';
+import { AiVisibilityPage } from './pages/AiVisibilityPage';
 
 const AppContent: React.FC = () => {
   const { currentPage } = useApp();
@@ -33,6 +37,14 @@ const AppContent: React.FC = () => {
         return <ProductDetailPage />;
       case 'actions':
         return <ActionsPage />;
+      case 'ai-discovery':
+        return <AiDiscoveryPage />;
+      case 'feed-readiness':
+        return <FeedReadinessPage />;
+      case 'business-profile':
+        return <BusinessProfilePage />;
+      case 'ai-visibility':
+        return <AiVisibilityPage />;
       case 'settings':
         return <SettingsPage />;
       default:

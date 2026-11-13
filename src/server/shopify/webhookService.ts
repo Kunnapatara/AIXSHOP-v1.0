@@ -112,16 +112,25 @@ export async function registerShopifyWebhookSubscriptions(
 }
 
 /**
- * Queries active webhook subscriptions from Shopify Admin API.
+ * Queries active webhook subscriptions from Shopify Admin API with cursor pagination.
  */
 export async function getShopifyWebhookSubscriptions(
   shopDomain: string,
   accessToken: string,
   options: { customFetch?: typeof fetch } = {}
 ): Promise<Array<{ id: string; topic: string; callbackUrl?: string }>> {
+  const allSubscriptions: Array<{ id: string; topic: string; callbackUrl?: string }> = [];
+  let hasNextPage = true;
+  let cursor: string | null = null;
+  let pageSafety = 0;
+
   const query = `
-    query getWebhooks {
-      webhookSubscriptions(first: 25) {
+    query getWebhooks($first: Int!, $after: String) {
+      webhookSubscriptions(first: $first, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         edges {
           node {
             id
@@ -138,44 +147,71 @@ export async function getShopifyWebhookSubscriptions(
     }
   `;
 
-  try {
-    const response = await executeShopifyGraphQL<{
-      webhookSubscriptions: {
-        edges: Array<{
-          node: {
-            id: string;
-            topic: string;
-            endpoint?: { callbackUrl?: string };
-          };
-        }>;
-      };
-    }>(shopDomain, accessToken, query, {}, options);
+  type WebhookSubscriptionsPageData = {
+    webhookSubscriptions: {
+      pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      edges: Array<{
+        node: {
+          id: string;
+          topic: string;
+          endpoint?: { callbackUrl?: string };
+        };
+      }>;
+    };
+  };
 
-    return (response.data?.webhookSubscriptions?.edges || []).map(e => ({
-      id: e.node.id,
-      topic: e.node.topic,
-      callbackUrl: e.node.endpoint?.callbackUrl,
-    }));
-  } catch (err: any) {
-    console.warn(`[AIXSHOP Webhooks] Failed to fetch webhook subscriptions for ${shopDomain}:`, err.message);
-    return [];
+  while (hasNextPage && pageSafety < 10) {
+    pageSafety++;
+    const response: { data?: WebhookSubscriptionsPageData } = await executeShopifyGraphQL<WebhookSubscriptionsPageData>(
+      shopDomain,
+      accessToken,
+      query,
+      { first: 50, after: cursor },
+      options
+    );
+
+    const edges = response.data?.webhookSubscriptions?.edges || [];
+    for (const edge of edges) {
+      allSubscriptions.push({
+        id: edge.node.id,
+        topic: edge.node.topic,
+        callbackUrl: edge.node.endpoint?.callbackUrl,
+      });
+    }
+
+    hasNextPage = Boolean(response.data?.webhookSubscriptions?.pageInfo?.hasNextPage);
+    cursor = response.data?.webhookSubscriptions?.pageInfo?.endCursor || null;
   }
+
+  return allSubscriptions;
 }
 
 export interface WebhookVerificationResult {
   verified: boolean;
-  status: 'active' | 'registered_unverified' | 'not_configured' | 'partially_registered' | 'verification_failed';
+  status: 'active' | 'partially_registered' | 'unverified' | 'mismatch' | 'not_configured' | 'error';
   requiredTopics: string[];
   activeTopics: string[];
   missingTopics: string[];
+  mismatchedTopics: string[];
   liveSubscriptions: Array<{ id: string; topic: string; callbackUrl?: string }>;
   verifiedAt: string;
   message: string;
 }
 
+function normalizeWebhookUrl(u?: string): string {
+  if (!u) return '';
+  try {
+    const p = new URL(u);
+    return `${p.protocol}//${p.host}${p.pathname.replace(/\/+$/, '')}`.toLowerCase();
+  } catch {
+    return u.trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
 /**
  * Actively queries Shopify Admin GraphQL API to verify existing webhook subscriptions.
- * Distinguishes between active, partially registered, registered unverified, and failed states.
+ * Validates both required topics and configured callback URL.
+ * Distinguishes between active, partially registered, unverified, mismatch, not configured, and error states.
  */
 export async function verifyShopifyWebhookSubscriptionsLive(
   repo: DatabaseRepository,
@@ -192,6 +228,7 @@ export async function verifyShopifyWebhookSubscriptionsLive(
       requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
       activeTopics: [],
       missingTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      mismatchedTopics: [],
       liveSubscriptions: [],
       verifiedAt: nowIso,
       message: 'Shopify is not currently connected to this workspace.',
@@ -202,30 +239,50 @@ export async function verifyShopifyWebhookSubscriptionsLive(
     const accessToken = await getValidShopifyAccessToken(repo, workspaceId, { customFetch: options.customFetch });
     const liveSubs = await getShopifyWebhookSubscriptions(connection.shopDomain, accessToken, options);
 
-    const activeTopicsSet = new Set(liveSubs.map(s => s.topic.toUpperCase().replace(/\//g, '_')));
+    const { webhookUrl } = getShopifyOAuthEnv();
+    const expectedNormalizedUrl = normalizeWebhookUrl(webhookUrl);
+
     const activeTopics: string[] = [];
     const missingTopics: string[] = [];
+    const mismatchedTopics: string[] = [];
 
     for (const requiredTopic of DEFAULT_SHOPIFY_WEBHOOK_TOPICS) {
-      if (activeTopicsSet.has(requiredTopic)) {
-        activeTopics.push(requiredTopic);
-      } else {
+      const matchingSubs = liveSubs.filter(
+        s => s.topic.toUpperCase().replace(/\//g, '_') === requiredTopic
+      );
+
+      if (matchingSubs.length === 0) {
         missingTopics.push(requiredTopic);
+      } else {
+        const hasUrlMatch = expectedNormalizedUrl
+          ? matchingSubs.some(s => normalizeWebhookUrl(s.callbackUrl) === expectedNormalizedUrl)
+          : true;
+
+        if (hasUrlMatch) {
+          activeTopics.push(requiredTopic);
+        } else {
+          mismatchedTopics.push(requiredTopic);
+        }
       }
     }
 
-    const verified = missingTopics.length === 0;
-    const status = verified
+    const isAllActive = missingTopics.length === 0 && mismatchedTopics.length === 0;
+    const hasMismatch = mismatchedTopics.length > 0;
+    const status = isAllActive
       ? 'active'
+      : hasMismatch
+      ? 'mismatch'
       : activeTopics.length > 0
       ? 'partially_registered'
-      : 'registered_unverified';
+      : 'unverified';
 
-    const message = verified
-      ? `All ${activeTopics.length} required webhook subscriptions are actively verified on Shopify Admin API.`
+    const message = isAllActive
+      ? `All ${activeTopics.length} required webhook subscriptions are actively verified on Shopify Admin API pointing to ${webhookUrl}.`
+      : hasMismatch
+      ? `Webhook callback URL mismatch: ${mismatchedTopics.join(', ')} point to different endpoints than configured ${webhookUrl}.`
       : activeTopics.length > 0
       ? `Partially verified: ${activeTopics.length} of ${DEFAULT_SHOPIFY_WEBHOOK_TOPICS.length} webhooks active on Shopify. Missing: ${missingTopics.join(', ')}.`
-      : `No matching webhooks found active on Shopify Admin API. Required topics: ${DEFAULT_SHOPIFY_WEBHOOK_TOPICS.join(', ')}.`;
+      : `No matching webhooks found active on Shopify Admin API for required topics: ${DEFAULT_SHOPIFY_WEBHOOK_TOPICS.join(', ')}.`;
 
     // Persist verified live subscriptions and verification timestamp in repository
     await repo.saveShopifyConnection({
@@ -241,11 +298,12 @@ export async function verifyShopifyWebhookSubscriptionsLive(
     });
 
     return {
-      verified,
+      verified: isAllActive,
       status,
       requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
       activeTopics,
       missingTopics,
+      mismatchedTopics,
       liveSubscriptions: liveSubs,
       verifiedAt: nowIso,
       message,
@@ -253,10 +311,11 @@ export async function verifyShopifyWebhookSubscriptionsLive(
   } catch (err: any) {
     return {
       verified: false,
-      status: 'verification_failed',
+      status: 'error',
       requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
       activeTopics: [],
       missingTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+      mismatchedTopics: [],
       liveSubscriptions: [],
       verifiedAt: nowIso,
       message: `Failed to verify Shopify webhook subscriptions: ${err?.message || 'Admin API error'}`,

@@ -21,7 +21,10 @@ import {
   LogIn,
   Database,
   Building2,
-  ChevronDown
+  ChevronDown,
+  Compass,
+  FileSpreadsheet,
+  BarChart3
 } from 'lucide-react';
 import { ToastContainer } from '../common/ToastContainer';
 
@@ -83,6 +86,13 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
     },
   ];
 
+  const aiCommerceNavItems: { id: NavigationPage; label: string; icon: React.ElementType }[] = [
+    { id: 'ai-discovery', label: 'AI Discovery', icon: Compass },
+    { id: 'feed-readiness', label: 'Feed Readiness', icon: FileSpreadsheet },
+    { id: 'business-profile', label: 'Business Profile', icon: Building2 },
+    { id: 'ai-visibility', label: 'AI Visibility', icon: BarChart3 },
+  ];
+
   const getPageTitle = () => {
     switch (currentPage) {
       case 'home': return 'Store Overview';
@@ -90,6 +100,10 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
       case 'products': return 'Product Catalog';
       case 'product-detail': return 'Product Intelligence';
       case 'actions': return 'Merchant Action Center';
+      case 'ai-discovery': return 'AI Discovery Readiness';
+      case 'feed-readiness': return 'Feed Readiness & Export';
+      case 'business-profile': return 'Brand & Business Profile';
+      case 'ai-visibility': return 'AI Visibility Monitoring';
       case 'settings': return 'Store & Catalog Settings';
       default: return 'AIXSHOP';
     }
@@ -188,6 +202,28 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
                       {item.badge}
                     </span>
                   )}
+                </button>
+              );
+            })}
+
+            <div className="px-3 pt-5 pb-2 text-[11px] font-semibold tracking-wider text-stone-400 uppercase">
+              AI Commerce & Feeds
+            </div>
+            {aiCommerceNavItems.map(item => {
+              const Icon = item.icon;
+              const isActive = currentPage === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => navigateTo(item.id)}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                    isActive
+                      ? 'bg-orange-50 text-orange-700 font-semibold'
+                      : 'text-stone-700 hover:bg-stone-100 hover:text-stone-900'
+                  }`}
+                >
+                  <Icon className={`w-4 h-4 ${isActive ? 'text-orange-600' : 'text-stone-500'}`} />
+                  <span>{item.label}</span>
                 </button>
               );
             })}
@@ -427,6 +463,28 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
                             {item.badge}
                           </span>
                         )}
+                      </button>
+                    );
+                  })}
+
+                  <div className="px-2 pt-3 pb-1 text-[11px] font-semibold text-stone-400 uppercase tracking-wider">
+                    AI Commerce & Feeds
+                  </div>
+                  {aiCommerceNavItems.map(item => {
+                    const Icon = item.icon;
+                    const isActive = currentPage === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        onClick={() => navigateTo(item.id)}
+                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium min-h-[44px] ${
+                          isActive
+                            ? 'bg-orange-50 text-orange-700 font-semibold'
+                            : 'text-stone-700 hover:bg-stone-50'
+                        }`}
+                      >
+                        <Icon className={`w-4 h-4 ${isActive ? 'text-orange-600' : 'text-stone-500'}`} />
+                        <span>{item.label}</span>
                       </button>
                     );
                   })}

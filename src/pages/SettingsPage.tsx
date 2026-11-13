@@ -62,6 +62,7 @@ export const SettingsPage: React.FC = () => {
 
   // Shopify Integration State
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatusResponse | null>(null);
+  const [shopifySyncRuns, setShopifySyncRuns] = useState<any[]>([]);
   const [isLoadingShopify, setIsLoadingShopify] = useState(false);
   const [isSyncingShopify, setIsSyncingShopify] = useState(false);
   const [isResumingShopify, setIsResumingShopify] = useState(false);
@@ -100,8 +101,12 @@ export const SettingsPage: React.FC = () => {
     }
     setIsLoadingShopify(true);
     try {
-      const status = await apiClient.getShopifyStatus();
+      const [status, runsRes] = await Promise.all([
+        apiClient.getShopifyStatus(),
+        apiClient.getShopifySyncRuns(10).catch(() => ({ syncRuns: [] as any[] })),
+      ]);
       setShopifyStatus(status);
+      setShopifySyncRuns((runsRes as any).syncRuns || (runsRes as any).runs || []);
       if (status.shopDomain && !shopifyShopInput) {
         setShopifyShopInput(status.shopDomain);
       }
@@ -151,10 +156,10 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
-  const handleResumeSyncShopify = async () => {
+  const handleResumeSyncShopify = async (syncRunId?: string) => {
     setIsResumingShopify(true);
     try {
-      const res = await apiClient.resumeShopifySync();
+      const res = await apiClient.resumeShopifySync(syncRunId ? { syncRunId } : undefined);
       addToast(
         'Sync Resumed',
         res.message || `Successfully resumed synchronization: imported ${res.variantsImported || 0} additional SKUs.`,
@@ -667,7 +672,7 @@ export const SettingsPage: React.FC = () => {
                       </div>
                       <button
                         disabled={isResumingShopify || isSyncingShopify}
-                        onClick={handleResumeSyncShopify}
+                        onClick={() => handleResumeSyncShopify()}
                         className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-1.5 self-start sm:self-auto shrink-0 disabled:opacity-50 cursor-pointer"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${isResumingShopify ? 'animate-spin' : ''}`} />
@@ -690,7 +695,7 @@ export const SettingsPage: React.FC = () => {
                       {shopifyStatus.canResumeSync && (
                         <button
                           disabled={isResumingShopify || isSyncingShopify}
-                          onClick={handleResumeSyncShopify}
+                          onClick={() => handleResumeSyncShopify()}
                           className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                         >
                           <RefreshCw className={`w-3.5 h-3.5 ${isResumingShopify ? 'animate-spin' : ''}`} />
@@ -811,6 +816,75 @@ export const SettingsPage: React.FC = () => {
                       </button>
                     </div>
                   </div>
+
+                  {/* Operational Sync Run History & Attempt Lineage */}
+                  {shopifySyncRuns.length > 0 && (
+                    <div className="pt-4 border-t border-stone-100 space-y-2">
+                      <h4 className="text-xs font-bold text-stone-900">Recent Sync Runs & Attempt Lineage</h4>
+                      <div className="overflow-x-auto border border-stone-200 rounded-lg">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead>
+                            <tr className="bg-stone-50 border-b border-stone-200 text-stone-600 font-semibold">
+                              <th className="py-2 px-3">Run / Attempt</th>
+                              <th className="py-2 px-3">Status</th>
+                              <th className="py-2 px-3">Variant Completeness</th>
+                              <th className="py-2 px-3 text-right">Products / Variants</th>
+                              <th className="py-2 px-3 text-right">Started</th>
+                              <th className="py-2 px-3 text-right">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-stone-100 font-mono tabular-nums">
+                            {shopifySyncRuns.slice(0, 6).map((run) => (
+                              <tr key={run.id} className="hover:bg-stone-50">
+                                <td className="py-2 px-3 text-stone-800">
+                                  <div>{run.id.slice(0, 14)}...</div>
+                                  <div className="text-[10px] text-stone-500">
+                                    Attempt #{run.attemptNumber || 1}
+                                    {run.parentSyncRunId ? ` · Parent ${run.parentSyncRunId.slice(0, 10)}` : ''}
+                                  </div>
+                                </td>
+                                <td className="py-2 px-3">
+                                  <span className={`font-semibold ${
+                                    run.status === 'completed'
+                                      ? 'text-emerald-700'
+                                      : run.status === 'partially_completed'
+                                      ? 'text-amber-700'
+                                      : run.status === 'failed'
+                                      ? 'text-red-700'
+                                      : 'text-stone-700'
+                                  }`}>
+                                    {run.status}
+                                  </span>
+                                </td>
+                                <td className="py-2 px-3 text-stone-600">
+                                  {run.variantCompletenessStatus || 'complete'}
+                                </td>
+                                <td className="py-2 px-3 text-right text-stone-800">
+                                  {run.productsImported ?? 0} / {run.variantsImported ?? 0}
+                                </td>
+                                <td className="py-2 px-3 text-right text-stone-500">
+                                  {run.startedAt ? new Date(run.startedAt).toLocaleString() : '—'}
+                                </td>
+                                <td className="py-2 px-3 text-right">
+                                  {(run.status === 'partially_completed' || run.status === 'failed') && run.cursorResumed ? (
+                                    <button
+                                      disabled={isResumingShopify || isSyncingShopify}
+                                      onClick={() => handleResumeSyncShopify(run.id)}
+                                      className="font-sans text-orange-700 hover:text-orange-800 font-semibold cursor-pointer"
+                                    >
+                                      Resume
+                                    </button>
+                                  ) : (
+                                    <span className="text-stone-400">—</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (

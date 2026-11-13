@@ -8,6 +8,10 @@ import { createStoreRoutes } from './routes/storeRoutes';
 import { createBillingRoutes } from './routes/billingRoutes';
 import { createAuditRoutes } from './routes/auditRoutes';
 import { createShopifyRoutes } from './routes/shopifyRoutes';
+import { createDiscoveryRoutes } from './routes/discoveryRoutes';
+import { createBusinessProfileRoutes } from './routes/businessProfileRoutes';
+import { createFeedRoutes } from './routes/feedRoutes';
+import { createVisibilityRoutes } from './routes/visibilityRoutes';
 import { csrfProtection } from './middleware/auth';
 
 export function createApp(customRepo?: DatabaseRepository): Express {
@@ -162,6 +166,10 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   app.use('/api/billing', createBillingRoutes(repo));
   app.use('/api/audit', createAuditRoutes(repo));
   app.use('/api/shopify', createShopifyRoutes(repo));
+  app.use('/api/discovery', createDiscoveryRoutes(repo));
+  app.use('/api/business-profile', createBusinessProfileRoutes(repo));
+  app.use('/api/feed', createFeedRoutes(repo));
+  app.use('/api/visibility', createVisibilityRoutes(repo));
 
   // Global error handler
   app.use((err: any, req: any, res: any, next: any) => {

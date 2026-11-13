@@ -257,6 +257,57 @@ class ApiClient {
       method: 'POST',
     });
   }
+
+  async getShopifySyncRuns(limit: number = 10): Promise<{ success: boolean; syncRuns: any[] }> {
+    return this.request<{ success: boolean; syncRuns: any[] }>(`/api/shopify/sync/runs?limit=${limit}`);
+  }
+
+  // AI Discovery Endpoints
+  async getDiscoveryAudit(): Promise<{
+    success: boolean;
+    readiness: any;
+    hubChecklist: any;
+    productCount: number;
+    storeDomain: string;
+  }> {
+    return this.request('/api/discovery/audit');
+  }
+
+  // Business Profile Endpoints
+  async getBusinessProfile(): Promise<{ success: boolean; profile: any }> {
+    return this.request('/api/business-profile');
+  }
+
+  async updateBusinessProfile(profile: any): Promise<{ success: boolean; profile: any }> {
+    return this.request('/api/business-profile', {
+      method: 'PUT',
+      body: JSON.stringify(profile),
+    });
+  }
+
+  // Feed Readiness Endpoints
+  async validateFeed(platform: string): Promise<{ success: boolean; report: any }> {
+    return this.request('/api/feed/validate', {
+      method: 'POST',
+      body: JSON.stringify({ platform }),
+    });
+  }
+
+  getFeedExportUrl(platform: string, format: string = 'csv', filter: string = 'all'): string {
+    return `/api/feed/export?platform=${encodeURIComponent(platform)}&format=${encodeURIComponent(format)}&filter=${encodeURIComponent(filter)}`;
+  }
+
+  // Visibility Monitoring Endpoints
+  async getVisibilitySummary(): Promise<{ success: boolean; summary: any }> {
+    return this.request('/api/visibility/summary');
+  }
+
+  async uploadVisibilityCsv(csvContent: string, filename: string): Promise<{ success: boolean; import: any; summary: any }> {
+    return this.request('/api/visibility/upload', {
+      method: 'POST',
+      body: JSON.stringify({ csvContent, filename }),
+    });
+  }
 }
 
 export interface ShopifyStatusResponse {

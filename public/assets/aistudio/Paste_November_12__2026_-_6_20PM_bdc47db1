@@ -1,0 +1,1374 @@
+# AIXSHOP v1.0 — REMAINING WORK COMPLETION
+## Production Readiness, Shopify Integration Integrity, AI Discovery Readiness & Commerce Feed
+
+Repository:
+https://github.com/Kunnapatara/AIXSHOP-v1.0
+
+Current baseline commit to inspect:
+`83a149de43c3cacb6049883e4da0858b1fef3549`
+
+Previous Shopify integration commit:
+`f57dbdc7bc30e5177eddf0a31c0f91a9c364da12`
+
+Development environment:
+Google AI Studio — Build Mode.
+
+---
+
+# 1. PRIMARY OBJECTIVE
+
+Continue development of the existing AIXSHOP v1.0 application.
+
+Complete the remaining engineering work required to make the existing product reliable for real Shopify merchants and prepare it for the emerging AI Commerce / AI Discovery ecosystem.
+
+This assignment consists of five connected workstreams:
+
+A. Complete Shopify Workstream D Gap Closure.
+
+B. Complete AI Discovery Readiness functionality.
+
+C. Improve Product Catalog Quality, Evidence and Feed Readiness.
+
+D. Verify and complete Billing, Subscription and Entitlement lifecycle where gaps remain.
+
+E. Complete Production Readiness Verification and deployment documentation.
+
+This is an incremental continuation, not a rewrite.
+
+**NON-NEGOTIABLE PRINCIPLE: ZERO LOSS OF DEVELOPMENT PROGRESS.**
+
+Preserve all working functionality, historical data, migrations, existing user accounts, workspace data, billing records, audit history, and Shopify integrations.
+
+Do not replace a working implementation with a simplified demo.
+
+Do not create fake integration results, simulated business metrics, or fabricated production readiness evidence.
+
+The goal is a system that can serve actual paying merchants, not merely pass mocked demonstrations.
+
+# 2. MANDATORY BASELINE INSPECTION
+
+Before editing any code, inspect the actual current repository.
+
+Inspect at minimum:
+
+- `src/server/db/`
+- `src/server/shopify/`
+- `src/server/routes/shopifyRoutes.ts`
+- `src/server/services/`
+- `src/server/billing/`
+- `src/server/routes/billingRoutes.ts`
+- `src/domain/audit/`
+- `src/domain/catalog/`
+- `src/domain/validation/`
+- `src/pages/`
+- `src/components/`
+- `src/api/client.ts`
+- All database migrations.
+- All existing tests.
+- `.env.example`
+- `package.json`
+- Deployment and architecture documentation.
+
+Use the current `main` branch as the initial reference, but verify the current HEAD before editing.
+
+Do not assume the latest commit contains all changes claimed in previous reports.
+
+## Baseline requirements
+
+Record:
+
+1. Current HEAD commit SHA.
+2. Current repository structure.
+3. Existing features and actual implementation status.
+4. Existing migrations and applied-migration mechanism.
+5. Existing database repository interfaces.
+6. Existing test files and test coverage.
+7. Existing Stripe/Sandbox billing architecture.
+8. Existing Shopify OAuth, GraphQL, webhook and sync architecture.
+9. Existing catalog audit rules and mutation workflow.
+10. Existing product, variant, offer and evidence data models.
+
+Classify each item as:
+
+- Implemented and source-verified.
+- Implemented but not adequately tested.
+- Partially implemented.
+- Missing.
+- Blocked by external credentials or services.
+
+Do not edit until this baseline has been established.
+
+# 3. WORKSTREAM A — COMPLETE SHOPIFY WORKSTREAM D
+
+## A1. PostgreSQL Transaction-scoped Refresh Lock
+
+### Confirmed issue
+
+The latest repository adds a second callback parameter to:
+
+`withShopifyRefreshLock()`
+
+The PostgreSQL implementation provides a `saveConnection()` function that writes through the transaction-scoped `PoolClient`.
+
+However, the current `refreshShopifyToken()` implementation still calls:
+
+`repo.saveShopifyConnection()`
+
+The callback still receives only the connection argument.
+
+This means the new transaction-scoped persistence mechanism is not necessarily being used by the actual refresh flow.
+
+### Required correction
+
+Refactor `refreshShopifyToken()` and the repository contract so that the real refresh execution path uses the transaction-scoped persistence callback.
+
+Requirements:
+
+1. Receive both the locked connection and transaction-scoped save function.
+2. Perform the token expiry re-check after acquiring the database lock.
+3. Skip unnecessary refresh requests if another worker already rotated the token.
+4. Persist the rotated access token and refresh token using the supplied transaction-scoped save function.
+5. Persist `reauthorization_required` through the same transaction-scoped mechanism when appropriate.
+6. Never call the global pooled `repo.saveShopifyConnection()` from inside the locked transaction.
+7. Preserve AES-256-GCM encryption and existing token format.
+8. Preserve refresh-token rotation behavior.
+9. Handle failed Shopify requests, malformed responses, rollback and connection release correctly.
+10. Ensure the database transaction does not remain open after any failure.
+11. Avoid introducing a second database lock or nested transaction unnecessarily.
+12. Preserve the existing in-process concurrency protection while ensuring it does not replace the PostgreSQL distributed lock.
+
+Review whether the lock should be keyed by workspace ID or a more specific connection identity.
+
+### PostgreSQL regression tests
+
+Implement real integration tests using PostgreSQL and independent database connections.
+
+Test:
+
+- Two repository instances concurrently refreshing one connection.
+- Exactly one refresh operation when the first worker successfully rotates the token.
+- The second worker reads the newly persisted token.
+- Persistence occurs inside the same transaction that owns the row lock.
+- Refresh failure rolls back correctly.
+- Reauthorization state persists correctly.
+- Connections are released after success and failure.
+- No deadlock.
+- No pool exhaustion.
+- Independent workspaces can refresh independently.
+
+A sequential MemoryRepository test is not sufficient.
+
+If PostgreSQL is unavailable, mark these tests BLOCKED, not PASSED.
+
+## A2. Variant Pagination Completeness
+
+### Confirmed issue
+
+The current `fetchProductsPage()` retrieves additional variants but does not return explicit variant completeness metadata.
+
+Repeated or non-advancing cursors can terminate pagination without sufficiently informing `syncShopifyCatalog()` that variant data is incomplete.
+
+The sync completion condition does not reliably cover every early-termination path.
+
+### Required correction
+
+Create an explicit pagination result contract.
+
+Every product must have an associated variant completeness result.
+
+At minimum:
+
+- `complete`
+- `incomplete_page_limit`
+- `incomplete_repeated_cursor`
+- `incomplete_non_advancing_cursor`
+- `failed_api_error`
+- `incomplete_missing_cursor`
+
+Track:
+
+- Product ID.
+- Number of variants fetched.
+- Number of unique variants.
+- Number of pages fetched.
+- Last cursor.
+- Whether Shopify reports `hasNextPage`.
+- Termination reason.
+- Error information, where applicable.
+
+Requirements:
+
+1. Detect repeated cursors.
+2. Detect missing cursors while `hasNextPage=true`.
+3. Detect non-advancing cursors.
+4. Detect page-limit exhaustion.
+5. Deduplicate variant IDs.
+6. Preserve valid retrieved data without claiming completeness.
+7. Propagate completeness metadata from `client.ts` into `syncService.ts`.
+8. Persist completeness information in the Sync Run.
+9. Prevent any sync containing incomplete required variants from becoming `completed`.
+10. Prevent an early cursor-loop termination from becoming `completed`.
+11. Preserve safe idempotent product and variant upserts.
+12. Support resumption when the failure is recoverable.
+
+Do not treat an API error as an empty variant list.
+
+### Required tests
+
+Test normal pagination, multiple pages, empty variants, repeated cursors, non-advancing cursors, missing cursor, page limits, API errors, duplicate variant IDs and incomplete-data persistence.
+
+Assert the final database state and Sync Run status.
+
+## A3. Webhook Truth Verification
+
+### Confirmed issues
+
+The current webhook query:
+
+`webhookSubscriptions(first: 25)`
+
+does not fully paginate.
+
+The verifier checks topics without requiring the configured callback URL to match.
+
+The current `GET /api/shopify/status` derives webhook status from cached `connection.webhookSubscriptions`.
+
+The live subscription fetch helper catches errors and returns an empty array, which can incorrectly disguise an API failure as missing subscriptions.
+
+The registration route constructs a callback URL from `appUrl` instead of consistently using the configured `webhookUrl`.
+
+### Required correction
+
+Implement authoritative live webhook verification.
+
+Use the canonical configured webhook callback URL from `getShopifyOAuthEnv()`.
+
+Verify:
+
+1. Required topic.
+2. Callback URL.
+3. Subscription ID.
+4. Correct Shopify connection.
+5. Current live API response.
+6. Pagination completion.
+
+Use a documented URL normalization policy.
+
+Do not accept an unrelated callback URL.
+
+Do not silently swallow Shopify GraphQL errors.
+
+Do not report an API error as an ordinary missing-subscription result.
+
+### Required webhook states
+
+Use a consistent typed status contract:
+
+- `active`
+- `partially_registered`
+- `unverified`
+- `mismatch`
+- `not_configured`
+- `error`
+
+`active` is allowed only when every required topic has a live subscription pointing to the expected callback URL and the verification result is still within the defined freshness period.
+
+Persist a dedicated webhook verification result or equivalent trustworthy verification record.
+
+Do not use the general Shopify connection `lastVerifiedAt` as a substitute for webhook verification time.
+
+### Status API
+
+Refactor `/api/shopify/status`.
+
+It must:
+
+- Never report Active from cached records alone.
+- Report UNVERIFIED if no successful live verification exists.
+- Report MISMATCH if callback URL is wrong.
+- Report ERROR if live verification fails.
+- Expire old verification results.
+- Never fall back to cached Active on API errors.
+- Return safe diagnostic details without secrets.
+
+### Required tests
+
+Correct callback, wrong callback, missing topic, duplicate topic, removed live subscription, stale cache, expired verification, API error, missing configuration, more than 25 subscriptions and status endpoint truthfulness.
+
+## A4. Durable Sync Run Lifecycle
+
+### Confirmed issues
+
+The current `resumeShopifySync()` ignores the supplied `syncRunId` and retrieves the latest run instead.
+
+The resumed operation calls `syncShopifyCatalog()`, which creates a new ID using `Date.now()`.
+
+The newly introduced type fields:
+
+- `parentSyncRunId`
+- `attemptNumber`
+- `variantCompletenessStatus`
+- `paginationMetadata`
+
+are not sufficient unless they are persisted and read back through the actual PostgreSQL repository and migration.
+
+The newly introduced `getShopifySyncRunById()` query uses only `WHERE id = $1` and does not explicitly scope the query by workspace.
+
+### Required correction
+
+Implement a durable Sync Run and Resume Attempt model.
+
+Each Sync Run must have a stable unique ID.
+
+Each Resume Attempt must have a separate unique Attempt ID.
+
+Preserve the original Sync Run identity when continuing the same logical operation.
+
+Use an explicit Parent Sync Run relationship for attempt history.
+
+Required data:
+
+- Sync Run ID.
+- Workspace ID.
+- Shopify connection / shop identity.
+- Status.
+- Parent Sync Run ID.
+- Attempt ID.
+- Attempt number.
+- Product cursor.
+- Variant pagination state.
+- Products discovered.
+- Products imported.
+- Variants imported.
+- Excluded by plan.
+- Page progress.
+- Variant completeness.
+- Failure reason.
+- Started, updated and completed timestamps.
+
+### Resume validation
+
+1. Honor the exact `syncRunId` supplied by the client.
+2. If no ID is supplied, use a documented safe default.
+3. Verify workspace ownership on the server.
+4. Verify Shopify connection ownership.
+5. Reject cross-workspace IDs.
+6. Reject completed or cancelled runs.
+7. Prevent concurrent resume of the same run.
+8. Prevent duplicate attempts.
+9. Persist each attempt.
+10. Make retries idempotent.
+11. Persist cursor progress before losing recoverable work.
+12. Ensure incomplete variants cannot become completed through resume.
+13. Never report COMPLETED after cursor-loop termination.
+
+All repository methods that retrieve or update Sync Runs must enforce workspace scoping.
+
+Never trust an unscoped Sync Run ID supplied by a client.
+
+### Database migration
+
+Inspect migrations 001–008 and preserve them.
+
+Add forward-only migrations for the new Sync Run and Attempt schema.
+
+Do not rewrite applied migrations.
+
+Add appropriate:
+
+- Composite workspace foreign keys.
+- Parent Run foreign keys.
+- Unique constraints.
+- Indexes.
+- State constraints where appropriate.
+- Attempt ordering indexes.
+
+Existing records must remain readable.
+
+### UI lifecycle monitoring
+
+Upgrade Settings > Shopify into a useful operational Sync Run monitor.
+
+Display:
+
+- Sync Run ID.
+- Status.
+- Start time.
+- Last update.
+- Completion time.
+- Products discovered/imported.
+- Variants imported.
+- Pagination progress.
+- Variant completeness.
+- Partial/failure reason.
+- Resume availability.
+- Parent Run ID.
+- Resume Attempt history.
+
+Add a list of recent Sync Runs with pagination where necessary.
+
+Do not expose full raw cursors or credentials.
+
+The UI must use the authenticated server-side API and must not infer lifecycle correctness from local state.
+
+The server must enforce every action independently of UI button visibility.
+
+# 4. WORKSTREAM B — AI DISCOVERY READINESS MODULE
+
+## Product objective
+
+Introduce a new module inside AIXSHOP:
+
+**AI Discovery Readiness**
+
+Purpose:
+
+Help Shopify merchants prepare accurate, complete, structured and trustworthy product and business information for discovery through AI-powered commerce and search experiences.
+
+This is a readiness and data-quality product.
+
+It is NOT an AI ranking guarantee.
+
+It is NOT a guarantee that ChatGPT, Google, Gemini or another AI platform will recommend a product.
+
+Do not claim access to private ChatGPT conversations or unpublished OpenAI analytics APIs.
+
+Do not create fake AI visibility numbers.
+
+## B1. Product Discovery Readiness Audit
+
+Build deterministic rules using actual Shopify product and variant data.
+
+Evaluate:
+
+### Product Identity
+
+- Product title.
+- Brand/vendor.
+- Product category.
+- Product type.
+- Product handle.
+- Product URL.
+- Product status.
+
+### Product Content
+
+- Description presence.
+- Description quality and useful product information.
+- Material.
+- Dimensions.
+- Size.
+- Color.
+- Intended use.
+- Important specifications.
+- Relevant attributes.
+
+Do not invent missing product specifications.
+
+### Product Identifiers
+
+- SKU.
+- GTIN.
+- UPC.
+- EAN.
+- Barcode format.
+- Check digit validity.
+- Variant identity.
+
+Do not fabricate GTINs or recommend arbitrary identifiers.
+
+### Product Images
+
+- Primary image availability.
+- Image URL validity.
+- Image accessibility where technically testable.
+- Alt text availability.
+- Image association with the correct product.
+- Image freshness where reliable timestamps exist.
+
+Do not claim an image is visually suitable unless actual image analysis has been performed.
+
+### Offer and Availability
+
+- Price.
+- Currency.
+- Availability.
+- Inventory data.
+- Variant-level offer consistency.
+- Product URL.
+- Last synchronization time.
+
+Distinguish unknown inventory from zero inventory.
+
+Do not infer availability from missing data.
+
+### Data Freshness
+
+- Shopify source updated time.
+- Last successful catalog sync.
+- Price update freshness.
+- Inventory freshness.
+- Last verified product URL.
+- Source provenance.
+
+### Output
+
+Generate structured findings with:
+
+- Finding ID.
+- Rule ID.
+- Product ID.
+- Variant ID, if applicable.
+- Observed source value.
+- Expected condition.
+- Actual evidence.
+- Risk/severity.
+- Recommended action.
+- Whether merchant input is required.
+- Recheck status.
+
+Keep readiness findings separate from external AI visibility claims.
+
+## B2. AI Discovery Readiness Score
+
+Implement a deterministic score with transparent dimensions.
+
+Suggested dimensions:
+
+1. Product Identity.
+2. Product Content.
+3. Structured Attributes.
+4. Product Identifiers.
+5. Images.
+6. Price and Availability.
+7. URL and Source Consistency.
+8. Data Freshness.
+
+Each dimension must expose:
+
+- Score.
+- Maximum score.
+- Rules evaluated.
+- Passed rules.
+- Failed rules.
+- Not assessed rules.
+- Evidence.
+
+Do not silently treat missing data as passing.
+
+Do not treat Not Assessed as Pass.
+
+Document scoring weights and formulas.
+
+Do not reuse the existing generic `completenessScore` as an AI Discovery score without proving that the semantics match.
+
+The new score must be reproducible from the same source data and rule version.
+
+## B3. Brand & Business Information Readiness
+
+Create a separate workspace-scoped Business Profile model.
+
+Potential fields:
+
+- Legal business name.
+- Public brand name.
+- Brand description.
+- Official website.
+- Primary domain.
+- Contact information.
+- Business location.
+- Support channels.
+- Product categories.
+- Shipping policy URL.
+- Return policy URL.
+- Refund policy URL.
+- Privacy policy URL.
+- Terms of service URL.
+- Brand logo.
+- Business social profiles.
+- Verification status.
+- Source provenance.
+- Last verified timestamp.
+
+Requirements:
+
+1. Preserve existing Store Profile functionality.
+2. Avoid confusing the Shopify store name with the legal business name.
+3. Support merchant-confirmed data.
+4. Store verification source and verification time.
+5. Identify conflicting business information.
+6. Do not invent legal or company information.
+7. Keep business data isolated by workspace.
+8. Record changes and their source.
+9. Allow merchant review before publishing or exporting.
+
+Do not claim that completing this profile automatically verifies a business with OpenAI.
+
+## B4. ChatGPT Business Hub Preparation
+
+Prepare an optional Business Hub Readiness Checklist for merchants.
+
+The checklist may include:
+
+- Official brand name.
+- Official website.
+- Domain ownership evidence.
+- Business email.
+- Contact details.
+- Brand logo.
+- Product catalog information.
+- Business description.
+- Business identity verification preparation.
+
+Provide a downloadable or copyable profile summary for merchants.
+
+Important boundaries:
+
+- The merchant must claim and verify their own business.
+- AIXSHOP must not claim ownership of customer businesses.
+- Do not attempt automated Business Hub registration without an official supported integration.
+- Do not promise that the business will be approved.
+- Do not imply that a profile is reserved or trademark-protected.
+- Do not assume Thai merchants have access to features restricted to other regions.
+
+This is preparation and guidance, not an unofficial OpenAI registration integration.
+
+# 5. WORKSTREAM C — PRODUCT FEED READINESS & CATALOG DATA QUALITY
+
+## C1. Feed Validation Architecture
+
+Build a platform-independent canonical feed validation layer.
+
+Then add platform-specific adapters only where the official platform specifications are verified.
+
+Potential initial targets:
+
+- Google Merchant Center product data.
+- Meta Commerce catalog.
+- Schema.org Product structured data.
+- A future AI Commerce feed adapter when a supported specification is available.
+
+Do not invent undocumented feed fields or claim compatibility without schema validation.
+
+Each adapter must have:
+
+- Schema/version.
+- Required fields.
+- Optional fields.
+- Field mapping.
+- Validation rules.
+- Error messages.
+- Export format.
+- Test fixtures.
+
+## C2. Product Feed Validation
+
+Validate:
+
+- Product ID.
+- Product title.
+- Description.
+- Brand.
+- GTIN / MPN where applicable.
+- Product URL.
+- Image URL.
+- Price.
+- Currency.
+- Availability.
+- Condition.
+- Variant identifiers.
+- Product category.
+- Required platform attributes.
+
+Distinguish:
+
+- Valid.
+- Invalid.
+- Missing.
+- Not Applicable.
+- Not Verified.
+
+Do not mark a product as Feed Ready merely because it has a high generic completeness score.
+
+## C3. Feed Export
+
+Implement safe export functionality.
+
+Initial formats:
+
+- CSV.
+- JSON.
+
+Allow merchants to:
+
+1. Select a target platform.
+2. Run validation.
+3. Inspect errors.
+4. Export valid records.
+5. Export rejected records with reasons.
+6. Download a validation report.
+
+Never silently omit rejected products.
+
+Do not publish or submit a feed to an external platform automatically without explicit authorization and a supported integration.
+
+## C4. Canonical Product URL Correction
+
+Review the Shopify Product Mapping logic.
+
+The current mapping builds product offer URLs using a hardcoded generic Shopify hostname.
+
+Correct product URL construction using the actual verified store domain and appropriate canonical storefront URL.
+
+Requirements:
+
+- Preserve the actual shop domain.
+- Respect configured primary storefront domain when verified.
+- Handle missing storefront configuration explicitly.
+- Never invent a canonical URL.
+- Record URL provenance.
+- Test URL generation for multiple stores.
+
+## C5. Safe Audit Recommendations
+
+Review the existing `auditEngine.ts`.
+
+Identify recommendations that invent or assume product information.
+
+Examples requiring review:
+
+- Suggesting an arbitrary price such as `0.00`.
+- Suggesting a generic category that may not describe the product.
+- Automatically assigning the store name as manufacturer brand without merchant confirmation.
+- Suggesting placeholder image paths as if they were valid assets.
+- Claiming a platform requirement without identifying the applicable platform specification.
+
+Correct these behaviors.
+
+Requirements:
+
+1. Never fabricate product data.
+2. Never fabricate GTINs or manufacturer identifiers.
+3. Never invent prices, inventory, materials, certifications or specifications.
+4. Mark missing merchant input as `NEEDS_MERCHANT_INPUT`.
+5. Distinguish a recommendation from a verified correction.
+6. Preserve evidence-based findings.
+7. Require merchant approval for changes.
+8. Recheck against the actual updated source data.
+9. Preserve the existing action approval and audit history.
+
+Platform-specific claims must be backed by the applicable documented specification and version.
+
+# 6. WORKSTREAM D — AI VISIBILITY MONITORING
+
+Create a separate AI Visibility Monitoring area, but implement only metrics supported by actual evidence.
+
+Potential metrics:
+
+- Brand Mentions.
+- Product Mentions.
+- Website Clicks.
+- Discovery Topics.
+- Source / Platform.
+- Observation Date.
+- Evidence Source.
+- Reporting Period.
+
+### Data source policy
+
+Use only:
+
+1. Official APIs with documented authorization.
+2. Official analytics exports uploaded by the merchant.
+3. Verified third-party integrations.
+4. Clearly labeled manual observations.
+
+Do not scrape private ChatGPT conversations.
+
+Do not infer actual mentions from generated AI responses.
+
+Do not fabricate Website Clicks.
+
+Do not display estimated data as actual analytics.
+
+If no supported source exists, display:
+
+`DATA SOURCE NOT CONNECTED`
+
+If the merchant uploads a CSV, preserve:
+
+- Upload source.
+- File timestamp.
+- Reporting period.
+- Imported records.
+- Validation errors.
+- Duplicate detection.
+- Import history.
+
+Clearly distinguish imported analytics from directly verified platform analytics.
+
+Do not claim AIXSHOP can measure ChatGPT mentions unless the data source actually supports it.
+
+# 7. WORKSTREAM E — BILLING, SUBSCRIPTION & ENTITLEMENT VERIFICATION
+
+The repository already contains a Stripe billing provider, Sandbox provider, checkout routes, subscription records and webhook processing.
+
+Do not replace these systems.
+
+Audit the actual implementation first.
+
+Current authoritative plan configuration observed in the source includes:
+
+- Free Audit.
+- Starter — $49/month.
+- Growth — $149/month.
+- Enterprise — $499/month.
+
+Treat these as current code values, not as independently verified market prices.
+
+## E1. Stripe Checkout
+
+Verify:
+
+- Real Stripe Checkout Session creation.
+- Correct workspace association.
+- Correct plan-to-Price ID mapping.
+- Correct subscription mode.
+- Customer reuse.
+- Trusted success and cancellation URLs.
+- No arbitrary redirect URL.
+- No client-controlled price or entitlement elevation.
+
+## E2. Subscription Lifecycle
+
+Verify and complete:
+
+- Checkout completed.
+- Subscription created.
+- Subscription updated.
+- Subscription cancelled.
+- Subscription deleted.
+- Payment failed.
+- Past due.
+- Unpaid.
+- Refund handling where relevant.
+- Plan changes.
+- Cancellation at period end.
+- Renewal.
+- Expiration.
+
+Entitlements must follow authoritative server-side subscription state.
+
+Do not trust frontend plan values.
+
+## E3. Webhook Integrity
+
+Verify:
+
+- Raw body preservation.
+- Signature verification.
+- Event idempotency.
+- Duplicate event handling.
+- Failed event retry behavior.
+- Out-of-order event handling.
+- Workspace mapping.
+- Stripe Price ID validation.
+- Atomic subscription and entitlement updates.
+
+Inspect whether a webhook marked `processing` can become permanently stuck after worker failure.
+
+Implement safe recovery where required.
+
+## E4. Entitlement Enforcement
+
+Verify plan limits across:
+
+- Catalog imports.
+- Shopify sync.
+- SKU counts.
+- Audit execution.
+- Feed exports.
+- AI Discovery features.
+- Business Profile features.
+- Monitoring and history.
+
+Ensure paid entitlements cannot be bypassed through direct API requests.
+
+Ensure downgrade and cancellation behavior is explicit and does not destroy merchant data.
+
+## E5. Live Billing Verification
+
+Implement automated test coverage using Sandbox and mocked Stripe boundaries.
+
+Live Stripe tests require real test-mode credentials and actual Stripe configuration.
+
+Do not claim live payment readiness without testing a real Stripe test-mode Checkout and webhook lifecycle.
+
+Production Stripe mode must never silently fall back to Sandbox.
+
+# 8. SECURITY, DATA INTEGRITY & TENANT ISOLATION
+
+Audit the complete application.
+
+Verify:
+
+- Workspace authorization.
+- Role-based access control.
+- Cross-workspace query isolation.
+- Session authentication.
+- CSRF protection where required.
+- Input validation.
+- SQL parameterization.
+- Secret handling.
+- Shopify token encryption.
+- Webhook HMAC verification.
+- Stripe webhook verification.
+- Rate limiting for sensitive routes.
+- Error response information leakage.
+- File upload validation.
+- Export authorization.
+- Audit history immutability.
+
+Every new AI Discovery, Business Profile, Feed and Monitoring record must be workspace-scoped.
+
+Never trust a client-supplied workspace ID.
+
+Every read, update, delete, export and download must verify ownership and authorization server-side.
+
+Preserve existing RBAC behavior.
+
+# 9. DATABASE & MIGRATION RULES
+
+Preserve all existing migrations 001–008.
+
+Do not edit or rewrite already-applied migrations.
+
+Add forward-only migrations when new schema is required.
+
+Before migration:
+
+1. Inspect existing table definitions.
+2. Inspect applied migration tracking.
+3. Inspect current records.
+4. Check foreign keys and indexes.
+5. Check data backfill requirements.
+
+New schema must preserve:
+
+- Workspace isolation.
+- Composite foreign-key integrity where applicable.
+- Referential integrity.
+- Unique business identifiers.
+- Idempotency.
+- Backward compatibility.
+
+Use database constraints where they materially protect correctness.
+
+Do not drop existing production tables or reset user data.
+
+Test migrations against PostgreSQL when available.
+
+# 10. UI / PRODUCT EXPERIENCE
+
+Keep AIXSHOP's existing visual design and navigation conventions.
+
+Add the following navigation or equivalent sections without disrupting existing workflows:
+
+1. Catalog Health.
+2. AI Discovery Readiness.
+3. Brand & Business Profile.
+4. Feed Readiness.
+5. AI Visibility.
+6. Shopify Sync History.
+7. Existing Billing and Settings.
+
+The interface should make it easy for a merchant to understand:
+
+- What is wrong.
+- Which product is affected.
+- What evidence supports the finding.
+- What needs merchant input.
+- What can be safely fixed.
+- What has been verified after correction.
+- What is not yet connected or measurable.
+
+Avoid decorative scores without explainable calculations.
+
+Avoid fake analytics and placeholder business data in production views.
+
+Use empty states that clearly explain what data is required.
+
+Do not remove existing Audit History, Evidence, Approval, Recheck or Billing screens.
+
+# 11. PERFORMANCE & SCALABILITY
+
+Evaluate the application using realistic catalog sizes.
+
+Test where feasible:
+
+- 100 products.
+- 1,000 products.
+- 10,000 products.
+- Large variant counts.
+- Multiple concurrent workspaces.
+- Repeated sync requests.
+- Interrupted sync.
+- Large feed export.
+- Large audit history.
+
+These are test scenarios, not assumed supported production capacities.
+
+Implement pagination, bounded processing, backpressure and safe retries where needed.
+
+Avoid loading entire catalogs into memory unnecessarily.
+
+Measure actual resource usage before claiming scalability.
+
+Do not claim a particular tenant capacity without evidence.
+
+# 12. REGRESSION TEST REQUIREMENTS
+
+Run all existing tests and add missing coverage.
+
+### Shopify
+
+- PostgreSQL concurrent refresh.
+- Transaction-scoped token persistence.
+- Variant completeness.
+- Cursor loops.
+- Webhook callback mismatch.
+- Webhook API errors.
+- Webhook pagination.
+- Stale verification.
+- Explicit Sync Run ID.
+- Parent / Attempt linkage.
+- Cross-workspace access rejection.
+- Concurrent resume.
+- UI lifecycle API contracts.
+
+### AI Discovery
+
+- Deterministic scoring.
+- Missing product information.
+- Missing brand.
+- Missing identifiers.
+- Invalid GTIN.
+- Missing images.
+- Invalid product URL.
+- Missing price.
+- Unknown inventory.
+- Stale product data.
+- Not Assessed handling.
+- Workspace isolation.
+- Merchant approval.
+- Recheck after changes.
+
+### Feed
+
+- Valid product export.
+- Invalid product rejection.
+- Required field validation.
+- Currency validation.
+- Identifier validation.
+- Variant consistency.
+- Export completeness.
+- No silent product omission.
+
+### Billing
+
+- Checkout.
+- Correct plan mapping.
+- Webhook signatures.
+- Idempotency.
+- Duplicate events.
+- Out-of-order events.
+- Cancellation.
+- Renewal.
+- Payment failure.
+- Entitlement changes.
+- Cross-workspace billing isolation.
+
+### Security
+
+- Unauthorized access.
+- Cross-workspace access.
+- Invalid input.
+- SQL injection boundaries.
+- Secret leakage.
+- Export authorization.
+- Webhook signature failure.
+
+Run:
+
+- Full existing test suite.
+- TypeScript type-check.
+- Lint.
+- Production build.
+- Migration validation.
+- PostgreSQL integration tests where configured.
+
+Do not delete or weaken existing tests to make the suite pass.
+
+Do not skip tests merely to produce a green report.
+
+# 13. EXTERNAL INTEGRATION BOUNDARIES
+
+The following must be reported separately.
+
+### PostgreSQL
+
+Requires a real `DATABASE_URL`.
+
+### Shopify
+
+Requires:
+
+- Shopify Partner App.
+- Client ID.
+- Client Secret.
+- Authorized test store.
+- Correct redirect URL.
+- Public webhook URL.
+
+### Stripe
+
+Requires:
+
+- Stripe test-mode secret key.
+- Stripe webhook secret.
+- Real test Price IDs.
+- Reachable webhook endpoint.
+
+### AI Visibility
+
+Requires an actual supported data source or merchant-uploaded analytics export.
+
+### ChatGPT Business Hub
+
+Merchant ownership verification and claiming must remain an owner-controlled process unless OpenAI provides a documented authorized API.
+
+Do not claim that AIXSHOP can directly access Business Hub analytics without an official integration.
+
+If any external dependency is missing:
+
+- Complete local code and test work.
+- Add integration tests.
+- Mark live verification BLOCKED.
+- Document exact prerequisites.
+- Do not fabricate successful external verification.
+
+# 14. IMPLEMENTATION ORDER
+
+Execute in this order:
+
+1. Inspect and record the current baseline.
+2. Fix PostgreSQL Refresh Lock.
+3. Fix Variant Pagination Completeness.
+4. Fix Webhook Truth Verification.
+5. Complete durable Sync Run Lifecycle.
+6. Complete regression tests for Workstream D.
+7. Audit and correct unsafe existing catalog recommendations.
+8. Implement AI Discovery Readiness.
+9. Implement Brand & Business Information Readiness.
+10. Implement Feed Readiness and export.
+11. Implement evidence-based AI Visibility data ingestion.
+12. Audit and complete billing lifecycle gaps.
+13. Complete security and tenant-isolation verification.
+14. Complete performance and deployment readiness tests.
+15. Update documentation and deployment checklist.
+
+After each stage:
+
+- Inspect the actual diff.
+- Run relevant tests.
+- Verify existing functionality.
+- Fix regressions before continuing.
+
+Do not silently defer a required task.
+
+If a task is blocked, state exactly why and continue with independent tasks.
+
+# 15. COMMERCIAL READINESS REQUIREMENTS
+
+AIXSHOP must deliver practical value to paying Shopify merchants.
+
+The product must allow a merchant to:
+
+1. Connect a real Shopify store.
+2. Import the actual catalog.
+3. Inspect genuine product and variant data.
+4. Identify actionable catalog defects.
+5. Understand the evidence behind each defect.
+6. Approve safe corrections.
+7. Recheck corrected products.
+8. Inspect historical audit results.
+9. Evaluate AI Discovery Readiness.
+10. Validate product feeds.
+11. Export usable catalog data.
+12. Manage subscription and entitlements.
+
+The product must not require AI APIs merely to perform deterministic catalog validation.
+
+Prefer the existing deterministic engine for core checks.
+
+AI may be added later for optional assistance, but it must not fabricate product specifications or override source-of-truth data.
+
+Do not add recurring infrastructure or paid API dependencies without documenting their costs and operational requirements.
+
+Do not claim that a readiness score guarantees traffic, ranking, mentions, clicks or sales.
+
+# 16. DOCUMENTATION
+
+Update the relevant documentation:
+
+- Shopify integration architecture.
+- PostgreSQL concurrency behavior.
+- Sync Run lifecycle.
+- Variant completeness semantics.
+- Webhook verification truth boundary.
+- AI Discovery Readiness rules.
+- Score calculation.
+- Brand Profile data model.
+- Feed adapters and schema versions.
+- AI Visibility data source requirements.
+- Billing lifecycle.
+- Security and tenant isolation.
+- Deployment checklist.
+- Environment variables.
+- Test instructions.
+- Known limitations.
+
+Correct any historical test-count discrepancies.
+
+The deployment checklist must reflect actual executed evidence, not previous claims.
+
+# 17. FINAL ACCEPTANCE MATRIX
+
+The project must provide a final status for each area.
+
+| Area | Acceptance criteria |
+|---|---|
+| Refresh Lock | Actual refresh flow uses transaction-scoped persistence |
+| PostgreSQL Concurrency | Independent connection tests demonstrate correct locking |
+| Variant Pagination | Incomplete data can never become Completed |
+| Webhooks | Topics and callback URLs are verified live |
+| Status API | No stale-cache false Active |
+| Sync Lifecycle | Stable Run IDs and durable Resume Attempts |
+| Tenant Isolation | No cross-workspace Sync Run or business data access |
+| UI Monitoring | Recent runs, progress, errors and attempts are visible |
+| AI Discovery | Deterministic, evidence-backed readiness audit |
+| Brand Profile | Merchant-confirmed workspace-scoped business data |
+| Feed Readiness | Platform-specific validation and usable exports |
+| AI Visibility | Only evidence-backed analytics are displayed |
+| Catalog Audit | No fabricated product recommendations |
+| Billing | Correct Checkout, webhook lifecycle and entitlement enforcement |
+| Security | Existing and new isolation/security tests pass |
+| Database | Forward-only migrations preserve existing records |
+| Performance | Actual measurements documented |
+| Build | Type-check, lint and production build pass |
+| Documentation | Matches actual source code and test evidence |
+
+Use only these statuses:
+
+- PASS — Independently Executed and Verified.
+- PARTIAL — Implemented, but verification incomplete.
+- BLOCKED — External dependency unavailable.
+- FAIL — Defect remains.
+
+# 18. FINAL REPORT
+
+Provide a detailed report containing:
+
+## A. Baseline
+
+- Current commit SHA.
+- Files inspected.
+- Existing implementation status.
+- Existing tests and actual execution results.
+
+## B. Changes Implemented
+
+For every workstream:
+
+- Root cause.
+- Files changed.
+- Technical correction.
+- Database changes.
+- Tests added.
+- Actual execution results.
+
+## C. Verification Matrix
+
+Report every acceptance criterion separately.
+
+## D. Actual Test Results
+
+Report exact numbers:
+
+- Passed.
+- Failed.
+- Skipped.
+- Not Executed.
+- Blocked.
+
+Include actual command output or reproducible evidence.
+
+Do not reuse old reported test counts as new results.
+
+## E. External Integration Status
+
+Separate:
+
+- PostgreSQL.
+- Shopify OAuth.
+- Shopify webhooks.
+- Stripe.
+- AI Visibility data sources.
+
+## F. Commercial Readiness
+
+Explain:
+
+- What a real merchant can do today.
+- Which features are genuinely operational.
+- Which features require credentials or external services.
+- What prevents accepting real paying customers.
+- Any remaining operational costs or infrastructure requirements.
+
+## G. Remaining Risks
+
+List every unresolved defect, missing dependency and unsupported capability.
+
+## H. Git Operations
+
+Do not commit, push, merge, deploy, reset branches, overwrite remote files or delete existing work automatically.
+
+Do not perform destructive operations.
+
+Preserve the current development environment.
+
+Provide the final diff summary and wait for explicit owner approval before committing or pushing.
+
+---
+
+# FINAL DIRECTIVE
+
+Complete the remaining AIXSHOP work incrementally.
+
+The existing Shopify integration must be technically correct before it is described as production-ready.
+
+The new AI Discovery module must create measurable value using actual catalog data.
+
+Product Feed exports must be valid and traceable.
+
+AI Visibility metrics must come from real evidence.
+
+Billing must grant the correct entitlements.
+
+Every workspace must remain isolated.
+
+No fake data, no fabricated test results, no unsupported platform claims, and no destructive rewrites.
+
+**ZERO LOSS OF DEVELOPMENT PROGRESS.**
+
+Prioritize real merchant value, data integrity, operational reliability, and independently verifiable evidence over superficial feature completion.

@@ -3,7 +3,8 @@ export type VariantCompletenessStatus =
   | 'incomplete_page_limit'
   | 'incomplete_repeated_cursor'
   | 'incomplete_non_advancing_cursor'
-  | 'failed_api_error';
+  | 'failed_api_error'
+  | 'incomplete_missing_cursor';
 
 export interface ProductVariantCompleteness {
   productId: string;
@@ -11,8 +12,12 @@ export interface ProductVariantCompleteness {
   isComplete: boolean;
   status: VariantCompletenessStatus;
   variantsFetched: number;
+  uniqueVariantsCount?: number;
+  pagesFetched?: number;
   reason?: string;
   lastCursor?: string | null;
+  hasNextPage?: boolean;
+  error?: string;
 }
 
 export type WebhookStatusCategory = 

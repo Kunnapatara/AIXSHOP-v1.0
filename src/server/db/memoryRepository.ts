@@ -1213,9 +1213,11 @@ export class MemoryRepository implements DatabaseRepository {
     return JSON.parse(JSON.stringify(updated));
   }
 
-  async getShopifySyncRunById(id: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+  async getShopifySyncRunById(id: string, workspaceId?: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
     const run = this.shopifySyncRuns.get(id);
-    return run ? JSON.parse(JSON.stringify(run)) : null;
+    if (!run) return null;
+    if (workspaceId && run.workspaceId !== workspaceId) return null;
+    return JSON.parse(JSON.stringify(run));
   }
 
   async getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
@@ -1289,6 +1291,106 @@ export class MemoryRepository implements DatabaseRepository {
         this.shopifyRefreshLocks.delete(workspaceId);
       }
     }
+  }
+
+  private businessProfiles = new Map<string, import('../../domain/businessProfile/types').WorkspaceBusinessProfile>();
+  private visibilityImports = new Map<string, import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord>();
+  private visibilityMetrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[] = [];
+
+  async getWorkspaceBusinessProfile(workspaceId: string): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile | null> {
+    const profile = this.businessProfiles.get(workspaceId);
+    return profile ? JSON.parse(JSON.stringify(profile)) : null;
+  }
+
+  async saveWorkspaceBusinessProfile(profile: import('../../domain/businessProfile/types').WorkspaceBusinessProfile): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile> {
+    const copy = {
+      ...profile,
+      updatedAt: new Date().toISOString(),
+      createdAt: profile.createdAt || new Date().toISOString(),
+    };
+    this.businessProfiles.set(profile.workspaceId, JSON.parse(JSON.stringify(copy)));
+    return copy;
+  }
+
+  async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
+    const copy = { ...record, createdAt: record.createdAt || new Date().toISOString() };
+    this.visibilityImports.set(record.id, copy);
+    return copy;
+  }
+
+  async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
+    for (const m of metrics) {
+      const idx = this.visibilityMetrics.findIndex(
+        (existing) =>
+          existing.workspaceId === m.workspaceId &&
+          existing.observationDate === m.observationDate &&
+          existing.platform === m.platform &&
+          (existing.discoveryTopic || '') === (m.discoveryTopic || '')
+      );
+      const copy = JSON.parse(JSON.stringify(m));
+      if (idx >= 0) {
+        this.visibilityMetrics[idx] = copy;
+      } else {
+        this.visibilityMetrics.push(copy);
+      }
+    }
+  }
+
+  async getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary> {
+    const wsMetrics = this.visibilityMetrics.filter(m => m.workspaceId === workspaceId);
+    const wsImports = Array.from(this.visibilityImports.values()).filter(i => i.workspaceId === workspaceId);
+
+    if (wsMetrics.length === 0 && wsImports.length === 0) {
+      return {
+        connected: false,
+        status: 'DATA_SOURCE_NOT_CONNECTED',
+        message: 'DATA SOURCE NOT CONNECTED - No official AI platform analytics API or verified telemetry connected',
+        totalBrandMentions: 0,
+        totalProductMentions: 0,
+        totalWebsiteClicks: 0,
+        platforms: [],
+        recentObservations: [],
+        imports: [],
+      };
+    }
+
+    let totalBrandMentions = 0;
+    let totalProductMentions = 0;
+    let totalWebsiteClicks = 0;
+    const platformMap = new Map<string, { mentions: number; clicks: number }>();
+
+    for (const m of wsMetrics) {
+      totalBrandMentions += m.brandMentions || 0;
+      totalProductMentions += m.productMentions || 0;
+      totalWebsiteClicks += m.websiteClicks || 0;
+
+      const plat = platformMap.get(m.platform) || { mentions: 0, clicks: 0 };
+      plat.mentions += (m.brandMentions || 0) + (m.productMentions || 0);
+      plat.clicks += (m.websiteClicks || 0);
+      platformMap.set(m.platform, plat);
+    }
+
+    const platforms = Array.from(platformMap.entries()).map(([platform, data]) => ({
+      platform,
+      mentions: data.mentions,
+      clicks: data.clicks,
+    }));
+
+    const sortedObservations = [...wsMetrics].sort(
+      (a, b) => new Date(b.observationDate).getTime() - new Date(a.observationDate).getTime()
+    );
+
+    return {
+      connected: true,
+      status: 'CONNECTED',
+      message: 'Merchant-verified AI discovery analytics active',
+      totalBrandMentions,
+      totalProductMentions,
+      totalWebsiteClicks,
+      platforms,
+      recentObservations: sortedObservations.slice(0, 50),
+      imports: wsImports,
+    };
   }
 }
 

@@ -89,6 +89,9 @@ export class PostgresRepository implements DatabaseRepository {
       'shopify_sync_runs',
       'shopify_webhook_events',
       'shopify_oauth_states',
+      'workspace_business_profiles',
+      'ai_visibility_imports',
+      'ai_visibility_metrics',
     ];
 
     try {
@@ -319,6 +322,7 @@ export class PostgresRepository implements DatabaseRepository {
           '006_audit_history_snapshots.sql',
           '007_shopify_integration.sql',
           '008_audit_composite_integrity_and_shopify_hardening.sql',
+          '009_durable_sync_runs_and_ai_discovery.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -2687,9 +2691,9 @@ export class PostgresRepository implements DatabaseRepository {
     };
   }
 
-  async getShopifySyncRunById(id: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
-    const res = await this.pool.query<any>(
-      `SELECT 
+  async getShopifySyncRunById(id: string, workspaceId?: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+    const query = workspaceId
+      ? `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
         variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
@@ -2697,8 +2701,20 @@ export class PostgresRepository implements DatabaseRepository {
         started_at AS "startedAt", completed_at AS "completedAt",
         created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_sync_runs
-       WHERE id = $1`,
-      [id]
+       WHERE id = $1 AND workspace_id = $2`
+      : `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        started_at AS "startedAt", completed_at AS "completedAt",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_sync_runs
+       WHERE id = $1`;
+
+    const res = await this.pool.query<any>(
+      query,
+      workspaceId ? [id, workspaceId] : [id]
     );
 
     if (res.rows.length === 0) return null;
@@ -2904,6 +2920,233 @@ export class PostgresRepository implements DatabaseRepository {
     } finally {
       client.release();
     }
+  }
+
+  async getWorkspaceBusinessProfile(workspaceId: string): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile | null> {
+    const res = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId",
+        legal_business_name AS "legalBusinessName",
+        public_brand_name AS "publicBrandName",
+        brand_description AS "brandDescription",
+        official_website AS "officialWebsite",
+        primary_domain AS "primaryDomain",
+        contact_email AS "contactEmail",
+        contact_phone AS "contactPhone",
+        business_address AS "businessAddress",
+        support_url AS "supportUrl",
+        shipping_policy_url AS "shippingPolicyUrl",
+        return_policy_url AS "returnPolicyUrl",
+        refund_policy_url AS "refundPolicyUrl",
+        privacy_policy_url AS "privacyPolicyUrl",
+        terms_of_service_url AS "termsOfServiceUrl",
+        logo_url AS "logoUrl",
+        social_profiles_json AS "socialProfiles",
+        verification_status AS "verificationStatus",
+        last_verified_at AS "lastVerifiedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+       FROM workspace_business_profiles
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      ...r,
+      socialProfiles: Array.isArray(r.socialProfiles) ? r.socialProfiles : [],
+      lastVerifiedAt: r.lastVerifiedAt ? new Date(r.lastVerifiedAt).toISOString() : null,
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
+  async saveWorkspaceBusinessProfile(profile: import('../../domain/businessProfile/types').WorkspaceBusinessProfile): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile> {
+    const res = await this.pool.query<any>(
+      `INSERT INTO workspace_business_profiles (
+        id, workspace_id, legal_business_name, public_brand_name, brand_description,
+        official_website, primary_domain, contact_email, contact_phone, business_address,
+        support_url, shipping_policy_url, return_policy_url, refund_policy_url,
+        privacy_policy_url, terms_of_service_url, logo_url, social_profiles_json,
+        verification_status, last_verified_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20, NOW(), NOW())
+      ON CONFLICT (workspace_id) DO UPDATE SET
+        legal_business_name = EXCLUDED.legal_business_name,
+        public_brand_name = EXCLUDED.public_brand_name,
+        brand_description = EXCLUDED.brand_description,
+        official_website = EXCLUDED.official_website,
+        primary_domain = EXCLUDED.primary_domain,
+        contact_email = EXCLUDED.contact_email,
+        contact_phone = EXCLUDED.contact_phone,
+        business_address = EXCLUDED.business_address,
+        support_url = EXCLUDED.support_url,
+        shipping_policy_url = EXCLUDED.shipping_policy_url,
+        return_policy_url = EXCLUDED.return_policy_url,
+        refund_policy_url = EXCLUDED.refund_policy_url,
+        privacy_policy_url = EXCLUDED.privacy_policy_url,
+        terms_of_service_url = EXCLUDED.terms_of_service_url,
+        logo_url = EXCLUDED.logo_url,
+        social_profiles_json = EXCLUDED.social_profiles_json,
+        verification_status = EXCLUDED.verification_status,
+        last_verified_at = EXCLUDED.last_verified_at,
+        updated_at = NOW()
+      RETURNING *`,
+      [
+        profile.id,
+        profile.workspaceId,
+        profile.legalBusinessName || null,
+        profile.publicBrandName || null,
+        profile.brandDescription || null,
+        profile.officialWebsite || null,
+        profile.primaryDomain || null,
+        profile.contactEmail || null,
+        profile.contactPhone || null,
+        profile.businessAddress || null,
+        profile.supportUrl || null,
+        profile.shippingPolicyUrl || null,
+        profile.returnPolicyUrl || null,
+        profile.refundPolicyUrl || null,
+        profile.privacyPolicyUrl || null,
+        profile.termsOfServiceUrl || null,
+        profile.logoUrl || null,
+        JSON.stringify(profile.socialProfiles || []),
+        profile.verificationStatus || 'unverified',
+        profile.lastVerifiedAt || null,
+      ]
+    );
+
+    const r = res.rows[0];
+    return {
+      ...profile,
+      id: r.id,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+
+  async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
+    await this.pool.query(
+      `INSERT INTO ai_visibility_imports (
+        id, workspace_id, filename, row_count, reporting_period_start, reporting_period_end, source_platform, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+      [
+        record.id,
+        record.workspaceId,
+        record.filename,
+        record.rowCount,
+        record.reportingPeriodStart || null,
+        record.reportingPeriodEnd || null,
+        record.sourcePlatform || 'merchant_upload',
+      ]
+    );
+    return record;
+  }
+
+  async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
+    for (const m of metrics) {
+      await this.pool.query(
+        `INSERT INTO ai_visibility_metrics (
+          id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, evidence_source, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+          brand_mentions = EXCLUDED.brand_mentions,
+          product_mentions = EXCLUDED.product_mentions,
+          website_clicks = EXCLUDED.website_clicks,
+          evidence_source = EXCLUDED.evidence_source`,
+        [
+          m.id,
+          m.workspaceId,
+          m.importId || null,
+          m.observationDate,
+          m.platform,
+          m.brandMentions,
+          m.productMentions,
+          m.websiteClicks,
+          m.discoveryTopic || '',
+          m.evidenceSource || null,
+        ]
+      );
+    }
+  }
+
+  async getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary> {
+    const metricsRes = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", import_id AS "importId",
+        observation_date::text AS "observationDate", platform,
+        brand_mentions AS "brandMentions", product_mentions AS "productMentions",
+        website_clicks AS "websiteClicks", discovery_topic AS "discoveryTopic",
+        evidence_source AS "evidenceSource", created_at AS "createdAt"
+       FROM ai_visibility_metrics
+       WHERE workspace_id = $1
+       ORDER BY observation_date DESC
+       LIMIT 100`,
+      [workspaceId]
+    );
+
+    const importsRes = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", filename, row_count AS "rowCount",
+        reporting_period_start::text AS "reportingPeriodStart",
+        reporting_period_end::text AS "reportingPeriodEnd",
+        source_platform AS "sourcePlatform", created_at AS "createdAt"
+       FROM ai_visibility_imports
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      [workspaceId]
+    );
+
+    const metrics = metricsRes.rows;
+    const imports = importsRes.rows;
+
+    if (metrics.length === 0 && imports.length === 0) {
+      return {
+        connected: false,
+        status: 'DATA_SOURCE_NOT_CONNECTED',
+        message: 'DATA SOURCE NOT CONNECTED - No official AI platform analytics API or verified telemetry connected',
+        totalBrandMentions: 0,
+        totalProductMentions: 0,
+        totalWebsiteClicks: 0,
+        platforms: [],
+        recentObservations: [],
+        imports: [],
+      };
+    }
+
+    let totalBrandMentions = 0;
+    let totalProductMentions = 0;
+    let totalWebsiteClicks = 0;
+    const platformMap = new Map<string, { mentions: number; clicks: number }>();
+
+    for (const m of metrics) {
+      totalBrandMentions += Number(m.brandMentions || 0);
+      totalProductMentions += Number(m.productMentions || 0);
+      totalWebsiteClicks += Number(m.websiteClicks || 0);
+
+      const plat = platformMap.get(m.platform) || { mentions: 0, clicks: 0 };
+      plat.mentions += Number(m.brandMentions || 0) + Number(m.productMentions || 0);
+      plat.clicks += Number(m.websiteClicks || 0);
+      platformMap.set(m.platform, plat);
+    }
+
+    const platforms = Array.from(platformMap.entries()).map(([platform, data]) => ({
+      platform,
+      mentions: data.mentions,
+      clicks: data.clicks,
+    }));
+
+    return {
+      connected: true,
+      status: 'CONNECTED',
+      message: 'Merchant-verified AI discovery analytics active',
+      totalBrandMentions,
+      totalProductMentions,
+      totalWebsiteClicks,
+      platforms,
+      recentObservations: metrics,
+      imports,
+    };
   }
 }
 

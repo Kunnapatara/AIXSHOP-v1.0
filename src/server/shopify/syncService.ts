@@ -29,7 +29,8 @@ export function extractShopifyNumericId(gid: string): string {
  */
 export function mapShopifyProductNodeToDomain(
   node: ShopifyGraphQLProductNode,
-  currency = 'USD'
+  currency = 'USD',
+  storeDomain?: string
 ): Product {
   const numericId = extractShopifyNumericId(node.id);
   const prodId = `p_shopify_${numericId || Math.random().toString(36).substring(2, 9)}`;
@@ -78,7 +79,12 @@ export function mapShopifyProductNodeToDomain(
   const rawDesc = node.descriptionHtml || node.description || '';
   const cleanDesc = rawDesc.replace(/<[^>]*>?/gm, '').trim();
 
-  // 4. Map direct storefront offer
+  // 4. Map direct storefront offer using canonical store domain
+  const canonicalDomain = (storeDomain || 'store.myshopify.com')
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '');
+  const productUrl = `https://${canonicalDomain}/products/${node.handle || numericId}`;
+
   const offers: Offer[] = [];
   if (variants.length > 0 && variants[0].price !== null) {
     offers.push({
@@ -88,7 +94,7 @@ export function mapShopifyProductNodeToDomain(
       currency,
       availability: variants.some(v => (v.inventoryCount ?? 1) > 0) ? 'in_stock' : 'out_of_stock',
       condition: 'new',
-      url: `https://myshopify.com/products/${node.handle || numericId}`,
+      url: productUrl,
       merchantId: 'shopify',
       lastSync: new Date().toISOString(),
     });
@@ -113,6 +119,8 @@ export function mapShopifyProductNodeToDomain(
       shopifyHandle: node.handle || '',
       shopifyStatus: node.status || 'ACTIVE',
       provenance: 'shopify_graphql_admin_api',
+      canonicalProductUrl: productUrl,
+      urlProvenance: storeDomain ? 'verified_shopify_store_domain' : 'fallback_shopify_domain',
     },
     variants,
     offers,
@@ -130,6 +138,8 @@ export interface SyncCatalogOptions {
   maxPages?: number;
   pageSize?: number;
   resumeCursor?: string;
+  parentSyncRunId?: string;
+  attemptNumber?: number;
 }
 
 export interface SyncCatalogResult {
@@ -183,6 +193,8 @@ export async function syncShopifyCatalog(
       productsImported: 0,
       variantsImported: 0,
       excludedByPlan: 0,
+      parentSyncRunId: options.parentSyncRunId || null,
+      attemptNumber: options.attemptNumber || 1,
       startedAt: new Date().toISOString(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -236,6 +248,8 @@ export async function syncShopifyCatalog(
       let planLimitHit = false;
 
       const mergedProducts: Product[] = [];
+      const allVariantCompleteness: Record<string, import('./types').ProductVariantCompleteness> = {};
+      let isEarlyCursorBreak = false;
 
       while (hasNextPage && pageCount < maxPages) {
         pageCount++;
@@ -246,6 +260,10 @@ export async function syncShopifyCatalog(
           pageSize,
           { customFetch: options.customFetch }
         );
+
+        if (pageResult.variantCompleteness) {
+          Object.assign(allVariantCompleteness, pageResult.variantCompleteness);
+        }
 
         for (const rawNode of pageResult.products) {
           totalDiscoveredProducts++;
@@ -264,8 +282,8 @@ export async function syncShopifyCatalog(
             continue;
           }
 
-          // Map node to domain Product
-          const mappedProduct = mapShopifyProductNodeToDomain(rawNode, storeProfile?.currency || 'USD');
+          // Map node to domain Product with canonical store domain
+          const mappedProduct = mapShopifyProductNodeToDomain(rawNode, storeProfile?.currency || 'USD', shop);
 
           // Check for existing product in catalog to protect merchant edits
           const existingMatch = 
@@ -299,6 +317,7 @@ export async function syncShopifyCatalog(
         hasNextPage = pageResult.hasNextPage;
         if (pageResult.endCursor && seenCursors.has(pageResult.endCursor)) {
           // Guard against non-advancing or repeating cursors
+          isEarlyCursorBreak = true;
           break;
         }
         cursor = pageResult.endCursor;
@@ -310,10 +329,21 @@ export async function syncShopifyCatalog(
       const untouchedExisting = existingProducts.filter(p => !finalProductIds.has(p.id));
       const finalCatalogProducts = [...untouchedExisting, ...mergedProducts];
 
-      const isPartiallyCompleted = planLimitHit || (hasNextPage && pageCount >= maxPages);
+      const incompleteVariants = Object.values(allVariantCompleteness).filter(v => !v.isComplete);
+      const hasIncompleteVariants = incompleteVariants.length > 0;
+      let worstCompletenessStatus: import('./types').VariantCompletenessStatus = 'complete';
+      if (hasIncompleteVariants) {
+        worstCompletenessStatus = incompleteVariants[0].status;
+      }
+
+      const isPartiallyCompleted = planLimitHit || (hasNextPage && pageCount >= maxPages) || isEarlyCursorBreak || hasIncompleteVariants;
       const finalStatus = isPartiallyCompleted ? 'partially_completed' : 'completed';
       const message = planLimitHit
         ? `Imported ${importedProductsCount} products (${importedVariantsCount} SKUs). Reached ${entitlement.tier} plan limit of ${skuLimit} SKUs. ${excludedSkusCount} SKU(s) excluded.`
+        : isEarlyCursorBreak
+        ? `Sync interrupted: repeated or non-advancing cursor detected on products page ${pageCount}. Pass cursor '${cursor}' to resume.`
+        : hasIncompleteVariants
+        ? `Partially completed: ${incompleteVariants.length} product(s) have incomplete variants (${worstCompletenessStatus}). Pass cursor '${cursor}' to resume.`
         : (hasNextPage && pageCount >= maxPages)
         ? `Partially completed import of ${importedProductsCount} products (${importedVariantsCount} variants) from ${shop}. Pagination ceiling reached (${maxPages} pages); pass cursor '${cursor}' to resume.`
         : `Successfully imported ${importedProductsCount} products and ${importedVariantsCount} variants from ${shop}.`;
@@ -333,6 +363,16 @@ export async function syncShopifyCatalog(
         variantsImported: importedVariantsCount,
         excludedByPlan: excludedSkusCount,
         cursorResumed: isPartiallyCompleted ? (cursor ?? undefined) : undefined,
+        variantCompletenessStatus: worstCompletenessStatus,
+        paginationMetadata: {
+          pagesFetched: pageCount,
+          maxPages,
+          pageSize,
+          hasNextPage,
+          lastCursor: cursor,
+          isEarlyCursorBreak,
+          incompleteVariantsCount: incompleteVariants.length,
+        },
         completedAt: new Date().toISOString(),
         errorMessage: isPartiallyCompleted ? message : null,
       });
@@ -402,27 +442,43 @@ export async function resumeShopifySync(
   workspaceId: string,
   options: ResumeSyncOptions = {}
 ): Promise<SyncCatalogResult> {
-  const latestRun = await repo.getLatestShopifySyncRun(workspaceId);
-  if (!latestRun) {
-    throw new Error(`[AIXSHOP Shopify Sync] No previous sync run found for workspace ${workspaceId} to resume.`);
+  let targetRun: import('./types').ShopifySyncRunRecord | null = null;
+
+  if (options.syncRunId) {
+    targetRun = await repo.getShopifySyncRunById(options.syncRunId, workspaceId);
+    if (!targetRun) {
+      throw new Error(
+        `[AIXSHOP Shopify Sync] No sync run found with ID '${options.syncRunId}' for workspace ${workspaceId}.`
+      );
+    }
+  } else {
+    targetRun = await repo.getLatestShopifySyncRun(workspaceId);
+    if (!targetRun) {
+      throw new Error(`[AIXSHOP Shopify Sync] No previous sync run found for workspace ${workspaceId} to resume.`);
+    }
   }
 
-  if (latestRun.status !== 'partially_completed') {
+  if (targetRun.status !== 'partially_completed') {
     throw new Error(
-      `[AIXSHOP Shopify Sync] Latest sync run is '${latestRun.status}', not 'partially_completed'. Start a new sync instead.`
+      `[AIXSHOP Shopify Sync] Latest sync run is '${targetRun.status}', not 'partially_completed'. Start a new sync instead.`
     );
   }
 
-  if (!latestRun.cursorResumed) {
+  if (!targetRun.cursorResumed) {
     throw new Error(
       '[AIXSHOP Shopify Sync] Previous sync run does not contain a resumption cursor.'
     );
   }
 
+  const parentSyncRunId = targetRun.parentSyncRunId || targetRun.id;
+  const attemptNumber = (targetRun.attemptNumber || 1) + 1;
+
   return syncShopifyCatalog(repo, workspaceId, {
-    resumeCursor: latestRun.cursorResumed,
+    resumeCursor: targetRun.cursorResumed,
     maxPages: options.maxPages,
     pageSize: options.pageSize,
     customFetch: options.customFetch,
+    parentSyncRunId,
+    attemptNumber,
   });
 }

@@ -5,6 +5,10 @@ export type NavigationPage =
   | 'products' 
   | 'product-detail' 
   | 'actions' 
+  | 'ai-discovery'
+  | 'feed-readiness'
+  | 'business-profile'
+  | 'ai-visibility'
   | 'settings';
 
 export type PrimaryMerchantPage = 'home' | 'audit' | 'products' | 'actions';
@@ -87,6 +91,7 @@ export interface Finding {
   recommendedValue?: string;
   actionItemId?: string;
   ruleCode?: string;
+  needsMerchantInput?: boolean;
 }
 
 export type ActionStatus = 'pending_review' | 'approved' | 'applied_externally' | 'dismissed';
@@ -108,6 +113,7 @@ export interface ActionItem {
     to: string;
   };
   verificationStatus: VerificationStatus;
+  needsMerchantInput?: boolean;
   recheckNotes?: string;
   lastRecheckTimestamp?: string;
   approvedAt?: string;
