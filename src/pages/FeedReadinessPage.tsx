@@ -59,6 +59,7 @@ export const FeedReadinessPage: React.FC = () => {
 
     // Local demo export fallback
     const currency = storeProfile.currency || 'USD';
+    const evalMap = new Map((report?.evaluations || []).map((e) => [e.productId, e]));
     let targetProducts = products;
     if (exportFilter === 'valid_only' && report) {
       const validIds = new Set(report.evaluations.filter((e) => e.isValid).map((e) => e.productId));
@@ -70,13 +71,49 @@ export const FeedReadinessPage: React.FC = () => {
     let ext = 'csv';
 
     if (platform === 'schema_org') {
-      content = JSON.stringify(targetProducts.map((p) => mapProductToSchemaOrgJsonLd(p, currency)), null, 2);
+      content = JSON.stringify(
+        targetProducts.map((p) => {
+          const item = mapProductToSchemaOrgJsonLd(p, currency);
+          if (exportFilter === 'all') {
+            const ev = evalMap.get(p.id);
+            item.aixshopValidation = {
+              validationScope: 'local_structural_check_only',
+              externalPlatformAccepted: false,
+              status: ev?.isValid ? 'valid' : 'invalid',
+              errors: (ev?.errors || []).map((e) => `${e.field}: ${e.message}`),
+            };
+          }
+          return item;
+        }),
+        null,
+        2
+      );
       mime = 'application/json;charset=utf-8';
       ext = 'json';
     } else if (platform === 'meta_commerce') {
-      content = exportToCsv(targetProducts.map((p) => mapProductToMetaRow(p, currency)));
+      content = exportToCsv(
+        targetProducts.map((p) => {
+          const row = mapProductToMetaRow(p, currency);
+          if (exportFilter === 'all') {
+            const ev = evalMap.get(p.id);
+            row.validation_status = ev?.isValid ? 'valid' : 'invalid';
+            row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
+          }
+          return row;
+        })
+      );
     } else {
-      content = exportToCsv(targetProducts.map((p) => mapProductToGmcRow(p, currency)));
+      content = exportToCsv(
+        targetProducts.map((p) => {
+          const row = mapProductToGmcRow(p, currency);
+          if (exportFilter === 'all') {
+            const ev = evalMap.get(p.id);
+            row.validation_status = ev?.isValid ? 'valid' : 'invalid';
+            row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
+          }
+          return row;
+        })
+      );
     }
 
     const blob = new Blob([content], { type: mime });
@@ -166,6 +203,14 @@ export const FeedReadinessPage: React.FC = () => {
 
       {report && (
         <>
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <span>
+              {report.limitationsNotice ||
+                'Local structural check only: passing validation does not verify Google Merchant Center or Meta Commerce approval.'}
+            </span>
+          </div>
+
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="bg-white border border-stone-200 rounded-xl p-4">
               <span className="text-xs font-medium text-stone-500 block">Feed Readiness</span>
@@ -246,7 +291,9 @@ export const FeedReadinessPage: React.FC = () => {
                       <tr key={ev.productId} className="hover:bg-stone-50/70">
                         <td className="py-3 px-4">
                           <div className="font-semibold text-stone-900">{ev.title}</div>
-                          <div className="font-mono text-[11px] text-stone-500">{ev.sku}</div>
+                          <div className={`font-mono text-[11px] ${ev.sku ? 'text-stone-500' : 'text-red-600'}`}>
+                            {ev.sku || 'Missing SKU'}
+                          </div>
                         </td>
                         <td className="py-3 px-4 whitespace-nowrap">
                           {ev.isValid ? (

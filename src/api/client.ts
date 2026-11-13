@@ -194,8 +194,9 @@ class ApiClient {
   }
 
   // Shopify Endpoints
-  async getShopifyStatus(): Promise<ShopifyStatusResponse> {
-    return this.request<ShopifyStatusResponse>('/api/shopify/status');
+  async getShopifyStatus(options?: { verify?: 'live' }): Promise<ShopifyStatusResponse> {
+    const query = options?.verify === 'live' ? '?verify=live' : '';
+    return this.request<ShopifyStatusResponse>(`/api/shopify/status${query}`);
   }
 
   async syncShopify(options?: { maxPages?: number; pageSize?: number; resumeCursor?: string }): Promise<{
@@ -319,8 +320,21 @@ export interface ShopifyStatusResponse {
   installedAt: string | null;
   lastVerifiedAt: string | null;
   canResumeSync?: boolean;
-  webhookStatus?: 'active' | 'not_configured' | 'pending' | 'inactive' | 'partially_registered' | 'registered_unverified' | 'verification_failed';
+  webhookStatus?: 'active' | 'not_configured' | 'pending' | 'inactive' | 'partially_registered' | 'registered_unverified' | 'unverified' | 'mismatch' | 'verification_incomplete' | 'verification_unavailable' | 'verification_failed' | 'error';
   activeWebhooks?: string[];
+  webhookDetails?: {
+    verificationMode: 'live' | 'cached';
+    isLiveVerified: boolean;
+    requiredTopics: string[];
+    verifiedTopics: string[];
+    missingTopics: string[];
+    mismatchedSubscriptions: Array<{ id: string; topic: string; callbackUrl?: string; expectedUrl: string }>;
+    webhookLastVerifiedAt: string | null;
+    lastVerifiedAt: string | null;
+    isFresh: boolean;
+    completenessStatus?: string;
+    error?: string;
+  };
   latestSync?: {
     id?: string;
     status: string;

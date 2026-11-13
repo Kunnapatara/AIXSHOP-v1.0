@@ -28,7 +28,9 @@ export const BusinessProfilePage: React.FC = () => {
     privacyPolicyUrl: '',
     termsOfServiceUrl: '',
     logoUrl: '',
-    verificationStatus: 'unverified',
+    verificationStatus: 'not_verified',
+    verificationSource: null,
+    lastVerifiedAt: null,
   });
 
   useEffect(() => {
@@ -66,9 +68,16 @@ export const BusinessProfilePage: React.FC = () => {
     setSaving(true);
     setError(null);
     try {
-      const res = await apiClient.updateBusinessProfile(profile);
+      const {
+        verificationStatus: _vs,
+        verificationSource: _vsrc,
+        verificationEvidence: _vev,
+        lastVerifiedAt: _lva,
+        ...editableFields
+      } = profile;
+      const res = await apiClient.updateBusinessProfile(editableFields);
       setProfile(res.profile);
-      addToast('Business Profile Saved', 'Merchant brand and policy metadata persisted to workspace.', 'success');
+      addToast('Business Profile Saved', 'Merchant brand and policy metadata persisted as merchant self-declared.', 'success');
     } catch (err: any) {
       setError(err.message || 'Failed to save business profile');
       addToast('Save Failed', err.message || 'Could not update business profile.', 'error');
@@ -277,17 +286,28 @@ export const BusinessProfilePage: React.FC = () => {
           </section>
 
           <div className="pt-4 border-t border-stone-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <label className="text-xs font-semibold text-stone-700">Verification Status:</label>
-              <select
-                value={profile.verificationStatus || 'unverified'}
-                onChange={(e) => handleChange('verificationStatus', e.target.value)}
-                className="px-3 py-1.5 bg-stone-50 border border-stone-300 rounded-lg text-xs font-medium text-stone-900"
-              >
-                <option value="unverified">Unverified</option>
-                <option value="merchant_verified">Merchant Verified</option>
-                <option value="conflict_detected">Conflict Detected</option>
-              </select>
+            <div className="flex flex-wrap items-center gap-2.5">
+              <span className="text-xs font-semibold text-stone-700">Server Verification Status:</span>
+              <span className={`px-2.5 py-1 rounded-md text-xs font-mono font-semibold border ${
+                profile.verificationStatus === 'independently_verified'
+                  ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                  : profile.verificationStatus === 'merchant_self_declared'
+                  ? 'bg-amber-50 text-amber-800 border-amber-200'
+                  : profile.verificationStatus === 'verification_failed'
+                  ? 'bg-red-50 text-red-800 border-red-200'
+                  : 'bg-stone-100 text-stone-700 border-stone-200'
+              }`}>
+                {profile.verificationStatus || 'not_verified'}
+              </span>
+              {profile.verificationStatus === 'independently_verified' && profile.lastVerifiedAt ? (
+                <span className="text-[11px] font-mono text-stone-500">
+                  Source: {profile.verificationSource || 'verified'} · {new Date(profile.lastVerifiedAt).toLocaleDateString()}
+                </span>
+              ) : (
+                <span className="text-[11px] text-stone-500">
+                  Self-declared merchant metadata (requires external DNS/platform proof for independent verification)
+                </span>
+              )}
             </div>
 
             <button

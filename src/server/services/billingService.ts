@@ -69,7 +69,19 @@ export class BillingService {
     return this.provider.createPortalSession(workspaceId, customerId || `cust_${workspaceId}`, returnUrl);
   }
 
-  async handleWebhook(rawBody: string | Buffer, signatureHeader: string): Promise<WebhookProcessingResult> {
+  async renewEventLease(
+    eventId: string,
+    leaseOwner: string,
+    extendMs: number = 300000
+  ): Promise<boolean> {
+    return this.repo.renewBillingEventLease(eventId, leaseOwner, extendMs);
+  }
+
+  async handleWebhook(
+    rawBody: string | Buffer,
+    signatureHeader: string,
+    options?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<WebhookProcessingResult> {
     // 1. Resolve webhook secret safely without insecure production fallback
     let secret = '';
     if (this.provider.providerName === 'stripe') {
@@ -103,7 +115,7 @@ export class BillingService {
     // 3. Parse event payload safely
     const event = this.provider.parseWebhookEvent(rawBody);
 
-    // 4. Atomic Event Claim (PostgreSQL concurrency & idempotency guard)
+    // 4. Atomic Event Claim with durable lease ownership (PostgreSQL concurrency & idempotency guard)
     const claimRecord: BillingEventRecord = {
       id: `bevt_${event.id}`,
       provider: this.provider.providerName,
@@ -115,7 +127,7 @@ export class BillingService {
       processedAt: new Date().toISOString(),
     };
 
-    const claim = await this.repo.claimBillingEvent(claimRecord);
+    const claim = await this.repo.claimBillingEvent(claimRecord, options);
 
     if (!claim.claimed) {
       const existingStatus = claim.event?.status;
@@ -142,23 +154,25 @@ export class BillingService {
       }
     }
 
-    // 5. Dispatch event processing within guarded transaction
+    const leaseOwner = claim.leaseOwner;
+
+    // 5. Dispatch event processing within guarded transaction & lease ownership
     let result: WebhookProcessingResult;
     try {
-      result = await this.processEvent(event);
+      result = await this.processEvent(event, leaseOwner);
 
       if (result.action === 'ignored') {
-        await this.repo.updateBillingEventStatus(event.id, 'ignored');
+        await this.repo.updateBillingEventStatus(event.id, 'ignored', undefined, leaseOwner);
       }
     } catch (err: any) {
-      await this.repo.updateBillingEventStatus(event.id, 'failed');
+      await this.repo.updateBillingEventStatus(event.id, 'failed', err?.message, leaseOwner).catch(() => {});
       throw err;
     }
 
     return result;
   }
 
-  private async processEvent(event: WebhookEventPayload): Promise<WebhookProcessingResult> {
+  private async processEvent(event: WebhookEventPayload, leaseOwner?: string): Promise<WebhookProcessingResult> {
     const dataObj = event.data?.object || {};
     const eventCreated = event.created || Math.floor(Date.now() / 1000);
 
@@ -261,6 +275,7 @@ export class BillingService {
           subscription: subscriptionRecord,
           storeProfileUpdate,
           markProcessed: true,
+          leaseOwner,
         });
 
         return {
@@ -365,6 +380,7 @@ export class BillingService {
           subscription: subRecord,
           storeProfileUpdate,
           markProcessed: true,
+          leaseOwner,
         });
 
         return {
@@ -429,6 +445,7 @@ export class BillingService {
             skuLimit: AUTHORITATIVE_PLANS['free_audit'].skuLimit,
           },
           markProcessed: true,
+          leaseOwner,
         });
 
         return {
@@ -480,8 +497,13 @@ export class BillingService {
                 skuLimit: safeSkuLimit,
               },
               markProcessed: true,
+              leaseOwner,
             });
+            return { success: true, action: 'processed', message: 'Invoice payment succeeded recorded and subscription reactivated.', subscription: updatedSub };
           }
+        }
+        if (leaseOwner) {
+          await this.repo.updateBillingEventStatus(event.id, 'processed', undefined, leaseOwner);
         }
         return { success: true, action: 'processed', message: 'Invoice payment succeeded recorded.' };
       }
@@ -518,10 +540,88 @@ export class BillingService {
               eventId: event.id,
               subscription: updatedSub,
               markProcessed: true,
+              leaseOwner,
             });
+            return { success: true, action: 'processed', message: 'Invoice payment failure processed; status marked past_due.', subscription: updatedSub };
           }
         }
+        if (leaseOwner) {
+          await this.repo.updateBillingEventStatus(event.id, 'processed', undefined, leaseOwner);
+        }
         return { success: true, action: 'processed', message: 'Invoice payment failure processed; status marked past_due.' };
+      }
+
+      case 'charge.refunded': {
+        const subId = dataObj.subscription;
+        let workspaceId = dataObj.metadata?.workspaceId || dataObj.workspaceId;
+
+        let existingSub: SubscriptionRecord | null = null;
+        if (workspaceId) {
+          existingSub = await this.repo.getSubscriptionByWorkspace(workspaceId);
+        } else if (subId) {
+          existingSub = await this.repo.getSubscriptionBySubscriptionId(subId);
+          if (existingSub) {
+            workspaceId = existingSub.workspaceId;
+          }
+        }
+
+        if (!workspaceId || !existingSub) {
+          return { success: true, action: 'ignored', message: 'No matching workspace subscription found for refund event.' };
+        }
+
+        if (existingSub.lastEventCreated && eventCreated < existingSub.lastEventCreated) {
+          return {
+            success: true,
+            action: 'ignored',
+            message: `Stale charge.refunded event (${eventCreated} < ${existingSub.lastEventCreated}) safely ignored.`,
+          };
+        }
+
+        const isFullRefund = Boolean(
+          dataObj.refunded === true ||
+          (typeof dataObj.amount === 'number' &&
+            dataObj.amount > 0 &&
+            typeof dataObj.amount_refunded === 'number' &&
+            dataObj.amount_refunded >= dataObj.amount)
+        );
+
+        if (isFullRefund) {
+          const updatedSub: SubscriptionRecord = {
+            ...existingSub,
+            status: 'canceled',
+            cancelAtPeriodEnd: true,
+            lastEventCreated: eventCreated,
+            updatedAt: new Date().toISOString(),
+          };
+
+          await this.repo.applyBillingTransition({
+            eventId: event.id,
+            subscription: updatedSub,
+            storeProfileUpdate: {
+              tier: 'Free Audit',
+              skuLimit: AUTHORITATIVE_PLANS['free_audit'].skuLimit,
+            },
+            markProcessed: true,
+            leaseOwner,
+          });
+
+          return {
+            success: true,
+            action: 'processed',
+            message: `Full refund processed for workspace ${workspaceId}; subscription canceled and downgraded to Free Audit without data loss.`,
+            subscription: updatedSub,
+          };
+        }
+
+        if (leaseOwner) {
+          await this.repo.updateBillingEventStatus(event.id, 'processed', undefined, leaseOwner);
+        }
+        return {
+          success: true,
+          action: 'processed',
+          message: `Partial refund recorded for workspace ${workspaceId}; existing plan preserved.`,
+          subscription: existingSub,
+        };
       }
 
       default:

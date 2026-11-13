@@ -132,13 +132,23 @@ export interface DatabaseRepository {
   saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord>;
   getBillingEventById(eventId: string): Promise<BillingEventRecord | null>;
   saveBillingEvent(event: BillingEventRecord): Promise<void>;
-  claimBillingEvent(event: BillingEventRecord): Promise<{ claimed: boolean; event: BillingEventRecord | null }>;
-  updateBillingEventStatus(eventId: string, status: 'processing' | 'processed' | 'failed' | 'ignored', payload?: any): Promise<void>;
+  claimBillingEvent(
+    event: BillingEventRecord,
+    leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }>;
+  renewBillingEventLease(eventId: string, leaseOwner: string, extendMs?: number): Promise<boolean>;
+  updateBillingEventStatus(
+    eventId: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    payload?: any,
+    leaseOwner?: string
+  ): Promise<void>;
   applyBillingTransition(params: {
     eventId: string;
     subscription: SubscriptionRecord;
     storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
     markProcessed?: boolean;
+    leaseOwner?: string;
   }): Promise<void>;
 
   // Catalog Audit Runs
@@ -173,8 +183,12 @@ export interface DatabaseRepository {
   saveShopifyOAuthState(state: { id: string; workspaceId: string; shopDomain: string; expiresAt: string }): Promise<void>;
   getAndConsumeShopifyOAuthState(stateId: string): Promise<{ id: string; workspaceId: string; shopDomain: string; expiresAt: string } | null>;
   createShopifySyncRun(run: import('../shopify/types').ShopifySyncRunRecord): Promise<import('../shopify/types').ShopifySyncRunRecord>;
-  updateShopifySyncRun(id: string, updates: Partial<import('../shopify/types').ShopifySyncRunRecord>): Promise<import('../shopify/types').ShopifySyncRunRecord>;
-  getShopifySyncRunById(id: string, workspaceId?: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
+  updateShopifySyncRun(
+    id: string,
+    workspaceId: string,
+    updates: Partial<import('../shopify/types').ShopifySyncRunRecord>
+  ): Promise<import('../shopify/types').ShopifySyncRunRecord>;
+  getShopifySyncRunById(id: string, workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
   getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
   getShopifySyncRuns(workspaceId: string, limit?: number): Promise<import('../shopify/types').ShopifySyncRunRecord[]>;
   claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }>;
@@ -190,6 +204,10 @@ export interface DatabaseRepository {
   saveWorkspaceBusinessProfile(profile: import('../../domain/businessProfile/types').WorkspaceBusinessProfile): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile>;
   saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord>;
   saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void>;
+  saveVisibilityImportAtomic(
+    record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
+    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]
+  ): Promise<{ importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord; metricsSaved: number }>;
   getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary>;
 }
 

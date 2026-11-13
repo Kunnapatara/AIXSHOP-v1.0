@@ -2,38 +2,123 @@ import { Router, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
-import { VisibilityImportRecord, VisibilityMetricRecord } from '../../domain/monitoring/aiVisibilityTypes';
+import {
+  VisibilityImportRecord,
+  VisibilityImportRowError,
+  VisibilityMetricRecord,
+} from '../../domain/monitoring/aiVisibilityTypes';
 
-function parseCsvLines(csvText: string): string[][] {
-  const lines: string[][] = [];
-  const rawLines = csvText.split(/\r?\n/).filter((l) => l.trim().length > 0);
+const MAX_CSV_BYTES = 1_048_576; // 1 MB safety limit
+const MAX_CSV_ROWS = 5000;
 
-  for (const line of rawLines) {
-    const row: string[] = [];
-    let inQuotes = false;
-    let currentCell = '';
+const SUPPORTED_AI_PLATFORMS: Readonly<Record<string, string>> = {
+  'chatgpt search': 'ChatGPT Search',
+  'chatgpt': 'ChatGPT Search',
+  'openai': 'ChatGPT Search',
+  'perplexity shopping': 'Perplexity Shopping',
+  'perplexity': 'Perplexity',
+  'google ai overviews': 'Google AI Overviews',
+  'ai overviews': 'Google AI Overviews',
+  'google gemini': 'Google Gemini',
+  'gemini': 'Google Gemini',
+  'microsoft copilot': 'Microsoft Copilot',
+  'copilot': 'Microsoft Copilot',
+  'bing copilot': 'Microsoft Copilot',
+  'claude': 'Claude',
+  'anthropic claude': 'Claude',
+  'meta ai': 'Meta AI',
+};
 
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i];
+/**
+ * State-machine RFC-4180 CSV parser supporting newlines inside quoted cells,
+ * escaped quotes (""), CRLF/LF line endings, and strict unclosed quote detection.
+ */
+export function parseCsvRfc4180(csvText: string): string[][] {
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentCell = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < csvText.length; i++) {
+    const char = csvText[i];
+
+    if (inQuotes) {
       if (char === '"') {
-        if (inQuotes && line[i + 1] === '"') {
+        if (csvText[i + 1] === '"') {
           currentCell += '"';
           i++;
         } else {
-          inQuotes = !inQuotes;
+          inQuotes = false;
         }
-      } else if (char === ',' && !inQuotes) {
-        row.push(currentCell.trim());
-        currentCell = '';
       } else {
         currentCell += char;
       }
+      continue;
     }
-    row.push(currentCell.trim());
-    lines.push(row);
+
+    if (char === '"') {
+      if (currentCell.length === 0) {
+        inQuotes = true;
+      } else {
+        throw new Error('Malformed CSV: unexpected quote inside unquoted field.');
+      }
+    } else if (char === ',') {
+      currentRow.push(currentCell.trim());
+      currentCell = '';
+    } else if (char === '\r' || char === '\n') {
+      if (char === '\r' && csvText[i + 1] === '\n') {
+        i++;
+      }
+      currentRow.push(currentCell.trim());
+      if (currentRow.some((c) => c.length > 0)) {
+        rows.push(currentRow);
+      }
+      currentRow = [];
+      currentCell = '';
+    } else {
+      currentCell += char;
+    }
   }
 
-  return lines;
+  if (inQuotes) {
+    throw new Error('Malformed CSV: unclosed quoted field at end of input.');
+  }
+
+  currentRow.push(currentCell.trim());
+  if (currentRow.some((c) => c.length > 0)) {
+    rows.push(currentRow);
+  }
+
+  return rows;
+}
+
+function isValidStrictIsoDate(raw: string): { valid: boolean; reason?: string } {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return { valid: false, reason: 'Date must strictly match YYYY-MM-DD format.' };
+  }
+  const [yStr, mStr, dStr] = raw.split('-');
+  const year = Number(yStr);
+  const month = Number(mStr);
+  const day = Number(dStr);
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  if (
+    dt.getUTCFullYear() !== year ||
+    dt.getUTCMonth() !== month - 1 ||
+    dt.getUTCDate() !== day
+  ) {
+    return { valid: false, reason: `Calendar date "${raw}" does not exist.` };
+  }
+
+  const maxAllowed = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  if (raw < '2020-01-01' || raw > maxAllowed) {
+    return { valid: false, reason: `Date "${raw}" is outside valid observation range (2020-01-01 to ${maxAllowed}).` };
+  }
+  return { valid: true };
+}
+
+function normalizeSupportedPlatform(rawPlatform: string): string | null {
+  const key = rawPlatform.trim().toLowerCase().replace(/\s+/g, ' ');
+  return SUPPORTED_AI_PLATFORMS[key] || null;
 }
 
 export function createVisibilityRoutes(repo: DatabaseRepository): Router {
@@ -56,7 +141,7 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // POST /api/visibility/upload — Merchant CSV analytics ingestion with deduplication
+  // POST /api/visibility/upload — Strict transactional CSV analytics ingestion with deduplication
   router.post('/upload', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
@@ -66,9 +151,27 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Missing csvContent string in request body' });
       }
 
-      const rows = parseCsvLines(csvContent);
+      if (Buffer.byteLength(csvContent, 'utf8') > MAX_CSV_BYTES) {
+        return res.status(413).json({
+          error: `CSV payload exceeds maximum allowed size of ${MAX_CSV_BYTES} bytes.`,
+        });
+      }
+
+      let rows: string[][];
+      try {
+        rows = parseCsvRfc4180(csvContent);
+      } catch (parseErr: any) {
+        return res.status(400).json({ error: parseErr.message || 'Invalid CSV syntax' });
+      }
+
       if (rows.length < 2) {
         return res.status(400).json({ error: 'CSV file must include a header line and at least one data row' });
+      }
+
+      if (rows.length - 1 > MAX_CSV_ROWS) {
+        return res.status(400).json({
+          error: `CSV exceeds maximum allowed ${MAX_CSV_ROWS} data rows per upload.`,
+        });
       }
 
       const header = rows[0].map((h) => h.toLowerCase().replace(/[\s_-]+/g, ''));
@@ -89,31 +192,87 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
       const importId = `vimp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       const nowIso = new Date().toISOString();
       const dedupeMap = new Map<string, VisibilityMetricRecord>();
+      const rowErrors: VisibilityImportRowError[] = [];
+
+      const validateNonNegInt = (
+        rowIdx: number,
+        colIdx: number,
+        fieldName: string,
+        rawRow: string[]
+      ): number => {
+        if (colIdx < 0) return 0;
+        const raw = (rawRow[colIdx] ?? '').trim();
+        if (!raw) {
+          rowErrors.push({
+            rowNumber: rowIdx + 1,
+            field: fieldName,
+            value: '',
+            reason: `Missing required non-negative integer for "${fieldName}".`,
+          });
+          return 0;
+        }
+        if (!/^\d+$/.test(raw)) {
+          rowErrors.push({
+            rowNumber: rowIdx + 1,
+            field: fieldName,
+            value: raw,
+            reason: `Invalid integer "${raw}" for "${fieldName}". Negative, decimal, or non-numeric values are rejected.`,
+          });
+          return 0;
+        }
+        const n = Number(raw);
+        if (!Number.isSafeInteger(n) || n < 0) {
+          rowErrors.push({
+            rowNumber: rowIdx + 1,
+            field: fieldName,
+            value: raw,
+            reason: `Integer overflow or invalid value "${raw}" for "${fieldName}".`,
+          });
+          return 0;
+        }
+        return n;
+      };
 
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         if (row.length === 0 || row.every((c) => !c)) continue;
 
         const rawDate = (row[dateIdx] || '').trim();
-        const observationDate = /^\d{4}-\d{2}-\d{2}/.test(rawDate)
-          ? rawDate.slice(0, 10)
-          : new Date().toISOString().slice(0, 10);
+        const dateCheck = isValidStrictIsoDate(rawDate);
+        if (!dateCheck.valid) {
+          rowErrors.push({
+            rowNumber: i + 1,
+            field: 'date',
+            value: rawDate,
+            reason: dateCheck.reason || 'Invalid date.',
+          });
+        }
 
-        const platform = (platformIdx >= 0 && row[platformIdx] ? row[platformIdx] : sourcePlatform || 'ChatGPT Search').trim();
+        const rawPlatform = platformIdx >= 0 ? (row[platformIdx] || '').trim() : String(sourcePlatform || '').trim();
+        const canonicalPlatform = rawPlatform ? normalizeSupportedPlatform(rawPlatform) : null;
+        if (!canonicalPlatform) {
+          rowErrors.push({
+            rowNumber: i + 1,
+            field: 'platform',
+            value: rawPlatform,
+            reason: rawPlatform
+              ? `Unsupported AI platform "${rawPlatform}". Supported: ${Array.from(new Set(Object.values(SUPPORTED_AI_PLATFORMS))).join(', ')}.`
+              : 'Platform value is required.',
+          });
+        }
+
+        const brandMentions = validateNonNegInt(i, brandMentionsIdx, 'brand_mentions', row);
+        const productMentions = validateNonNegInt(i, productMentionsIdx, 'product_mentions', row);
+        const websiteClicks = validateNonNegInt(i, clicksIdx, 'website_clicks', row);
+
+        if (rowErrors.some((e) => e.rowNumber === i + 1)) {
+          continue;
+        }
+
         const topic = (topicIdx >= 0 && row[topicIdx] ? row[topicIdx] : '').trim();
-
-        const parseNonNegInt = (idx: number, fallback: number) => {
-          if (idx < 0 || !row[idx]) return fallback;
-          const n = parseInt(row[idx], 10);
-          return !isNaN(n) && n >= 0 ? n : fallback;
-        };
-
-        const brandMentions = parseNonNegInt(brandMentionsIdx, 0);
-        const productMentions = parseNonNegInt(productMentionsIdx, 0);
-        const websiteClicks = parseNonNegInt(clicksIdx, 0);
         const evidenceSource = evidenceIdx >= 0 && row[evidenceIdx] ? row[evidenceIdx].trim() : filename || 'merchant_csv';
 
-        const dedupeKey = `${observationDate}::${platform.toLowerCase()}::${topic.toLowerCase()}`;
+        const dedupeKey = `${rawDate}::${canonicalPlatform!.toLowerCase()}::${topic.toLowerCase()}`;
         const existing = dedupeMap.get(dedupeKey);
 
         if (existing) {
@@ -125,8 +284,8 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
             id: `vm_${Date.now()}_${i}_${Math.random().toString(36).substring(2, 6)}`,
             workspaceId,
             importId,
-            observationDate,
-            platform,
+            observationDate: rawDate,
+            platform: canonicalPlatform!,
             brandMentions,
             productMentions,
             websiteClicks,
@@ -135,6 +294,16 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
             createdAt: nowIso,
           });
         }
+      }
+
+      if (rowErrors.length > 0) {
+        return res.status(400).json({
+          error: `CSV validation failed on ${rowErrors.length} field(s). No metrics were committed.`,
+          status: 'failed',
+          acceptedRowCount: 0,
+          rejectedRowCount: new Set(rowErrors.map((e) => e.rowNumber)).size,
+          errors: rowErrors,
+        });
       }
 
       const parsedMetrics = Array.from(dedupeMap.values());
@@ -149,19 +318,23 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
         workspaceId,
         filename: typeof filename === 'string' && filename.trim() ? filename.trim() : 'merchant_analytics.csv',
         rowCount: parsedMetrics.length,
+        rejectedRowCount: 0,
+        status: 'completed',
+        errors: [],
         reportingPeriodStart: dates[0] || null,
         reportingPeriodEnd: dates[dates.length - 1] || null,
         sourcePlatform: typeof sourcePlatform === 'string' && sourcePlatform.trim() ? sourcePlatform.trim() : 'merchant_csv_upload',
         createdAt: nowIso,
       };
 
-      await repo.saveVisibilityImport(importRecord);
-      await repo.saveVisibilityMetrics(parsedMetrics);
+      await repo.saveVisibilityImportAtomic(importRecord, parsedMetrics);
 
       const summary = await repo.getVisibilitySummary(workspaceId);
 
       return res.json({
         success: true,
+        acceptedRowCount: parsedMetrics.length,
+        rejectedRowCount: 0,
         import: importRecord,
         summary,
       });

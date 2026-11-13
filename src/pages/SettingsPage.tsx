@@ -177,13 +177,16 @@ export const SettingsPage: React.FC = () => {
   const handleVerifyWebhooks = async () => {
     setIsVerifyingWebhooks(true);
     try {
-      const res = await apiClient.verifyShopifyWebhooks();
+      const liveStatus = await apiClient.getShopifyStatus({ verify: 'live' });
+      setShopifyStatus(liveStatus);
       addToast(
-        res.verified ? 'Webhooks Verified' : 'Webhook Status',
-        res.message,
-        res.verified ? 'success' : 'info'
+        liveStatus.webhookDetails?.isLiveVerified ? 'Webhooks Live-Verified' : 'Webhook Live Check',
+        liveStatus.webhookDetails?.error ||
+          (liveStatus.webhookStatus === 'active'
+            ? 'All required webhook subscriptions are verified active on Shopify.'
+            : `Webhook status: ${liveStatus.webhookStatus}`),
+        liveStatus.webhookDetails?.isLiveVerified ? 'success' : 'info'
       );
-      await fetchShopifyStatus();
     } catch (err: any) {
       addToast('Verification Failed', err.message || 'Failed to verify webhooks.', 'error');
     } finally {
@@ -761,32 +764,50 @@ export const SettingsPage: React.FC = () => {
                   {/* Webhook Status */}
                   <div className="pt-3 border-t border-stone-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                     <div className="space-y-1.5">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <Zap className="w-3.5 h-3.5 text-amber-500 shrink-0" />
                         <span className="font-semibold text-stone-800">Shopify Webhook Subscriptions:</span>
                         <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-semibold border ${
-                          shopifyStatus.webhookStatus === 'active'
+                          shopifyStatus.webhookStatus === 'active' && shopifyStatus.webhookDetails?.isLiveVerified
                             ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                            : shopifyStatus.webhookStatus === 'partially_registered'
+                            : shopifyStatus.webhookStatus === 'mismatch' || shopifyStatus.webhookStatus === 'verification_unavailable' || shopifyStatus.webhookStatus === 'verification_incomplete'
+                            ? 'bg-red-50 text-red-800 border-red-200'
+                            : shopifyStatus.webhookStatus === 'partially_registered' || shopifyStatus.webhookStatus === 'registered_unverified'
                             ? 'bg-amber-50 text-amber-800 border-amber-200'
                             : 'bg-stone-100 text-stone-600 border-stone-200'
                         }`}>
-                          {shopifyStatus.webhookStatus === 'active' ? '● Verified Active' : shopifyStatus.webhookStatus || 'Unverified'}
+                          {shopifyStatus.webhookStatus === 'active' && shopifyStatus.webhookDetails?.isLiveVerified
+                            ? '● Verified Active (Live)'
+                            : shopifyStatus.webhookStatus === 'registered_unverified'
+                            ? 'Registered (Cached — Live Check Required)'
+                            : shopifyStatus.webhookStatus || 'Unverified'}
+                        </span>
+                        <span className="text-[10px] font-mono text-stone-500">
+                          {shopifyStatus.webhookDetails?.webhookLastVerifiedAt
+                            ? `Last live webhook check: ${new Date(shopifyStatus.webhookDetails.webhookLastVerifiedAt).toLocaleString()}`
+                            : 'Never live-verified'}
                         </span>
                       </div>
                       <div className="flex flex-wrap gap-1.5 pl-5">
                         {['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE', 'APP_UNINSTALLED'].map(topic => {
                           const isSubscribed = (shopifyStatus.activeWebhooks || []).some(w => w.toUpperCase() === topic);
+                          const isTopicLiveVerified = (shopifyStatus.webhookDetails?.verifiedTopics || []).some(w => w.toUpperCase() === topic);
                           return (
                             <span
                               key={topic}
                               className={`inline-flex items-center gap-1 font-mono text-[10px] px-2 py-0.5 rounded border font-semibold ${
-                                isSubscribed
+                                isTopicLiveVerified && shopifyStatus.webhookDetails?.isLiveVerified
                                   ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                  : isSubscribed
+                                  ? 'bg-amber-50 text-amber-800 border-amber-200'
                                   : 'bg-stone-50 text-stone-500 border-stone-200'
                               }`}
                             >
-                              {isSubscribed ? <Check className="w-2.5 h-2.5 text-emerald-600" /> : <span className="w-1.5 h-1.5 rounded-full bg-stone-400" />}
+                              {isTopicLiveVerified && shopifyStatus.webhookDetails?.isLiveVerified ? (
+                                <Check className="w-2.5 h-2.5 text-emerald-600" />
+                              ) : (
+                                <span className={`w-1.5 h-1.5 rounded-full ${isSubscribed ? 'bg-amber-500' : 'bg-stone-400'}`} />
+                              )}
                               <span>{topic.toLowerCase()}</span>
                             </span>
                           );

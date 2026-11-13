@@ -1,0 +1,908 @@
+# AIXSHOP v1.0 — Complete Remediation & Production Readiness
+
+## Mission
+
+Perform a complete, evidence-driven remediation of the existing AIXSHOP v1.0 codebase.
+
+Repository: `https://github.com/Kunnapatara/AIXSHOP-v1.0`
+
+The objective is to fix all confirmed outstanding defects, preserve all existing development progress, and bring the application to a verifiable production-launch standard.
+
+This is an incremental remediation task, NOT a rewrite or replacement project.
+
+**Core principle: ZERO LOSS OF DEVELOPMENT PROGRESS.**
+
+Do not assume that a feature is complete merely because its endpoint, UI, migration, or test exists. Verify the complete implementation path, including database persistence, workspace isolation, error handling, and actual runtime behavior.
+
+## 1. Mandatory Rules — Preserve Existing Work
+
+1. Inspect the entire existing project structure before making changes.
+2. Identify the current Git commit, existing implementation, migrations, tests, and project architecture.
+3. Preserve all existing features, business logic, UI, API contracts, database records, migrations, and working integrations.
+4. Do not delete, replace, simplify, or rewrite working modules merely to make implementation easier.
+5. Do not introduce duplicate services, repositories, routes, database tables, or parallel implementations.
+6. Reuse the existing architecture, interfaces, repositories, validation utilities, and test infrastructure.
+7. Make small, targeted, backward-compatible changes.
+8. Do not modify historical database migrations. Use new forward-only migrations when schema changes are necessary.
+9. Do not remove or weaken existing tests to make the test suite pass.
+10. Do not fabricate test results, database results, external API responses, or production verification.
+11. Do not commit, push, publish, deploy, or modify the remote Git repository without explicit owner approval.
+12. Do not expose credentials, access tokens, API keys, customer data, or sensitive environment variables in logs or reports.
+
+Before modifying any file, establish a baseline and identify the exact files and dependencies involved.
+
+If an existing implementation conflicts with a proposed fix, preserve the existing behavior unless a specific defect requires changing it. Document the compatibility implications.
+
+---
+
+# 2. Workstream A — Shopify Synchronization, PostgreSQL Persistence & Webhook Verification
+
+## A1. Fix Durable Sync Run Lineage in PostgreSQL
+
+Inspect:
+
+- `src/server/shopify/syncService.ts`
+- `src/server/db/postgresRepository.ts`
+- `src/server/db/migrations/009_durable_sync_runs_and_ai_discovery.sql`
+- Related repository interfaces, routes, and tests.
+
+Confirmed defect:
+
+The PostgreSQL repository does not fully persist and retrieve the Sync Run lineage and pagination metadata introduced by Migration 009.
+
+Implement complete PostgreSQL support for:
+
+- `parentSyncRunId`
+- `attemptNumber`
+- `variantCompletenessStatus`
+- `paginationMetadata`
+- Existing Sync Run status and lifecycle fields.
+
+Requirements:
+
+1. `createShopifySyncRun()` must persist all applicable fields.
+2. `updateShopifySyncRun()` must update all applicable fields.
+3. `getShopifySyncRuns()` must retrieve and map all applicable fields.
+4. Resume operations must preserve the original parent-child lineage.
+5. A resumed attempt must have a durable, correctly incremented attempt number.
+6. The original Sync Run must remain available as the parent record.
+7. Do not silently create disconnected Sync Runs.
+8. Ensure database column names and application property names are mapped consistently.
+9. Preserve compatibility with existing Sync Run records.
+10. Add tests for initial sync, resumed sync, multiple attempts, and retrieval after database persistence.
+
+### Workspace isolation
+
+Review every Sync Run repository method.
+
+The current `updateShopifySyncRun()` implementation uses an ID-only condition in its SQL update.
+
+Fix this by enforcing workspace-scoped database operations.
+
+Requirements:
+
+- Every read, update, delete, and lookup must enforce the relevant `workspace_id`.
+- Never trust a client-supplied workspace ID without validating the authenticated user's access.
+- A user from Workspace A must never read or modify Workspace B's Sync Runs.
+- Use workspace-scoped composite conditions wherever appropriate.
+- Add cross-workspace isolation tests.
+
+Do not rely only on IDs being difficult to guess.
+
+## A2. Complete Shopify Pagination Safeguards
+
+Inspect the product and variant pagination implementations.
+
+Variant pagination already has several incomplete-state safeguards. Verify that these safeguards cover every termination path.
+
+Also fix the remaining product-level pagination issue.
+
+Requirements:
+
+- Detect `hasNextPage = true` with a missing or null `endCursor`.
+- Detect repeated cursors.
+- Detect non-advancing cursors.
+- Detect API errors.
+- Detect page-limit termination.
+- Prevent unnecessary repeated requests when cursor progress is impossible.
+- Never mark an incomplete catalog as fully completed.
+- Propagate pagination completeness to the Sync Run result.
+- Preserve the reason for incomplete synchronization in durable metadata.
+
+Expected outcomes must distinguish:
+
+- Complete
+- Partial / Incomplete
+- Failed
+
+A partial synchronization must never be represented as a fully successful catalog synchronization.
+
+Add tests for each pagination termination condition.
+
+## A3. Make Shopify Webhook Verification Truthful
+
+Inspect:
+
+- `src/server/shopify/webhookService.ts`
+- `src/server/routes` Shopify status routes
+- Webhook subscription persistence and related tests.
+
+Confirmed defects:
+
+- Webhook verification has a fixed pagination limit of 10 pages without sufficient completion safeguards.
+- Cursor progress is not fully validated.
+- The status endpoint can rely on cached webhook subscription data.
+- A general connection verification timestamp can be mistaken for a webhook verification timestamp.
+
+Implement a reliable webhook verification process.
+
+Requirements:
+
+1. Paginate until the Shopify API explicitly reports `hasNextPage = false`.
+2. Do not claim complete verification if pagination is incomplete.
+3. Detect missing, repeated, or non-advancing cursors.
+4. Handle Shopify API errors explicitly.
+5. Verify the actual callback URL against the expected application callback URL.
+6. Verify the required webhook topics.
+7. Distinguish missing subscriptions from API verification failures.
+8. Persist the verification result and a dedicated `webhookLastVerifiedAt` timestamp.
+9. Do not reuse a general connection timestamp as proof of current webhook verification.
+10. The status endpoint must not label cached subscription data as live verification.
+11. If live verification cannot be completed, return a truthful status such as `verification_unavailable`, `verification_incomplete`, or the project's existing equivalent.
+12. Preserve useful diagnostic information without exposing secrets.
+
+Add tests for:
+
+- All required subscriptions present.
+- Missing subscription.
+- Incorrect callback URL.
+- Multiple pages of subscriptions.
+- Repeated cursor.
+- Missing cursor.
+- API error.
+- Stale cached data.
+- Verification unavailable.
+
+Do not report a webhook as verified merely because an earlier verification succeeded.
+
+---
+
+# 3. Workstream B — Business Profile Verification & AI Discovery Readiness
+
+Inspect:
+
+- `src/server/routes/businessProfileRoutes.ts`
+- Business Profile domain models.
+- Database repositories and migrations.
+- AI Discovery Readiness services and UI.
+- Related tests.
+
+## B1. Prevent Self-Declared External Verification
+
+Confirmed defect:
+
+The Business Profile API currently permits client input to set `verificationStatus = merchant_verified`, and the server can set `lastVerifiedAt` when saving the profile.
+
+This creates a false impression of independent verification.
+
+Implement a strict separation between:
+
+- `merchant_self_declared`
+- `independently_verified`
+- `verification_pending`
+- `verification_failed`
+- `not_verified`
+
+Use the existing status vocabulary if an equivalent already exists, but preserve the distinction.
+
+Requirements:
+
+1. A merchant may submit and edit their own business information.
+2. A merchant must not be able to set an externally verified status.
+3. A merchant must not be able to set an independently verified timestamp.
+4. The server must ignore or reject client attempts to modify protected verification fields.
+5. Only an authorized server-side verification process may set independently verified status.
+6. Record verification source, timestamp, and relevant evidence when independent verification is actually performed.
+7. If no official verification source or integration exists, keep the profile explicitly self-declared or unverified.
+8. Do not imply verification by Shopify, Google, Meta, OpenAI, or any other platform without actual evidence.
+
+Add authorization and tampering tests.
+
+## B2. Verify AI Discovery Readiness Claims
+
+Review all eight AI Discovery Readiness dimensions and the Brand/Business Profile features.
+
+Requirements:
+
+- Each score or readiness result must be traceable to actual evidence.
+- Distinguish measured data, merchant-provided data, inferred assessments, and unavailable data.
+- Do not fabricate AI visibility, rankings, citations, mentions, or traffic.
+- Do not claim official platform integration without a real authorized integration.
+- The ChatGPT Business Hub Readiness Checklist must be presented as a merchant preparation checklist, not an official ChatGPT API integration or automatic listing/claiming feature.
+- Clearly communicate limitations and unavailable data.
+- Ensure scores are deterministic and explainable.
+- Add tests for missing, incomplete, self-declared, and verified evidence.
+
+---
+
+# 4. Workstream C — Product Feed Validation & Safe Export
+
+Inspect:
+
+- `src/domain/feed/feedValidationEngine.ts`
+- Feed export services and routes.
+- Product and variant data models.
+- Tests and official feed requirements.
+
+Confirmed defects:
+
+- Missing product price can be exported as `0.00`.
+- Missing merchant SKU can fall back to an internal product ID.
+- These fabricated values can make invalid catalog data appear valid.
+
+## C1. Eliminate Fabricated Product Data
+
+Never invent or silently substitute:
+
+- Price
+- SKU
+- GTIN / EAN / UPC
+- Brand
+- Product title
+- Product description
+- Product image URL
+- Product URL
+- Product availability
+- Product condition
+- Product specifications
+- Merchant identity
+
+Requirements:
+
+1. Missing price must remain missing or null.
+2. Missing SKU must not be replaced by an internal database ID.
+3. Missing GTIN must not be fabricated.
+4. Missing brand must not be replaced with an assumed brand.
+5. Missing images must not be replaced with placeholder URLs.
+6. Product URLs must use the actual verified Shopify store domain and correct product URL data.
+7. Preserve the distinction between merchant-provided data and generated or derived values.
+8. Derived values must be explicitly documented and must satisfy the relevant feed specification.
+
+## C2. Correct Export Modes
+
+Implement and test truthful behavior for:
+
+### `valid_only`
+
+- Export only products that pass all applicable mandatory validation rules.
+- Exclude invalid products.
+- Do not silently convert invalid values into acceptable values.
+
+### `all`
+
+- Preserve all requested product records.
+- Keep missing or invalid fields explicitly missing.
+- Include validation errors or warnings in the export metadata where supported.
+- Never fabricate values merely to produce a syntactically complete feed.
+
+Ensure the export accurately communicates whether a product is valid for its target destination.
+
+## C3. Validate Destination Requirements
+
+Review requirements for:
+
+- Google Merchant Center
+- Meta Commerce
+- Schema.org structured data
+
+Use the official documentation applicable to each destination.
+
+Do not claim full compliance unless the actual required fields, formats, identifiers, and validation rules have been implemented and tested.
+
+Clearly distinguish:
+
+- Syntactic validity
+- Required-field completeness
+- Destination-specific eligibility
+- Actual acceptance by the external platform
+
+A locally valid export is not proof that Google or Meta has accepted the product feed.
+
+Add test cases for missing price, missing SKU, missing GTIN, missing brand, missing image, invalid URL, and invalid product data.
+
+---
+
+# 5. Workstream D — AI Visibility Data Integrity & Import
+
+Inspect:
+
+- `src/server/db/postgresRepository.ts`
+- `src/server/db/migrations/009_durable_sync_runs_and_ai_discovery.sql`
+- `src/server/routes/visibilityRoutes.ts`
+- Visibility domain models and tests.
+
+## D1. Fix PostgreSQL Visibility Metric Deduplication
+
+Confirmed defect:
+
+`saveVisibilityMetrics()` uses:
+
+`ON CONFLICT (workspace_id, observation_date, platform, discovery_topic)`
+
+However, Migration 009 does not create a matching unique constraint or unique index for this conflict target.
+
+PostgreSQL may reject this operation because the required unique constraint does not exist.
+
+Implement a new forward-only migration.
+
+Requirements:
+
+1. Inspect the actual existing table schema.
+2. Check for existing duplicate records before creating the unique index.
+3. Define a safe duplicate-resolution strategy.
+4. Do not delete valid historical observations without documenting the impact.
+5. Add a unique constraint or unique index matching the repository's actual conflict target.
+6. Ensure the migration is safe for existing installations.
+7. Keep the migration repeatable according to the project's existing migration conventions.
+8. Verify the migration using an actual PostgreSQL database when credentials are available.
+
+Do not modify historical migrations.
+
+## D2. Strict CSV Validation
+
+Confirmed defects:
+
+- Invalid dates can default to the current date.
+- Invalid numeric values can default to zero.
+
+These behaviors can create false visibility analytics.
+
+Implement strict validation.
+
+Requirements:
+
+- Reject invalid dates.
+- Reject invalid numeric values.
+- Do not replace malformed values with the current date.
+- Do not replace malformed numeric values with zero.
+- Validate platform names against supported values.
+- Validate required fields.
+- Validate date formats and date ranges.
+- Reject malformed rows with clear row-level error messages.
+- Preserve valid source values without silently changing their meaning.
+- Handle quoted commas and escaped quotes correctly.
+- Handle newlines inside quoted CSV fields if supported by the parser.
+- Set reasonable file-size and row-count limits.
+- Prevent formula injection when exporting user-controlled text back to CSV.
+
+If a row is invalid, report why it was rejected.
+
+## D3. Import Atomicity and Idempotency
+
+Review the entire visibility import lifecycle.
+
+Requirements:
+
+1. Determine whether imports are atomic or partially committed.
+2. Prefer transaction-based atomic imports where appropriate.
+3. If partial imports are intentionally supported, report accepted and rejected row counts accurately.
+4. Never report a complete import when some rows failed.
+5. Prevent duplicate observations using the defined unique key.
+6. Ensure deduplication is workspace-scoped.
+7. Record import status and errors truthfully.
+8. Prevent cross-workspace data leakage.
+9. Add tests for duplicate rows, duplicate imports, malformed rows, transaction rollback, and partial failure behavior.
+
+Do not fabricate visibility results when no external data source is connected.
+
+`DATA_SOURCE_NOT_CONNECTED` must remain an explicit and truthful state.
+
+---
+
+# 6. Workstream E — Billing Webhook Processing & Concurrency Safety
+
+Inspect:
+
+- `src/server/db/postgresRepository.ts`
+- MemoryRepository implementation.
+- Billing event processing services.
+- Stripe webhook routes.
+- Existing billing tests.
+
+Confirmed defect:
+
+The stale processing recovery mechanism can reclaim an event after five minutes, but there is no sufficient lease heartbeat or ownership mechanism.
+
+A legitimate worker running longer than five minutes may overlap with another worker processing the same event.
+
+## E1. Implement Safe Billing Event Leases
+
+Requirements:
+
+1. Preserve the existing billing event lifecycle and interfaces wherever possible.
+2. Add a durable lease ownership mechanism or equivalent safe concurrency control.
+3. Support lease expiration and renewal.
+4. Implement heartbeat/lease extension for long-running processing.
+5. Ensure only the current lease owner can complete, fail, or release the claimed event.
+6. Prevent an expired worker from overwriting the result of a newer worker.
+7. Preserve event idempotency.
+8. Prevent concurrent duplicate entitlement changes.
+9. Handle worker crashes and recover abandoned events safely.
+10. Use atomic PostgreSQL operations for claiming and updating event ownership.
+11. Keep MemoryRepository behavior consistent with the production repository.
+
+Do not assume that a five-minute timeout alone guarantees safe concurrency.
+
+## E2. Billing Lifecycle Regression
+
+Verify the full lifecycle:
+
+- Checkout initiated.
+- Checkout completed.
+- Subscription created.
+- Subscription renewed.
+- Payment failed.
+- Subscription canceled.
+- Subscription reactivated where supported.
+- Plan changed.
+- Upgrade.
+- Downgrade.
+- Refund where applicable.
+- Duplicate webhook delivery.
+- Out-of-order webhook delivery.
+- Worker crash and recovery.
+- Entitlement enforcement.
+
+Requirements:
+
+- Entitlements must be derived from trusted server-side billing state.
+- Never trust a client-supplied plan or subscription status.
+- Prevent duplicate credits or subscription extensions.
+- Handle out-of-order events safely.
+- Ensure refunds and cancellations update access according to the existing business rules.
+- Preserve billing event audit history.
+
+Do not replace the existing Stripe or Sandbox billing architecture.
+
+---
+
+# 7. Security, Authorization & Data Isolation Audit
+
+Review the entire application for security regressions introduced by the new features.
+
+At minimum, inspect:
+
+- Authentication and session handling.
+- Workspace authorization.
+- Shopify OAuth state and callback validation.
+- Token encryption and storage.
+- Webhook signature verification.
+- Billing webhook signature verification.
+- API authorization.
+- Input validation.
+- SQL parameterization.
+- CSV import and export.
+- Cross-workspace access.
+- Sensitive logging.
+- Rate limits and resource limits.
+- Error handling and information disclosure.
+
+Use the existing security architecture.
+
+Add targeted regression tests for confirmed risks.
+
+Do not weaken authentication or authorization to make integrations work.
+
+---
+
+# 8. Database Migration & Data Integrity
+
+Review all migrations from the beginning through the latest migration.
+
+Requirements:
+
+1. Verify migration ordering and auto-discovery.
+2. Verify all required tables, columns, indexes, and constraints.
+3. Verify forward-only migration practices.
+4. Verify behavior on a fresh database.
+5. Verify behavior on an existing database containing historical records.
+6. Verify migration failure and recovery behavior.
+7. Verify that migration execution is not accidentally duplicated.
+8. Verify foreign keys and workspace-scoped relationships.
+9. Verify unique constraints match repository `ON CONFLICT` clauses.
+10. Verify database indexes support the actual query patterns.
+
+Do not mark database work complete merely because migration files exist.
+
+Actual migration execution must be separately verified.
+
+---
+
+# 9. Required Testing Strategy
+
+Use the existing test framework and test conventions.
+
+Do not replace the test framework or remove existing coverage.
+
+## 9.1 Unit Tests
+
+Add or update tests for:
+
+- Product pagination.
+- Variant pagination.
+- Sync Run lineage.
+- Sync Run workspace isolation.
+- Webhook verification.
+- Business Profile verification.
+- Feed validation.
+- Safe feed exports.
+- Visibility CSV validation.
+- Visibility deduplication.
+- Billing lease ownership.
+- Billing idempotency.
+
+## 9.2 PostgreSQL Integration Tests
+
+Run actual PostgreSQL integration tests when `DATABASE_URL` is available.
+
+At minimum verify:
+
+- Migration execution.
+- Sync Run persistence and retrieval.
+- Parent-child lineage persistence.
+- Workspace isolation.
+- Visibility metric insertion and deduplication.
+- Unique index behavior.
+- Transaction rollback.
+- Billing event claiming.
+- Concurrent worker behavior.
+- Lease renewal and expiration.
+- Stale worker ownership rejection.
+
+Do not count skipped PostgreSQL tests as passed integration tests.
+
+If PostgreSQL is unavailable, mark these tests as BLOCKED, not PASS.
+
+## 9.3 Regression Tests
+
+All previously passing tests must remain passing.
+
+Do not change expected test outcomes merely to conceal regressions.
+
+Report:
+
+- Total tests.
+- Passed.
+- Failed.
+- Skipped.
+- Actual reasons for skipped tests.
+- Tests newly added.
+- Tests modified.
+- Tests removed, if any, with justification.
+
+Reconcile the test count across test output, package scripts, and project documentation.
+
+## 9.4 Build and Static Checks
+
+Run all existing applicable checks, including:
+
+- TypeScript type checking.
+- Lint.
+- Unit tests.
+- Integration tests.
+- Production build.
+- Migration checks.
+- Existing security scans where available.
+
+Use Semgrep and Trivy if they are already configured or available in the existing development workflow. Do not create a replacement security-auditor system.
+
+---
+
+# 10. External Integration Verification
+
+Code tests alone do not establish production readiness.
+
+Verify external integrations separately when valid credentials and test environments are available.
+
+### Shopify
+
+Use a Shopify development store.
+
+Verify:
+
+- OAuth installation.
+- OAuth callback.
+- Token persistence.
+- Token refresh.
+- Product pagination.
+- Variant pagination.
+- Catalog completeness.
+- Webhook registration.
+- Webhook callback delivery.
+- Webhook signature verification.
+- Sync Run persistence.
+- Resume synchronization.
+
+### Stripe
+
+Use Stripe test mode.
+
+Verify:
+
+- Checkout.
+- Successful payment.
+- Subscription creation.
+- Renewal.
+- Payment failure.
+- Cancellation.
+- Upgrade and downgrade.
+- Refund handling where supported.
+- Webhook signature verification.
+- Duplicate and out-of-order event processing.
+- Entitlement updates.
+
+### PostgreSQL
+
+Use a real PostgreSQL instance.
+
+Verify:
+
+- All migrations.
+- Repository operations.
+- Constraints and indexes.
+- Transactions.
+- Concurrent operations.
+- Workspace isolation.
+
+Never claim these external tests passed if credentials or environments are unavailable.
+
+Do not use production credentials or perform real charges.
+
+---
+
+# 11. Production Readiness & Operational Checks
+
+Review existing deployment and operational configuration without replacing working infrastructure.
+
+Verify:
+
+- Environment variable validation.
+- Production build configuration.
+- Database connection and pool settings.
+- Secure secret handling.
+- Health checks.
+- Logging and error reporting.
+- Background processing behavior.
+- Webhook retry behavior.
+- Database backup and recovery procedures.
+- Migration deployment procedure.
+- Resource and request limits.
+- Rate limiting.
+- Monitoring and alerting.
+- Graceful shutdown.
+- Production error handling.
+
+Clearly identify anything that still requires owner-provided credentials, infrastructure, or manual configuration.
+
+---
+
+# 12. Product Truthfulness & Customer-Facing Behavior
+
+Review the UI, reports, dashboard, and API responses.
+
+The product must clearly distinguish:
+
+- Verified data.
+- Merchant-provided data.
+- Inferred assessments.
+- Missing data.
+- Partial synchronization.
+- Failed synchronization.
+- External integration unavailable.
+- External platform acceptance not verified.
+
+Never present:
+
+- A local validation result as external platform approval.
+- A merchant declaration as independent verification.
+- A partial catalog sync as a complete sync.
+- Cached webhook information as live verification.
+- Missing product data as valid fabricated values.
+- Missing AI visibility data as zero visibility.
+- A disconnected data source as an active integration.
+
+Maintain the existing AIXSHOP product positioning as a real Shopify Catalog Health & Operations SaaS.
+
+Do not add AI API dependencies unless technically necessary and explicitly justified. Prioritize Shopify Admin API and the application's own validation engine.
+
+---
+
+# 13. Execution Order
+
+Execute in the following order to minimize regression risk.
+
+### Phase 1 — Baseline and Architecture Inspection
+
+- Inspect repository and current implementation.
+- Identify current commit and working tree status.
+- Review migrations, repositories, services, routes, UI, and tests.
+- Run baseline checks where possible.
+- Create a defect-to-file mapping.
+- Record existing test results.
+
+Do not modify code until the baseline is understood.
+
+### Phase 2 — Critical Data Integrity Fixes
+
+Fix:
+
+1. PostgreSQL Sync Run lineage persistence.
+2. Workspace-scoped Sync Run operations.
+3. Visibility metric unique index and deduplication.
+4. Strict CSV validation.
+5. Safe feed exports without fabricated values.
+6. Business Profile verification spoofing.
+
+### Phase 3 — Synchronization & Webhook Reliability
+
+Fix:
+
+1. Product pagination safeguards.
+2. Variant pagination safeguards.
+3. Durable incomplete-state reporting.
+4. Complete webhook pagination.
+5. Callback URL verification.
+6. Dedicated webhook verification timestamp.
+7. Truthful status reporting.
+
+### Phase 4 — Billing Concurrency
+
+Fix:
+
+1. Lease ownership.
+2. Lease heartbeat and renewal.
+3. Stale worker protection.
+4. Duplicate event prevention.
+5. Full billing lifecycle regression.
+
+### Phase 5 — Security & Regression
+
+- Run security checks.
+- Run all unit tests.
+- Run PostgreSQL integration tests where available.
+- Run TypeScript, lint, and production build.
+- Fix regressions without removing existing features.
+- Re-run affected tests after every correction.
+
+### Phase 6 — External Integration Verification
+
+Where credentials and environments are available:
+
+- Test Shopify development store.
+- Test PostgreSQL.
+- Test Stripe test mode.
+
+Otherwise, document the exact missing requirements and mark each item BLOCKED.
+
+### Phase 7 — Final Production Readiness Assessment
+
+Produce an evidence-based final report.
+
+Do not declare production readiness based only on a successful build or unit test suite.
+
+---
+
+# 14. Final Deliverables
+
+Provide a detailed report containing:
+
+## A. Baseline
+
+- Starting commit.
+- Project structure reviewed.
+- Baseline test results.
+- Existing features preserved.
+- Existing known limitations.
+
+## B. Remediation Summary
+
+For every defect:
+
+| Field | Required Information |
+|---|---|
+| Defect | Exact problem |
+| Root Cause | Confirmed technical cause |
+| Files Changed | Actual file paths |
+| Fix | What was changed |
+| Tests | Tests added or updated |
+| Result | PASS / FAIL / BLOCKED |
+| Evidence | Test output or relevant implementation evidence |
+
+## C. Database Verification
+
+- Migration files added.
+- Migration execution result.
+- Unique indexes and constraints.
+- Workspace isolation verification.
+- PostgreSQL integration results.
+
+## D. Test Results
+
+Report exact counts:
+
+- Passed
+- Failed
+- Skipped
+- Blocked
+
+Separate unit tests from integration tests and external integration tests.
+
+## E. External Integration Results
+
+Report Shopify, Stripe, and PostgreSQL separately.
+
+Use only:
+
+- PASS — Actually verified.
+- FAIL — Tested and failed.
+- BLOCKED — Cannot verify because a required credential, environment, or service is unavailable.
+- NOT TESTED — Not executed.
+
+## F. Remaining Limitations
+
+List every unresolved issue, its impact, and the exact next action required.
+
+Do not hide incomplete work.
+
+## G. Production Readiness
+
+Assess the following independently:
+
+1. Application build.
+2. Core catalog functionality.
+3. Data integrity.
+4. Workspace isolation.
+5. Shopify integration.
+6. Webhook reliability.
+7. Billing lifecycle.
+8. PostgreSQL reliability.
+9. Security.
+10. Operational readiness.
+
+Do not combine these into one misleading score.
+
+Provide a clear distinction between:
+
+- Code-complete.
+- Test-verified.
+- External-integration-verified.
+- Production-deployable.
+
+---
+
+# 15. Completion Criteria
+
+The remediation task is complete only when:
+
+1. All confirmed source-level defects have been addressed.
+2. Existing functionality remains intact.
+3. Sync Run lineage is durably persisted in PostgreSQL.
+4. All Sync Run operations enforce workspace isolation.
+5. Pagination cannot falsely report complete synchronization.
+6. Webhook status reflects actual verification evidence.
+7. Business Profile verification cannot be self-declared as independently verified.
+8. Feed exports never fabricate missing merchant data.
+9. Visibility imports reject malformed data and deduplicate correctly in PostgreSQL.
+10. Billing event processing has safe lease ownership and concurrency control.
+11. Existing regression tests remain passing.
+12. New targeted tests cover the defects.
+13. Production build and static checks pass.
+14. PostgreSQL integration tests pass when a database is available.
+15. Shopify and Stripe test-mode verification is completed when credentials are available.
+16. All remaining blockers are explicitly documented.
+
+A missing external credential must not be concealed or treated as a successful test.
+
+**Final instruction:** Work directly within the existing AIXSHOP project, preserve all existing development progress, and make only necessary incremental changes. Do not perform a destructive rewrite, do not remove working features, and do not commit, push, or deploy without explicit owner approval.
+
+Start with the baseline inspection, then proceed through the remediation phases. Do not stop after producing an audit report: implement the fixes, test them, and report the actual results.

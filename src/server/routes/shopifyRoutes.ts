@@ -46,28 +46,79 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           activeWebhooks: [],
           latestSync,
           canResumeSync,
+          webhookDetails: {
+            verificationMode: 'cached',
+            isLiveVerified: false,
+            requiredTopics: ['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE', 'APP_UNINSTALLED'],
+            verifiedTopics: [],
+            missingTopics: ['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE', 'APP_UNINSTALLED'],
+            mismatchedSubscriptions: [],
+            webhookLastVerifiedAt: null,
+            lastVerifiedAt: null,
+            isFresh: false,
+          },
         };
         return res.json(status);
       }
 
-      const activeWebhooks = (connection.webhookSubscriptions || []).map(w => 
-        typeof w === 'string' ? w : w.topic
-      );
-
-      const lastVerifiedTime = connection.lastVerifiedAt ? new Date(connection.lastVerifiedAt).getTime() : 0;
-      const isVerificationFresh = (Date.now() - lastVerifiedTime) < (24 * 60 * 60 * 1000);
-
-      let derivedWebhookStatus: import('../shopify/types').WebhookStatusCategory = 'unverified';
-      if (!connection.webhookSubscriptions || connection.webhookSubscriptions.length === 0) {
-        derivedWebhookStatus = 'not_configured';
-      } else if (!isVerificationFresh) {
-        derivedWebhookStatus = 'unverified';
-      } else if (activeWebhooks.length >= 4) {
-        derivedWebhookStatus = 'active';
-      } else if (activeWebhooks.length > 0) {
-        derivedWebhookStatus = 'partially_registered';
+      const verifyMode = String(req.query.verify || '').toLowerCase();
+      if (verifyMode === 'live') {
+        const liveResult = await verifyShopifyWebhookSubscriptionsLive(repo, workspaceId);
+        const refreshedConnection = (await repo.getShopifyConnection(workspaceId)) || connection;
+        const activeWebhooks = liveResult.liveSubscriptions.map(w => w.topic);
+        const status: ShopifyPublicStatus = {
+          connected: refreshedConnection.status === 'connected',
+          status: refreshedConnection.status,
+          shopDomain: refreshedConnection.shopDomain,
+          grantedScopes: refreshedConnection.grantedScopes.split(',').map(s => s.trim()).filter(Boolean),
+          installedAt: refreshedConnection.installedAt,
+          lastVerifiedAt: refreshedConnection.lastVerifiedAt,
+          tokenExpiresAt: refreshedConnection.tokenExpiresAt || null,
+          refreshTokenExpiresAt: refreshedConnection.refreshTokenExpiresAt || null,
+          webhookStatus: liveResult.status,
+          activeWebhooks,
+          latestSync,
+          canResumeSync,
+          webhookDetails: {
+            verificationMode: 'live',
+            isLiveVerified: liveResult.verified,
+            requiredTopics: liveResult.requiredTopics,
+            verifiedTopics: liveResult.activeTopics,
+            missingTopics: liveResult.missingTopics,
+            mismatchedSubscriptions: liveResult.mismatchedSubscriptions,
+            webhookLastVerifiedAt: liveResult.webhookLastVerifiedAt,
+            lastVerifiedAt: liveResult.webhookLastVerifiedAt,
+            isFresh: Boolean(liveResult.webhookLastVerifiedAt),
+            completenessStatus: liveResult.completenessStatus,
+            error: liveResult.status === 'verification_unavailable' ? liveResult.message : undefined,
+          },
+        };
+        return res.json(status);
       }
 
+      const requiredTopics = ['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE', 'APP_UNINSTALLED'];
+      const storedSubs = connection.webhookSubscriptions || [];
+      const activeWebhooks = storedSubs.map(w => typeof w === 'string' ? w : w.topic);
+
+      const webhookVerifiedIso = connection.webhookLastVerifiedAt || null;
+      const webhookVerifiedTime = webhookVerifiedIso ? new Date(webhookVerifiedIso).getTime() : 0;
+      const isFresh = Boolean(webhookVerifiedTime && (Date.now() - webhookVerifiedTime) < (24 * 60 * 60 * 1000));
+
+      // Cached reads must never masquerade as active live verification
+      const storedStatus = connection.webhookVerificationStatus;
+      let cachedWebhookStatus: import('../shopify/types').WebhookStatusCategory = 'registered_unverified';
+      if (storedSubs.length === 0 && (!storedStatus || storedStatus === 'not_configured')) {
+        cachedWebhookStatus = 'not_configured';
+      } else if (storedStatus === 'verification_unavailable' || storedStatus === 'verification_incomplete' || storedStatus === 'mismatch' || storedStatus === 'partially_registered' || storedStatus === 'registered_unverified') {
+        cachedWebhookStatus = storedStatus;
+      } else if (storedStatus === 'active' || storedSubs.length > 0) {
+        // Previous registration or prior live verification exists in cache; still not freshly live-verified
+        cachedWebhookStatus = 'registered_unverified';
+      } else {
+        cachedWebhookStatus = 'unverified';
+      }
+
+      const details = connection.webhookVerificationDetails || {};
       const status: ShopifyPublicStatus = {
         connected: connection.status === 'connected',
         status: connection.status,
@@ -77,10 +128,23 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         lastVerifiedAt: connection.lastVerifiedAt,
         tokenExpiresAt: connection.tokenExpiresAt || null,
         refreshTokenExpiresAt: connection.refreshTokenExpiresAt || null,
-        webhookStatus: derivedWebhookStatus,
+        webhookStatus: cachedWebhookStatus,
         activeWebhooks,
         latestSync,
         canResumeSync,
+        webhookDetails: {
+          verificationMode: 'cached',
+          isLiveVerified: false,
+          requiredTopics,
+          verifiedTopics: Array.isArray(details.activeTopics) ? details.activeTopics : [],
+          missingTopics: Array.isArray(details.missingTopics) ? details.missingTopics : requiredTopics.filter(t => !activeWebhooks.map(a => a.toUpperCase()).includes(t)),
+          mismatchedSubscriptions: Array.isArray(details.mismatchedSubscriptions) ? details.mismatchedSubscriptions : [],
+          webhookLastVerifiedAt: webhookVerifiedIso,
+          lastVerifiedAt: webhookVerifiedIso,
+          isFresh,
+          completenessStatus: details.completenessStatus,
+          error: details.error,
+        },
       };
 
       return res.json(status);
@@ -220,17 +284,33 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         callbackUrl
       );
 
-      const successfulTopics = results.filter(r => r.success).map(r => r.topic);
+      const successfulResults = results.filter(r => r.success);
+      const successfulTopics = successfulResults.map(r => r.topic);
+      const nowIso = new Date().toISOString();
       await repo.saveShopifyConnection({
         ...connection,
-        webhookSubscriptions: successfulTopics,
-        updatedAt: new Date().toISOString(),
+        webhookSubscriptions: successfulResults.map(r => ({
+          id: r.id || `registered_${r.topic}`,
+          topic: r.topic,
+          callbackUrl,
+          active: false,
+          status: 'unverified' as const,
+        })),
+        webhookVerificationStatus: successfulTopics.length > 0 ? 'registered_unverified' : 'not_configured',
+        webhookVerificationDetails: {
+          registeredAt: nowIso,
+          registeredTopics: successfulTopics,
+          expectedCallbackUrl: callbackUrl,
+          verificationMode: 'cached',
+        },
+        updatedAt: nowIso,
       });
 
       return res.json({
         success: true,
         results,
         activeWebhooks: successfulTopics,
+        webhookStatus: successfulTopics.length > 0 ? 'registered_unverified' : 'not_configured',
       });
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Webhooks] Registration error:', err);

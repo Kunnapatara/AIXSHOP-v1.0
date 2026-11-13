@@ -88,6 +88,9 @@ export interface BillingEventRecord {
   idempotencyKey: string;
   payload: any;
   status: 'processing' | 'processed' | 'failed' | 'ignored';
+  leaseOwner?: string | null;
+  leaseExpiresAt?: string | null;
+  attemptCount?: number;
   processedAt: string;
   createdAt?: string;
   updatedAt?: string;

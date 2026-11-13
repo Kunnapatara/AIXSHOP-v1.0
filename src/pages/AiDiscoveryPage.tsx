@@ -380,13 +380,21 @@ export const AiDiscoveryPage: React.FC = () => {
           {/* Business Hub Checklist View */}
           {activeSection === 'business-hub' && hubChecklist && (
             <div className="space-y-4">
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-xs text-amber-900 flex items-start gap-2.5">
+                <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <span>
+                  {hubChecklist.limitationsNotice ||
+                    'Merchant Preparation Checklist Only: Official ChatGPT Business Hub API integration is not connected. Self-declared entries are not independently verified.'}
+                </span>
+              </div>
+
               <div className="bg-white border border-stone-200 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-sm font-bold text-stone-900">
-                    ChatGPT & AI Commerce Business Hub Readiness
+                    ChatGPT & AI Commerce Business Hub Preparation Checklist
                   </h2>
                   <p className="text-xs text-stone-500 mt-1">
-                    Verification checklist preparing merchant business identity, policy links, and catalog metadata for external AI platforms.
+                    Local merchant preparation checklist for business identity, policy links, and catalog metadata.
                   </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -401,7 +409,7 @@ export const AiDiscoveryPage: React.FC = () => {
                     className="px-3.5 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    <span>Export Readiness Package</span>
+                    <span>Export Preparation Package</span>
                   </button>
                 </div>
               </div>
@@ -418,7 +426,13 @@ export const AiDiscoveryPage: React.FC = () => {
                             item.status === 'ready' ? 'text-emerald-700' : 'text-amber-700'
                           }`}
                         >
-                          {item.status === 'ready' ? 'Verified' : item.status === 'missing' ? 'Missing' : 'Action Required'}
+                          {item.status === 'ready'
+                            ? item.dataOrigin === 'merchant_self_declared'
+                              ? 'Provided (Self-Declared)'
+                              : 'Ready (Local Check)'
+                            : item.status === 'missing'
+                            ? 'Missing'
+                            : 'Action Required'}
                         </span>
                       </div>
                       <h3 className="text-sm font-semibold text-stone-900">{item.title}</h3>

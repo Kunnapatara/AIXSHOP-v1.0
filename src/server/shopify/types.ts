@@ -1,10 +1,18 @@
-export type VariantCompletenessStatus = 
+export type VariantCompletenessStatus =
   | 'complete'
   | 'incomplete_page_limit'
   | 'incomplete_repeated_cursor'
   | 'incomplete_non_advancing_cursor'
   | 'failed_api_error'
   | 'incomplete_missing_cursor';
+
+export type PaginationCompletenessStatus =
+  | 'complete'
+  | 'incomplete_page_limit'
+  | 'incomplete_repeated_cursor'
+  | 'incomplete_non_advancing_cursor'
+  | 'incomplete_missing_cursor'
+  | 'failed_api_error';
 
 export interface ProductVariantCompleteness {
   productId: string;
@@ -20,11 +28,14 @@ export interface ProductVariantCompleteness {
   error?: string;
 }
 
-export type WebhookStatusCategory = 
+export type WebhookStatusCategory =
   | 'active'
+  | 'registered_unverified'
   | 'unverified'
   | 'mismatch'
   | 'partially_registered'
+  | 'verification_incomplete'
+  | 'verification_unavailable'
   | 'not_configured'
   | 'error';
 
@@ -47,6 +58,9 @@ export interface ShopifyConnectionRecord {
   refreshTokenExpiresAt?: string | null;
   lastRefreshedAt?: string | null;
   webhookSubscriptions?: Array<string | WebhookSubscriptionDetail>;
+  webhookLastVerifiedAt?: string | null;
+  webhookVerificationStatus?: WebhookStatusCategory;
+  webhookVerificationDetails?: Record<string, any> | null;
   grantedScopes: string;
   keyVersion: string;
   status: 'connected' | 'disconnected' | 'reauth_required' | 'reauthorization_required';
@@ -70,6 +84,7 @@ export interface ShopifySyncRunRecord {
   parentSyncRunId?: string | null;
   attemptNumber?: number;
   variantCompletenessStatus?: VariantCompletenessStatus | 'not_applicable';
+  variantCompleteness?: Record<string, ProductVariantCompleteness>;
   paginationMetadata?: Record<string, any>;
   startedAt: string;
   completedAt?: string | null;
@@ -115,12 +130,17 @@ export interface ShopifyPublicStatus {
   activeWebhooks: string[];
   canResumeSync: boolean;
   webhookDetails?: {
+    verificationMode: 'live' | 'cached';
+    isLiveVerified: boolean;
     requiredTopics: string[];
     verifiedTopics: string[];
     missingTopics: string[];
     mismatchedSubscriptions: Array<{ id: string; topic: string; callbackUrl?: string; expectedUrl: string }>;
+    webhookLastVerifiedAt: string | null;
     lastVerifiedAt: string | null;
     isFresh: boolean;
+    completenessStatus?: PaginationCompletenessStatus;
+    error?: string;
   };
   recentSyncRuns?: ShopifySyncRunRecord[];
 }

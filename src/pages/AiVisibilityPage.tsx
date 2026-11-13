@@ -129,7 +129,7 @@ export const AiVisibilityPage: React.FC = () => {
             <div>
               <h2 className="text-sm font-bold text-stone-900">Upload Verified Merchant Analytics CSV</h2>
               <p className="text-xs text-stone-500">
-                Required column: <code className="font-mono">date</code>. Optional: <code className="font-mono">platform, brand_mentions, product_mentions, website_clicks, topic</code>. Rows are deduplicated by date, platform, and topic.
+                Required columns: <code className="font-mono">date</code> (strict YYYY-MM-DD) and <code className="font-mono">platform</code> (e.g. ChatGPT Search, Perplexity Shopping). Integers must be non-negative; malformed rows fail atomically without defaults.
               </p>
             </div>
             <button

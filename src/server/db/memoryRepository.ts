@@ -706,48 +706,89 @@ export class MemoryRepository implements DatabaseRepository {
     this.billingEvents.set(event.eventId, JSON.parse(JSON.stringify(event)));
   }
 
-  async claimBillingEvent(event: BillingEventRecord): Promise<{ claimed: boolean; event: BillingEventRecord | null }> {
+  async claimBillingEvent(
+    event: BillingEventRecord,
+    leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }> {
     const existing = this.billingEvents.get(event.eventId);
     const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const leaseDurationMs = Math.max(1000, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseOwner = leaseOptions?.leaseOwner || `worker_${now}_${Math.random().toString(36).slice(2, 10)}`;
+    const leaseExpiresAt = new Date(now + leaseDurationMs).toISOString();
 
     if (!existing) {
       const record: BillingEventRecord = {
         ...JSON.parse(JSON.stringify(event)),
         status: 'processing',
-        processedAt: new Date(now).toISOString(),
-        createdAt: new Date(now).toISOString(),
-        updatedAt: new Date(now).toISOString(),
+        leaseOwner,
+        leaseExpiresAt,
+        attemptCount: 1,
+        processedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
       };
       this.billingEvents.set(event.eventId, record);
-      return { claimed: true, event: JSON.parse(JSON.stringify(record)) };
+      return { claimed: true, event: JSON.parse(JSON.stringify(record)), leaseOwner };
     }
 
     const processedTime = new Date(existing.processedAt).getTime();
-    const isStale = existing.status === 'processing' && (now - processedTime > 5 * 60 * 1000);
+    const leaseExpiryTime = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() : NaN;
+    const isStale =
+      existing.status === 'processing' &&
+      (!isNaN(leaseExpiryTime) ? leaseExpiryTime < now : now - processedTime > 5 * 60 * 1000);
     const isFailed = existing.status === 'failed';
 
     if (isFailed || isStale) {
       existing.status = 'processing';
-      existing.processedAt = new Date(now).toISOString();
-      existing.updatedAt = new Date(now).toISOString();
+      existing.leaseOwner = leaseOwner;
+      existing.leaseExpiresAt = leaseExpiresAt;
+      existing.attemptCount = (existing.attemptCount || 0) + 1;
+      existing.processedAt = nowIso;
+      existing.updatedAt = nowIso;
       if (event.payload) {
         existing.payload = JSON.parse(JSON.stringify(event.payload));
       }
-      return { claimed: true, event: JSON.parse(JSON.stringify(existing)) };
+      return { claimed: true, event: JSON.parse(JSON.stringify(existing)), leaseOwner };
     }
 
     return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
   }
 
+  async renewBillingEventLease(
+    eventId: string,
+    leaseOwner: string,
+    extendMs: number = 5 * 60 * 1000
+  ): Promise<boolean> {
+    const existing = this.billingEvents.get(eventId);
+    if (!existing || existing.status !== 'processing' || existing.leaseOwner !== leaseOwner) {
+      return false;
+    }
+    const now = Date.now();
+    if (existing.leaseExpiresAt && new Date(existing.leaseExpiresAt).getTime() < now) {
+      return false;
+    }
+    existing.leaseExpiresAt = new Date(now + Math.max(1000, extendMs)).toISOString();
+    existing.updatedAt = new Date(now).toISOString();
+    return true;
+  }
+
   async updateBillingEventStatus(
     eventId: string,
     status: 'processing' | 'processed' | 'failed' | 'ignored',
-    payload?: any
+    payload?: any,
+    leaseOwner?: string
   ): Promise<void> {
     const existing = this.billingEvents.get(eventId);
     if (existing) {
+      if (leaseOwner && (existing.status !== 'processing' || existing.leaseOwner !== leaseOwner)) {
+        throw new Error(`Billing lease ownership lost for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
+      }
       existing.status = status;
       existing.updatedAt = new Date().toISOString();
+      if (status !== 'processing') {
+        existing.leaseExpiresAt = null;
+      }
       if (payload !== undefined) {
         existing.payload = JSON.parse(JSON.stringify(payload));
       }
@@ -759,11 +800,20 @@ export class MemoryRepository implements DatabaseRepository {
     subscription: SubscriptionRecord;
     storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
     markProcessed?: boolean;
+    leaseOwner?: string;
   }): Promise<void> {
+    // Verify lease ownership BEFORE modifying any workspace/subscription state
+    const prevEvent = this.billingEvents.get(params.eventId);
+    if (params.leaseOwner) {
+      if (!prevEvent || prevEvent.status !== 'processing' || prevEvent.leaseOwner !== params.leaseOwner) {
+        throw new Error(`Billing lease ownership lost for event ${params.eventId}: stale worker rejected.`);
+      }
+    }
+
     // Snapshot state for atomic rollback simulation
     const prevSub = this.subscriptions.get(params.subscription.workspaceId);
     const prevStore = this.stores.get(params.subscription.workspaceId);
-    const prevEvent = this.billingEvents.get(params.eventId);
+    const prevEventSnapshot = prevEvent ? JSON.parse(JSON.stringify(prevEvent)) : undefined;
 
     try {
       // 1. Save subscription
@@ -789,6 +839,7 @@ export class MemoryRepository implements DatabaseRepository {
       // 3. Update billing event
       if (params.markProcessed !== false && prevEvent) {
         prevEvent.status = 'processed';
+        prevEvent.leaseExpiresAt = null;
         prevEvent.processedAt = new Date().toISOString();
         prevEvent.updatedAt = new Date().toISOString();
       }
@@ -798,7 +849,7 @@ export class MemoryRepository implements DatabaseRepository {
       else this.subscriptions.delete(params.subscription.workspaceId);
 
       if (prevStore) this.stores.set(params.subscription.workspaceId, prevStore);
-      if (prevEvent) this.billingEvents.set(params.eventId, prevEvent);
+      if (prevEventSnapshot) this.billingEvents.set(params.eventId, prevEventSnapshot);
       throw err;
     }
   }
@@ -813,6 +864,17 @@ export class MemoryRepository implements DatabaseRepository {
     this.subscriptions.clear();
     this.billingEvents.clear();
     this.auditRuns.clear();
+    this.auditRunFindings.clear();
+    this.auditRunEvidence.clear();
+    this.auditRunProducts.clear();
+    this.auditRunManifests.clear();
+    this.shopifyConnections.clear();
+    this.shopifyOAuthStates.clear();
+    this.shopifySyncRuns.clear();
+    this.shopifyWebhookEvents.clear();
+    this.businessProfiles.clear();
+    this.visibilityImports.clear();
+    this.visibilityMetrics = [];
   }
 
   // Catalog Audit Runs
@@ -1199,24 +1261,29 @@ export class MemoryRepository implements DatabaseRepository {
     return JSON.parse(JSON.stringify(copy));
   }
 
-  async updateShopifySyncRun(id: string, updates: Partial<import('../shopify/types').ShopifySyncRunRecord>): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+  async updateShopifySyncRun(
+    id: string,
+    workspaceId: string,
+    updates: Partial<import('../shopify/types').ShopifySyncRunRecord>
+  ): Promise<import('../shopify/types').ShopifySyncRunRecord> {
     const existing = this.shopifySyncRuns.get(id);
-    if (!existing) {
-      throw new Error(`ShopifySyncRun ${id} not found.`);
+    if (!existing || existing.workspaceId !== workspaceId) {
+      throw new Error(`ShopifySyncRun ${id} not found for workspace ${workspaceId}.`);
     }
     const updated = {
       ...existing,
-      ...updates,
+      ...JSON.parse(JSON.stringify(updates)),
+      id: existing.id,
+      workspaceId: existing.workspaceId,
       updatedAt: new Date().toISOString(),
     };
     this.shopifySyncRuns.set(id, updated);
     return JSON.parse(JSON.stringify(updated));
   }
 
-  async getShopifySyncRunById(id: string, workspaceId?: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
+  async getShopifySyncRunById(id: string, workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
     const run = this.shopifySyncRuns.get(id);
-    if (!run) return null;
-    if (workspaceId && run.workspaceId !== workspaceId) return null;
+    if (!run || run.workspaceId !== workspaceId) return null;
     return JSON.parse(JSON.stringify(run));
   }
 
@@ -1313,9 +1380,15 @@ export class MemoryRepository implements DatabaseRepository {
   }
 
   async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
-    const copy = { ...record, createdAt: record.createdAt || new Date().toISOString() };
+    const copy = {
+      ...JSON.parse(JSON.stringify(record)),
+      status: record.status || 'completed',
+      rejectedRowCount: record.rejectedRowCount ?? 0,
+      errors: record.errors ? JSON.parse(JSON.stringify(record.errors)) : [],
+      createdAt: record.createdAt || new Date().toISOString(),
+    };
     this.visibilityImports.set(record.id, copy);
-    return copy;
+    return JSON.parse(JSON.stringify(copy));
   }
 
   async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
@@ -1333,6 +1406,23 @@ export class MemoryRepository implements DatabaseRepository {
       } else {
         this.visibilityMetrics.push(copy);
       }
+    }
+  }
+
+  async saveVisibilityImportAtomic(
+    record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
+    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]
+  ): Promise<{ importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord; metricsSaved: number }> {
+    const prevImports = new Map(this.visibilityImports);
+    const prevMetrics = JSON.parse(JSON.stringify(this.visibilityMetrics));
+    try {
+      const savedImport = await this.saveVisibilityImport(record);
+      await this.saveVisibilityMetrics(metrics);
+      return { importRecord: savedImport, metricsSaved: metrics.length };
+    } catch (err) {
+      this.visibilityImports = prevImports;
+      this.visibilityMetrics = prevMetrics;
+      throw err;
     }
   }
 

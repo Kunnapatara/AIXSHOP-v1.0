@@ -323,6 +323,7 @@ export class PostgresRepository implements DatabaseRepository {
           '007_shopify_integration.sql',
           '008_audit_composite_integrity_and_shopify_hardening.sql',
           '009_durable_sync_runs_and_ai_discovery.sql',
+          '010_remediation_integrity_and_leases.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -1667,23 +1668,35 @@ export class PostgresRepository implements DatabaseRepository {
 
   async getBillingEventById(eventId: string): Promise<BillingEventRecord | null> {
     const res = await this.pool.query<any>(
-      `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey", payload_json AS "payload", status, processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+      `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
+              payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
+              attempt_count AS "attemptCount", processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM billing_events
        WHERE event_id = $1`,
       [eventId]
     );
     if (res.rows.length === 0) return null;
-    return res.rows[0];
+    const r = res.rows[0];
+    return {
+      ...r,
+      leaseExpiresAt: r.leaseExpiresAt ? new Date(r.leaseExpiresAt).toISOString() : null,
+      processedAt: new Date(r.processedAt).toISOString(),
+    };
   }
 
   async saveBillingEvent(event: BillingEventRecord): Promise<void> {
     await this.pool.query(
-      `INSERT INTO billing_events (id, provider, event_id, event_type, idempotency_key, payload_json, status, processed_at, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, NOW(), NOW(), NOW())
+      `INSERT INTO billing_events (
+         id, provider, event_id, event_type, idempotency_key, payload_json, status,
+         lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, NOW(), NOW())
        ON CONFLICT (provider, event_id) DO UPDATE SET
          status = EXCLUDED.status,
          payload_json = EXCLUDED.payload_json,
-         processed_at = NOW(),
+         lease_owner = EXCLUDED.lease_owner,
+         lease_expires_at = EXCLUDED.lease_expires_at,
+         attempt_count = EXCLUDED.attempt_count,
+         processed_at = EXCLUDED.processed_at,
          updated_at = NOW()`,
       [
         event.id,
@@ -1693,25 +1706,49 @@ export class PostgresRepository implements DatabaseRepository {
         event.idempotencyKey,
         JSON.stringify(event.payload || {}),
         event.status,
+        event.leaseOwner || null,
+        event.leaseExpiresAt || null,
+        event.attemptCount ?? 0,
+        event.processedAt || new Date().toISOString(),
       ]
     );
   }
 
-  async claimBillingEvent(event: BillingEventRecord): Promise<{ claimed: boolean; event: BillingEventRecord | null }> {
-    // Atomic insert-or-claim query:
-    // 1. If row does not exist, inserts with status = 'processing'.
-    // 2. If row exists and status is 'failed', or status is 'processing' older than 5 minutes (stale worker), claims it.
-    // 3. Otherwise does not update and returns 0 rows.
+  async claimBillingEvent(
+    event: BillingEventRecord,
+    leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }> {
+    // Atomic insert-or-claim query with explicit durable lease ownership and expiration:
+    // 1. If row does not exist, inserts with status='processing', unique lease_owner, lease_expires_at, attempt_count=1.
+    // 2. If row exists and status='failed', or status='processing' whose lease_expires_at has elapsed (or legacy >5m), atomically steals/claims lease.
+    // 3. Otherwise returns 0 rows so active workers never overlap.
+    const leaseDurationMs = Math.max(1000, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseOwner = leaseOptions?.leaseOwner || `worker_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
     const res = await this.pool.query<any>(
-      `INSERT INTO billing_events (id, provider, event_id, event_type, idempotency_key, payload_json, status, processed_at, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', NOW(), NOW(), NOW())
+      `INSERT INTO billing_events (
+         id, provider, event_id, event_type, idempotency_key, payload_json, status,
+         lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', $7, NOW() + ($8 * INTERVAL '1 millisecond'), 1, NOW(), NOW(), NOW())
        ON CONFLICT (provider, event_id) DO UPDATE SET
          status = 'processing',
+         lease_owner = EXCLUDED.lease_owner,
+         lease_expires_at = NOW() + ($8 * INTERVAL '1 millisecond'),
+         attempt_count = COALESCE(billing_events.attempt_count, 0) + 1,
+         payload_json = CASE WHEN EXCLUDED.payload_json <> '{}'::jsonb THEN EXCLUDED.payload_json ELSE billing_events.payload_json END,
          processed_at = NOW(),
          updated_at = NOW()
        WHERE billing_events.status = 'failed'
-          OR (billing_events.status = 'processing' AND billing_events.processed_at < NOW() - INTERVAL '5 minutes')
-       RETURNING id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey", payload_json AS "payload", status, processed_at AS "processedAt"`,
+          OR (
+            billing_events.status = 'processing' AND (
+              (billing_events.lease_expires_at IS NOT NULL AND billing_events.lease_expires_at < NOW())
+              OR (billing_events.lease_expires_at IS NULL AND billing_events.processed_at < NOW() - INTERVAL '5 minutes')
+            )
+          )
+       RETURNING id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
+                 payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
+                 attempt_count AS "attemptCount", processed_at AS "processedAt"`,
       [
         event.id,
         event.provider,
@@ -1719,36 +1756,79 @@ export class PostgresRepository implements DatabaseRepository {
         event.eventType,
         event.idempotencyKey,
         JSON.stringify(event.payload || {}),
+        leaseOwner,
+        leaseDurationMs,
       ]
     );
 
     if (res.rows.length > 0) {
-      return { claimed: true, event: res.rows[0] };
+      const row = res.rows[0];
+      return {
+        claimed: true,
+        leaseOwner,
+        event: {
+          ...row,
+          leaseExpiresAt: row.leaseExpiresAt ? new Date(row.leaseExpiresAt).toISOString() : null,
+          processedAt: new Date(row.processedAt).toISOString(),
+        },
+      };
     }
 
     const existing = await this.getBillingEventById(event.eventId);
     return { claimed: false, event: existing };
   }
 
+  async renewBillingEventLease(
+    eventId: string,
+    leaseOwner: string,
+    extendMs: number = 5 * 60 * 1000
+  ): Promise<boolean> {
+    const safeExtendMs = Math.max(1000, extendMs);
+    const res = await this.pool.query<{ id: string }>(
+      `UPDATE billing_events
+       SET lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond'),
+           updated_at = NOW()
+       WHERE event_id = $1
+         AND lease_owner = $2
+         AND status = 'processing'
+         AND (lease_expires_at IS NULL OR lease_expires_at >= NOW())
+       RETURNING id`,
+      [eventId, leaseOwner, safeExtendMs]
+    );
+    return (res.rowCount || 0) > 0;
+  }
+
   async updateBillingEventStatus(
     eventId: string,
     status: 'processing' | 'processed' | 'failed' | 'ignored',
-    payload?: any
+    payload?: any,
+    leaseOwner?: string
   ): Promise<void> {
+    const params: any[] = [eventId, status];
+    const setClauses = ['status = $2', 'updated_at = NOW()'];
+    if (status !== 'processing') {
+      setClauses.push('lease_expires_at = NULL');
+    }
     if (payload !== undefined) {
-      await this.pool.query(
-        `UPDATE billing_events
-         SET status = $2, payload_json = $3::jsonb, updated_at = NOW()
-         WHERE event_id = $1`,
-        [eventId, status, JSON.stringify(payload)]
-      );
-    } else {
-      await this.pool.query(
-        `UPDATE billing_events
-         SET status = $2, updated_at = NOW()
-         WHERE event_id = $1`,
-        [eventId, status]
-      );
+      params.push(JSON.stringify(payload));
+      setClauses.push(`payload_json = $${params.length}::jsonb`);
+    }
+
+    let whereClause = 'WHERE event_id = $1';
+    if (leaseOwner) {
+      params.push(leaseOwner);
+      whereClause += ` AND lease_owner = $${params.length} AND status = 'processing'`;
+    }
+
+    const res = await this.pool.query(
+      `UPDATE billing_events
+       SET ${setClauses.join(', ')}
+       ${whereClause}`,
+      params
+    );
+
+    if (leaseOwner && res.rowCount === 0) {
+      throw new Error(`Billing lease ownership lost for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
     }
   }
 
@@ -1757,10 +1837,26 @@ export class PostgresRepository implements DatabaseRepository {
     subscription: SubscriptionRecord;
     storeProfileUpdate?: { tier: PlanTier; skuLimit?: number };
     markProcessed?: boolean;
+    leaseOwner?: string;
   }): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+
+      // 0. Lock and verify billing event lease ownership BEFORE applying entitlement changes
+      if (params.leaseOwner) {
+        const lockRes = await client.query<{ status: string; lease_owner: string | null }>(
+          `SELECT status, lease_owner
+           FROM billing_events
+           WHERE event_id = $1
+           FOR UPDATE`,
+          [params.eventId]
+        );
+        const evtRow = lockRes.rows[0];
+        if (!evtRow || evtRow.status !== 'processing' || evtRow.lease_owner !== params.leaseOwner) {
+          throw new Error(`Billing lease ownership lost for event ${params.eventId}: stale worker "${params.leaseOwner}" rejected.`);
+        }
+      }
 
       // 1. Upsert subscription record
       await client.query(
@@ -1808,16 +1904,28 @@ export class PostgresRepository implements DatabaseRepository {
         );
       }
 
-      // 3. Mark billing event processed
+      // 3. Mark billing event processed strictly by lease owner if provided
       if (params.markProcessed !== false) {
-        await client.query(
-          `UPDATE billing_events
-           SET status = 'processed',
-               processed_at = NOW(),
-               updated_at = NOW()
-           WHERE event_id = $1`,
-          [params.eventId]
+        const updateQuery = params.leaseOwner
+          ? `UPDATE billing_events
+             SET status = 'processed',
+                 lease_expires_at = NULL,
+                 processed_at = NOW(),
+                 updated_at = NOW()
+             WHERE event_id = $1 AND lease_owner = $2 AND status = 'processing'`
+          : `UPDATE billing_events
+             SET status = 'processed',
+                 lease_expires_at = NULL,
+                 processed_at = NOW(),
+                 updated_at = NOW()
+             WHERE event_id = $1`;
+        const updateRes = await client.query(
+          updateQuery,
+          params.leaseOwner ? [params.eventId, params.leaseOwner] : [params.eventId]
         );
+        if (params.leaseOwner && updateRes.rowCount === 0) {
+          throw new Error(`Billing lease ownership lost during commit for event ${params.eventId}.`);
+        }
       }
 
       await client.query('COMMIT');
@@ -2432,6 +2540,27 @@ export class PostgresRepository implements DatabaseRepository {
   // Workstream C: Shopify Integration Methods
   // ==========================================
 
+  private mapShopifyConnectionRow(r: any): import('../shopify/types').ShopifyConnectionRecord {
+    return {
+      ...r,
+      tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
+      refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
+      lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
+      webhookSubscriptions: Array.isArray(r.webhookSubscriptions)
+        ? r.webhookSubscriptions
+        : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : []),
+      webhookLastVerifiedAt: r.webhookLastVerifiedAt ? new Date(r.webhookLastVerifiedAt).toISOString() : null,
+      webhookVerificationStatus: r.webhookVerificationStatus || 'not_configured',
+      webhookVerificationDetails: typeof r.webhookVerificationDetails === 'string'
+        ? JSON.parse(r.webhookVerificationDetails)
+        : (r.webhookVerificationDetails || {}),
+      installedAt: new Date(r.installedAt).toISOString(),
+      lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
   async getShopifyConnection(workspaceId: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
     const res = await this.pool.query<any>(
       `SELECT 
@@ -2439,6 +2568,9 @@ export class PostgresRepository implements DatabaseRepository {
         access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
         token_expires_at AS "tokenExpiresAt", refresh_token_expires_at AS "refreshTokenExpiresAt",
         last_refreshed_at AS "lastRefreshedAt", webhook_subscriptions_json AS "webhookSubscriptions",
+        webhook_last_verified_at AS "webhookLastVerifiedAt",
+        webhook_verification_status AS "webhookVerificationStatus",
+        webhook_verification_details AS "webhookVerificationDetails",
         granted_scopes AS "grantedScopes", key_version AS "keyVersion", status, installed_at AS "installedAt",
         last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_connections
@@ -2447,18 +2579,7 @@ export class PostgresRepository implements DatabaseRepository {
     );
 
     if (res.rows.length === 0) return null;
-    const r = res.rows[0];
-    return {
-      ...r,
-      tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
-      refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
-      lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
-      webhookSubscriptions: Array.isArray(r.webhookSubscriptions) ? r.webhookSubscriptions : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : undefined),
-      installedAt: new Date(r.installedAt).toISOString(),
-      lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
-      createdAt: new Date(r.createdAt).toISOString(),
-      updatedAt: new Date(r.updatedAt).toISOString(),
-    };
+    return this.mapShopifyConnectionRow(res.rows[0]);
   }
 
   async getShopifyConnectionByShop(shopDomain: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
@@ -2469,6 +2590,9 @@ export class PostgresRepository implements DatabaseRepository {
         access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
         token_expires_at AS "tokenExpiresAt", refresh_token_expires_at AS "refreshTokenExpiresAt",
         last_refreshed_at AS "lastRefreshedAt", webhook_subscriptions_json AS "webhookSubscriptions",
+        webhook_last_verified_at AS "webhookLastVerifiedAt",
+        webhook_verification_status AS "webhookVerificationStatus",
+        webhook_verification_details AS "webhookVerificationDetails",
         granted_scopes AS "grantedScopes", key_version AS "keyVersion", status, installed_at AS "installedAt",
         last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_connections
@@ -2477,18 +2601,7 @@ export class PostgresRepository implements DatabaseRepository {
     );
 
     if (res.rows.length === 0) return null;
-    const r = res.rows[0];
-    return {
-      ...r,
-      tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
-      refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
-      lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
-      webhookSubscriptions: Array.isArray(r.webhookSubscriptions) ? r.webhookSubscriptions : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : undefined),
-      installedAt: new Date(r.installedAt).toISOString(),
-      lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
-      createdAt: new Date(r.createdAt).toISOString(),
-      updatedAt: new Date(r.updatedAt).toISOString(),
-    };
+    return this.mapShopifyConnectionRow(res.rows[0]);
   }
 
   async saveShopifyConnection(conn: import('../shopify/types').ShopifyConnectionRecord): Promise<import('../shopify/types').ShopifyConnectionRecord> {
@@ -2496,9 +2609,10 @@ export class PostgresRepository implements DatabaseRepository {
       `INSERT INTO shopify_connections (
         id, workspace_id, shop_domain, access_token_encrypted, refresh_token_encrypted,
         token_expires_at, refresh_token_expires_at, last_refreshed_at, webhook_subscriptions_json,
+        webhook_last_verified_at, webhook_verification_status, webhook_verification_details,
         granted_scopes, key_version, status, installed_at,
         last_verified_at, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15, $16, $17, NOW(), NOW())
       ON CONFLICT (workspace_id) DO UPDATE SET
         shop_domain = EXCLUDED.shop_domain,
         access_token_encrypted = EXCLUDED.access_token_encrypted,
@@ -2507,6 +2621,9 @@ export class PostgresRepository implements DatabaseRepository {
         refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
         last_refreshed_at = EXCLUDED.last_refreshed_at,
         webhook_subscriptions_json = EXCLUDED.webhook_subscriptions_json,
+        webhook_last_verified_at = EXCLUDED.webhook_last_verified_at,
+        webhook_verification_status = EXCLUDED.webhook_verification_status,
+        webhook_verification_details = EXCLUDED.webhook_verification_details,
         granted_scopes = EXCLUDED.granted_scopes,
         key_version = EXCLUDED.key_version,
         status = EXCLUDED.status,
@@ -2521,7 +2638,10 @@ export class PostgresRepository implements DatabaseRepository {
         conn.tokenExpiresAt || null,
         conn.refreshTokenExpiresAt || null,
         conn.lastRefreshedAt || null,
-        conn.webhookSubscriptions ? JSON.stringify(conn.webhookSubscriptions) : null,
+        JSON.stringify(conn.webhookSubscriptions || []),
+        conn.webhookLastVerifiedAt || null,
+        conn.webhookVerificationStatus || 'not_configured',
+        JSON.stringify(conn.webhookVerificationDetails || {}),
         conn.grantedScopes,
         conn.keyVersion,
         conn.status,
@@ -2574,12 +2694,44 @@ export class PostgresRepository implements DatabaseRepository {
     };
   }
 
+  private mapShopifySyncRunRow(r: any): import('../shopify/types').ShopifySyncRunRecord {
+    const parseJson = (v: any, fallback: any) =>
+      v === null || v === undefined ? fallback : typeof v === 'string' ? JSON.parse(v) : v;
+
+    return {
+      ...r,
+      parentSyncRunId: r.parentSyncRunId || null,
+      attemptNumber: typeof r.attemptNumber === 'number' ? r.attemptNumber : Number(r.attemptNumber || 1),
+      variantCompletenessStatus: r.variantCompletenessStatus || 'complete',
+      variantCompleteness: parseJson(r.variantCompleteness, undefined),
+      paginationMetadata: parseJson(r.paginationMetadata, undefined),
+      startedAt: new Date(r.startedAt).toISOString(),
+      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+    };
+  }
+
   async createShopifySyncRun(run: import('../shopify/types').ShopifySyncRunRecord): Promise<import('../shopify/types').ShopifySyncRunRecord> {
-    await this.pool.query(
+    const res = await this.pool.query<any>(
       `INSERT INTO shopify_sync_runs (
         id, workspace_id, shop_domain, status, products_discovered, products_imported,
-        variants_imported, excluded_by_plan, cursor_resumed, error_message, started_at, completed_at, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())`,
+        variants_imported, excluded_by_plan, cursor_resumed, error_message,
+        parent_sync_run_id, attempt_number, variant_completeness_status,
+        variant_completeness_json, pagination_metadata_json,
+        started_at, completed_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, $16, $17, NOW(), NOW())
+      RETURNING
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        parent_sync_run_id AS "parentSyncRunId", attempt_number AS "attemptNumber",
+        variant_completeness_status AS "variantCompletenessStatus",
+        variant_completeness_json AS "variantCompleteness",
+        pagination_metadata_json AS "paginationMetadata",
+        started_at AS "startedAt", completed_at AS "completedAt",
+        created_at AS "createdAt", updated_at AS "updatedAt"`,
       [
         run.id,
         run.workspaceId,
@@ -2591,17 +2743,26 @@ export class PostgresRepository implements DatabaseRepository {
         run.excludedByPlan,
         run.cursorResumed || null,
         run.errorMessage || null,
+        run.parentSyncRunId || null,
+        run.attemptNumber ?? 1,
+        run.variantCompletenessStatus || 'complete',
+        JSON.stringify(run.variantCompleteness || {}),
+        JSON.stringify(run.paginationMetadata || {}),
         run.startedAt,
         run.completedAt || null,
       ]
     );
 
-    return run;
+    return res.rows[0] ? this.mapShopifySyncRunRow(res.rows[0]) : run;
   }
 
-  async updateShopifySyncRun(id: string, updates: Partial<import('../shopify/types').ShopifySyncRunRecord>): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+  async updateShopifySyncRun(
+    id: string,
+    workspaceId: string,
+    updates: Partial<import('../shopify/types').ShopifySyncRunRecord>
+  ): Promise<import('../shopify/types').ShopifySyncRunRecord> {
     const setClauses: string[] = ['updated_at = NOW()'];
-    const params: any[] = [id];
+    const params: any[] = [id, workspaceId];
 
     if (updates.status !== undefined) {
       params.push(updates.status);
@@ -2635,33 +2796,50 @@ export class PostgresRepository implements DatabaseRepository {
       params.push(updates.cursorResumed);
       setClauses.push(`cursor_resumed = $${params.length}`);
     }
+    if (updates.parentSyncRunId !== undefined) {
+      params.push(updates.parentSyncRunId);
+      setClauses.push(`parent_sync_run_id = $${params.length}`);
+    }
+    if (updates.attemptNumber !== undefined) {
+      params.push(updates.attemptNumber);
+      setClauses.push(`attempt_number = $${params.length}`);
+    }
+    if (updates.variantCompletenessStatus !== undefined) {
+      params.push(updates.variantCompletenessStatus);
+      setClauses.push(`variant_completeness_status = $${params.length}`);
+    }
+    if (updates.variantCompleteness !== undefined) {
+      params.push(JSON.stringify(updates.variantCompleteness || {}));
+      setClauses.push(`variant_completeness_json = $${params.length}::jsonb`);
+    }
+    if (updates.paginationMetadata !== undefined) {
+      params.push(JSON.stringify(updates.paginationMetadata || {}));
+      setClauses.push(`pagination_metadata_json = $${params.length}::jsonb`);
+    }
 
     const res = await this.pool.query<any>(
       `UPDATE shopify_sync_runs
        SET ${setClauses.join(', ')}
-       WHERE id = $1
+       WHERE id = $1 AND workspace_id = $2
        RETURNING 
          id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
          products_discovered AS "productsDiscovered", products_imported AS "productsImported",
          variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
          cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+         parent_sync_run_id AS "parentSyncRunId", attempt_number AS "attemptNumber",
+         variant_completeness_status AS "variantCompletenessStatus",
+         variant_completeness_json AS "variantCompleteness",
+         pagination_metadata_json AS "paginationMetadata",
          started_at AS "startedAt", completed_at AS "completedAt",
          created_at AS "createdAt", updated_at AS "updatedAt"`,
       params
     );
 
     if (res.rows.length === 0) {
-      throw new Error(`ShopifySyncRun ${id} not found.`);
+      throw new Error(`ShopifySyncRun ${id} not found for workspace ${workspaceId}.`);
     }
 
-    const r = res.rows[0];
-    return {
-      ...r,
-      startedAt: new Date(r.startedAt).toISOString(),
-      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
-      createdAt: new Date(r.createdAt).toISOString(),
-      updatedAt: new Date(r.updatedAt).toISOString(),
-    };
+    return this.mapShopifySyncRunRow(res.rows[0]);
   }
 
   async getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
@@ -2671,6 +2849,10 @@ export class PostgresRepository implements DatabaseRepository {
         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
         variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
         cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        parent_sync_run_id AS "parentSyncRunId", attempt_number AS "attemptNumber",
+        variant_completeness_status AS "variantCompletenessStatus",
+        variant_completeness_json AS "variantCompleteness",
+        pagination_metadata_json AS "paginationMetadata",
         started_at AS "startedAt", completed_at AS "completedAt",
         created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_sync_runs
@@ -2681,51 +2863,29 @@ export class PostgresRepository implements DatabaseRepository {
     );
 
     if (res.rows.length === 0) return null;
-    const r = res.rows[0];
-    return {
-      ...r,
-      startedAt: new Date(r.startedAt).toISOString(),
-      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
-      createdAt: new Date(r.createdAt).toISOString(),
-      updatedAt: new Date(r.updatedAt).toISOString(),
-    };
+    return this.mapShopifySyncRunRow(res.rows[0]);
   }
 
-  async getShopifySyncRunById(id: string, workspaceId?: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
-    const query = workspaceId
-      ? `SELECT 
-        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
-        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
-        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
-        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
-        started_at AS "startedAt", completed_at AS "completedAt",
-        created_at AS "createdAt", updated_at AS "updatedAt"
-       FROM shopify_sync_runs
-       WHERE id = $1 AND workspace_id = $2`
-      : `SELECT 
-        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
-        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
-        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
-        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
-        started_at AS "startedAt", completed_at AS "completedAt",
-        created_at AS "createdAt", updated_at AS "updatedAt"
-       FROM shopify_sync_runs
-       WHERE id = $1`;
-
+  async getShopifySyncRunById(id: string, workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
     const res = await this.pool.query<any>(
-      query,
-      workspaceId ? [id, workspaceId] : [id]
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
+        products_discovered AS "productsDiscovered", products_imported AS "productsImported",
+        variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
+        cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        parent_sync_run_id AS "parentSyncRunId", attempt_number AS "attemptNumber",
+        variant_completeness_status AS "variantCompletenessStatus",
+        variant_completeness_json AS "variantCompleteness",
+        pagination_metadata_json AS "paginationMetadata",
+        started_at AS "startedAt", completed_at AS "completedAt",
+        created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_sync_runs
+       WHERE id = $1 AND workspace_id = $2`,
+      [id, workspaceId]
     );
 
     if (res.rows.length === 0) return null;
-    const r = res.rows[0];
-    return {
-      ...r,
-      startedAt: new Date(r.startedAt).toISOString(),
-      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
-      createdAt: new Date(r.createdAt).toISOString(),
-      updatedAt: new Date(r.updatedAt).toISOString(),
-    };
+    return this.mapShopifySyncRunRow(res.rows[0]);
   }
 
   async getShopifySyncRuns(workspaceId: string, limit = 20): Promise<import('../shopify/types').ShopifySyncRunRecord[]> {
@@ -2735,6 +2895,10 @@ export class PostgresRepository implements DatabaseRepository {
         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
         variants_imported AS "variantsImported", excluded_by_plan AS "excludedByPlan",
         cursor_resumed AS "cursorResumed", error_message AS "errorMessage",
+        parent_sync_run_id AS "parentSyncRunId", attempt_number AS "attemptNumber",
+        variant_completeness_status AS "variantCompletenessStatus",
+        variant_completeness_json AS "variantCompleteness",
+        pagination_metadata_json AS "paginationMetadata",
         started_at AS "startedAt", completed_at AS "completedAt",
         created_at AS "createdAt", updated_at AS "updatedAt"
        FROM shopify_sync_runs
@@ -2744,13 +2908,7 @@ export class PostgresRepository implements DatabaseRepository {
       [workspaceId, limit]
     );
 
-    return res.rows.map(r => ({
-      ...r,
-      startedAt: new Date(r.startedAt).toISOString(),
-      completedAt: r.completedAt ? new Date(r.completedAt).toISOString() : null,
-      createdAt: new Date(r.createdAt).toISOString(),
-      updatedAt: new Date(r.updatedAt).toISOString(),
-    }));
+    return res.rows.map(r => this.mapShopifySyncRunRow(r));
   }
 
   async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
@@ -2829,6 +2987,9 @@ export class PostgresRepository implements DatabaseRepository {
           refresh_token_expires_at AS "refreshTokenExpiresAt",
           last_refreshed_at AS "lastRefreshedAt",
           webhook_subscriptions_json AS "webhookSubscriptions",
+          webhook_last_verified_at AS "webhookLastVerifiedAt",
+          webhook_verification_status AS "webhookVerificationStatus",
+          webhook_verification_details AS "webhookVerificationDetails",
           granted_scopes AS "grantedScopes",
           key_version AS "keyVersion",
           status, installed_at AS "installedAt",
@@ -2844,36 +3005,17 @@ export class PostgresRepository implements DatabaseRepository {
         throw new Error(`[AIXSHOP Shopify Refresh] No Shopify connection found for workspace ${workspaceId}.`);
       }
 
-      const r = res.rows[0];
-      const lockedConn: import('../shopify/types').ShopifyConnectionRecord = {
-        id: r.id,
-        workspaceId: r.workspaceId,
-        shopDomain: r.shopDomain,
-        accessTokenEncrypted: r.accessTokenEncrypted,
-        refreshTokenEncrypted: r.refreshTokenEncrypted,
-        tokenExpiresAt: r.tokenExpiresAt ? new Date(r.tokenExpiresAt).toISOString() : null,
-        refreshTokenExpiresAt: r.refreshTokenExpiresAt ? new Date(r.refreshTokenExpiresAt).toISOString() : null,
-        lastRefreshedAt: r.lastRefreshedAt ? new Date(r.lastRefreshedAt).toISOString() : null,
-        webhookSubscriptions: Array.isArray(r.webhookSubscriptions)
-          ? r.webhookSubscriptions
-          : (typeof r.webhookSubscriptions === 'string' ? JSON.parse(r.webhookSubscriptions) : []),
-        grantedScopes: r.grantedScopes,
-        keyVersion: r.keyVersion,
-        status: r.status,
-        installedAt: new Date(r.installedAt).toISOString(),
-        lastVerifiedAt: new Date(r.lastVerifiedAt).toISOString(),
-        createdAt: new Date(r.createdAt).toISOString(),
-        updatedAt: new Date(r.updatedAt).toISOString(),
-      };
+      const lockedConn = this.mapShopifyConnectionRow(res.rows[0]);
 
       const saveConnection = async (conn: import('../shopify/types').ShopifyConnectionRecord): Promise<import('../shopify/types').ShopifyConnectionRecord> => {
         await client.query(
           `INSERT INTO shopify_connections (
             id, workspace_id, shop_domain, access_token_encrypted, refresh_token_encrypted,
             token_expires_at, refresh_token_expires_at, last_refreshed_at, webhook_subscriptions_json,
+            webhook_last_verified_at, webhook_verification_status, webhook_verification_details,
             granted_scopes, key_version, status, installed_at,
             last_verified_at, created_at, updated_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15, $16, $17, NOW(), NOW())
           ON CONFLICT (workspace_id) DO UPDATE SET
             shop_domain = EXCLUDED.shop_domain,
             access_token_encrypted = EXCLUDED.access_token_encrypted,
@@ -2882,6 +3024,9 @@ export class PostgresRepository implements DatabaseRepository {
             refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
             last_refreshed_at = EXCLUDED.last_refreshed_at,
             webhook_subscriptions_json = EXCLUDED.webhook_subscriptions_json,
+            webhook_last_verified_at = EXCLUDED.webhook_last_verified_at,
+            webhook_verification_status = EXCLUDED.webhook_verification_status,
+            webhook_verification_details = EXCLUDED.webhook_verification_details,
             granted_scopes = EXCLUDED.granted_scopes,
             key_version = EXCLUDED.key_version,
             status = EXCLUDED.status,
@@ -2896,7 +3041,10 @@ export class PostgresRepository implements DatabaseRepository {
             conn.tokenExpiresAt || null,
             conn.refreshTokenExpiresAt || null,
             conn.lastRefreshedAt || null,
-            conn.webhookSubscriptions ? JSON.stringify(conn.webhookSubscriptions) : null,
+            JSON.stringify(conn.webhookSubscriptions || []),
+            conn.webhookLastVerifiedAt || null,
+            conn.webhookVerificationStatus || 'not_configured',
+            JSON.stringify(conn.webhookVerificationDetails || {}),
             conn.grantedScopes,
             conn.keyVersion,
             conn.status,
@@ -2943,6 +3091,8 @@ export class PostgresRepository implements DatabaseRepository {
         logo_url AS "logoUrl",
         social_profiles_json AS "socialProfiles",
         verification_status AS "verificationStatus",
+        verification_source AS "verificationSource",
+        verification_evidence_json AS "verificationEvidence",
         last_verified_at AS "lastVerifiedAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
@@ -2953,9 +3103,29 @@ export class PostgresRepository implements DatabaseRepository {
 
     if (res.rows.length === 0) return null;
     const r = res.rows[0];
+    const normalizeStatus = (s: string): import('../../domain/businessProfile/types').BusinessVerificationStatus => {
+      if (s === 'merchant_verified') return 'merchant_self_declared';
+      if (s === 'unverified') return 'not_verified';
+      if (
+        s === 'not_verified' ||
+        s === 'merchant_self_declared' ||
+        s === 'verification_pending' ||
+        s === 'verification_failed' ||
+        s === 'independently_verified'
+      ) {
+        return s;
+      }
+      return 'not_verified';
+    };
+
     return {
       ...r,
       socialProfiles: Array.isArray(r.socialProfiles) ? r.socialProfiles : [],
+      verificationStatus: normalizeStatus(r.verificationStatus),
+      verificationSource: r.verificationSource || null,
+      verificationEvidence: typeof r.verificationEvidence === 'string'
+        ? JSON.parse(r.verificationEvidence)
+        : (r.verificationEvidence || null),
       lastVerifiedAt: r.lastVerifiedAt ? new Date(r.lastVerifiedAt).toISOString() : null,
       createdAt: new Date(r.createdAt).toISOString(),
       updatedAt: new Date(r.updatedAt).toISOString(),
@@ -2969,8 +3139,8 @@ export class PostgresRepository implements DatabaseRepository {
         official_website, primary_domain, contact_email, contact_phone, business_address,
         support_url, shipping_policy_url, return_policy_url, refund_policy_url,
         privacy_policy_url, terms_of_service_url, logo_url, social_profiles_json,
-        verification_status, last_verified_at, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20, NOW(), NOW())
+        verification_status, verification_source, verification_evidence_json, last_verified_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20, $21::jsonb, $22, NOW(), NOW())
       ON CONFLICT (workspace_id) DO UPDATE SET
         legal_business_name = EXCLUDED.legal_business_name,
         public_brand_name = EXCLUDED.public_brand_name,
@@ -2989,6 +3159,8 @@ export class PostgresRepository implements DatabaseRepository {
         logo_url = EXCLUDED.logo_url,
         social_profiles_json = EXCLUDED.social_profiles_json,
         verification_status = EXCLUDED.verification_status,
+        verification_source = EXCLUDED.verification_source,
+        verification_evidence_json = EXCLUDED.verification_evidence_json,
         last_verified_at = EXCLUDED.last_verified_at,
         updated_at = NOW()
       RETURNING *`,
@@ -3011,7 +3183,9 @@ export class PostgresRepository implements DatabaseRepository {
         profile.termsOfServiceUrl || null,
         profile.logoUrl || null,
         JSON.stringify(profile.socialProfiles || []),
-        profile.verificationStatus || 'unverified',
+        profile.verificationStatus || 'not_verified',
+        profile.verificationSource || null,
+        JSON.stringify(profile.verificationEvidence || {}),
         profile.lastVerifiedAt || null,
       ]
     );
@@ -3027,13 +3201,17 @@ export class PostgresRepository implements DatabaseRepository {
   async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
     await this.pool.query(
       `INSERT INTO ai_visibility_imports (
-        id, workspace_id, filename, row_count, reporting_period_start, reporting_period_end, source_platform, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+        id, workspace_id, filename, row_count, rejected_row_count, status, errors_json,
+        reporting_period_start, reporting_period_end, source_platform, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, NOW())`,
       [
         record.id,
         record.workspaceId,
         record.filename,
         record.rowCount,
+        record.rejectedRowCount ?? 0,
+        record.status || 'completed',
+        JSON.stringify(record.errors || []),
         record.reportingPeriodStart || null,
         record.reportingPeriodEnd || null,
         record.sourcePlatform || 'merchant_upload',
@@ -3049,6 +3227,7 @@ export class PostgresRepository implements DatabaseRepository {
           id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, evidence_source, created_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+          import_id = EXCLUDED.import_id,
           brand_mentions = EXCLUDED.brand_mentions,
           product_mentions = EXCLUDED.product_mentions,
           website_clicks = EXCLUDED.website_clicks,
@@ -3066,6 +3245,68 @@ export class PostgresRepository implements DatabaseRepository {
           m.evidenceSource || null,
         ]
       );
+    }
+  }
+
+  async saveVisibilityImportAtomic(
+    record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
+    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]
+  ): Promise<{ importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord; metricsSaved: number }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO ai_visibility_imports (
+          id, workspace_id, filename, row_count, rejected_row_count, status, errors_json,
+          reporting_period_start, reporting_period_end, source_platform, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, NOW())`,
+        [
+          record.id,
+          record.workspaceId,
+          record.filename,
+          record.rowCount,
+          record.rejectedRowCount ?? 0,
+          record.status || 'completed',
+          JSON.stringify(record.errors || []),
+          record.reportingPeriodStart || null,
+          record.reportingPeriodEnd || null,
+          record.sourcePlatform || 'merchant_upload',
+        ]
+      );
+
+      for (const m of metrics) {
+        await client.query(
+          `INSERT INTO ai_visibility_metrics (
+            id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, evidence_source, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+          ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+            import_id = EXCLUDED.import_id,
+            brand_mentions = EXCLUDED.brand_mentions,
+            product_mentions = EXCLUDED.product_mentions,
+            website_clicks = EXCLUDED.website_clicks,
+            evidence_source = EXCLUDED.evidence_source`,
+          [
+            m.id,
+            m.workspaceId,
+            m.importId || null,
+            m.observationDate,
+            m.platform,
+            m.brandMentions,
+            m.productMentions,
+            m.websiteClicks,
+            m.discoveryTopic || '',
+            m.evidenceSource || null,
+          ]
+        );
+      }
+
+      await client.query('COMMIT');
+      return { importRecord: record, metricsSaved: metrics.length };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
   }
 
@@ -3087,6 +3328,7 @@ export class PostgresRepository implements DatabaseRepository {
     const importsRes = await this.pool.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", filename, row_count AS "rowCount",
+        rejected_row_count AS "rejectedRowCount", status, errors_json AS "errors",
         reporting_period_start::text AS "reportingPeriodStart",
         reporting_period_end::text AS "reportingPeriodEnd",
         source_platform AS "sourcePlatform", created_at AS "createdAt"

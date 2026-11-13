@@ -80,6 +80,10 @@ export interface GraphQLClientOptions {
   timeoutMs?: number;
 }
 
+export interface FetchProductsPageOptions extends GraphQLClientOptions {
+  maxVariantPages?: number;
+}
+
 /**
  * Executes an authenticated GraphQL query or mutation against the Shopify Admin API.
  * Pinned to official supported version (2026-10).
@@ -294,7 +298,7 @@ export async function fetchProductsPage(
   accessToken: string,
   cursor: string | null = null,
   limit = 50,
-  options?: GraphQLClientOptions
+  options?: FetchProductsPageOptions
 ): Promise<{
   products: ShopifyGraphQLProductNode[];
   hasNextPage: boolean;
@@ -425,7 +429,9 @@ export async function fetchProductsPage(
     if (vCursor) seenVariantCursors.add(vCursor);
     const seenVariantIds = new Set(initialEdges.map(e => e.node.id));
 
-    while (vHasNext && vCursor && vSafetyPages < 50) {
+    const maxVariantPages = options?.maxVariantPages ?? 50;
+
+    while (vHasNext && vCursor && vSafetyPages < maxVariantPages) {
       vSafetyPages++;
       let more: { variants: import('./types').ShopifyGraphQLVariantEdge[]; hasNextPage: boolean; endCursor: string | null };
       try {
@@ -456,21 +462,21 @@ export async function fetchProductsPage(
         break;
       }
 
-      if (more.endCursor && seenVariantCursors.has(more.endCursor)) {
-        terminationStatus = 'incomplete_repeated_cursor';
-        terminationReason = `Variant pagination repeated cursor ${more.endCursor}.`;
-        break;
-      }
-
       if (more.endCursor && more.endCursor === vCursor) {
         terminationStatus = 'incomplete_non_advancing_cursor';
         terminationReason = `Variant cursor did not advance from ${vCursor}.`;
         break;
       }
 
-      if (vSafetyPages >= 50 && more.hasNextPage) {
+      if (more.endCursor && seenVariantCursors.has(more.endCursor)) {
+        terminationStatus = 'incomplete_repeated_cursor';
+        terminationReason = `Variant pagination repeated cursor ${more.endCursor}.`;
+        break;
+      }
+
+      if (vSafetyPages >= maxVariantPages && more.hasNextPage) {
         terminationStatus = 'incomplete_page_limit';
-        terminationReason = 'Exhausted safety page limit (50 pages) while variants remained.';
+        terminationReason = `Exhausted safety page limit (${maxVariantPages} pages) while variants remained.`;
         break;
       }
 

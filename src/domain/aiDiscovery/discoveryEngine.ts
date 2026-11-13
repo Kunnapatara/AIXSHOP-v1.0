@@ -40,6 +40,8 @@ export interface DiscoveryAuditResult {
   findings: DiscoveryFinding[];
   auditedAt: string;
   ruleVersion: string;
+  dataOrigin: 'measured_catalog_data' | 'unavailable_empty_catalog';
+  limitationsNotice: string;
 }
 
 export const DISCOVERY_RULE_VERSION = 'v1.0-deterministic';
@@ -269,10 +271,18 @@ export function evaluateDiscoveryReadiness(
 
     // 7. URL & Source Consistency
     const offerUrl = offers[0]?.url || product.attributes?.canonicalProductUrl || '';
-    const hasCanonicalUrl = offerUrl.startsWith('https://') && !offerUrl.includes('myshopify.com/products');
-    if (hasCanonicalUrl) {
-      dimStats.urlAndSourceConsistency.passed++;
-    } else if (offerUrl.startsWith('https://')) {
+    const urlProvenance = product.attributes?.urlProvenance || '';
+    const normalizedExpectedDomain = storeDomain ? storeDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase() : '';
+    let isValidCanonicalUrl = false;
+    if (offerUrl.startsWith('https://') && urlProvenance !== 'unavailable_store_domain') {
+      if (normalizedExpectedDomain && normalizedExpectedDomain !== 'store.myshopify.com') {
+        isValidCanonicalUrl = offerUrl.toLowerCase().includes(normalizedExpectedDomain);
+      } else {
+        isValidCanonicalUrl = !offerUrl.includes('store.myshopify.com');
+      }
+    }
+
+    if (isValidCanonicalUrl) {
       dimStats.urlAndSourceConsistency.passed++;
     } else {
       dimStats.urlAndSourceConsistency.failed++;
@@ -283,11 +293,11 @@ export function evaluateDiscoveryReadiness(
         productId: product.id,
         productTitle: title,
         severity: 'medium',
-        title: 'Missing Canonical Storefront Product URL',
+        title: 'Missing or Unverified Canonical Storefront Product URL',
         observedValue: offerUrl || '(none)',
-        expectedCondition: 'Explicit storefront URL pointing to verified merchant domain',
-        evidence: `Product offer URL is "${offerUrl || '(empty)'}".`,
-        recommendation: 'Ensure catalog sync uses verified custom storefront domain.',
+        expectedCondition: 'Explicit HTTPS storefront URL pointing to verified merchant store domain',
+        evidence: `Product offer URL is "${offerUrl || '(empty)'}" (provenance: ${urlProvenance || 'unknown'}).`,
+        recommendation: 'Ensure catalog sync uses verified Shopify storefront domain and valid product handle.',
         needsMerchantInput: false,
         recheckStatus: 'unverified',
       });
@@ -321,7 +331,8 @@ export function evaluateDiscoveryReadiness(
   for (const [key, meta] of Object.entries(weights)) {
     const stats = dimStats[key];
     const rulesEvaluated = stats.passed + stats.failed;
-    const ratio = rulesEvaluated > 0 ? stats.passed / rulesEvaluated : 1.0;
+    // Empty catalogs or dimensions with 0 assessed rules MUST NOT score 100%
+    const ratio = rulesEvaluated > 0 ? stats.passed / rulesEvaluated : 0;
     const dimScore = Math.round(ratio * meta.weight);
     weightedSum += dimScore;
 
@@ -336,13 +347,15 @@ export function evaluateDiscoveryReadiness(
       notAssessedCount: stats.notAssessed,
       rulesEvaluated,
       evidence: [
-        `${stats.passed} rules passed out of ${rulesEvaluated} assessed.`,
-        stats.failed > 0 ? `${stats.failed} defect(s) detected.` : 'No critical defects found.',
+        rulesEvaluated === 0
+          ? 'No products or rules assessed yet (0 / 0).'
+          : `${stats.passed} rules passed out of ${rulesEvaluated} assessed.`,
+        stats.failed > 0 ? `${stats.failed} defect(s) detected.` : rulesEvaluated > 0 ? 'No critical defects found.' : 'Requires catalog data to assess.',
       ],
     };
   }
 
-  const overallScore = Math.min(100, Math.max(0, weightedSum));
+  const overallScore = products.length === 0 ? 0 : Math.min(100, Math.max(0, weightedSum));
 
   return {
     overallScore,
@@ -352,6 +365,9 @@ export function evaluateDiscoveryReadiness(
     findings,
     auditedAt,
     ruleVersion: DISC_RULE_VERSION,
+    dataOrigin: products.length > 0 ? 'measured_catalog_data' : 'unavailable_empty_catalog',
+    limitationsNotice:
+      'Local deterministic structural check of catalog fields only. Does not query live external AI search rankings, citations, or official ChatGPT Business Hub enrollment.',
   };
 }
 
@@ -368,6 +384,9 @@ export function buildBusinessHubChecklist(
 ): BusinessHubChecklistResult {
   const items: BusinessHubChecklistResult['checklistItems'] = [];
 
+  const profileOrigin: 'independently_verified' | 'merchant_self_declared' =
+    profile?.verificationStatus === 'independently_verified' ? 'independently_verified' : 'merchant_self_declared';
+
   // 1. Legal & Brand Identity
   const hasLegalName = Boolean(profile?.legalBusinessName?.trim());
   items.push({
@@ -375,6 +394,7 @@ export function buildBusinessHubChecklist(
     category: 'identity',
     title: 'Legal Business Entity Name',
     status: hasLegalName ? 'ready' : 'action_required',
+    dataOrigin: profileOrigin,
     currentValue: profile?.legalBusinessName || undefined,
     requirementDescription: 'Official registered business name matching commercial registration or tax records.',
   });
@@ -385,6 +405,7 @@ export function buildBusinessHubChecklist(
     category: 'identity',
     title: 'Public Commerce Brand Name',
     status: hasBrandName ? 'ready' : 'action_required',
+    dataOrigin: profileOrigin,
     currentValue: profile?.publicBrandName || undefined,
     requirementDescription: 'Public consumer-facing trademark or brand name.',
   });
@@ -394,8 +415,9 @@ export function buildBusinessHubChecklist(
   items.push({
     id: 'hub_website',
     category: 'identity',
-    title: 'Official Verified Website (HTTPS)',
+    title: 'Official Website URL (HTTPS)',
     status: hasWebsite ? 'ready' : 'action_required',
+    dataOrigin: profileOrigin,
     currentValue: profile?.officialWebsite || undefined,
     requirementDescription: 'Primary secure storefront domain owned and operated by the merchant.',
   });
@@ -407,6 +429,7 @@ export function buildBusinessHubChecklist(
     category: 'contact',
     title: 'Official Business Contact Email',
     status: hasEmail ? 'ready' : 'action_required',
+    dataOrigin: profileOrigin,
     currentValue: profile?.contactEmail || undefined,
     requirementDescription: 'Corporate business email address on company domain for owner verification.',
   });
@@ -417,6 +440,7 @@ export function buildBusinessHubChecklist(
     category: 'contact',
     title: 'Customer Support Telephone Number',
     status: hasPhone ? 'ready' : 'action_required',
+    dataOrigin: profileOrigin,
     currentValue: profile?.contactPhone || undefined,
     requirementDescription: 'Direct customer contact or service desk telephone number.',
   });
@@ -428,6 +452,7 @@ export function buildBusinessHubChecklist(
     category: 'policies',
     title: 'Public Privacy Policy URL',
     status: hasPrivacy ? 'ready' : 'missing',
+    dataOrigin: profileOrigin,
     currentValue: profile?.privacyPolicyUrl || undefined,
     requirementDescription: 'Legally compliant privacy disclosure accessible to consumers and web crawlers.',
   });
@@ -438,6 +463,7 @@ export function buildBusinessHubChecklist(
     category: 'policies',
     title: 'Return & Refund Policy URL',
     status: hasReturns ? 'ready' : 'missing',
+    dataOrigin: profileOrigin,
     currentValue: profile?.returnPolicyUrl || undefined,
     requirementDescription: 'Explicit terms covering returns, exchanges, refunds, and merchant warranty.',
   });
@@ -448,6 +474,7 @@ export function buildBusinessHubChecklist(
     category: 'policies',
     title: 'Shipping & Delivery Policy URL',
     status: hasShipping ? 'ready' : 'missing',
+    dataOrigin: profileOrigin,
     currentValue: profile?.shippingPolicyUrl || undefined,
     requirementDescription: 'Clear delivery timeframes, rates, and international shipping specifications.',
   });
@@ -459,24 +486,31 @@ export function buildBusinessHubChecklist(
     category: 'catalog',
     title: 'Synchronized Product Catalog',
     status: hasCatalog ? 'ready' : 'action_required',
+    dataOrigin: 'measured_catalog_data',
     currentValue: `${catalogProductsCount} products in catalog`,
-    requirementDescription: 'Active verified product catalog with structured pricing, inventory, and GTINs.',
+    requirementDescription: 'Active product catalog with structured pricing, inventory, and GTINs.',
   });
 
-  const isDiscoveryReady = discoveryScore >= 70;
+  const isDiscoveryReady = hasCatalog && discoveryScore >= 70;
   items.push({
     id: 'hub_discovery_score',
     category: 'catalog',
     title: 'AI Discovery Readiness Score Threshold (≥70%)',
     status: isDiscoveryReady ? 'ready' : 'action_required',
+    dataOrigin: 'measured_catalog_data',
     currentValue: `${discoveryScore}%`,
-    requirementDescription: 'Minimum deterministic catalog readiness score for high-quality conversational discovery.',
+    requirementDescription: 'Minimum deterministic local catalog readiness score for conversational discovery.',
   });
 
   const readyCount = items.filter(i => i.status === 'ready').length;
   const overallReadinessScore = Math.round((readyCount / items.length) * 100);
+  const limitationsNotice =
+    'Merchant Preparation Checklist Only: No official ChatGPT Business Hub or external AI platform registration API is connected. Self-declared merchant profile entries do not represent independent external verification.';
 
   const exportableMerchantPackage = {
+    packageType: 'merchant_preparation_checklist',
+    officialIntegrationConnected: false,
+    profileVerificationStatus: profile?.verificationStatus || 'not_verified',
     brandIdentity: {
       legalName: profile?.legalBusinessName || '',
       publicBrand: profile?.publicBrandName || '',
@@ -502,12 +536,15 @@ export function buildBusinessHubChecklist(
       aiDiscoveryScore: discoveryScore,
       evaluatedAt: new Date().toISOString(),
     },
-    disclaimer: 'This package is prepared by AIXSHOP for merchant-controlled verification on external AI discovery platforms. AIXSHOP does not make unofficial claims or automate third-party registration without explicit platform APIs.',
+    disclaimer: limitationsNotice,
   };
 
   return {
     checklistItems: items,
     overallReadinessScore,
+    checklistType: 'merchant_preparation_checklist',
+    officialIntegrationConnected: false,
+    limitationsNotice,
     exportableMerchantPackage,
   };
 }

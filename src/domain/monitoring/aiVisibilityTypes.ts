@@ -12,11 +12,22 @@ export interface VisibilityMetricRecord {
   createdAt: string;
 }
 
+export interface VisibilityImportRowError {
+  rowNumber: number;
+  field?: string;
+  value?: string;
+  reason: string;
+  raw?: string;
+}
+
 export interface VisibilityImportRecord {
   id: string;
   workspaceId: string;
   filename: string;
   rowCount: number;
+  rejectedRowCount?: number;
+  status?: 'completed' | 'partial' | 'failed';
+  errors?: VisibilityImportRowError[];
   reportingPeriodStart?: string | null;
   reportingPeriodEnd?: string | null;
   sourcePlatform: string;
