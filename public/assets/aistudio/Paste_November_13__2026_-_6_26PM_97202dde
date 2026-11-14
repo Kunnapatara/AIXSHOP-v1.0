@@ -1,0 +1,767 @@
+# AIXSHOP v1.0 — Complete Remaining Remediation & Verification
+## Google AI Studio Build Mode — Implementation Instructions
+
+Repository: `https://github.com/Kunnapatara/AIXSHOP-v1.0`
+
+Objective: Complete all remaining source-code remediation and verification work identified in the latest independent code review, covering:
+
+- C1–C3: Feed Validation / Export
+- E1–E2: Billing Event Lease
+- PostgreSQL Migration 010 integrity
+- AI Discovery canonical URL validation
+- Visibility CSV parser correctness
+- Visibility duplicate-data migration semantics
+- Available automated security, integration, and regression verification
+
+This is an incremental remediation task. Do not rebuild the application, replace existing architecture, or discard completed work.
+
+---
+
+# 1. Mandatory Development Preservation Rules
+
+Before modifying anything:
+
+1. Inspect the current repository and identify the actual HEAD commit and working-tree state.
+2. Review the existing implementation, recent changes, migration history, tests, and relevant documentation.
+3. Establish a baseline for:
+   - Existing test results
+   - TypeScript checks
+   - Lint
+   - Build
+   - Existing database migrations
+   - Current Feed Validation / Export implementation
+   - Current Billing Event Lease implementation
+4. Identify the exact files and functions responsible for each remaining finding.
+5. Distinguish confirmed defects from assumptions and environment limitations.
+
+## Zero Loss of Development Progress
+
+These rules are mandatory:
+
+- Preserve all existing working features, completed work, architecture, and business logic.
+- Do not delete or replace working modules simply to simplify implementation.
+- Do not perform destructive rewrites.
+- Do not remove existing tests or weaken assertions to make tests pass.
+- Do not bypass validation, authorization, workspace isolation, or security controls.
+- Do not introduce mock implementations as substitutes for real production functionality.
+- Do not silently change existing API contracts, database semantics, or billing behavior.
+- Do not reset, overwrite, or discard existing database data.
+- Do not modify unrelated functionality.
+- Use backward-compatible and incremental changes wherever possible.
+- If a database change requires data migration, provide a safe, reversible, and documented migration strategy where technically possible.
+- Preserve existing migration files as historical records. If an applied migration must be corrected, create a new corrective migration rather than silently rewriting migration history.
+- Do not commit, push, publish, or deploy without explicit owner approval.
+
+If a proposed change risks existing data or functionality, stop that specific operation, explain the risk, and implement a safer alternative where possible.
+
+---
+
+# 2. C1–C3 — Feed Validation / Export
+
+The Feed Validation / Export implementation has already received previous remediation. Do not assume it is entirely correct or rewrite it.
+
+Perform a fresh source audit of the complete relevant workflow, including:
+
+- Product data normalization
+- Variant mapping
+- Identifier handling
+- Feed validation
+- Google Merchant Center export
+- Other supported feed formats
+- Error reporting
+- Missing-data handling
+- Export consistency
+- Regression tests
+
+## C1. Correct SKU, MPN, GTIN, and Identifier Semantics
+
+Inspect:
+
+`src/domain/feed/feedValidationEngine.ts`
+
+In particular, inspect `mapProductToGmcRow()` and all related mapping and validation functions.
+
+The previously identified defect is:
+
+`mpn: sku || undefined`
+
+A merchant SKU must not automatically be treated as a Manufacturer Part Number.
+
+Implement the following rules:
+
+1. Keep merchant SKU and manufacturer MPN as separate data fields.
+2. Map MPN only from an actual manufacturer part number field supported by the existing product data model.
+3. If no valid MPN exists, omit MPN from the exported row.
+4. Never fabricate MPN from SKU, product ID, variant ID, or another unrelated identifier.
+5. Map GTIN only from actual GTIN data.
+6. Preserve existing GTIN check-digit validation and invalid-identifier reporting.
+7. Do not infer a valid GTIN or MPN from incomplete information.
+8. Ensure `identifier_exists` is derived from actual identifier evidence and the applicable Google Merchant Center rules.
+9. Preserve the distinction between:
+   - SKU
+   - MPN
+   - GTIN
+   - Brand
+   - Product ID
+   - Variant ID
+
+Do not introduce a new product field without first checking whether an equivalent field already exists in the Shopify product/variant model and synchronization pipeline.
+
+If the source data does not contain MPN, represent it as missing rather than inventing a value.
+
+## C2. Feed Validation Correctness
+
+Audit all existing validation rules and ensure:
+
+- Missing required fields are reported accurately.
+- Invalid identifiers are not treated as valid.
+- Missing optional fields do not generate fabricated values.
+- Numeric values are not silently converted into misleading defaults.
+- Price and currency are handled consistently.
+- Availability and condition mappings are valid.
+- Variant-specific identifiers and prices are not incorrectly inherited from unrelated products.
+- Exported data is consistent with the validation result.
+- Unsupported fields are not silently represented as verified.
+- Validation errors identify the affected product or variant.
+
+Preserve existing feed capabilities and supported formats.
+
+Do not weaken validation merely to increase the number of exportable products.
+
+## C3. Feed Export Integrity
+
+Verify the complete path from normalized Shopify data to the final export.
+
+Requirements:
+
+- Export values must originate from actual stored product data or explicitly documented deterministic transformations.
+- Do not fabricate missing product attributes.
+- Ensure product and variant records are not accidentally duplicated.
+- Ensure export output is deterministic for unchanged input data.
+- Ensure invalid or incomplete records are handled according to the existing export contract.
+- Ensure the export reports skipped or rejected records with actionable reasons.
+- Verify that exported identifiers match the corresponding source product or variant.
+- Preserve existing workspace isolation and authorization rules.
+
+Add or update tests for all three areas.
+
+Required test cases include:
+
+- SKU present, MPN absent.
+- MPN present, SKU absent.
+- Both SKU and MPN present.
+- GTIN valid.
+- GTIN invalid.
+- Brand present but no manufacturer identifier.
+- Product with variants having different identifiers.
+- Missing price.
+- Missing currency.
+- Missing required feed attributes.
+- Repeated export of unchanged input.
+- Invalid product excluded or reported correctly.
+
+Do not claim full Google Merchant Center compliance unless the relevant current requirements have actually been checked and tested.
+
+---
+
+# 3. E1–E2 — Billing Event Lease
+
+Inspect:
+
+- `src/server/services/billingService.ts`
+- `src/server/routes/billingRoutes.ts`
+- `src/server/db/postgresRepository.ts`
+- `src/server/db/memoryRepository.ts`
+
+Preserve the existing billing architecture, event ownership model, idempotency protections, and entitlement lifecycle.
+
+## E1. Implement an Actual Automatic Lease Heartbeat
+
+The current implementation includes `renewEventLease()`, but the previous review found that `handleWebhook()` does not automatically renew the lease during long-running event processing.
+
+Implement a real heartbeat mechanism.
+
+Requirements:
+
+1. When a worker successfully claims a billing event, it must maintain the lease while processing is active.
+2. Start the heartbeat automatically inside the actual webhook processing lifecycle.
+3. Do not depend on callers remembering to manually invoke `renewEventLease()`.
+4. Renew the lease at a configurable interval safely shorter than the lease duration.
+5. Use a configurable lease duration and heartbeat interval with validated values.
+6. Ensure heartbeat renewal is scoped to the correct event ID and lease owner.
+7. Ensure a worker cannot renew another worker's lease.
+8. Stop the heartbeat when processing finishes, fails, or is cancelled.
+9. Await or otherwise safely handle outstanding heartbeat operations before finalizing event state.
+10. Handle renewal failures explicitly.
+
+### Lease Renewal Failure
+
+If the heartbeat fails:
+
+- The worker must not assume it still owns the event.
+- The worker must not apply entitlement changes after ownership has been lost.
+- The event must remain recoverable according to the existing retry and reclaim policy.
+- Log the failure with event ID, worker identity, and a safe error classification.
+- Never log secrets, signatures, or sensitive payment data.
+
+Avoid unhandled promise rejections and background heartbeat tasks that continue after request completion.
+
+### Webhook Route Integration
+
+Inspect:
+
+`src/server/routes/billingRoutes.ts`
+
+The current route calls:
+
+`billingService.handleWebhook(rawBody, signature)`
+
+Ensure the actual production route invokes the corrected lifecycle automatically.
+
+Do not add caller-supplied lease options if the service can safely own and configure the heartbeat lifecycle internally.
+
+Preserve raw-body signature verification and existing webhook authentication behavior.
+
+## E2. Enforce Lease Ownership and Expiration at Entitlement Mutation Time
+
+Inspect `applyBillingTransition()` and the corresponding PostgreSQL and memory repository implementations.
+
+The previous review found that ownership and event status are checked, but lease expiration is not enforced at the moment of entitlement mutation.
+
+Implement an atomic ownership check.
+
+Before applying a billing transition:
+
+- Event ID must match.
+- Lease owner must match the current worker.
+- Event status must permit the transition.
+- Lease must still be valid at mutation time.
+- The event must not have been reclaimed by another worker.
+- The entitlement mutation and event state transition must preserve the existing transaction and idempotency guarantees.
+
+For PostgreSQL:
+
+- Perform the ownership and expiry check in the same database transaction as the entitlement mutation.
+- Use database time for lease-expiration comparisons to avoid relying on potentially different application-server clocks.
+- Prevent a stale worker from applying a transition after lease expiration or ownership replacement.
+- Use appropriate row locking or conditional updates.
+- Ensure concurrent workers cannot both successfully apply the same billing event.
+
+For the memory repository:
+
+- Implement equivalent ownership and expiry semantics.
+- Keep behavior consistent with the PostgreSQL repository.
+
+### Required Billing Concurrency Tests
+
+Add tests covering:
+
+1. Normal webhook processing.
+2. Heartbeat renews the lease while processing is active.
+3. Processing that exceeds the original lease duration.
+4. Heartbeat renewal failure.
+5. Lease expiration before entitlement mutation.
+6. A second worker reclaiming an expired event.
+7. A stale worker attempting to mutate entitlement after reclaim.
+8. Two workers processing the same event concurrently.
+9. Duplicate delivery of the same webhook event.
+10. Worker cancellation and heartbeat cleanup.
+11. Database transaction rollback.
+12. Retry after an unsuccessful processing attempt.
+
+Verify that the event can be recovered without granting duplicate entitlements or losing legitimate subscription transitions.
+
+Do not treat an in-memory unit test as proof of PostgreSQL concurrency correctness.
+
+---
+
+# 4. PostgreSQL Migration 010 — Schema and Constraint Integrity
+
+Inspect:
+
+`src/server/db/migrations/010_remediation_integrity_and_leases.sql`
+
+Do not rewrite migration history or assume the migration has never been applied.
+
+## 4.1 Schema-Qualified Column Checks
+
+The current review found checks against `information_schema.columns` using `table_name` and `column_name`, without restricting `table_schema`.
+
+Correct every relevant column-existence check so that it explicitly targets the intended schema.
+
+Requirements:
+
+- Use the actual migration target schema.
+- Use `current_schema()` only if it accurately represents the application's migration contract.
+- If the application supports an explicitly configured schema, use that schema consistently.
+- Avoid accidentally matching a table or column in another schema.
+- Ensure table-existence and column-existence checks use the same schema assumptions.
+- Document the expected PostgreSQL search path and migration schema behavior.
+
+Test against a PostgreSQL instance with multiple schemas containing identically named tables.
+
+The migration must not incorrectly skip a required column because another schema contains a matching table or column.
+
+## 4.2 Validate Actual Unique Constraint Definitions
+
+The current migration checks constraint names and table relations but does not fully verify that an existing constraint has the expected definition.
+
+Implement validation that checks:
+
+- Target schema.
+- Target table.
+- Constraint type.
+- Exact participating columns.
+- Column order where relevant.
+- Expected uniqueness semantics.
+- Any relevant predicate or expression if the constraint is partial or expression-based.
+
+Do not treat a same-named but incorrectly defined constraint as a valid constraint.
+
+If an existing constraint conflicts with the expected definition:
+
+- Report the conflict.
+- Do not silently accept it.
+- Do not automatically drop a potentially important production constraint.
+- Provide a safe corrective migration strategy.
+
+Ensure the migration is idempotent where appropriate and safe for supported deployment scenarios.
+
+## 4.3 Migration Tests
+
+Add PostgreSQL integration tests for:
+
+- Clean database installation.
+- Existing database upgrade.
+- Re-running an already-applied migration where supported.
+- Multiple schemas with duplicate table names.
+- Same-named constraints with incorrect definitions.
+- Expected unique constraint definitions.
+- Existing data preservation.
+- Migration failure and rollback behavior.
+
+Record which scenarios were actually executed.
+
+---
+
+# 5. Visibility Duplicate Data — Determine Correct Business Semantics
+
+Inspect:
+
+- `src/server/db/migrations/010_remediation_integrity_and_leases.sql`
+- Visibility import routes and services.
+- Existing visibility tables and unique keys.
+- CSV import behavior.
+- Any available import history, source identifiers, timestamps, or provenance fields.
+
+The previous review found that duplicate rows with the same Date, Platform, and Topic are aggregated by summing numeric metrics before a unique constraint is added.
+
+This may be correct for separate observations, but incorrect for repeated imports of the same CSV.
+
+Do not automatically retain summation.
+Do not automatically replace summation with deletion.
+First determine the actual business meaning.
+
+## Required Investigation
+
+Determine whether duplicate records represent:
+
+A. Independent observations that should be aggregated.
+
+B. Re-imports of the same source data that should be deduplicated.
+
+C. A mixture of both.
+
+Use actual schema, code, tests, and available provenance data to establish the answer.
+
+If provenance is insufficient to distinguish these cases, explicitly report that the historical records cannot be reliably classified.
+
+## Safe Implementation Rules
+
+- Preserve all recoverable historical information.
+- Never silently discard metric values.
+- Never double-count known repeated imports.
+- Use stable import identifiers or source fingerprints where supported by the architecture.
+- Ensure re-importing the same source file does not inflate totals.
+- Ensure genuinely independent observations can still be represented correctly.
+- Keep aggregation rules explicit and documented.
+- If the existing schema cannot distinguish independent observations from duplicate imports, do not invent certainty.
+
+If a safe automated migration cannot be justified, stop the destructive portion and provide:
+
+1. The exact ambiguity.
+2. The affected data.
+3. The proposed safe migration.
+4. The information required from the owner.
+5. A non-destructive interim implementation.
+
+Add regression tests for repeated CSV imports and independent observations.
+
+---
+
+# 6. AI Discovery — Strict Canonical URL Validation
+
+Inspect:
+
+`src/domain/aiDiscovery/discoveryEngine.ts`
+
+The previously identified weak check uses substring matching similar to:
+
+`offerUrl.toLowerCase().includes(normalizedExpectedDomain)`
+
+This is not sufficient hostname validation.
+
+Replace it with structured URL validation.
+
+Requirements:
+
+1. Parse the candidate URL using the standard URL parser.
+2. Normalize the expected verified merchant domain safely.
+3. Compare the parsed hostname against the expected hostname using exact hostname matching.
+4. Reject hostile suffix and prefix domains.
+5. Reject URLs where the trusted domain appears only in the path, query, or fragment.
+6. Require HTTPS for production offer URLs unless an explicitly documented and justified exception exists.
+7. Reject embedded username/password credentials.
+8. Validate the allowed URL path according to the existing discovery contract.
+9. Reject malformed URLs.
+10. Handle internationalized domain names and hostname normalization safely.
+11. Do not accept arbitrary subdomains unless the verified-domain policy explicitly permits them.
+12. Do not use substring checks as a fallback.
+
+Required negative test cases:
+
+- `https://trusted-shop.com.attacker.example/product`
+- `https://attacker-trusted-shop.com/product`
+- `https://attacker.example/trusted-shop.com/product`
+- `https://attacker.example/?redirect=trusted-shop.com`
+- HTTP instead of HTTPS.
+- URL with username/password credentials.
+- Malformed URL.
+- Unapproved subdomain.
+- Unexpected port if prohibited by the existing policy.
+
+Required positive cases:
+
+- Exact verified merchant hostname.
+- Valid allowed product path.
+- Valid normalized hostname.
+- Any explicitly permitted subdomain according to the documented policy.
+
+Preserve legitimate discovery behavior and avoid rejecting valid merchant URLs without evidence.
+
+---
+
+# 7. Visibility CSV Parser — Strict CSV State Validation
+
+Inspect:
+
+`src/server/routes/visibilityRoutes.ts`
+
+The existing parser supports quoted fields and embedded newlines, but the previous review identified insufficient validation after a closing quote.
+
+For example:
+
+`"value"unexpected`
+
+must not be silently accepted as a valid quoted field.
+
+Implement a strict parser state machine consistent with the CSV format contract used by this application.
+
+Requirements:
+
+- Track whether the parser is inside a quoted field.
+- Track when a quoted field has closed.
+- Reject invalid characters immediately after a closing quote, except permitted delimiters, record separators, or explicitly allowed whitespace according to the chosen CSV contract.
+- Reject unclosed quoted fields.
+- Handle escaped double quotes correctly.
+- Handle commas inside quoted fields.
+- Handle embedded newlines inside quoted fields.
+- Handle CRLF and LF consistently.
+- Handle empty fields correctly.
+- Handle trailing delimiters correctly.
+- Validate consistent column counts against the header.
+- Reject malformed rows with actionable error messages and row numbers.
+- Avoid silently dropping malformed content.
+- Preserve valid existing CSV import behavior.
+
+Do not change the accepted CSV contract without documenting it.
+
+## Required CSV Tests
+
+Include:
+
+- Valid simple CSV.
+- Quoted comma.
+- Escaped quote.
+- Embedded newline in quoted field.
+- Empty field.
+- Trailing empty field.
+- CRLF input.
+- LF input.
+- Unclosed quote.
+- Unexpected characters after closing quote.
+- Extra columns.
+- Missing columns.
+- Empty header.
+- Duplicate header names, according to the application's existing policy.
+- Large input within supported limits.
+- Malformed input that must fail without partially importing records.
+
+Ensure import operations remain atomic: malformed input must not leave partially committed visibility records.
+
+---
+
+# 8. External Verification and Environment Assessment
+
+Do not claim that external integrations are verified unless they have actually been tested against the relevant external system.
+
+First inspect the available development environment and identify whether the following are installed and configured:
+
+- PostgreSQL
+- PostgreSQL test database
+- Docker, if used by the project
+- Shopify Development Store credentials
+- Shopify OAuth configuration
+- Shopify Admin API credentials
+- Shopify webhook configuration
+- Stripe Test Mode credentials
+- Stripe webhook signing secret
+- Semgrep
+- Trivy
+
+Never print secret values.
+
+Do not ask the user to paste credentials into source code, logs, or public files.
+
+## 8.1 PostgreSQL Migration Verification
+
+Where PostgreSQL is available:
+
+- Execute Migration 010 and any new corrective migrations against a real PostgreSQL instance.
+- Test clean installation.
+- Test upgrade from the previous supported schema.
+- Test multiple schemas.
+- Test constraint validation.
+- Test migration rollback or documented recovery behavior.
+- Preserve the test database and report any cleanup performed.
+
+If PostgreSQL is unavailable, report BLOCKED and provide exact commands and environment requirements.
+
+## 8.2 PostgreSQL Concurrency Verification
+
+Where PostgreSQL is available:
+
+- Use multiple real database connections.
+- Simulate simultaneous billing workers.
+- Verify lease acquisition and renewal.
+- Verify expired lease reclaim.
+- Verify stale-owner rejection.
+- Verify transactional entitlement mutation.
+- Verify idempotency under concurrent webhook processing.
+
+Unit tests alone are not sufficient.
+
+## 8.3 Shopify Verification
+
+If valid Development Store credentials exist:
+
+- Test OAuth flow.
+- Test token handling and authorization.
+- Test GraphQL pagination.
+- Test product and variant synchronization.
+- Test webhook signature verification.
+- Test actual webhook delivery and duplicate delivery behavior.
+- Verify workspace isolation.
+
+If credentials are unavailable, report BLOCKED. Do not fabricate successful Shopify tests.
+
+## 8.4 Stripe Verification
+
+If Stripe Test Mode credentials exist:
+
+- Test Checkout creation.
+- Test webhook signature verification.
+- Test subscription creation.
+- Test subscription update.
+- Test cancellation.
+- Test payment failure.
+- Test refund events.
+- Test duplicate webhook delivery.
+- Verify entitlement transitions.
+- Verify idempotency and event recovery.
+
+If credentials are unavailable, report BLOCKED.
+
+Never use live payment credentials or initiate real charges without explicit owner authorization.
+
+## 8.5 Semgrep and Trivy
+
+If tools are available:
+
+- Run Semgrep against the repository using appropriate rules.
+- Run Trivy filesystem and dependency vulnerability scans.
+- Review findings and distinguish confirmed vulnerabilities from informational findings.
+- Fix relevant findings without weakening security controls.
+
+If tools are unavailable, report BLOCKED and provide reproducible installation and execution commands.
+
+Do not claim a clean security scan if no scan was executed.
+
+---
+
+# 9. Required Regression and Quality Verification
+
+After implementation, run all available project checks.
+
+At minimum:
+
+1. Existing full test suite.
+2. New targeted unit tests.
+3. PostgreSQL integration tests where available.
+4. Billing concurrency tests.
+5. Feed validation/export tests.
+6. AI Discovery URL validation tests.
+7. Visibility CSV parser tests.
+8. Visibility duplicate-import tests.
+9. TypeScript checks.
+10. Lint.
+11. Production build.
+
+Do not modify tests to conceal failures.
+
+Do not claim a command passed unless it was actually executed and its result was observed.
+
+If a test cannot run because of missing infrastructure, credentials, or environment dependencies, classify it as BLOCKED rather than PASSED.
+
+For every failure:
+
+- Identify the failing test or command.
+- Determine whether the failure is introduced by this remediation or pre-existing.
+- Fix failures caused by the changes.
+- Do not conceal unresolved failures.
+
+---
+
+# 10. Final Deliverables
+
+Produce a detailed implementation and verification report.
+
+## A. Change Summary
+
+For each finding, report:
+
+- Finding ID
+- Original defect
+- Root cause
+- Files changed
+- Functions changed
+- Implementation details
+- Data or API compatibility impact
+- Security impact
+- Regression tests added
+
+Use these IDs:
+
+- C1 — SKU / MPN / GTIN semantics
+- C2 — Feed validation correctness
+- C3 — Feed export integrity
+- E1 — Automatic billing lease heartbeat
+- E2 — Atomic lease ownership and expiration enforcement
+- M010-S — Migration schema qualification
+- M010-C — Constraint definition validation
+- V-DATA — Visibility duplicate-data semantics
+- AD-URL — AI Discovery canonical URL validation
+- CSV-STRICT — Visibility CSV parser strictness
+
+## B. Verification Matrix
+
+Provide a table with these statuses:
+
+- PASS — Executed successfully with evidence.
+- FAIL — Executed and failed.
+- BLOCKED — Could not execute because a dependency, credential, or environment was unavailable.
+- NOT RUN — Not attempted.
+- NEEDS OWNER DECISION — Business or historical-data ambiguity requires owner input.
+
+Include:
+
+| Verification | Status | Evidence | Remaining Action |
+|---|---|---|---|
+| Feed validation tests | | | |
+| Feed export tests | | | |
+| Billing heartbeat tests | | | |
+| Billing lease expiration tests | | | |
+| Billing concurrency tests | | | |
+| Migration 010 schema tests | | | |
+| Constraint definition tests | | | |
+| Visibility duplicate-import tests | | | |
+| AI Discovery URL tests | | | |
+| Visibility CSV tests | | | |
+| Full test suite | | | |
+| TypeScript | | | |
+| Lint | | | |
+| Production build | | | |
+| PostgreSQL real integration | | | |
+| PostgreSQL multi-connection concurrency | | | |
+| Shopify OAuth / GraphQL | | | |
+| Shopify webhook delivery | | | |
+| Stripe Checkout | | | |
+| Stripe subscription / refund | | | |
+| Semgrep | | | |
+| Trivy | | | |
+
+## C. Migration and Data Safety Report
+
+Explain:
+
+- Whether Migration 010 is safe for the supported schema configuration.
+- Whether existing production databases need a corrective migration.
+- Whether any existing data may be duplicated or misrepresented.
+- Whether visibility historical records can be reliably classified.
+- Whether any owner decision is required before data migration.
+
+Do not claim data integrity if it has not been verified against actual data.
+
+## D. Production Readiness Assessment
+
+Assess separately:
+
+1. Source-code remediation.
+2. Automated test coverage.
+3. PostgreSQL integration.
+4. Billing correctness and concurrency.
+5. Shopify integration.
+6. Stripe integration.
+7. Security scanning.
+8. Deployment and production operations.
+
+Do not give an overall PASS merely because unit tests pass.
+
+Clearly identify what is verified, what remains blocked, and what still requires production-environment testing.
+
+## E. Remaining Work
+
+For every unresolved item, state:
+
+- Exact issue.
+- Why it remains unresolved.
+- Required environment, credential, or owner decision.
+- Exact next action.
+
+---
+
+# 11. Final Execution Rules
+
+- Work incrementally from the actual current repository state.
+- Preserve all existing development progress.
+- Do not replace the application architecture.
+- Do not invent missing credentials, test results, database records, or external verification.
+- Do not fabricate production-readiness claims.
+- Do not silently resolve ambiguous historical data by deleting or summing records.
+- Do not expose credentials or secrets in reports.
+- Do not commit, push, publish, or deploy.
+- Stop before any destructive or irreversible operation that requires owner approval.
+
+The objective is to deliver a technically correct, data-safe, testable remediation of the remaining AIXSHOP v1.0 issues, with clear evidence of what was actually verified and what still requires external access or owner approval.
+
+Begin by inspecting the current repository baseline. Then implement the changes incrementally and verify each workstream before proceeding to the next.

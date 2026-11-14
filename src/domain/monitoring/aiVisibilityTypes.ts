@@ -24,6 +24,7 @@ export interface VisibilityImportRecord {
   id: string;
   workspaceId: string;
   filename: string;
+  contentHash?: string | null;
   rowCount: number;
   rejectedRowCount?: number;
   status?: 'completed' | 'partial' | 'failed';

@@ -203,6 +203,7 @@ export interface DatabaseRepository {
   getWorkspaceBusinessProfile(workspaceId: string): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile | null>;
   saveWorkspaceBusinessProfile(profile: import('../../domain/businessProfile/types').WorkspaceBusinessProfile): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile>;
   saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord>;
+  getVisibilityImportByHash(workspaceId: string, contentHash: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord | null>;
   saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void>;
   saveVisibilityImportAtomic(
     record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,

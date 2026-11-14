@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { Router, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware, requireRole } from '../middleware/auth';
@@ -29,26 +30,38 @@ const SUPPORTED_AI_PLATFORMS: Readonly<Record<string, string>> = {
   'meta ai': 'Meta AI',
 };
 
+type CsvParserState = 'FIELD_START' | 'UNQUOTED' | 'IN_QUOTES' | 'AFTER_CLOSING_QUOTE';
+
 /**
- * State-machine RFC-4180 CSV parser supporting newlines inside quoted cells,
- * escaped quotes (""), CRLF/LF line endings, and strict unclosed quote detection.
+ * Strict RFC-4180 finite-state CSV parser.
+ * Contract:
+ * - Tracks 4 states: FIELD_START, UNQUOTED, IN_QUOTES, AFTER_CLOSING_QUOTE.
+ * - Quoted fields must begin at FIELD_START and end with a closing `"`.
+ * - Escaped quotes inside quoted fields must be doubled (`""`).
+ * - After a closing quote (AFTER_CLOSING_QUOTE), ONLY comma `,`, `\r`, `\n`, or EOF are valid;
+ *   any other character (including `"value"unexpected` or trailing spaces outside quotes) throws with 1-based row number.
+ * - Supports commas and embedded newlines (`\n` / `\r\n`) inside quoted fields.
+ * - Preserves empty fields and trailing empty fields (e.g. `a,b,` -> ['a', 'b', '']).
  */
 export function parseCsvRfc4180(csvText: string): string[][] {
+  const input = csvText.startsWith('\uFEFF') ? csvText.slice(1) : csvText;
   const rows: string[][] = [];
   let currentRow: string[] = [];
   let currentCell = '';
-  let inQuotes = false;
+  let state: CsvParserState = 'FIELD_START';
+  let rowHasDelimiterOrContent = false;
+  let rowNumber = 1;
 
-  for (let i = 0; i < csvText.length; i++) {
-    const char = csvText[i];
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
 
-    if (inQuotes) {
+    if (state === 'IN_QUOTES') {
       if (char === '"') {
-        if (csvText[i + 1] === '"') {
+        if (input[i + 1] === '"') {
           currentCell += '"';
           i++;
         } else {
-          inQuotes = false;
+          state = 'AFTER_CLOSING_QUOTE';
         }
       } else {
         currentCell += char;
@@ -56,36 +69,89 @@ export function parseCsvRfc4180(csvText: string): string[][] {
       continue;
     }
 
-    if (char === '"') {
-      if (currentCell.length === 0) {
-        inQuotes = true;
+    if (state === 'AFTER_CLOSING_QUOTE') {
+      if (char === ',') {
+        currentRow.push(currentCell.trim());
+        currentCell = '';
+        state = 'FIELD_START';
+        rowHasDelimiterOrContent = true;
+      } else if (char === '\r' || char === '\n') {
+        if (char === '\r' && input[i + 1] === '\n') {
+          i++;
+        }
+        currentRow.push(currentCell.trim());
+        rows.push(currentRow);
+        currentRow = [];
+        currentCell = '';
+        state = 'FIELD_START';
+        rowHasDelimiterOrContent = false;
+        rowNumber++;
       } else {
-        throw new Error('Malformed CSV: unexpected quote inside unquoted field.');
+        throw new Error(
+          `Malformed CSV at row ${rowNumber}: unexpected character ${JSON.stringify(char)} after closing quote.`
+        );
       }
+      continue;
+    }
+
+    if (state === 'FIELD_START') {
+      if (char === '"') {
+        state = 'IN_QUOTES';
+        rowHasDelimiterOrContent = true;
+      } else if (char === ',') {
+        currentRow.push('');
+        rowHasDelimiterOrContent = true;
+      } else if (char === '\r' || char === '\n') {
+        if (char === '\r' && input[i + 1] === '\n') {
+          i++;
+        }
+        if (rowHasDelimiterOrContent) {
+          currentRow.push('');
+          rows.push(currentRow);
+        }
+        currentRow = [];
+        currentCell = '';
+        state = 'FIELD_START';
+        rowHasDelimiterOrContent = false;
+        rowNumber++;
+      } else {
+        currentCell += char;
+        state = 'UNQUOTED';
+        rowHasDelimiterOrContent = true;
+      }
+      continue;
+    }
+
+    // state === 'UNQUOTED'
+    if (char === '"') {
+      throw new Error(`Malformed CSV at row ${rowNumber}: unexpected quote inside unquoted field.`);
     } else if (char === ',') {
       currentRow.push(currentCell.trim());
       currentCell = '';
+      state = 'FIELD_START';
+      rowHasDelimiterOrContent = true;
     } else if (char === '\r' || char === '\n') {
-      if (char === '\r' && csvText[i + 1] === '\n') {
+      if (char === '\r' && input[i + 1] === '\n') {
         i++;
       }
       currentRow.push(currentCell.trim());
-      if (currentRow.some((c) => c.length > 0)) {
-        rows.push(currentRow);
-      }
+      rows.push(currentRow);
       currentRow = [];
       currentCell = '';
+      state = 'FIELD_START';
+      rowHasDelimiterOrContent = false;
+      rowNumber++;
     } else {
       currentCell += char;
     }
   }
 
-  if (inQuotes) {
-    throw new Error('Malformed CSV: unclosed quoted field at end of input.');
+  if (state === 'IN_QUOTES') {
+    throw new Error(`Malformed CSV at row ${rowNumber}: unclosed quoted field at end of input.`);
   }
 
-  currentRow.push(currentCell.trim());
-  if (currentRow.some((c) => c.length > 0)) {
+  if (rowHasDelimiterOrContent || currentRow.length > 0 || state === 'AFTER_CLOSING_QUOTE') {
+    currentRow.push(currentCell.trim());
     rows.push(currentRow);
   }
 
@@ -119,6 +185,11 @@ function isValidStrictIsoDate(raw: string): { valid: boolean; reason?: string } 
 function normalizeSupportedPlatform(rawPlatform: string): string | null {
   const key = rawPlatform.trim().toLowerCase().replace(/\s+/g, ' ');
   return SUPPORTED_AI_PLATFORMS[key] || null;
+}
+
+export function computeCsvContentHash(csvContent: string): string {
+  const canonical = csvContent.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').trim();
+  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
 }
 
 export function createVisibilityRoutes(repo: DatabaseRepository): Router {
@@ -174,7 +245,29 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
         });
       }
 
-      const header = rows[0].map((h) => h.toLowerCase().replace(/[\s_-]+/g, ''));
+      const rawHeaderCells = rows[0];
+      const expectedColumnCount = rawHeaderCells.length;
+
+      // Reject empty header cells
+      if (rawHeaderCells.some((h) => h.trim().length === 0)) {
+        return res.status(400).json({
+          error: 'Malformed CSV header (row 1): empty column header name is not allowed.',
+        });
+      }
+
+      const header = rawHeaderCells.map((h) => h.toLowerCase().replace(/[\s_-]+/g, ''));
+
+      // Reject duplicate header names (after canonical normalization)
+      const seenHeaders = new Set<string>();
+      for (let hIdx = 0; hIdx < header.length; hIdx++) {
+        if (seenHeaders.has(header[hIdx])) {
+          return res.status(400).json({
+            error: `Malformed CSV header (row 1): duplicate column header "${rawHeaderCells[hIdx]}".`,
+          });
+        }
+        seenHeaders.add(header[hIdx]);
+      }
+
       const dateIdx = header.findIndex((h) => h.includes('date') || h.includes('day'));
       const platformIdx = header.findIndex((h) => h.includes('platform') || h.includes('model') || h.includes('engine') || h.includes('source') || h === 'ai');
       const brandMentionsIdx = header.findIndex((h) => h.includes('brandmention') || h === 'brand' || h === 'mentions');
@@ -235,7 +328,16 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
 
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
-        if (row.length === 0 || row.every((c) => !c)) continue;
+
+        if (row.length !== expectedColumnCount) {
+          rowErrors.push({
+            rowNumber: i + 1,
+            field: 'row',
+            value: `${row.length} column(s)`,
+            reason: `Column count mismatch on row ${i + 1}: expected ${expectedColumnCount} column(s) matching header, got ${row.length}.`,
+          });
+          continue;
+        }
 
         const rawDate = (row[dateIdx] || '').trim();
         const dateCheck = isValidStrictIsoDate(rawDate);
@@ -298,7 +400,7 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
 
       if (rowErrors.length > 0) {
         return res.status(400).json({
-          error: `CSV validation failed on ${rowErrors.length} field(s). No metrics were committed.`,
+          error: `CSV validation failed on ${rowErrors.length} field(s) (first at row ${rowErrors[0].rowNumber}). No metrics were committed.`,
           status: 'failed',
           acceptedRowCount: 0,
           rejectedRowCount: new Set(rowErrors.map((e) => e.rowNumber)).size,
@@ -311,12 +413,30 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'No valid metric rows could be parsed from CSV' });
       }
 
+      // Check source fingerprint AFTER validation passes so malformed files always fail 400
+      const contentHash = computeCsvContentHash(csvContent);
+      const duplicateBatch = await repo.getVisibilityImportByHash(workspaceId, contentHash);
+      if (duplicateBatch) {
+        const summary = await repo.getVisibilitySummary(workspaceId);
+        return res.json({
+          success: true,
+          duplicateImport: true,
+          action: 'duplicate_noop',
+          acceptedRowCount: 0,
+          rejectedRowCount: 0,
+          message: 'Identical CSV content was already imported; existing visibility metrics preserved without double-counting.',
+          import: duplicateBatch,
+          summary,
+        });
+      }
+
       const dates = parsedMetrics.map((m) => m.observationDate).sort();
 
       const importRecord: VisibilityImportRecord = {
         id: importId,
         workspaceId,
         filename: typeof filename === 'string' && filename.trim() ? filename.trim() : 'merchant_analytics.csv',
+        contentHash,
         rowCount: parsedMetrics.length,
         rejectedRowCount: 0,
         status: 'completed',
@@ -333,6 +453,8 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
 
       return res.json({
         success: true,
+        duplicateImport: false,
+        action: 'imported',
         acceptedRowCount: parsedMetrics.length,
         rejectedRowCount: 0,
         import: importRecord,

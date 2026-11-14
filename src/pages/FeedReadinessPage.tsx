@@ -4,8 +4,8 @@ import { useAuth } from '../context/AuthContext';
 import { apiClient } from '../api/client';
 import {
   evaluateFeedReadiness,
-  mapProductToGmcRow,
-  mapProductToMetaRow,
+  mapProductVariantsToGmcRows,
+  mapProductVariantsToMetaRows,
   mapProductToSchemaOrgJsonLd,
   exportToCsv,
   FeedPlatform,
@@ -92,26 +92,28 @@ export const FeedReadinessPage: React.FC = () => {
       ext = 'json';
     } else if (platform === 'meta_commerce') {
       content = exportToCsv(
-        targetProducts.map((p) => {
-          const row = mapProductToMetaRow(p, currency);
-          if (exportFilter === 'all') {
-            const ev = evalMap.get(p.id);
-            row.validation_status = ev?.isValid ? 'valid' : 'invalid';
-            row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
-          }
-          return row;
+        targetProducts.flatMap((p) => {
+          const ev = evalMap.get(p.id);
+          return mapProductVariantsToMetaRows(p, currency).map((row) => {
+            if (exportFilter === 'all') {
+              row.validation_status = ev?.isValid ? 'valid' : 'invalid';
+              row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
+            }
+            return row;
+          });
         })
       );
     } else {
       content = exportToCsv(
-        targetProducts.map((p) => {
-          const row = mapProductToGmcRow(p, currency);
-          if (exportFilter === 'all') {
-            const ev = evalMap.get(p.id);
-            row.validation_status = ev?.isValid ? 'valid' : 'invalid';
-            row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
-          }
-          return row;
+        targetProducts.flatMap((p) => {
+          const ev = evalMap.get(p.id);
+          return mapProductVariantsToGmcRows(p, currency).map((row) => {
+            if (exportFilter === 'all') {
+              row.validation_status = ev?.isValid ? 'valid' : 'invalid';
+              row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
+            }
+            return row;
+          });
         })
       );
     }

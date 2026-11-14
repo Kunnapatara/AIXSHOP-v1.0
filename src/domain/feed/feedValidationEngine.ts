@@ -1,4 +1,4 @@
-import { Product } from '../../types';
+import { Product, Variant } from '../../types';
 import { isValidGtin13 } from '../validation/gtin';
 
 export type FeedPlatform = 'google_merchant_center' | 'meta_commerce' | 'schema_org';
@@ -7,12 +7,14 @@ export interface FeedValidationError {
   field: string;
   message: string;
   severity: 'error' | 'warning';
+  variantId?: string;
 }
 
 export interface ProductFeedEvaluation {
   productId: string;
   sku: string;
   title: string;
+  variantCount?: number;
   isValid: boolean;
   errors: FeedValidationError[];
   warnings: FeedValidationError[];
@@ -41,6 +43,7 @@ export interface GmcFeedRow {
   availability: 'in_stock' | 'out_of_stock' | 'preorder' | 'backorder' | '';
   price: string; // e.g. "29.99 USD" or "" when missing
   brand: string;
+  sku?: string;
   gtin?: string;
   mpn?: string;
   identifier_exists: 'yes' | 'no';
@@ -59,6 +62,9 @@ export interface MetaFeedRow {
   link: string;
   image_link: string;
   brand: string;
+  sku?: string;
+  gtin?: string;
+  mpn?: string;
   item_group_id?: string;
   fb_product_category?: string;
   validation_status?: 'valid' | 'invalid';
@@ -72,6 +78,7 @@ export interface SchemaOrgProductJsonLd {
   description: string;
   image?: string;
   sku?: string;
+  mpn?: string;
   gtin13?: string;
   brand?: {
     '@type': 'Brand';
@@ -93,6 +100,20 @@ export interface SchemaOrgProductJsonLd {
   };
 }
 
+const SUPPORTED_ISO_CURRENCIES: ReadonlySet<string> | null = (() => {
+  try {
+    const intlAny = Intl as unknown as { supportedValuesOf?: (key: string) => string[] };
+    if (typeof intlAny.supportedValuesOf === 'function') {
+      return new Set(intlAny.supportedValuesOf('currency').map((c) => c.toUpperCase()));
+    }
+  } catch {
+    // Fallback to regex below if Intl.supportedValuesOf is unavailable
+  }
+  return null;
+})();
+
+const GENERIC_VALUES = new Set(['unspecified', 'unknown brand', 'unknown', 'n/a', 'none', 'na', 'null']);
+
 function isValidHttpUrl(stringUrl?: string): boolean {
   if (!stringUrl) return false;
   try {
@@ -113,45 +134,248 @@ function resolveProductLink(product: Product): string {
   return url;
 }
 
-function resolveProductPrice(product: Product): number | null {
-  const vPrice = product.variants?.[0]?.price;
-  if (typeof vPrice === 'number' && !isNaN(vPrice)) return vPrice;
+function resolveVariantPrice(product: Product, variant?: Variant): number | null {
+  const variants = product.variants || [];
+  if (variant) {
+    if (typeof variant.price === 'number' && Number.isFinite(variant.price)) {
+      return variant.price;
+    }
+    // Multi-variant products must never inherit another variant's or top-level offer's price
+    if (variants.length > 1) {
+      return null;
+    }
+  }
+  if (!variant) {
+    const vPrice = variants[0]?.price;
+    if (typeof vPrice === 'number' && Number.isFinite(vPrice)) return vPrice;
+  }
   const oPrice = product.offers?.[0]?.price;
-  if (typeof oPrice === 'number' && !isNaN(oPrice)) return oPrice;
+  if (typeof oPrice === 'number' && Number.isFinite(oPrice)) return oPrice;
   return null;
 }
 
 function resolveProductCurrency(product: Product, defaultCurrency = 'USD'): string {
-  return (product.offers?.[0]?.currency || defaultCurrency || '').trim().toUpperCase();
+  const firstOffer = product.offers?.[0];
+  if (firstOffer && firstOffer.currency !== undefined) {
+    return String(firstOffer.currency).trim().toUpperCase();
+  }
+  return (defaultCurrency || '').trim().toUpperCase();
 }
 
 function isValidIsoCurrency(currency: string): boolean {
-  return /^[A-Z]{3}$/.test(currency);
+  if (!/^[A-Z]{3}$/.test(currency)) return false;
+  if (SUPPORTED_ISO_CURRENCIES) {
+    return SUPPORTED_ISO_CURRENCIES.has(currency);
+  }
+  return true;
 }
 
 /**
- * Resolves explicit stock availability from offer or numeric variant inventory only.
+ * Resolves explicit stock availability from numeric variant inventory or single-variant offer only.
  * Returns null when availability data is missing rather than fabricating in_stock from status.
  */
-function resolveProductAvailability(product: Product): 'in_stock' | 'out_of_stock' | null {
-  const firstOffer = product.offers?.[0];
-  if (firstOffer?.availability === 'in_stock' || firstOffer?.availability === 'out_of_stock') {
-    return firstOffer.availability;
-  }
+function resolveVariantAvailability(
+  product: Product,
+  variant?: Variant
+): 'in_stock' | 'out_of_stock' | 'preorder' | null {
   const variants = product.variants || [];
-  if (variants.some((v) => typeof v.inventoryCount === 'number' && !isNaN(v.inventoryCount))) {
-    return variants.some((v) => (v.inventoryCount ?? 0) > 0) ? 'in_stock' : 'out_of_stock';
+  if (variant && typeof variant.inventoryCount === 'number' && Number.isFinite(variant.inventoryCount)) {
+    return variant.inventoryCount > 0 ? 'in_stock' : 'out_of_stock';
   }
+
+  // Only allow offer-level availability fallback when product has 0 or 1 variants
+  if (!variant || variants.length <= 1) {
+    const firstOffer = product.offers?.[0];
+    if (
+      firstOffer?.availability === 'in_stock' ||
+      firstOffer?.availability === 'out_of_stock' ||
+      firstOffer?.availability === 'preorder'
+    ) {
+      return firstOffer.availability;
+    }
+    if (!variant && variants.some((v) => typeof v.inventoryCount === 'number' && Number.isFinite(v.inventoryCount))) {
+      return variants.some((v) => (v.inventoryCount ?? 0) > 0) ? 'in_stock' : 'out_of_stock';
+    }
+  }
+
   return null;
 }
 
 function isGenericOrMissingBrand(brand: string): boolean {
   const lower = brand.trim().toLowerCase();
-  return !lower || lower === 'unspecified' || lower === 'unknown brand' || lower === 'n/a' || lower === 'none';
+  return !lower || GENERIC_VALUES.has(lower);
+}
+
+const MPN_ATTRIBUTE_KEYS = ['mpn', 'MPN', 'manufacturerPartNumber', 'manufacturer_part_number'] as const;
+
+/**
+ * Resolves an authentic Manufacturer Part Number (MPN) solely from explicit MPN attributes.
+ * NEVER fabricates or falls back to merchant SKU, variant ID, product ID, or barcode.
+ */
+export function resolveVariantMpn(product: Product, variant?: Variant): string {
+  const variantAttrs = variant?.attributes || {};
+  for (const key of MPN_ATTRIBUTE_KEYS) {
+    const raw = variantAttrs[key];
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      if (trimmed && !GENERIC_VALUES.has(trimmed.toLowerCase())) {
+        return trimmed;
+      }
+    }
+  }
+
+  // Product-level MPN attribute is only safe to apply when there is at most 1 variant,
+  // preventing distinct size/color variants from silently sharing a single product-level MPN.
+  if (!variant || (product.variants || []).length <= 1) {
+    const prodAttrs = product.attributes || {};
+    for (const key of MPN_ATTRIBUTE_KEYS) {
+      const raw = prodAttrs[key];
+      if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        if (trimmed && !GENERIC_VALUES.has(trimmed.toLowerCase())) {
+          return trimmed;
+        }
+      }
+    }
+  }
+
+  return '';
+}
+
+function isValidMpnFormat(mpn: string): boolean {
+  return mpn.length > 0 && mpn.length <= 70 && /^[\x21-\x7E\s]+$/.test(mpn);
+}
+
+function resolveOfferCondition(product: Product): 'new' | 'refurbished' | 'used' | '' {
+  const raw = (product.offers?.[0]?.condition || '').trim().toLowerCase();
+  if (raw === 'new' || raw === 'refurbished' || raw === 'used') {
+    return raw;
+  }
+  return '';
+}
+
+function validateVariantsCommon(
+  product: Product,
+  currency: string,
+  errors: FeedValidationError[],
+  warnings: FeedValidationError[],
+  options: { requireGtinWarning: boolean; priceField: string; gtinField: string; availabilityField: string }
+): void {
+  const variants = product.variants || [];
+  if (variants.length === 0) {
+    errors.push({ field: 'sku', message: 'Product has no variants or merchant SKU', severity: 'error' });
+    const offerPrice = resolveVariantPrice(product);
+    if (offerPrice === null || !Number.isFinite(offerPrice) || offerPrice <= 0) {
+      errors.push({ field: options.priceField, message: 'Valid positive price is required', severity: 'error' });
+    }
+    const avail = resolveVariantAvailability(product);
+    if (avail === null) {
+      errors.push({
+        field: options.availabilityField,
+        message: 'Explicit stock availability or inventory count is required',
+        severity: 'error',
+      });
+    }
+    if (!isValidIsoCurrency(currency)) {
+      errors.push({ field: 'currency', message: 'Valid ISO 4217 3-letter currency code is required', severity: 'error' });
+    }
+    return;
+  }
+
+  if (!isValidIsoCurrency(currency)) {
+    errors.push({ field: 'currency', message: 'Valid ISO 4217 3-letter currency code is required', severity: 'error' });
+  }
+
+  const seenSkus = new Set<string>();
+  const seenVariantIds = new Set<string>();
+
+  for (const variant of variants) {
+    const vLabel = variant.id || variant.title || 'unknown';
+    if (variant.id) {
+      if (seenVariantIds.has(variant.id)) {
+        errors.push({
+          field: 'variant_id',
+          variantId: variant.id,
+          message: `Duplicate variant ID "${variant.id}" detected in product "${product.id}"`,
+          severity: 'error',
+        });
+      }
+      seenVariantIds.add(variant.id);
+    }
+
+    const vSku = (variant.sku || '').trim();
+    if (!vSku) {
+      errors.push({
+        field: 'sku',
+        variantId: variant.id,
+        message: `Merchant variant SKU is missing (variant: ${vLabel})`,
+        severity: 'error',
+      });
+    } else if (seenSkus.has(vSku.toLowerCase())) {
+      errors.push({
+        field: 'sku',
+        variantId: variant.id,
+        message: `Duplicate variant SKU "${vSku}" within product "${product.id}"`,
+        severity: 'error',
+      });
+    } else {
+      seenSkus.add(vSku.toLowerCase());
+    }
+
+    const vPrice = resolveVariantPrice(product, variant);
+    if (vPrice === null || !Number.isFinite(vPrice) || vPrice <= 0) {
+      errors.push({
+        field: options.priceField,
+        variantId: variant.id,
+        message: `Valid positive price is required (variant: ${vLabel})`,
+        severity: 'error',
+      });
+    }
+
+    const vAvailability = resolveVariantAvailability(product, variant);
+    if (vAvailability === null) {
+      errors.push({
+        field: options.availabilityField,
+        variantId: variant.id,
+        message: `Explicit stock availability or numeric inventory count is required (variant: ${vLabel})`,
+        severity: 'error',
+      });
+    }
+
+    const barcode = (variant.barcode || '').trim();
+    const mpn = resolveVariantMpn(product, variant);
+
+    if (mpn && !isValidMpnFormat(mpn)) {
+      errors.push({
+        field: 'mpn',
+        variantId: variant.id,
+        message: `MPN "${mpn}" exceeds 70 ASCII characters or contains unsupported characters (variant: ${vLabel})`,
+        severity: 'error',
+      });
+    }
+
+    if (!barcode) {
+      if (options.requireGtinWarning && !mpn) {
+        warnings.push({
+          field: options.gtinField,
+          variantId: variant.id,
+          message: `GTIN/Barcode and MPN missing on variant "${vLabel}". High priority for AI shopping search engines.`,
+          severity: 'warning',
+        });
+      }
+    } else if (!isValidGtin13(barcode)) {
+      errors.push({
+        field: options.gtinField,
+        variantId: variant.id,
+        message: `Barcode "${barcode}" fails GS1 GTIN check-digit validation (variant: ${vLabel})`,
+        severity: 'error',
+      });
+    }
+  }
 }
 
 /**
- * Validates a single product for Google Merchant Center specifications.
+ * Validates a single product (and all of its variants) for Google Merchant Center specifications.
  */
 export function validateForGmc(product: Product, defaultCurrency = 'USD'): ProductFeedEvaluation {
   const errors: FeedValidationError[] = [];
@@ -159,16 +383,10 @@ export function validateForGmc(product: Product, defaultCurrency = 'USD'): Produ
 
   const mainVariant = product.variants?.[0];
   const sku = (mainVariant?.sku || '').trim();
-  const price = resolveProductPrice(product);
   const currency = resolveProductCurrency(product, defaultCurrency);
-  const availability = resolveProductAvailability(product);
 
   if (!product.id) {
     errors.push({ field: 'id', message: 'Product ID is missing', severity: 'error' });
-  }
-
-  if (!sku) {
-    errors.push({ field: 'sku', message: 'Merchant variant SKU is missing', severity: 'error' });
   }
 
   if (!product.title || product.title.trim().length === 0) {
@@ -193,34 +411,23 @@ export function validateForGmc(product: Product, defaultCurrency = 'USD'): Produ
     errors.push({ field: 'image_link', message: 'Valid primary image link URL is required', severity: 'error' });
   }
 
-  if (price === null || price <= 0) {
-    errors.push({ field: 'price', message: 'Valid positive price is required', severity: 'error' });
-  }
-
-  if (!isValidIsoCurrency(currency)) {
-    errors.push({ field: 'currency', message: 'Valid ISO 4217 3-letter currency code is required', severity: 'error' });
-  }
-
-  if (availability === null) {
-    errors.push({ field: 'availability', message: 'Explicit stock availability or inventory count is required', severity: 'error' });
-  }
-
   const brand = (product.brand || '').trim();
-  const barcode = (mainVariant?.barcode || '').trim();
   if (isGenericOrMissingBrand(brand)) {
     warnings.push({ field: 'brand', message: 'Brand is missing or generic. Required unless custom-made goods.', severity: 'warning' });
   }
 
-  if (!barcode) {
-    warnings.push({ field: 'gtin', message: 'GTIN/Barcode missing. High priority for AI shopping search engines.', severity: 'warning' });
-  } else if (!isValidGtin13(barcode)) {
-    errors.push({ field: 'gtin', message: `Barcode "${barcode}" fails GS1 GTIN check-digit validation`, severity: 'error' });
-  }
+  validateVariantsCommon(product, currency, errors, warnings, {
+    requireGtinWarning: true,
+    priceField: 'price',
+    gtinField: 'gtin',
+    availabilityField: 'availability',
+  });
 
   return {
     productId: product.id,
     sku,
     title: product.title || 'Untitled Product',
+    variantCount: product.variants?.length || 0,
     isValid: errors.length === 0,
     errors,
     warnings,
@@ -228,7 +435,7 @@ export function validateForGmc(product: Product, defaultCurrency = 'USD'): Produ
 }
 
 /**
- * Validates a single product for Meta Commerce Catalog specifications.
+ * Validates a single product (and all of its variants) for Meta Commerce Catalog specifications.
  */
 export function validateForMeta(product: Product, defaultCurrency = 'USD'): ProductFeedEvaluation {
   const errors: FeedValidationError[] = [];
@@ -236,16 +443,10 @@ export function validateForMeta(product: Product, defaultCurrency = 'USD'): Prod
 
   const mainVariant = product.variants?.[0];
   const sku = (mainVariant?.sku || '').trim();
-  const price = resolveProductPrice(product);
   const currency = resolveProductCurrency(product, defaultCurrency);
-  const availability = resolveProductAvailability(product);
 
   if (!product.id) {
     errors.push({ field: 'id', message: 'Product ID is missing', severity: 'error' });
-  }
-
-  if (!sku) {
-    errors.push({ field: 'sku', message: 'Merchant variant SKU is missing', severity: 'error' });
   }
 
   if (!product.title || product.title.trim().length === 0) {
@@ -266,32 +467,27 @@ export function validateForMeta(product: Product, defaultCurrency = 'USD'): Prod
     errors.push({ field: 'image_link', message: 'Valid image URL is required', severity: 'error' });
   }
 
-  if (price === null || price <= 0) {
-    errors.push({ field: 'price', message: 'Valid positive price is required', severity: 'error' });
-  }
-
-  if (!isValidIsoCurrency(currency)) {
-    errors.push({ field: 'currency', message: 'Valid ISO 4217 3-letter currency code is required', severity: 'error' });
-  }
-
-  if (availability === null) {
-    errors.push({ field: 'availability', message: 'Explicit stock availability or inventory count is required', severity: 'error' });
-  }
-
   const brand = (product.brand || '').trim();
   if (isGenericOrMissingBrand(brand)) {
     errors.push({ field: 'brand', message: 'Authentic brand name is required for Meta Commerce Catalog', severity: 'error' });
   }
 
-  const barcode = (mainVariant?.barcode || '').trim();
-  if (barcode && !isValidGtin13(barcode)) {
-    errors.push({ field: 'gtin', message: `Barcode "${barcode}" fails GS1 GTIN check-digit validation`, severity: 'error' });
+  if (!resolveOfferCondition(product)) {
+    warnings.push({ field: 'condition', message: 'Explicit product condition (new, refurbished, used) recommended for Meta Commerce', severity: 'warning' });
   }
+
+  validateVariantsCommon(product, currency, errors, warnings, {
+    requireGtinWarning: false,
+    priceField: 'price',
+    gtinField: 'gtin',
+    availabilityField: 'availability',
+  });
 
   return {
     productId: product.id,
     sku,
     title: product.title || 'Untitled Product',
+    variantCount: product.variants?.length || 0,
     isValid: errors.length === 0,
     errors,
     warnings,
@@ -299,7 +495,7 @@ export function validateForMeta(product: Product, defaultCurrency = 'USD'): Prod
 }
 
 /**
- * Validates a single product for Schema.org Product (JSON-LD) structured data.
+ * Validates a single product (and all of its variants) for Schema.org Product (JSON-LD) structured data.
  */
 export function validateForSchemaOrg(product: Product, defaultCurrency = 'USD'): ProductFeedEvaluation {
   const errors: FeedValidationError[] = [];
@@ -307,16 +503,10 @@ export function validateForSchemaOrg(product: Product, defaultCurrency = 'USD'):
 
   const mainVariant = product.variants?.[0];
   const sku = (mainVariant?.sku || '').trim();
-  const price = resolveProductPrice(product);
   const currency = resolveProductCurrency(product, defaultCurrency);
-  const availability = resolveProductAvailability(product);
 
   if (!product.title || product.title.trim().length === 0) {
     errors.push({ field: 'name', message: 'Schema.org name is required', severity: 'error' });
-  }
-
-  if (!sku) {
-    errors.push({ field: 'sku', message: 'Merchant variant SKU is missing', severity: 'error' });
   }
 
   if (!product.description || product.description.trim().length === 0) {
@@ -328,32 +518,30 @@ export function validateForSchemaOrg(product: Product, defaultCurrency = 'USD'):
     errors.push({ field: 'offers.url', message: 'Valid canonical offer URL is required', severity: 'error' });
   }
 
-  if (price === null || price <= 0) {
-    errors.push({ field: 'offers.price', message: 'Valid positive offer price is required', severity: 'error' });
-  }
-
-  if (!isValidIsoCurrency(currency)) {
-    errors.push({ field: 'offers.priceCurrency', message: 'Valid ISO 4217 currency code is required', severity: 'error' });
-  }
-
-  if (availability === null) {
-    errors.push({ field: 'offers.availability', message: 'Explicit stock availability is required for Schema.org Offer', severity: 'error' });
-  }
-
-  const barcode = (mainVariant?.barcode || '').trim();
-  if (barcode && !isValidGtin13(barcode)) {
-    errors.push({ field: 'gtin13', message: `Barcode "${barcode}" fails GS1 GTIN check-digit validation`, severity: 'error' });
-  }
-
   const imageLink = (product.image || '').trim();
   if (!imageLink || !isValidHttpUrl(imageLink)) {
     warnings.push({ field: 'image', message: 'Image URL recommended for visual AI search cards', severity: 'warning' });
+  }
+
+  validateVariantsCommon(product, currency, errors, warnings, {
+    requireGtinWarning: false,
+    priceField: 'offers.price',
+    gtinField: 'gtin13',
+    availabilityField: 'offers.availability',
+  });
+
+  // Map currency error field to offers.priceCurrency for Schema.org backwards compatibility
+  for (const err of errors) {
+    if (err.field === 'currency') {
+      err.field = 'offers.priceCurrency';
+    }
   }
 
   return {
     productId: product.id,
     sku,
     title: product.title || 'Untitled Product',
+    variantCount: product.variants?.length || 0,
     isValid: errors.length === 0,
     errors,
     warnings,
@@ -411,75 +599,170 @@ export function evaluateFeedReadiness(
 }
 
 /**
- * Maps product to Google Merchant Center CSV row object without fabricating missing values.
+ * Maps product (or a specific variant) to a Google Merchant Center CSV row without fabricating identifiers.
+ * Keeps SKU and MPN strictly separate; never derives MPN from SKU or product/variant IDs.
  */
-export function mapProductToGmcRow(product: Product, currency: string = 'USD'): GmcFeedRow {
-  const mainVariant = product.variants?.[0];
-  const price = resolveProductPrice(product);
+export function mapProductToGmcRow(
+  product: Product,
+  currency: string = 'USD',
+  variant?: Variant
+): GmcFeedRow {
+  const targetVariant = variant || product.variants?.[0];
+  const isMultiVariant = (product.variants || []).length > 1;
+  const price = resolveVariantPrice(product, targetVariant);
   const effectiveCurrency = resolveProductCurrency(product, currency);
   const brand = (product.brand || '').trim();
-  const gtin = (mainVariant?.barcode || '').trim();
-  const sku = (mainVariant?.sku || '').trim();
+  const cleanBrand = isGenericOrMissingBrand(brand) ? '' : brand;
+
+  const rawBarcode = (targetVariant?.barcode || '').trim();
+  const validGtin = rawBarcode && isValidGtin13(rawBarcode) ? rawBarcode : undefined;
+  const sku = (targetVariant?.sku || '').trim();
+  const mpn = resolveVariantMpn(product, targetVariant);
+  const validMpn = mpn && isValidMpnFormat(mpn) ? mpn : undefined;
+
   const link = resolveProductLink(product);
   const imageLink = (product.image || '').trim();
-  const availability = resolveProductAvailability(product) || '';
+  const availability = resolveVariantAvailability(product, targetVariant) || '';
+
+  const baseTitle = (product.title || '').trim();
+  const variantTitle = (targetVariant?.title || '').trim();
+  const fullTitle =
+    isMultiVariant && variantTitle && variantTitle.toLowerCase() !== 'default title'
+      ? `${baseTitle} - ${variantTitle}`
+      : baseTitle;
+
+  const hasValidIdentifier = Boolean(validGtin || validMpn);
 
   return {
-    id: product.id,
-    title: (product.title || '').trim(),
+    id: isMultiVariant && targetVariant?.id ? targetVariant.id : product.id,
+    title: fullTitle,
     description: (product.description || '').replace(/[\r\n]+/g, ' ').trim(),
     link: isValidHttpUrl(link) ? link : '',
     image_link: isValidHttpUrl(imageLink) ? imageLink : '',
     availability,
-    price: price !== null && price > 0 && effectiveCurrency ? `${Number(price).toFixed(2)} ${effectiveCurrency}` : '',
-    brand: isGenericOrMissingBrand(brand) ? '' : brand,
-    gtin: gtin || undefined,
-    mpn: sku || undefined,
-    identifier_exists: !isGenericOrMissingBrand(brand) && (Boolean(gtin) || Boolean(sku)) ? 'yes' : 'no',
+    price:
+      price !== null && Number.isFinite(price) && price > 0 && isValidIsoCurrency(effectiveCurrency)
+        ? `${Number(price).toFixed(2)} ${effectiveCurrency}`
+        : '',
+    brand: cleanBrand,
+    sku: sku || undefined,
+    gtin: validGtin,
+    mpn: validMpn,
+    identifier_exists: cleanBrand && hasValidIdentifier ? 'yes' : 'no',
     item_group_id: product.id,
   };
 }
 
 /**
- * Maps product to Meta Commerce CSV row object without fabricating missing values.
+ * Expands a product into deterministic deduplicated GMC rows (one per unique variant).
  */
-export function mapProductToMetaRow(product: Product, currency: string = 'USD'): MetaFeedRow {
-  const price = resolveProductPrice(product);
+export function mapProductVariantsToGmcRows(product: Product, currency: string = 'USD'): GmcFeedRow[] {
+  const variants = product.variants || [];
+  if (variants.length === 0) {
+    return [mapProductToGmcRow(product, currency)];
+  }
+  const seenIds = new Set<string>();
+  const rows: GmcFeedRow[] = [];
+  for (const variant of variants) {
+    const dedupeKey = variant.id || `${product.id}_${rows.length}`;
+    if (seenIds.has(dedupeKey)) continue;
+    seenIds.add(dedupeKey);
+    rows.push(mapProductToGmcRow(product, currency, variant));
+  }
+  return rows;
+}
+
+/**
+ * Maps product (or a specific variant) to Meta Commerce CSV row object without fabricating missing values.
+ */
+export function mapProductToMetaRow(
+  product: Product,
+  currency: string = 'USD',
+  variant?: Variant
+): MetaFeedRow {
+  const targetVariant = variant || product.variants?.[0];
+  const isMultiVariant = (product.variants || []).length > 1;
+  const price = resolveVariantPrice(product, targetVariant);
   const effectiveCurrency = resolveProductCurrency(product, currency);
   const brand = (product.brand || '').trim();
   const link = resolveProductLink(product);
   const imageLink = (product.image || '').trim();
-  const rawAvailability = resolveProductAvailability(product);
+  const rawAvailability = resolveVariantAvailability(product, targetVariant);
   const availability: MetaFeedRow['availability'] =
-    rawAvailability === 'in_stock' ? 'in stock' : rawAvailability === 'out_of_stock' ? 'out of stock' : '';
+    rawAvailability === 'in_stock'
+      ? 'in stock'
+      : rawAvailability === 'out_of_stock'
+        ? 'out of stock'
+        : rawAvailability === 'preorder'
+          ? 'available for order'
+          : '';
+
+  const sku = (targetVariant?.sku || '').trim();
+  const rawBarcode = (targetVariant?.barcode || '').trim();
+  const validGtin = rawBarcode && isValidGtin13(rawBarcode) ? rawBarcode : undefined;
+  const mpn = resolveVariantMpn(product, targetVariant);
+  const validMpn = mpn && isValidMpnFormat(mpn) ? mpn : undefined;
+
+  const baseTitle = (product.title || '').trim();
+  const variantTitle = (targetVariant?.title || '').trim();
+  const fullTitle =
+    isMultiVariant && variantTitle && variantTitle.toLowerCase() !== 'default title'
+      ? `${baseTitle} - ${variantTitle}`
+      : baseTitle;
 
   return {
-    id: product.id,
-    title: (product.title || '').trim(),
+    id: isMultiVariant && targetVariant?.id ? targetVariant.id : product.id,
+    title: fullTitle,
     description: (product.description || '').replace(/[\r\n]+/g, ' ').trim(),
     availability,
-    condition: product.offers?.[0]?.condition || '',
-    price: price !== null && price > 0 && effectiveCurrency ? `${Number(price).toFixed(2)} ${effectiveCurrency}` : '',
+    condition: resolveOfferCondition(product),
+    price:
+      price !== null && Number.isFinite(price) && price > 0 && isValidIsoCurrency(effectiveCurrency)
+        ? `${Number(price).toFixed(2)} ${effectiveCurrency}`
+        : '',
     link: isValidHttpUrl(link) ? link : '',
     image_link: isValidHttpUrl(imageLink) ? imageLink : '',
     brand: isGenericOrMissingBrand(brand) ? '' : brand,
+    sku: sku || undefined,
+    gtin: validGtin,
+    mpn: validMpn,
     item_group_id: product.id,
   };
 }
 
 /**
- * Maps product to Schema.org JSON-LD object without fabricating missing prices, SKUs, or availability.
+ * Expands a product into deterministic deduplicated Meta Commerce rows (one per unique variant).
+ */
+export function mapProductVariantsToMetaRows(product: Product, currency: string = 'USD'): MetaFeedRow[] {
+  const variants = product.variants || [];
+  if (variants.length === 0) {
+    return [mapProductToMetaRow(product, currency)];
+  }
+  const seenIds = new Set<string>();
+  const rows: MetaFeedRow[] = [];
+  for (const variant of variants) {
+    const dedupeKey = variant.id || `${product.id}_${rows.length}`;
+    if (seenIds.has(dedupeKey)) continue;
+    seenIds.add(dedupeKey);
+    rows.push(mapProductToMetaRow(product, currency, variant));
+  }
+  return rows;
+}
+
+/**
+ * Maps product to Schema.org JSON-LD object without fabricating missing prices, SKUs, MPNs, or availability.
  */
 export function mapProductToSchemaOrgJsonLd(product: Product, currency: string = 'USD'): SchemaOrgProductJsonLd {
   const mainVariant = product.variants?.[0];
   const sku = (mainVariant?.sku || '').trim();
   const gtin = (mainVariant?.barcode || '').trim();
-  const price = resolveProductPrice(product);
+  const mpn = resolveVariantMpn(product, mainVariant);
+  const price = resolveVariantPrice(product, mainVariant);
   const effectiveCurrency = resolveProductCurrency(product, currency);
   const brand = (product.brand || '').trim();
   const link = resolveProductLink(product);
   const imageLink = (product.image || '').trim();
-  const rawAvailability = resolveProductAvailability(product);
+  const rawAvailability = resolveVariantAvailability(product, mainVariant);
 
   const result: SchemaOrgProductJsonLd = {
     '@context': 'https://schema.org',
@@ -490,6 +773,10 @@ export function mapProductToSchemaOrgJsonLd(product: Product, currency: string =
 
   if (sku) {
     result.sku = sku;
+  }
+
+  if (mpn && isValidMpnFormat(mpn)) {
+    result.mpn = mpn;
   }
 
   if (gtin && isValidGtin13(gtin)) {
@@ -512,30 +799,35 @@ export function mapProductToSchemaOrgJsonLd(product: Product, currency: string =
   };
   let hasOfferField = false;
 
-  if (price !== null && price > 0) {
+  if (price !== null && Number.isFinite(price) && price > 0) {
     offer.price = Number(price).toFixed(2);
     hasOfferField = true;
   }
-  if (effectiveCurrency) {
+  if (isValidIsoCurrency(effectiveCurrency)) {
     offer.priceCurrency = effectiveCurrency;
     hasOfferField = true;
   }
   if (rawAvailability) {
     offer.availability =
-      rawAvailability === 'in_stock' ? 'https://schema.org/InStock' : 'https://schema.org/OutOfStock';
+      rawAvailability === 'in_stock'
+        ? 'https://schema.org/InStock'
+        : rawAvailability === 'preorder'
+          ? 'https://schema.org/PreOrder'
+          : 'https://schema.org/OutOfStock';
     hasOfferField = true;
   }
   if (isValidHttpUrl(link)) {
     offer.url = link;
     hasOfferField = true;
   }
-  if (product.offers?.[0]?.condition === 'new') {
+  const condition = resolveOfferCondition(product);
+  if (condition === 'new') {
     offer.itemCondition = 'https://schema.org/NewCondition';
     hasOfferField = true;
-  } else if (product.offers?.[0]?.condition === 'refurbished') {
+  } else if (condition === 'refurbished') {
     offer.itemCondition = 'https://schema.org/RefurbishedCondition';
     hasOfferField = true;
-  } else if (product.offers?.[0]?.condition === 'used') {
+  } else if (condition === 'used') {
     offer.itemCondition = 'https://schema.org/UsedCondition';
     hasOfferField = true;
   }
@@ -564,10 +856,21 @@ export function sanitizeCsvCell(val: any): string {
 
 /**
  * Converts array of flat objects to CSV string with formula injection protection.
+ * Preserves a deterministic union of headers across all rows so optional fields on later rows are never dropped.
  */
 export function exportToCsv(rows: Record<string, any>[]): string {
   if (rows.length === 0) return '';
-  const headers = Object.keys(rows[0]);
+  const headers: string[] = [];
+  const headerSet = new Set<string>();
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!headerSet.has(key)) {
+        headerSet.add(key);
+        headers.push(key);
+      }
+    }
+  }
+
   const escapeCsv = (val: any) => {
     const safe = sanitizeCsvCell(val).replace(/"/g, '""');
     return `"${safe}"`;

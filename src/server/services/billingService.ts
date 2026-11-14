@@ -17,13 +17,63 @@ export interface WebhookProcessingResult {
   subscription?: SubscriptionRecord;
 }
 
+export interface BillingLeaseConfig {
+  leaseDurationMs?: number;
+  heartbeatIntervalMs?: number;
+}
+
+const DEFAULT_LEASE_DURATION_MS = 300_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 60_000;
+const MIN_LEASE_DURATION_MS = 50;
+const MIN_HEARTBEAT_INTERVAL_MS = 10;
+
+export function validateBillingLeaseConfig(
+  config?: BillingLeaseConfig,
+  baseConfig?: { leaseDurationMs: number; heartbeatIntervalMs: number }
+): { leaseDurationMs: number; heartbeatIntervalMs: number } {
+  const leaseDurationMs = config?.leaseDurationMs ?? baseConfig?.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
+  if (typeof leaseDurationMs !== 'number' || !Number.isFinite(leaseDurationMs) || leaseDurationMs < MIN_LEASE_DURATION_MS) {
+    throw new Error(
+      `[AIXSHOP Billing] Invalid leaseDurationMs (${leaseDurationMs}): must be a finite number >= ${MIN_LEASE_DURATION_MS}ms.`
+    );
+  }
+
+  let heartbeatIntervalMs: number;
+  if (config?.heartbeatIntervalMs !== undefined) {
+    heartbeatIntervalMs = config.heartbeatIntervalMs;
+  } else if (config?.leaseDurationMs !== undefined) {
+    // Derive a safe heartbeat shorter than custom leaseDurationMs when caller only overrides leaseDurationMs
+    const preferred = baseConfig?.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    heartbeatIntervalMs = preferred < leaseDurationMs
+      ? preferred
+      : Math.max(MIN_HEARTBEAT_INTERVAL_MS, Math.floor(leaseDurationMs / 3));
+  } else {
+    heartbeatIntervalMs = baseConfig?.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+  }
+
+  if (
+    typeof heartbeatIntervalMs !== 'number' ||
+    !Number.isFinite(heartbeatIntervalMs) ||
+    heartbeatIntervalMs < MIN_HEARTBEAT_INTERVAL_MS ||
+    heartbeatIntervalMs >= leaseDurationMs
+  ) {
+    throw new Error(
+      `[AIXSHOP Billing] Invalid heartbeatIntervalMs (${heartbeatIntervalMs}): must be finite, >= ${MIN_HEARTBEAT_INTERVAL_MS}ms, and strictly less than leaseDurationMs (${leaseDurationMs}ms).`
+    );
+  }
+
+  return { leaseDurationMs, heartbeatIntervalMs };
+}
+
 export class BillingService {
   private repo: DatabaseRepository;
   private provider: IBillingProvider;
+  private leaseConfig: { leaseDurationMs: number; heartbeatIntervalMs: number };
 
-  constructor(repo: DatabaseRepository, provider: IBillingProvider) {
+  constructor(repo: DatabaseRepository, provider: IBillingProvider, leaseConfig?: BillingLeaseConfig) {
     this.repo = repo;
     this.provider = provider;
+    this.leaseConfig = validateBillingLeaseConfig(leaseConfig);
   }
 
   async createCheckoutSession(
@@ -80,8 +130,16 @@ export class BillingService {
   async handleWebhook(
     rawBody: string | Buffer,
     signatureHeader: string,
-    options?: { leaseOwner?: string; leaseDurationMs?: number }
+    options?: { leaseOwner?: string; leaseDurationMs?: number; heartbeatIntervalMs?: number }
   ): Promise<WebhookProcessingResult> {
+    const effectiveLease = validateBillingLeaseConfig(
+      {
+        leaseDurationMs: options?.leaseDurationMs,
+        heartbeatIntervalMs: options?.heartbeatIntervalMs,
+      },
+      this.leaseConfig
+    );
+
     // 1. Resolve webhook secret safely without insecure production fallback
     let secret = '';
     if (this.provider.providerName === 'stripe') {
@@ -127,7 +185,10 @@ export class BillingService {
       processedAt: new Date().toISOString(),
     };
 
-    const claim = await this.repo.claimBillingEvent(claimRecord, options);
+    const claim = await this.repo.claimBillingEvent(claimRecord, {
+      leaseOwner: options?.leaseOwner,
+      leaseDurationMs: effectiveLease.leaseDurationMs,
+    });
 
     if (!claim.claimed) {
       const existingStatus = claim.event?.status;
@@ -155,24 +216,119 @@ export class BillingService {
     }
 
     const leaseOwner = claim.leaseOwner;
+    if (!leaseOwner) {
+      throw new Error(`[AIXSHOP Billing] Claimed billing event ${event.id} without lease owner.`);
+    }
 
-    // 5. Dispatch event processing within guarded transaction & lease ownership
+    // 5. Automatic lease heartbeat lifecycle + guarded dispatch
+    const hb = {
+      leaseLost: false,
+      leaseLostReason: '',
+      stopped: false,
+      inFlightRenewal: null as Promise<void> | null,
+      token: 0,
+    };
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const stopHeartbeat = () => {
+      hb.stopped = true;
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+
+    const triggerHeartbeatRenewal = () => {
+      if (hb.stopped || hb.leaseLost || hb.inFlightRenewal) {
+        return;
+      }
+      const myToken = ++hb.token;
+      hb.inFlightRenewal = (async () => {
+        try {
+          const renewed = await this.renewEventLease(
+            event.id,
+            leaseOwner,
+            effectiveLease.leaseDurationMs
+          );
+          if (!renewed) {
+            hb.leaseLost = true;
+            hb.leaseLostReason = 'lease renewal returned false (expired or reclaimed)';
+            stopHeartbeat();
+            console.warn('[AIXSHOP Billing Heartbeat]', {
+              eventId: event.id,
+              leaseOwner,
+              classification: 'lease_renewal_rejected',
+            });
+          }
+        } catch (renewErr: any) {
+          hb.leaseLost = true;
+          hb.leaseLostReason = `lease renewal exception (${renewErr?.name || 'Error'})`;
+          stopHeartbeat();
+          console.error('[AIXSHOP Billing Heartbeat]', {
+            eventId: event.id,
+            leaseOwner,
+            classification: 'lease_renewal_error',
+            errorName: renewErr?.name || 'Error',
+          });
+        } finally {
+          if (hb.token === myToken) {
+            hb.inFlightRenewal = null;
+          }
+        }
+      })();
+    };
+
+    heartbeatTimer = setInterval(triggerHeartbeatRenewal, effectiveLease.heartbeatIntervalMs);
+    if (typeof heartbeatTimer.unref === 'function') {
+      heartbeatTimer.unref();
+    }
+
+    const beforeCommitGuard = async () => {
+      stopHeartbeat();
+      if (hb.inFlightRenewal) {
+        await hb.inFlightRenewal;
+      }
+      if (hb.leaseLost) {
+        const lostErr: any = new Error(
+          `Billing lease ownership lost for event ${event.id}: worker "${leaseOwner}" aborted (${hb.leaseLostReason}).`
+        );
+        lostErr.code = 'BILLING_LEASE_LOST';
+        throw lostErr;
+      }
+    };
+
     let result: WebhookProcessingResult;
     try {
-      result = await this.processEvent(event, leaseOwner);
+      result = await this.processEvent(event, leaseOwner, beforeCommitGuard);
 
       if (result.action === 'ignored') {
+        await beforeCommitGuard();
         await this.repo.updateBillingEventStatus(event.id, 'ignored', undefined, leaseOwner);
       }
     } catch (err: any) {
-      await this.repo.updateBillingEventStatus(event.id, 'failed', err?.message, leaseOwner).catch(() => {});
+      stopHeartbeat();
+      if (hb.inFlightRenewal) {
+        await hb.inFlightRenewal.catch(() => {});
+      }
+      if (!hb.leaseLost) {
+        await this.repo.updateBillingEventStatus(event.id, 'failed', err?.message, leaseOwner).catch(() => {});
+      }
       throw err;
+    } finally {
+      stopHeartbeat();
+      if (hb.inFlightRenewal) {
+        await hb.inFlightRenewal.catch(() => {});
+      }
     }
 
     return result;
   }
 
-  private async processEvent(event: WebhookEventPayload, leaseOwner?: string): Promise<WebhookProcessingResult> {
+  private async processEvent(
+    event: WebhookEventPayload,
+    leaseOwner?: string,
+    beforeCommitGuard?: () => Promise<void>
+  ): Promise<WebhookProcessingResult> {
     const dataObj = event.data?.object || {};
     const eventCreated = event.created || Math.floor(Date.now() / 1000);
 
@@ -270,6 +426,7 @@ export class BillingService {
           skuLimit: plan.skuLimit === Infinity ? undefined : plan.skuLimit,
         } : undefined;
 
+        if (beforeCommitGuard) await beforeCommitGuard();
         await this.repo.applyBillingTransition({
           eventId: event.id,
           subscription: subscriptionRecord,
@@ -375,6 +532,7 @@ export class BillingService {
           };
         }
 
+        if (beforeCommitGuard) await beforeCommitGuard();
         await this.repo.applyBillingTransition({
           eventId: event.id,
           subscription: subRecord,
@@ -437,6 +595,7 @@ export class BillingService {
         };
 
         // Downgrade store to Free Audit without deleting existing products
+        if (beforeCommitGuard) await beforeCommitGuard();
         await this.repo.applyBillingTransition({
           eventId: event.id,
           subscription: updatedSub,
@@ -489,6 +648,7 @@ export class BillingService {
             const rawLimit = planDef?.skuLimit;
             const safeSkuLimit = (rawLimit === Infinity || rawLimit === undefined) ? undefined : rawLimit;
 
+            if (beforeCommitGuard) await beforeCommitGuard();
             await this.repo.applyBillingTransition({
               eventId: event.id,
               subscription: updatedSub,
@@ -503,6 +663,7 @@ export class BillingService {
           }
         }
         if (leaseOwner) {
+          if (beforeCommitGuard) await beforeCommitGuard();
           await this.repo.updateBillingEventStatus(event.id, 'processed', undefined, leaseOwner);
         }
         return { success: true, action: 'processed', message: 'Invoice payment succeeded recorded.' };
@@ -536,6 +697,7 @@ export class BillingService {
               updatedAt: new Date().toISOString(),
             };
 
+            if (beforeCommitGuard) await beforeCommitGuard();
             await this.repo.applyBillingTransition({
               eventId: event.id,
               subscription: updatedSub,
@@ -546,6 +708,7 @@ export class BillingService {
           }
         }
         if (leaseOwner) {
+          if (beforeCommitGuard) await beforeCommitGuard();
           await this.repo.updateBillingEventStatus(event.id, 'processed', undefined, leaseOwner);
         }
         return { success: true, action: 'processed', message: 'Invoice payment failure processed; status marked past_due.' };
@@ -594,6 +757,7 @@ export class BillingService {
             updatedAt: new Date().toISOString(),
           };
 
+          if (beforeCommitGuard) await beforeCommitGuard();
           await this.repo.applyBillingTransition({
             eventId: event.id,
             subscription: updatedSub,
@@ -614,6 +778,7 @@ export class BillingService {
         }
 
         if (leaseOwner) {
+          if (beforeCommitGuard) await beforeCommitGuard();
           await this.repo.updateBillingEventStatus(event.id, 'processed', undefined, leaseOwner);
         }
         return {

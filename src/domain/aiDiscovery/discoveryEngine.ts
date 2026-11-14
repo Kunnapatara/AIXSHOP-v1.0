@@ -46,6 +46,180 @@ export interface DiscoveryAuditResult {
 
 export const DISCOVERY_RULE_VERSION = 'v1.0-deterministic';
 
+const PLACEHOLDER_STORE_DOMAINS = new Set([
+  'myshopify.com',
+  'store.myshopify.com',
+  'example.com',
+  'localhost',
+]);
+
+export interface CanonicalUrlValidationOptions {
+  urlProvenance?: string;
+  allowSubdomains?: boolean;
+  allowedSubdomains?: string[];
+}
+
+export interface CanonicalUrlValidationResult {
+  valid: boolean;
+  normalizedUrl?: string;
+  normalizedHostname?: string;
+  reason?: string;
+}
+
+/**
+ * Normalizes a merchant store domain or URL into an IDN-safe (Punycode) lowercase hostname.
+ * Rejects empty values, credentials, paths, custom ports, and unverified generic placeholders.
+ */
+export function normalizeVerifiedDomainHostname(rawDomain?: string): string | null {
+  if (!rawDomain || typeof rawDomain !== 'string') {
+    return null;
+  }
+  const trimmed = rawDomain.trim();
+  if (!trimmed || /\s|[\u0000-\u001F\u007F]/.test(trimmed)) {
+    return null;
+  }
+
+  let candidate = trimmed;
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return null;
+  }
+  if (parsed.username !== '' || parsed.password !== '' || parsed.port !== '') {
+    return null;
+  }
+
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (!host || !host.includes('.') || host.startsWith('.') || host.includes('..')) {
+    return null;
+  }
+  if (PLACEHOLDER_STORE_DOMAINS.has(host)) {
+    return null;
+  }
+
+  return host;
+}
+
+/**
+ * Strictly validates a canonical product offer URL against the verified merchant domain
+ * using the WHATWG URL parser and exact hostname matching (zero substring checks).
+ */
+export function validateCanonicalProductUrl(
+  offerUrl: string,
+  storeDomain?: string,
+  options?: CanonicalUrlValidationOptions
+): CanonicalUrlValidationResult {
+  if (!offerUrl || typeof offerUrl !== 'string') {
+    return { valid: false, reason: 'Missing offer URL.' };
+  }
+
+  const trimmed = offerUrl.trim();
+  if (!trimmed || /\s|[\u0000-\u001F\u007F]/.test(trimmed)) {
+    return { valid: false, reason: 'Malformed URL containing whitespace or control characters.' };
+  }
+
+  // Reject unparsed empty credentials like https://@host/path
+  const schemeEnd = trimmed.indexOf('://');
+  if (schemeEnd === -1) {
+    return { valid: false, reason: 'Malformed URL missing scheme.' };
+  }
+  const afterScheme = trimmed.slice(schemeEnd + 3);
+  const authority = afterScheme.split(/[/?#]/)[0] || '';
+  if (authority.includes('@')) {
+    return { valid: false, reason: 'URLs with embedded username/password credentials are rejected.' };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { valid: false, reason: 'Malformed URL cannot be parsed by WHATWG URL parser.' };
+  }
+
+  if (parsed.protocol !== 'https:') {
+    return { valid: false, reason: `Insecure scheme "${parsed.protocol}" rejected; HTTPS is required.` };
+  }
+
+  if (parsed.username !== '' || parsed.password !== '') {
+    return { valid: false, reason: 'URLs with embedded credentials are rejected.' };
+  }
+
+  if (parsed.port !== '') {
+    return { valid: false, reason: `Custom port ":${parsed.port}" is prohibited for canonical storefront URLs.` };
+  }
+
+  const actualHost = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (!actualHost || !actualHost.includes('.')) {
+    return { valid: false, reason: 'Invalid hostname in offer URL.' };
+  }
+
+  // Validate product path (must be non-root without path traversal or empty segments, even pre-normalization)
+  const rawPathPart = afterScheme.slice(authority.length).split(/[?#]/)[0] || '';
+  const rawSegments = rawPathPart.split('/').filter(Boolean);
+  if (
+    rawSegments.some((seg) => {
+      const lower = seg.toLowerCase();
+      return lower === '.' || lower === '..' || lower.includes('%2e');
+    })
+  ) {
+    return { valid: false, reason: `Path traversal segment in "${rawPathPart}" is rejected.` };
+  }
+
+  const pathname = parsed.pathname || '/';
+  if (pathname === '/' || pathname.includes('//')) {
+    return { valid: false, reason: `Invalid product URL path "${pathname}".` };
+  }
+  const decodedSegments = pathname.split('/').filter(Boolean);
+  if (decodedSegments.length === 0 || decodedSegments.some(seg => seg === '.' || seg === '..')) {
+    return { valid: false, reason: `Path traversal or empty product path "${pathname}" is rejected.` };
+  }
+
+  const expectedHost = normalizeVerifiedDomainHostname(storeDomain);
+  if (!expectedHost) {
+    return {
+      valid: false,
+      reason: storeDomain
+        ? `Expected verified merchant domain "${storeDomain}" is missing, malformed, or a placeholder.`
+        : 'Verified merchant store domain is not configured.',
+    };
+  }
+
+  let hostMatches = actualHost === expectedHost;
+
+  if (!hostMatches && options?.allowedSubdomains && options.allowedSubdomains.length > 0) {
+    const normalizedAllowed = options.allowedSubdomains
+      .map(s => normalizeVerifiedDomainHostname(s))
+      .filter((s): s is string => Boolean(s));
+    hostMatches =
+      normalizedAllowed.includes(actualHost) &&
+      actualHost.endsWith(`.${expectedHost}`);
+  } else if (!hostMatches && options?.allowSubdomains === true) {
+    hostMatches = actualHost.endsWith(`.${expectedHost}`);
+  }
+
+  if (!hostMatches) {
+    return {
+      valid: false,
+      reason: `Hostname "${actualHost}" does not match verified merchant domain "${expectedHost}".`,
+    };
+  }
+
+  return {
+    valid: true,
+    normalizedUrl: parsed.href,
+    normalizedHostname: actualHost,
+  };
+}
+
 /**
  * Deterministically evaluates catalog products against 8 AI discovery & shopping readiness dimensions.
  * Computes transparent, explainable scores based on genuine product metadata without synthetic values.
@@ -269,20 +443,12 @@ export function evaluateDiscoveryReadiness(
       });
     }
 
-    // 7. URL & Source Consistency
+    // 7. URL & Source Consistency (strict canonical URL validation, zero substring fallback)
     const offerUrl = offers[0]?.url || product.attributes?.canonicalProductUrl || '';
     const urlProvenance = product.attributes?.urlProvenance || '';
-    const normalizedExpectedDomain = storeDomain ? storeDomain.replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase() : '';
-    let isValidCanonicalUrl = false;
-    if (offerUrl.startsWith('https://') && urlProvenance !== 'unavailable_store_domain') {
-      if (normalizedExpectedDomain && normalizedExpectedDomain !== 'store.myshopify.com') {
-        isValidCanonicalUrl = offerUrl.toLowerCase().includes(normalizedExpectedDomain);
-      } else {
-        isValidCanonicalUrl = !offerUrl.includes('store.myshopify.com');
-      }
-    }
+    const urlCheck = validateCanonicalProductUrl(offerUrl, storeDomain, { urlProvenance });
 
-    if (isValidCanonicalUrl) {
+    if (urlCheck.valid) {
       dimStats.urlAndSourceConsistency.passed++;
     } else {
       dimStats.urlAndSourceConsistency.failed++;
@@ -296,7 +462,7 @@ export function evaluateDiscoveryReadiness(
         title: 'Missing or Unverified Canonical Storefront Product URL',
         observedValue: offerUrl || '(none)',
         expectedCondition: 'Explicit HTTPS storefront URL pointing to verified merchant store domain',
-        evidence: `Product offer URL is "${offerUrl || '(empty)'}" (provenance: ${urlProvenance || 'unknown'}).`,
+        evidence: `Product offer URL "${offerUrl || '(empty)'}" rejected: ${urlCheck.reason || 'invalid URL'} (provenance: ${urlProvenance || 'unknown'}).`,
         recommendation: 'Ensure catalog sync uses verified Shopify storefront domain and valid product handle.',
         needsMerchantInput: false,
         recheckStatus: 'unverified',

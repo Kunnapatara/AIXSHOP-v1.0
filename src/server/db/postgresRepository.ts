@@ -324,6 +324,7 @@ export class PostgresRepository implements DatabaseRepository {
           '008_audit_composite_integrity_and_shopify_hardening.sql',
           '009_durable_sync_runs_and_ai_discovery.sql',
           '010_remediation_integrity_and_leases.sql',
+          '011_corrective_integrity_and_visibility_provenance.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -345,6 +346,7 @@ export class PostgresRepository implements DatabaseRepository {
           constraint_type: string;
           source_columns: string;
           target_columns: string;
+          is_partial_index?: boolean;
         }>(`
           SELECT
             src_ns.nspname AS source_schema,
@@ -362,12 +364,14 @@ export class PostgresRepository implements DatabaseRepository {
               SELECT string_agg(att.attname, ',' ORDER BY u.attpos)
               FROM unnest(c.confkey) WITH ORDINALITY AS u(attnum, attpos)
               JOIN pg_attribute att ON att.attrelid = c.confrelid AND att.attnum = u.attnum
-            ), '') AS target_columns
+            ), '') AS target_columns,
+            COALESCE(idx.indpred IS NOT NULL, false) AS is_partial_index
           FROM pg_constraint c
           JOIN pg_class src_t ON c.conrelid = src_t.oid
           JOIN pg_namespace src_ns ON src_t.relnamespace = src_ns.oid
           LEFT JOIN pg_class tgt_t ON c.confrelid = tgt_t.oid
           LEFT JOIN pg_namespace tgt_ns ON tgt_t.relnamespace = tgt_ns.oid
+          LEFT JOIN pg_index idx ON idx.indexrelid = c.conindid
           WHERE src_ns.nspname = current_schema()
             AND c.contype IN ('f', 'u', 'p');
         `);
@@ -382,13 +386,14 @@ export class PostgresRepository implements DatabaseRepository {
 
         const catalogRows = catalogConstraintsRes.rows;
 
-        // 4.1 Verify unique constraint on stores(workspace_id, id) with exact ordinal order
+        // 4.1 Verify unique constraint on stores(workspace_id, id) with exact ordinal order and full-table coverage
         const expectedStoreCols = ['workspace_id', 'id'];
         const storeUniqueConstraint = catalogRows.find(
           r =>
             (r.source_schema || activeSchema) === activeSchema &&
             r.source_table === 'stores' &&
             ['u', 'p'].includes(r.constraint_type) &&
+            r.is_partial_index !== true &&
             arraysEqual(parseCols(r.source_columns), expectedStoreCols)
         );
 
@@ -406,6 +411,7 @@ export class PostgresRepository implements DatabaseRepository {
             (r.source_schema || activeSchema) === activeSchema &&
             r.source_table === 'audit_runs' &&
             ['u', 'p'].includes(r.constraint_type) &&
+            r.is_partial_index !== true &&
             arraysEqual(parseCols(r.source_columns), expectedAuditRunCols)
         );
 
@@ -413,6 +419,40 @@ export class PostgresRepository implements DatabaseRepository {
           return {
             isReady: false,
             error: 'Database schema integrity error: audit_runs table missing unique key on (workspace_id, id). Run "npm run db:migrate".',
+          };
+        }
+
+        // 4.1c Verify unique constraint on shopify_sync_runs(workspace_id, id)
+        const shopifySyncRunUniqueConstraint = catalogRows.find(
+          r =>
+            (r.source_schema || activeSchema) === activeSchema &&
+            r.source_table === 'shopify_sync_runs' &&
+            ['u', 'p'].includes(r.constraint_type) &&
+            r.is_partial_index !== true &&
+            arraysEqual(parseCols(r.source_columns), ['workspace_id', 'id'])
+        );
+
+        if (!shopifySyncRunUniqueConstraint) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: shopify_sync_runs table missing unique key on (workspace_id, id). Run "npm run db:migrate".',
+          };
+        }
+
+        // 4.1d Verify non-partial unique constraint on ai_visibility_metrics(workspace_id, observation_date, platform, discovery_topic)
+        const visibilityMetricUniqueConstraint = catalogRows.find(
+          r =>
+            (r.source_schema || activeSchema) === activeSchema &&
+            r.source_table === 'ai_visibility_metrics' &&
+            ['u', 'p'].includes(r.constraint_type) &&
+            r.is_partial_index !== true &&
+            arraysEqual(parseCols(r.source_columns), ['workspace_id', 'observation_date', 'platform', 'discovery_topic'])
+        );
+
+        if (!visibilityMetricUniqueConstraint) {
+          return {
+            isReady: false,
+            error: 'Database schema integrity error: ai_visibility_metrics table missing unique key on (workspace_id, observation_date, platform, discovery_topic). Run "npm run db:migrate".',
           };
         }
 
@@ -488,6 +528,13 @@ export class PostgresRepository implements DatabaseRepository {
             targetColumns: ['workspace_id', 'id'],
             description: 'audit_run_products(workspace_id, audit_run_id) -> audit_runs(workspace_id, id)',
           },
+          {
+            sourceTable: 'shopify_sync_runs',
+            sourceColumns: ['workspace_id', 'parent_sync_run_id'],
+            targetTable: 'shopify_sync_runs',
+            targetColumns: ['workspace_id', 'id'],
+            description: 'shopify_sync_runs(workspace_id, parent_sync_run_id) -> shopify_sync_runs(workspace_id, id)',
+          },
         ];
 
         for (const reqFk of requiredCompositeFks) {
@@ -530,6 +577,8 @@ export class PostgresRepository implements DatabaseRepository {
             verifiedConstraints: [
               'stores(workspace_id, id) UNIQUE',
               'audit_runs(workspace_id, id) UNIQUE',
+              'shopify_sync_runs(workspace_id, id) UNIQUE',
+              'ai_visibility_metrics(workspace_id, observation_date, platform, discovery_topic) UNIQUE',
               ...requiredCompositeFks.map(f => f.description),
               'products(workspace_id) -> workspaces(id)',
             ],
@@ -1722,7 +1771,7 @@ export class PostgresRepository implements DatabaseRepository {
     // 1. If row does not exist, inserts with status='processing', unique lease_owner, lease_expires_at, attempt_count=1.
     // 2. If row exists and status='failed', or status='processing' whose lease_expires_at has elapsed (or legacy >5m), atomically steals/claims lease.
     // 3. Otherwise returns 0 rows so active workers never overlap.
-    const leaseDurationMs = Math.max(1000, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseDurationMs = Math.max(50, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
     const leaseOwner = leaseOptions?.leaseOwner || `worker_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
     const res = await this.pool.query<any>(
@@ -1783,7 +1832,7 @@ export class PostgresRepository implements DatabaseRepository {
     leaseOwner: string,
     extendMs: number = 5 * 60 * 1000
   ): Promise<boolean> {
-    const safeExtendMs = Math.max(1000, extendMs);
+    const safeExtendMs = Math.max(50, extendMs);
     const res = await this.pool.query<{ id: string }>(
       `UPDATE billing_events
        SET lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond'),
@@ -1791,7 +1840,10 @@ export class PostgresRepository implements DatabaseRepository {
        WHERE event_id = $1
          AND lease_owner = $2
          AND status = 'processing'
-         AND (lease_expires_at IS NULL OR lease_expires_at >= NOW())
+         AND (
+           (lease_expires_at IS NOT NULL AND lease_expires_at >= NOW())
+           OR (lease_expires_at IS NULL AND processed_at >= NOW() - INTERVAL '5 minutes')
+         )
        RETURNING id`,
       [eventId, leaseOwner, safeExtendMs]
     );
@@ -1817,7 +1869,13 @@ export class PostgresRepository implements DatabaseRepository {
     let whereClause = 'WHERE event_id = $1';
     if (leaseOwner) {
       params.push(leaseOwner);
-      whereClause += ` AND lease_owner = $${params.length} AND status = 'processing'`;
+      whereClause += `
+        AND lease_owner = $${params.length}
+        AND status = 'processing'
+        AND (
+          (lease_expires_at IS NOT NULL AND lease_expires_at >= NOW())
+          OR (lease_expires_at IS NULL AND processed_at >= NOW() - INTERVAL '5 minutes')
+        )`;
     }
 
     const res = await this.pool.query(
@@ -1828,7 +1886,7 @@ export class PostgresRepository implements DatabaseRepository {
     );
 
     if (leaseOwner && res.rowCount === 0) {
-      throw new Error(`Billing lease ownership lost for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
+      throw new Error(`Billing lease ownership lost or expired for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
     }
   }
 
@@ -1843,18 +1901,27 @@ export class PostgresRepository implements DatabaseRepository {
     try {
       await client.query('BEGIN');
 
-      // 0. Lock and verify billing event lease ownership BEFORE applying entitlement changes
+      // 0. Lock and verify billing event lease ownership and DB-clock non-expiration BEFORE applying entitlement changes
       if (params.leaseOwner) {
-        const lockRes = await client.query<{ status: string; lease_owner: string | null }>(
-          `SELECT status, lease_owner
+        const lockRes = await client.query<{
+          status: string;
+          lease_owner: string | null;
+          is_expired: boolean;
+        }>(
+          `SELECT status,
+                  lease_owner,
+                  (
+                    (lease_expires_at IS NOT NULL AND lease_expires_at < NOW())
+                    OR (lease_expires_at IS NULL AND processed_at < NOW() - INTERVAL '5 minutes')
+                  ) AS is_expired
            FROM billing_events
            WHERE event_id = $1
            FOR UPDATE`,
           [params.eventId]
         );
         const evtRow = lockRes.rows[0];
-        if (!evtRow || evtRow.status !== 'processing' || evtRow.lease_owner !== params.leaseOwner) {
-          throw new Error(`Billing lease ownership lost for event ${params.eventId}: stale worker "${params.leaseOwner}" rejected.`);
+        if (!evtRow || evtRow.status !== 'processing' || evtRow.lease_owner !== params.leaseOwner || evtRow.is_expired) {
+          throw new Error(`Billing lease ownership lost or expired for event ${params.eventId}: stale worker "${params.leaseOwner}" rejected.`);
         }
       }
 
@@ -1904,7 +1971,7 @@ export class PostgresRepository implements DatabaseRepository {
         );
       }
 
-      // 3. Mark billing event processed strictly by lease owner if provided
+      // 3. Mark billing event processed strictly by non-expired lease owner if provided
       if (params.markProcessed !== false) {
         const updateQuery = params.leaseOwner
           ? `UPDATE billing_events
@@ -1912,7 +1979,13 @@ export class PostgresRepository implements DatabaseRepository {
                  lease_expires_at = NULL,
                  processed_at = NOW(),
                  updated_at = NOW()
-             WHERE event_id = $1 AND lease_owner = $2 AND status = 'processing'`
+             WHERE event_id = $1
+               AND lease_owner = $2
+               AND status = 'processing'
+               AND (
+                 (lease_expires_at IS NOT NULL AND lease_expires_at >= NOW())
+                 OR (lease_expires_at IS NULL AND processed_at >= NOW() - INTERVAL '5 minutes')
+               )`
           : `UPDATE billing_events
              SET status = 'processed',
                  lease_expires_at = NULL,
@@ -1924,7 +1997,7 @@ export class PostgresRepository implements DatabaseRepository {
           params.leaseOwner ? [params.eventId, params.leaseOwner] : [params.eventId]
         );
         if (params.leaseOwner && updateRes.rowCount === 0) {
-          throw new Error(`Billing lease ownership lost during commit for event ${params.eventId}.`);
+          throw new Error(`Billing lease ownership lost or expired during commit for event ${params.eventId}.`);
         }
       }
 
@@ -3201,13 +3274,14 @@ export class PostgresRepository implements DatabaseRepository {
   async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
     await this.pool.query(
       `INSERT INTO ai_visibility_imports (
-        id, workspace_id, filename, row_count, rejected_row_count, status, errors_json,
+        id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
         reporting_period_start, reporting_period_end, source_platform, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, NOW())`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())`,
       [
         record.id,
         record.workspaceId,
         record.filename,
+        record.contentHash || null,
         record.rowCount,
         record.rejectedRowCount ?? 0,
         record.status || 'completed',
@@ -3218,6 +3292,29 @@ export class PostgresRepository implements DatabaseRepository {
       ]
     );
     return record;
+  }
+
+  async getVisibilityImportByHash(
+    workspaceId: string,
+    contentHash: string
+  ): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord | null> {
+    if (!contentHash) return null;
+    const res = await this.pool.query<any>(
+      `SELECT
+        id, workspace_id AS "workspaceId", filename, content_hash AS "contentHash",
+        row_count AS "rowCount", rejected_row_count AS "rejectedRowCount", status,
+        errors_json AS "errors", reporting_period_start::text AS "reportingPeriodStart",
+        reporting_period_end::text AS "reportingPeriodEnd",
+        source_platform AS "sourcePlatform", created_at AS "createdAt"
+       FROM ai_visibility_imports
+       WHERE workspace_id = $1
+         AND content_hash = $2
+         AND status = 'completed'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [workspaceId, contentHash]
+    );
+    return res.rows[0] || null;
   }
 
   async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
@@ -3257,13 +3354,14 @@ export class PostgresRepository implements DatabaseRepository {
       await client.query('BEGIN');
       await client.query(
         `INSERT INTO ai_visibility_imports (
-          id, workspace_id, filename, row_count, rejected_row_count, status, errors_json,
+          id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
           reporting_period_start, reporting_period_end, source_platform, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, NOW())`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())`,
         [
           record.id,
           record.workspaceId,
           record.filename,
+          record.contentHash || null,
           record.rowCount,
           record.rejectedRowCount ?? 0,
           record.status || 'completed',
@@ -3327,7 +3425,7 @@ export class PostgresRepository implements DatabaseRepository {
 
     const importsRes = await this.pool.query<any>(
       `SELECT 
-        id, workspace_id AS "workspaceId", filename, row_count AS "rowCount",
+        id, workspace_id AS "workspaceId", filename, content_hash AS "contentHash", row_count AS "rowCount",
         rejected_row_count AS "rejectedRowCount", status, errors_json AS "errors",
         reporting_period_start::text AS "reportingPeriodStart",
         reporting_period_end::text AS "reportingPeriodEnd",

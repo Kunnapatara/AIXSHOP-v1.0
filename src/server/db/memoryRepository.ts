@@ -713,7 +713,7 @@ export class MemoryRepository implements DatabaseRepository {
     const existing = this.billingEvents.get(event.eventId);
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
-    const leaseDurationMs = Math.max(1000, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseDurationMs = Math.max(50, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
     const leaseOwner = leaseOptions?.leaseOwner || `worker_${now}_${Math.random().toString(36).slice(2, 10)}`;
     const leaseExpiresAt = new Date(now + leaseDurationMs).toISOString();
 
@@ -768,7 +768,10 @@ export class MemoryRepository implements DatabaseRepository {
     if (existing.leaseExpiresAt && new Date(existing.leaseExpiresAt).getTime() < now) {
       return false;
     }
-    existing.leaseExpiresAt = new Date(now + Math.max(1000, extendMs)).toISOString();
+    if (!existing.leaseExpiresAt && existing.processedAt && now - new Date(existing.processedAt).getTime() > 5 * 60 * 1000) {
+      return false;
+    }
+    existing.leaseExpiresAt = new Date(now + Math.max(50, extendMs)).toISOString();
     existing.updatedAt = new Date(now).toISOString();
     return true;
   }
@@ -781,8 +784,16 @@ export class MemoryRepository implements DatabaseRepository {
   ): Promise<void> {
     const existing = this.billingEvents.get(eventId);
     if (existing) {
-      if (leaseOwner && (existing.status !== 'processing' || existing.leaseOwner !== leaseOwner)) {
-        throw new Error(`Billing lease ownership lost for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
+      if (leaseOwner) {
+        const now = Date.now();
+        const leaseExpiryTime = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() : NaN;
+        const processedTime = existing.processedAt ? new Date(existing.processedAt).getTime() : NaN;
+        const isExpired = !isNaN(leaseExpiryTime)
+          ? leaseExpiryTime < now
+          : (!isNaN(processedTime) && now - processedTime > 5 * 60 * 1000);
+        if (existing.status !== 'processing' || existing.leaseOwner !== leaseOwner || isExpired) {
+          throw new Error(`Billing lease ownership lost or expired for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
+        }
       }
       existing.status = status;
       existing.updatedAt = new Date().toISOString();
@@ -802,11 +813,17 @@ export class MemoryRepository implements DatabaseRepository {
     markProcessed?: boolean;
     leaseOwner?: string;
   }): Promise<void> {
-    // Verify lease ownership BEFORE modifying any workspace/subscription state
+    // Verify lease ownership and non-expiration BEFORE modifying any workspace/subscription state
     const prevEvent = this.billingEvents.get(params.eventId);
     if (params.leaseOwner) {
-      if (!prevEvent || prevEvent.status !== 'processing' || prevEvent.leaseOwner !== params.leaseOwner) {
-        throw new Error(`Billing lease ownership lost for event ${params.eventId}: stale worker rejected.`);
+      const now = Date.now();
+      const leaseExpiryTime = prevEvent?.leaseExpiresAt ? new Date(prevEvent.leaseExpiresAt).getTime() : NaN;
+      const processedTime = prevEvent?.processedAt ? new Date(prevEvent.processedAt).getTime() : NaN;
+      const isExpired = !isNaN(leaseExpiryTime)
+        ? leaseExpiryTime < now
+        : (!isNaN(processedTime) && now - processedTime > 5 * 60 * 1000);
+      if (!prevEvent || prevEvent.status !== 'processing' || prevEvent.leaseOwner !== params.leaseOwner || isExpired) {
+        throw new Error(`Billing lease ownership lost or expired for event ${params.eventId}: stale worker rejected.`);
       }
     }
 
@@ -1382,6 +1399,7 @@ export class MemoryRepository implements DatabaseRepository {
   async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
     const copy = {
       ...JSON.parse(JSON.stringify(record)),
+      contentHash: record.contentHash ?? null,
       status: record.status || 'completed',
       rejectedRowCount: record.rejectedRowCount ?? 0,
       errors: record.errors ? JSON.parse(JSON.stringify(record.errors)) : [],
@@ -1389,6 +1407,22 @@ export class MemoryRepository implements DatabaseRepository {
     };
     this.visibilityImports.set(record.id, copy);
     return JSON.parse(JSON.stringify(copy));
+  }
+
+  async getVisibilityImportByHash(
+    workspaceId: string,
+    contentHash: string
+  ): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord | null> {
+    if (!contentHash) return null;
+    const matches = Array.from(this.visibilityImports.values())
+      .filter(
+        (imp) =>
+          imp.workspaceId === workspaceId &&
+          imp.contentHash === contentHash &&
+          (imp.status || 'completed') === 'completed'
+      )
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return matches[0] ? JSON.parse(JSON.stringify(matches[0])) : null;
   }
 
   async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {

@@ -5,8 +5,8 @@ import { AuthRequest } from '../types';
 import { Product } from '../../types';
 import {
   evaluateFeedReadiness,
-  mapProductToGmcRow,
-  mapProductToMetaRow,
+  mapProductVariantsToGmcRows,
+  mapProductVariantsToMetaRows,
   mapProductToSchemaOrgJsonLd,
   exportToCsv,
   FeedPlatform,
@@ -81,12 +81,30 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
       );
 
       let products = allProducts;
+      const skippedSummaries: Array<{ productId: string; reasons: string[] }> = [];
       if (filter === 'valid_only') {
-        products = allProducts.filter((p) => evalByProductId.get(p.id)?.isValid === true);
+        products = [];
+        for (const p of allProducts) {
+          const ev = evalByProductId.get(p.id);
+          if (ev?.isValid) {
+            products.push(p);
+          } else {
+            skippedSummaries.push({
+              productId: p.id,
+              reasons: (ev?.errors || []).map((e) => `${e.field}: ${e.message}`),
+            });
+          }
+        }
       }
 
       res.setHeader('X-AIXSHOP-Validation-Scope', 'local_structural_check_only');
       res.setHeader('X-AIXSHOP-External-Platform-Accepted', 'false');
+      res.setHeader('X-AIXSHOP-Exported-Products', String(products.length));
+      res.setHeader('X-AIXSHOP-Skipped-Products', String(skippedSummaries.length));
+      if (skippedSummaries.length > 0) {
+        const serializedSkipped = JSON.stringify(skippedSummaries.slice(0, 20));
+        res.setHeader('X-AIXSHOP-Skipped-Reasons', serializedSkipped.slice(0, 2048));
+      }
 
       if (platform === 'schema_org' || format === 'json') {
         const jsonLdData = products.map((p: Product) => {
@@ -108,14 +126,15 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
       }
 
       if (platform === 'meta_commerce') {
-        const rows = products.map((p: Product) => {
-          const row = mapProductToMetaRow(p, currency);
-          if (filter === 'all') {
-            const ev = evalByProductId.get(p.id);
-            row.validation_status = ev?.isValid ? 'valid' : 'invalid';
-            row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
-          }
-          return row;
+        const rows = products.flatMap((p: Product) => {
+          const ev = evalByProductId.get(p.id);
+          return mapProductVariantsToMetaRows(p, currency).map((row) => {
+            if (filter === 'all') {
+              row.validation_status = ev?.isValid ? 'valid' : 'invalid';
+              row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
+            }
+            return row;
+          });
         });
         const csv = exportToCsv(rows);
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -124,14 +143,15 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
       }
 
       // Default: Google Merchant Center CSV
-      const rows = products.map((p: Product) => {
-        const row = mapProductToGmcRow(p, currency);
-        if (filter === 'all') {
-          const ev = evalByProductId.get(p.id);
-          row.validation_status = ev?.isValid ? 'valid' : 'invalid';
-          row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
-        }
-        return row;
+      const rows = products.flatMap((p: Product) => {
+        const ev = evalByProductId.get(p.id);
+        return mapProductVariantsToGmcRows(p, currency).map((row) => {
+          if (filter === 'all') {
+            row.validation_status = ev?.isValid ? 'valid' : 'invalid';
+            row.validation_errors = (ev?.errors || []).map((e) => `${e.field}: ${e.message}`).join('; ');
+          }
+          return row;
+        });
       });
       const csv = exportToCsv(rows);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
