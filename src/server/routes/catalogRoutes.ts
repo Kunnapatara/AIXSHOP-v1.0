@@ -1,5 +1,9 @@
 import { Router } from 'express';
-import { CatalogVersionConflictError, DatabaseRepository } from '../db/repository';
+import {
+  CatalogVersionConflictError,
+  CatalogVersionValidationError,
+  DatabaseRepository,
+} from '../db/repository';
 import { createAuthMiddleware } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
@@ -67,8 +71,25 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Invalid catalog payload format' });
       }
 
-      const rawExpected = req.body?.expectedVersion ?? payload.catalogVersion;
-      const expectedVersion = typeof rawExpected === 'number' && Number.isInteger(rawExpected) ? rawExpected : undefined;
+      const hasBodyExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expectedVersion');
+      const hasPayloadVersion = payload && Object.prototype.hasOwnProperty.call(payload, 'catalogVersion');
+      const hasExpectedProvided = hasBodyExpected || hasPayloadVersion;
+      const rawExpected = hasBodyExpected ? req.body.expectedVersion : payload.catalogVersion;
+
+      if (
+        hasExpectedProvided &&
+        (typeof rawExpected !== 'number' || !Number.isInteger(rawExpected) || rawExpected < 1)
+      ) {
+        const currentCatalog = await repo.loadWorkspaceCatalog(workspaceId);
+        return res.status(400).json({
+          error: 'expectedVersion must be a positive integer.',
+          code: 'INVALID_CATALOG_VERSION',
+          currentVersion: currentCatalog?.catalogVersion ?? 1,
+        });
+      }
+
+      const expectedVersion =
+        hasExpectedProvided && typeof rawExpected === 'number' ? rawExpected : undefined;
 
       return await repo.withWorkspaceLock(workspaceId, async () => {
         // Enforce authoritative plan quota on full catalog payload
@@ -99,19 +120,30 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
 
         // Never trust user-supplied storeId or workspaceId in body; derive from server session
         await repo.saveWorkspaceCatalog(workspaceId, payload, { expectedVersion });
+        const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
 
         return res.json({
           success: true,
           workspaceId,
           skuCount: proposedSkus,
+          catalogVersion: savedCatalog?.catalogVersion,
           timestamp: new Date().toISOString(),
         });
       });
     } catch (err: any) {
+      if (err instanceof CatalogVersionValidationError || err.code === 'INVALID_CATALOG_VERSION') {
+        return res.status(400).json({
+          error: err.message,
+          code: 'INVALID_CATALOG_VERSION',
+          currentVersion: err.currentVersion,
+        });
+      }
       if (err instanceof CatalogVersionConflictError || err.code === 'CATALOG_VERSION_CONFLICT') {
         return res.status(409).json({
           error: err.message,
           code: 'CATALOG_VERSION_CONFLICT',
+          currentVersion: err.currentVersion,
+          expectedVersion: err.expectedVersion,
         });
       }
       if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
@@ -278,6 +310,23 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   router.post('/migrate-demo', requireAuth, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
+      const hasBodyExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expectedVersion');
+      const rawExpected = hasBodyExpected ? req.body.expectedVersion : undefined;
+
+      if (
+        hasBodyExpected &&
+        (typeof rawExpected !== 'number' || !Number.isInteger(rawExpected) || rawExpected < 1)
+      ) {
+        const currentCatalog = await repo.loadWorkspaceCatalog(workspaceId);
+        return res.status(400).json({
+          error: 'expectedVersion must be a positive integer.',
+          code: 'INVALID_CATALOG_VERSION',
+          currentVersion: currentCatalog?.catalogVersion ?? 1,
+        });
+      }
+
+      const expectedVersion =
+        hasBodyExpected && typeof rawExpected === 'number' ? rawExpected : undefined;
 
       return await repo.withWorkspaceLock(workspaceId, async () => {
         const currentStore = await repo.getStoreByWorkspace(workspaceId);
@@ -321,15 +370,32 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           },
         };
 
-        await repo.saveWorkspaceCatalog(workspaceId, demoPayload);
+        await repo.saveWorkspaceCatalog(workspaceId, demoPayload, { expectedVersion });
+        const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
 
         return res.json({
           success: true,
           message: 'Demo catalog successfully imported to cloud workspace',
           skuCount: demoSkus,
+          catalogVersion: savedCatalog?.catalogVersion,
         });
       });
     } catch (err: any) {
+      if (err instanceof CatalogVersionValidationError || err.code === 'INVALID_CATALOG_VERSION') {
+        return res.status(400).json({
+          error: err.message,
+          code: 'INVALID_CATALOG_VERSION',
+          currentVersion: err.currentVersion,
+        });
+      }
+      if (err instanceof CatalogVersionConflictError || err.code === 'CATALOG_VERSION_CONFLICT') {
+        return res.status(409).json({
+          error: err.message,
+          code: 'CATALOG_VERSION_CONFLICT',
+          currentVersion: err.currentVersion,
+          expectedVersion: err.expectedVersion,
+        });
+      }
       if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
         return res.status(403).json({
           error: err.message,

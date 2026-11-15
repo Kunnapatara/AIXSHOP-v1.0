@@ -2,12 +2,49 @@ import { Response, NextFunction } from 'express';
 import { AuthRequest, WorkspaceRole } from '../types';
 import { DatabaseRepository } from '../db/repository';
 import { hashSessionToken } from '../security/tokens';
+import {
+  AuthRateLimitFailureMode,
+  resolveAuthRateLimitFailurePolicy,
+} from '../config/productionConfig';
 
 // Bounded in-memory rate limiting store with active TTL cleanup and FIFO eviction under load
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const resetHooks = new Set<() => void>();
 let lastPruneAt = Date.now();
 const DEFAULT_MAX_RATE_LIMITER_ENTRIES = 5000;
+
+export interface AuthRateLimiterDiagnostics {
+  policy: AuthRateLimitFailureMode;
+  failClosedByDefaultInProd: boolean;
+  explicitOverrideActive: boolean;
+  storageDegraded: boolean;
+  degradedEvents: number;
+  lastFailureAt: string | null;
+  lastRecoveredAt: string | null;
+  lastErrorCategory: string | null;
+}
+
+const rateLimiterDiagState = {
+  storageDegraded: false,
+  degradedEvents: 0,
+  lastFailureAt: null as string | null,
+  lastRecoveredAt: null as string | null,
+  lastErrorCategory: null as string | null,
+};
+
+export function getAuthRateLimiterDiagnostics(): AuthRateLimiterDiagnostics {
+  const policy = resolveAuthRateLimitFailurePolicy();
+  return {
+    policy: policy.mode,
+    failClosedByDefaultInProd: true,
+    explicitOverrideActive: policy.explicitOverride,
+    storageDegraded: rateLimiterDiagState.storageDegraded,
+    degradedEvents: rateLimiterDiagState.degradedEvents,
+    lastFailureAt: rateLimiterDiagState.lastFailureAt,
+    lastRecoveredAt: rateLimiterDiagState.lastRecoveredAt,
+    lastErrorCategory: rateLimiterDiagState.lastErrorCategory,
+  };
+}
 
 function pruneExpiredRateLimitEntries(now: number) {
   for (const [key, value] of loginAttempts.entries()) {
@@ -57,6 +94,11 @@ function consumeLocalBoundedRateLimit(
 
 export function _resetRateLimiter(): void {
   loginAttempts.clear();
+  rateLimiterDiagState.storageDegraded = false;
+  rateLimiterDiagState.degradedEvents = 0;
+  rateLimiterDiagState.lastFailureAt = null;
+  rateLimiterDiagState.lastRecoveredAt = null;
+  rateLimiterDiagState.lastErrorCategory = null;
   for (const hook of resetHooks) {
     try {
       hook();
@@ -183,8 +225,10 @@ export interface AuthRateLimiterOptions {
 /**
  * Shared rate limiter for authentication endpoints (brute-force & high-cardinality flood protection).
  * - Uses shared PostgreSQL / Repository storage via repo.consumeRateLimit when provided.
- * - Falls back safely to a strictly capacity-bounded local Map (LRU/FIFO eviction under capacity)
- *   or fails closed (503) if failClosedOnStorageError=true.
+ * - In production (NODE_ENV=production), defaults to FAIL CLOSED (HTTP 503 RATE_LIMITER_UNAVAILABLE)
+ *   when shared storage fails, unless explicitly overridden via AUTH_RATE_LIMIT_FAILURE_MODE=fallback_local
+ *   or options.failClosedOnStorageError=false.
+ * - In development/test, safely falls back to a strictly capacity-bounded local Map unless configured fail_closed.
  * - Applies trusted Express req.ip (respecting configured 'trust proxy') + normalized account email bucket.
  */
 export function authRateLimiter(
@@ -211,6 +255,12 @@ export function authRateLimiter(
       keysToCheck.push(`rl:${keyPrefix}:acct:${rawEmail}`);
     }
 
+    const policy = resolveAuthRateLimitFailurePolicy();
+    const failClosed =
+      options.failClosedOnStorageError !== undefined
+        ? options.failClosedOnStorageError
+        : policy.failClosedOnStorageError;
+
     try {
       if (repo && typeof repo.consumeRateLimit === 'function') {
         for (const k of keysToCheck) {
@@ -232,17 +282,39 @@ export function authRateLimiter(
             });
           }
         }
+        if (rateLimiterDiagState.storageDegraded) {
+          rateLimiterDiagState.storageDegraded = false;
+          rateLimiterDiagState.lastRecoveredAt = new Date().toISOString();
+          rateLimiterDiagState.lastErrorCategory = null;
+        }
         return next();
       }
-    } catch (storageErr: any) {
-      console.error('[AIXSHOP Auth RateLimit] Shared rate-limit storage error:', storageErr?.message || storageErr);
-      if (options.failClosedOnStorageError) {
+    } catch {
+      rateLimiterDiagState.storageDegraded = true;
+      rateLimiterDiagState.degradedEvents += 1;
+      rateLimiterDiagState.lastFailureAt = new Date().toISOString();
+      rateLimiterDiagState.lastErrorCategory = 'shared_storage_unavailable';
+      console.error(
+        `[AIXSHOP Auth RateLimit] Shared rate-limit storage error (policy=${failClosed ? 'fail_closed' : 'fallback_local'}).`
+      );
+      if (failClosed) {
         return res.status(503).json({
           error: 'Authentication rate limiter temporarily unavailable. Please retry shortly.',
           code: 'RATE_LIMITER_UNAVAILABLE',
         });
       }
-      // Fall through to bounded local limiter fallback below
+      // Explicit/non-production override allows falling through to bounded local limiter fallback below
+    }
+
+    if (failClosed && (!repo || typeof repo.consumeRateLimit !== 'function')) {
+      rateLimiterDiagState.storageDegraded = true;
+      rateLimiterDiagState.degradedEvents += 1;
+      rateLimiterDiagState.lastFailureAt = new Date().toISOString();
+      rateLimiterDiagState.lastErrorCategory = 'shared_storage_unconfigured';
+      return res.status(503).json({
+        error: 'Authentication rate limiter temporarily unavailable. Please retry shortly.',
+        code: 'RATE_LIMITER_UNAVAILABLE',
+      });
     }
 
     for (const k of keysToCheck) {

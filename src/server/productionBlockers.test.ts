@@ -8,7 +8,10 @@ import http from 'node:http';
 import { Pool } from 'pg';
 import { MemoryRepository } from './db/memoryRepository';
 import { PostgresRepository } from './db/postgresRepository';
-import { CatalogVersionConflictError } from './db/repository';
+import {
+  CatalogVersionConflictError,
+  CatalogVersionValidationError,
+} from './db/repository';
 import { createApp } from './app';
 import { processShopifyWebhook } from './shopify/webhookService';
 import { syncShopifyCatalog } from './shopify/syncService';
@@ -16,6 +19,7 @@ import { encryptCredential } from './security/encryption';
 import {
   getTrustedBaseUrl,
   parseTrustProxySetting,
+  resolveAuthRateLimitFailurePolicy,
   resolveTrustedRedirectUrl,
   validateProductionAppUrl,
   validateProductionConfig,
@@ -25,7 +29,12 @@ import {
   computeMigrationChecksum,
   runMigrations,
 } from './db/migrate';
-import { _getRateLimiterSize, _resetRateLimiter, authRateLimiter } from './middleware/auth';
+import {
+  _getRateLimiterSize,
+  _resetRateLimiter,
+  authRateLimiter,
+  getAuthRateLimiterDiagnostics,
+} from './middleware/auth';
 import { VisibilityObservationConflictError } from '../domain/monitoring/aiVisibilityTypes';
 import { StoragePayloadV1 } from '../domain/storage/storageTypes';
 
@@ -71,6 +80,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
     'DATABASE_URL',
     'DISABLE_AUTH',
     'ALLOW_INSECURE_HTTP',
+    'AUTH_RATE_LIMIT_FAILURE_MODE',
   ];
 
   beforeEach(() => {
@@ -1191,6 +1201,896 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       ]);
       const dupCount = [vResA, vResB].filter((r) => r.duplicateImport).length;
       assert.equal(dupCount, 1, 'Exactly one concurrent duplicate content_hash insert must become duplicate_noop');
+
+      // 3. Remediation A Live PG: Concurrent differing CSV imports on a nonexistent key must serialize cleanly
+      const makeImpDiff = (id: string, hashSeed: string) => ({
+        id,
+        workspaceId: wsId,
+        filename: `${id}.csv`,
+        contentHash: crypto.createHash('sha256').update(`${hashSeed}_${wsId}`).digest('hex'),
+        rowCount: 1,
+        rejectedRowCount: 0,
+        status: 'completed' as const,
+        errors: [],
+        reportingPeriodStart: '2026-10-05',
+        reportingPeriodEnd: '2026-10-05',
+        sourcePlatform: 'merchant_csv',
+        createdAt: new Date().toISOString(),
+      });
+      const makeMetricDiff = (impId: string, mentions: number, topic: string | null) => ({
+        id: `vm_${impId}`,
+        workspaceId: wsId,
+        importId: impId,
+        observationDate: '2026-10-05',
+        platform: 'ChatGPT Search',
+        brandMentions: mentions,
+        productMentions: 4,
+        websiteClicks: 2,
+        discoveryTopic: topic,
+        topicPresence: topic === null ? ('unspecified' as const) : ('explicit_blank' as const),
+        evidenceSource: 'live-conflict.csv',
+        createdAt: new Date().toISOString(),
+      });
+
+      const settledConflict = await Promise.allSettled([
+        repoA.saveVisibilityImportAtomic(makeImpDiff('vimp_c1', 'diff1'), [makeMetricDiff('vimp_c1', 10, null)]),
+        repoB.saveVisibilityImportAtomic(makeImpDiff('vimp_c2', 'diff2'), [makeMetricDiff('vimp_c2', 20, null)]),
+      ]);
+      const fulfilledConflict = settledConflict.filter((r) => r.status === 'fulfilled');
+      const rejectedConflict = settledConflict.filter((r) => r.status === 'rejected');
+      assert.equal(fulfilledConflict.length, 1);
+      assert.equal(rejectedConflict.length, 1);
+      assert.ok(rejectedConflict[0].status === 'rejected' && rejectedConflict[0].reason instanceof VisibilityObservationConflictError);
+
+      // NULL vs explicit '' remains distinct even concurrently on live PG
+      const blankRes = await repoB.saveVisibilityImportAtomic(
+        makeImpDiff('vimp_blank', 'blank'),
+        [makeMetricDiff('vimp_blank', 33, '')]
+      );
+      assert.equal(blankRes.metricsSaved, 1);
+
+      // 4. Remediation C + B Live PG: pool.max = 1 nested withWorkspaceLock + mandatory catalogVersion guard
+      const singleConnPool = new Pool({
+        ...(process.env.DATABASE_URL
+          ? { connectionString: process.env.DATABASE_URL }
+          : {
+              host: process.env.SQL_HOST || process.env.PGHOST,
+              port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
+              user: process.env.SQL_USER || process.env.PGUSER,
+              password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
+              database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
+            }),
+        max: 1,
+        connectionTimeoutMillis: 2000,
+      });
+      try {
+        const singleRepo = new PostgresRepository(singleConnPool);
+        await singleRepo.withWorkspaceLock(wsId, async () => {
+          const cat1 = (await singleRepo.loadWorkspaceCatalog(wsId))!;
+          await singleRepo.withWorkspaceLock(wsId, async () => {
+            await singleRepo.saveWorkspaceCatalog(wsId, cat1);
+          });
+          await singleRepo.mutateWorkspaceCatalog(wsId, async (cat) => ({
+            nextCatalog: cat,
+            result: true,
+          }));
+        });
+        const postSingleCat = (await singleRepo.loadWorkspaceCatalog(wsId))!;
+        assert.ok((postSingleCat.catalogVersion || 1) >= 2);
+        await assert.rejects(
+          () => singleRepo.saveWorkspaceCatalog(wsId, { ...postSingleCat, catalogVersion: undefined }),
+          (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409
+        );
+      } finally {
+        await singleConnPool.end();
+      }
+    });
+  });
+
+  // =========================================================================
+  // WORKSTREAM R — Remediations A-F Focused Verification Suite
+  // =========================================================================
+  describe('Workstream R: Remediations A-F Regression & Concurrency Suite', () => {
+    function buildEmptyCatalog(skuName = 'Default'): StoragePayloadV1 {
+      return {
+        products: [],
+        variants: [],
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+        storeProfile: {
+          name: `${skuName} Store`,
+          domain: 'test-store.myshopify.com',
+          currency: 'USD',
+          skuCount: 0,
+          catalogCompletenessAvg: 0,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Free Audit',
+          connectors: [],
+        },
+      };
+    }
+
+    function buildSingleProductCatalog(id: string, sku: string, title = 'Sample Product'): StoragePayloadV1 {
+      return {
+        products: [
+          {
+            id,
+            title,
+            brand: 'Solstice',
+            category: 'Home',
+            description: 'Quality test product',
+            image: '',
+            status: 'active',
+            completenessScore: 90,
+            evidenceCoverageScore: 0,
+            externalDiscoveryStatus: 'observed_in_sample',
+            attributes: {},
+            variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 29, inventoryCount: 5, attributes: {} }],
+            offers: [],
+            evidenceDocuments: [],
+            findingsCount: 0,
+            lastAudited: new Date().toISOString(),
+          },
+        ],
+        variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 29, inventoryCount: 5, attributes: {} }],
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+        storeProfile: {
+          name: 'Test Store',
+          domain: 'test-store.myshopify.com',
+          currency: 'USD',
+          skuCount: 1,
+          catalogCompletenessAvg: 90,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Free Audit',
+          connectors: [],
+        },
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // REMEDIATION A — Visibility Import Concurrency & Conflict Integrity
+    // -----------------------------------------------------------------------
+    test('RA1. Concurrent differing visibility imports on nonexistent key serialize cleanly: 1 commits, 1 rejects 409 without partial rows, replace_versioned chains history', async () => {
+      const repo = new MemoryRepository();
+      await repo.registerUser({
+        user: { id: 'u_ra1', email: 'ra1@example.com', passwordHash: 'h', fullName: 'RA1' },
+        workspace: { id: 'ws_ra1', name: 'WS RA1', slug: 'ws-ra1' },
+        session: {
+          id: 'sess_ra1',
+          sessionTokenHash: crypto.createHash('sha256').update('tok_ra1').digest('hex'),
+          userId: 'u_ra1',
+          activeWorkspaceId: 'ws_ra1',
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      const csvA = 'date,platform,brand_mentions,product_mentions,clicks,topic\n2026-11-01,ChatGPT Search,14,7,3,running shoes\n2026-11-01,Perplexity,5,2,1,trail shoes';
+      const csvB = 'date,platform,brand_mentions,product_mentions,clicks,topic\n2026-11-01,Perplexity,9,4,2,trail shoes\n2026-11-01,ChatGPT Search,99,40,12,running shoes';
+
+      const app = createApp(repo);
+      const { baseUrl, close } = await startTempAppServer(app);
+      try {
+        // Opposite-order overlapping key batches fired concurrently -> zero deadlock, 1 winner, 1 clean 409
+        const [rA, rB] = await Promise.all([
+          fetch(`${baseUrl}/api/visibility/upload`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_ra1' },
+            body: JSON.stringify({ csvContent: csvA, filename: 'batchA.csv' }),
+          }),
+          fetch(`${baseUrl}/api/visibility/upload`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_ra1' },
+            body: JSON.stringify({ csvContent: csvB, filename: 'batchB.csv' }),
+          }),
+        ]);
+        const statuses = [rA.status, rB.status].sort();
+        assert.deepEqual(statuses, [200, 409]);
+
+        // Partial-conflict batch introducing a new key + one existing conflicting key must roll back ALL rows
+        const csvPartialConflict =
+          'date,platform,brand_mentions,product_mentions,clicks,topic\n' +
+          '2026-11-02,Gemini,50,25,10,new topic only\n' +
+          '2026-11-01,ChatGPT Search,777,111,22,running shoes';
+        const rPartial = await fetch(`${baseUrl}/api/visibility/upload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_ra1' },
+          body: JSON.stringify({ csvContent: csvPartialConflict, filename: 'partial.csv' }),
+        });
+        assert.equal(rPartial.status, 409);
+
+        const summaryAfterRollback = await repo.getVisibilitySummary('ws_ra1');
+        assert.equal(
+          summaryAfterRollback.recentObservations.some((o) => o.discoveryTopic === 'new topic only'),
+          false,
+          'Rejected batch must NOT leave partial new rows committed'
+        );
+
+        // Concurrent unspecified (NULL) vs explicit blank ('') imports do NOT collide
+        const csvNull = 'date,platform,brand_mentions,product_mentions,clicks\n2026-11-03,Perplexity,6,3,1';
+        const csvBlank = 'date,platform,brand_mentions,product_mentions,clicks,topic\n2026-11-03,Perplexity,8,4,2,';
+        const [rNull, rBlank] = await Promise.all([
+          fetch(`${baseUrl}/api/visibility/upload`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_ra1' },
+            body: JSON.stringify({ csvContent: csvNull, filename: 'null.csv' }),
+          }),
+          fetch(`${baseUrl}/api/visibility/upload`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_ra1' },
+            body: JSON.stringify({ csvContent: csvBlank, filename: 'blank.csv' }),
+          }),
+        ]);
+        assert.equal(rNull.status, 200);
+        assert.equal(rBlank.status, 200);
+
+        // Explicit replace_versioned updates cleanly and links supersedes_history_id
+        const rReplace = await fetch(`${baseUrl}/api/visibility/upload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_ra1' },
+          body: JSON.stringify({ csvContent: csvPartialConflict, filename: 'replace.csv', conflictPolicy: 'replace_versioned' }),
+        });
+        assert.equal(rReplace.status, 200);
+        const hist = await repo.getVisibilityObservationHistory('ws_ra1');
+        const shoesHist = hist.filter((h) => h.discoveryTopic === 'running shoes').sort((a, b) => a.versionNumber - b.versionNumber);
+        assert.equal(shoesHist.length, 2);
+        assert.equal(shoesHist[0].versionNumber, 1);
+        assert.equal(shoesHist[1].versionNumber, 2);
+        assert.equal(shoesHist[1].supersedesHistoryId, shoesHist[0].id);
+      } finally {
+        await close();
+      }
+    });
+
+    test('RA2. PostgresRepository.saveVisibilityImportAtomic acquires sorted pg_advisory_xact_lock BEFORE FOR UPDATE checks and rejects on conflict', async () => {
+      const executedSql: Array<{ sql: string; params?: any[] }> = [];
+      const makeMockPool = (existingMetricRow: any | null): any => ({
+        query: async () => ({ rows: [] }),
+        connect: async () => ({
+          query: async (sql: string, params?: any[]) => {
+            executedSql.push({ sql, params });
+            if (sql.includes('FROM ai_visibility_metrics') && sql.includes('FOR UPDATE')) {
+              return { rows: existingMetricRow ? [existingMetricRow] : [] };
+            }
+            if (sql.includes('FROM ai_visibility_observation_history') && sql.includes('FOR UPDATE')) {
+              return { rows: [] };
+            }
+            return { rows: [], rowCount: 1 };
+          },
+          release: () => {},
+        }),
+      });
+
+      const pgFresh = new PostgresRepository(makeMockPool(null));
+      await pgFresh.saveVisibilityImportAtomic(
+        {
+          id: 'vimp_pg1',
+          workspaceId: 'ws_pg1',
+          filename: 'metrics.csv',
+          contentHash: 'h_pg1',
+          rowCount: 2,
+          rejectedRowCount: 0,
+          status: 'completed',
+          errors: [],
+          reportingPeriodStart: '2026-11-01',
+          reportingPeriodEnd: '2026-11-01',
+          sourcePlatform: 'merchant_csv',
+          createdAt: new Date().toISOString(),
+        },
+        [
+          {
+            id: 'm_z',
+            workspaceId: 'ws_pg1',
+            importId: 'vimp_pg1',
+            observationDate: '2026-11-01',
+            platform: 'Perplexity',
+            brandMentions: 2,
+            productMentions: 1,
+            websiteClicks: 0,
+            discoveryTopic: 'z-topic',
+            topicPresence: 'specified',
+            evidenceSource: 'a.csv',
+            createdAt: new Date().toISOString(),
+          },
+          {
+            id: 'm_null',
+            workspaceId: 'ws_pg1',
+            importId: 'vimp_pg1',
+            observationDate: '2026-11-01',
+            platform: 'Perplexity',
+            brandMentions: 5,
+            productMentions: 2,
+            websiteClicks: 1,
+            discoveryTopic: null,
+            topicPresence: 'unspecified',
+            evidenceSource: 'a.csv',
+            createdAt: new Date().toISOString(),
+          },
+        ]
+      );
+
+      const lockCalls = executedSql.filter((e) => e.sql.includes("pg_advisory_xact_lock(hashtext('aixshop_vis')"));
+      assert.equal(lockCalls.length, 2);
+      // Sorted canonical keys ensure STR:z-topic vs __NULL__ lock deterministically in sorted order
+      assert.equal(lockCalls[0].params?.[0], 'ws_pg1::2026-11-01::Perplexity::STR:z-topic');
+      assert.equal(lockCalls[1].params?.[0], 'ws_pg1::2026-11-01::Perplexity::__NULL__');
+      const firstSelectIdx = executedSql.findIndex((e) => e.sql.includes('FROM ai_visibility_metrics'));
+      const lastLockIdx = executedSql.map((e) => e.sql).lastIndexOf(lockCalls[1].sql);
+      assert.ok(lastLockIdx < firstSelectIdx, 'Advisory locks must precede metric SELECT ... FOR UPDATE checks');
+
+      const pgConflict = new PostgresRepository(
+        makeMockPool({ id: 'old_m', import_id: 'vimp_other', brand_mentions: 5, product_mentions: 2, website_clicks: 1 })
+      );
+      await assert.rejects(
+        () =>
+          pgConflict.saveVisibilityImportAtomic(
+            {
+              id: 'vimp_pg2',
+              workspaceId: 'ws_pg1',
+              filename: 'conflict.csv',
+              contentHash: 'h_pg2',
+              rowCount: 1,
+              rejectedRowCount: 0,
+              status: 'completed',
+              errors: [],
+              reportingPeriodStart: '2026-11-01',
+              reportingPeriodEnd: '2026-11-01',
+              sourcePlatform: 'merchant_csv',
+              createdAt: new Date().toISOString(),
+            },
+            [
+              {
+                id: 'm_conf',
+                workspaceId: 'ws_pg1',
+                importId: 'vimp_pg2',
+                observationDate: '2026-11-01',
+                platform: 'Perplexity',
+                brandMentions: 99,
+                productMentions: 50,
+                websiteClicks: 10,
+                discoveryTopic: null,
+                topicPresence: 'unspecified',
+                evidenceSource: 'conflict.csv',
+                createdAt: new Date().toISOString(),
+              },
+            ]
+          ),
+        (err: any) => err instanceof VisibilityObservationConflictError && err.statusCode === 409
+      );
+    });
+
+    // -----------------------------------------------------------------------
+    // REMEDIATION B — Mandatory Catalog Version Guard
+    // -----------------------------------------------------------------------
+    test('RB1. PUT /api/catalog and POST /api/catalog/migrate-demo enforce expectedVersion (400 malformed, 409 missing/stale, single initialization winner)', async () => {
+      const repo = new MemoryRepository();
+      await repo.registerUser({
+        user: { id: 'u_rb1', email: 'rb1@example.com', passwordHash: 'h', fullName: 'RB1' },
+        workspace: { id: 'ws_rb1', name: 'WS RB1', slug: 'ws-rb1' },
+        session: {
+          id: 'sess_rb1',
+          sessionTokenHash: crypto.createHash('sha256').update('tok_rb1').digest('hex'),
+          userId: 'u_rb1',
+          activeWorkspaceId: 'ws_rb1',
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      const app = createApp(repo);
+      const { baseUrl, close } = await startTempAppServer(app);
+      try {
+        // 1. Concurrent unversioned initializers on empty catalog: ONLY ONE wins, other rejects 409
+        const initA = fetch(`${baseUrl}/api/catalog`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({ payload: buildSingleProductCatalog('p_init_a', 'SKU-A', 'Winner A') }),
+        });
+        const initB = fetch(`${baseUrl}/api/catalog`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({ payload: buildSingleProductCatalog('p_init_b', 'SKU-B', 'Loser B') }),
+        });
+        const [resInitA, resInitB] = await Promise.all([initA, initB]);
+        const initStatuses = [resInitA.status, resInitB.status].sort();
+        assert.deepEqual(initStatuses, [200, 409], 'Concurrent unversioned initialization must allow exactly 1 winner and reject loser 409');
+
+        const catRes = await fetch(`${baseUrl}/api/catalog`, {
+          headers: { Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+        });
+        const catBody = await catRes.json();
+        assert.equal(catBody.catalog.catalogVersion, 2);
+
+        // 2. Subsequent unversioned PUT rejected with 409 + authoritative currentVersion
+        const missingVerRes = await fetch(`${baseUrl}/api/catalog`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({ payload: buildSingleProductCatalog('p_no_ver', 'SKU-NOVER') }),
+        });
+        assert.equal(missingVerRes.status, 409);
+        const missingVerJson = await missingVerRes.json();
+        assert.equal(missingVerJson.code, 'CATALOG_VERSION_CONFLICT');
+        assert.equal(missingVerJson.currentVersion, 2);
+
+        // 3. Malformed expectedVersion values (0, -1, 1.5, 'bad', null) return 400 INVALID_CATALOG_VERSION
+        for (const badVer of [0, -1, 1.5, 'bad', null]) {
+          const badRes = await fetch(`${baseUrl}/api/catalog`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+            body: JSON.stringify({ expectedVersion: badVer, payload: buildEmptyCatalog() }),
+          });
+          assert.equal(badRes.status, 400, `Malformed expectedVersion ${String(badVer)} must return 400`);
+          const badJson = await badRes.json();
+          assert.equal(badJson.code, 'INVALID_CATALOG_VERSION');
+          assert.equal(badJson.currentVersion, 2);
+        }
+
+        // 4. Stale expectedVersion returns 409 + currentVersion
+        const staleRes = await fetch(`${baseUrl}/api/catalog`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({ expectedVersion: 1, payload: buildSingleProductCatalog('p_stale', 'SKU-STALE') }),
+        });
+        assert.equal(staleRes.status, 409);
+        const staleJson = await staleRes.json();
+        assert.equal(staleJson.code, 'CATALOG_VERSION_CONFLICT');
+        assert.equal(staleJson.currentVersion, 2);
+
+        // 5. Concurrent versioned PUT with same expectedVersion=2 -> 1 winner (version 3), 1 conflict (409)
+        const [conc1, conc2] = await Promise.all([
+          fetch(`${baseUrl}/api/catalog`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+            body: JSON.stringify({ expectedVersion: 2, payload: buildSingleProductCatalog('p_v3_a', 'SKU-V3A') }),
+          }),
+          fetch(`${baseUrl}/api/catalog`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+            body: JSON.stringify({ expectedVersion: 2, payload: buildSingleProductCatalog('p_v3_b', 'SKU-V3B') }),
+          }),
+        ]);
+        assert.deepEqual([conc1.status, conc2.status].sort(), [200, 409]);
+
+        // 6. POST /api/catalog/migrate-demo without expectedVersion rejects overwriting initialized catalog
+        const demoBlocked = await fetch(`${baseUrl}/api/catalog/migrate-demo`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({}),
+        });
+        assert.equal(demoBlocked.status, 409);
+
+        // With current expectedVersion=3 succeeds and bumps version to 4
+        const demoOk = await fetch(`${baseUrl}/api/catalog/migrate-demo`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok_rb1', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({ expectedVersion: 3 }),
+        });
+        assert.equal(demoOk.status, 200);
+        const demoOkJson = await demoOk.json();
+        assert.equal(demoOkJson.catalogVersion, 4);
+      } finally {
+        await close();
+      }
+    });
+
+    test('RB2. PostgresRepository enforces CatalogVersionValidationError and rejects missing expectedVersion on initialized stores', async () => {
+      const makeStorePool = (skuCount: number, version: number): any => ({
+        query: async () => ({ rows: [] }),
+        connect: async () => ({
+          query: async (sql: string) => {
+            if (sql.includes('FROM stores') && sql.includes('FOR UPDATE')) {
+              return {
+                rows: [
+                  {
+                    id: 'store_ws_rb2',
+                    tier: 'Free Audit',
+                    sku_limit: null,
+                    name: 'RB2 Store',
+                    domain: 'rb2.myshopify.com',
+                    currency: 'USD',
+                    sku_count: skuCount,
+                    catalog_completeness_avg: 80,
+                    truth_boundary_strictness: 'standard',
+                    connectors_json: '[]',
+                    catalog_version: version,
+                  },
+                ],
+              };
+            }
+            if (sql.includes('has_products')) {
+              return { rows: [{ has_products: skuCount > 0, has_findings: false, has_actions: false }] };
+            }
+            return { rows: [], rowCount: 1 };
+          },
+          release: () => {},
+        }),
+      });
+
+      const pgInit = new PostgresRepository(makeStorePool(2, 3));
+      await assert.rejects(
+        () => pgInit.saveWorkspaceCatalog('ws_rb2', buildEmptyCatalog()),
+        (err: any) => err instanceof CatalogVersionConflictError && err.currentVersion === 3
+      );
+      await assert.rejects(
+        () => pgInit.saveWorkspaceCatalog('ws_rb2', buildEmptyCatalog(), { expectedVersion: 0 }),
+        (err: any) => err instanceof CatalogVersionValidationError && err.statusCode === 400
+      );
+    });
+
+    // -----------------------------------------------------------------------
+    // REMEDIATION C — PostgreSQL Advisory Lock & Connection Pool Safety
+    // -----------------------------------------------------------------------
+    test('RC1. withWorkspaceLock works under pool.max=1 with nested lock/save/mutate/load, releases client before contention backoff, and destroys client if unlock fails', async () => {
+      // Simulate strict bounded pool (maxClients = 3) serving 12 concurrent workspaces cleanly
+      const MAX_POOL = 3;
+      let inUse = 0;
+      let peakInUse = 0;
+      const advisoryHeld = new Set<string>();
+      const clientQueries: string[] = [];
+
+      const createBoundedPool = (options: { failUnlock?: boolean; unlockReturnsFalse?: boolean } = {}) => {
+        const destroyedClients: number[] = [];
+        const releasedClients: number[] = [];
+        let nextClientId = 1;
+
+        const pool: any = {
+          connect: async () => {
+            const deadline = Date.now() + 2000;
+            while (inUse >= MAX_POOL) {
+              if (Date.now() > deadline) {
+                throw new Error('Pool exhausted: caller held client while sleeping or leaked client');
+              }
+              await new Promise((r) => setTimeout(r, 5));
+            }
+            inUse++;
+            peakInUse = Math.max(peakInUse, inUse);
+            const cid = nextClientId++;
+            const heldKeysOnClient = new Set<string>();
+            let released = false;
+
+            return {
+              query: async (sql: string, params?: any[]) => {
+                clientQueries.push(sql);
+                const key = String(params?.[0] || 'default');
+                if (sql.includes('pg_try_advisory_lock')) {
+                  if (advisoryHeld.has(key)) {
+                    return { rows: [{ locked: false }] };
+                  }
+                  advisoryHeld.add(key);
+                  heldKeysOnClient.add(key);
+                  return { rows: [{ locked: true }] };
+                }
+                if (sql.includes('pg_advisory_unlock')) {
+                  if (options.failUnlock) {
+                    throw new Error('connection terminated during unlock');
+                  }
+                  if (options.unlockReturnsFalse) {
+                    return { rows: [{ pg_advisory_unlock: false }] };
+                  }
+                  advisoryHeld.delete(key);
+                  heldKeysOnClient.delete(key);
+                  return { rows: [{ pg_advisory_unlock: true }] };
+                }
+                if (sql.includes('FROM stores') && sql.includes('FOR UPDATE')) {
+                  return {
+                    rows: [
+                      {
+                        id: `store_${key}`,
+                        tier: 'Free Audit',
+                        sku_limit: null,
+                        name: 'Mock Store',
+                        domain: 'mock.myshopify.com',
+                        currency: 'USD',
+                        sku_count: 0,
+                        catalog_completeness_avg: 0,
+                        truth_boundary_strictness: 'standard',
+                        connectors_json: '[]',
+                        catalog_version: 1,
+                      },
+                    ],
+                  };
+                }
+                if (sql.includes('FROM stores') && sql.includes('sku_count')) {
+                  return {
+                    rows: [
+                      {
+                        id: `store_${key}`,
+                        name: 'Mock Store',
+                        domain: 'mock.myshopify.com',
+                        currency: 'USD',
+                        skuCount: 0,
+                        skuLimit: null,
+                        catalogCompletenessAvg: 0,
+                        truthBoundaryStrictness: 'standard',
+                        tier: 'Free Audit',
+                        connectorsJson: [],
+                        catalogVersion: 1,
+                      },
+                    ],
+                  };
+                }
+                return { rows: [], rowCount: 1 };
+              },
+              release: (destroy?: boolean) => {
+                if (released) return;
+                released = true;
+                inUse--;
+                if (destroy) {
+                  for (const k of heldKeysOnClient) advisoryHeld.delete(k);
+                  destroyedClients.push(cid);
+                } else {
+                  releasedClients.push(cid);
+                }
+              },
+            };
+          },
+          destroyedClients,
+          releasedClients,
+        };
+        return pool;
+      };
+
+      // 1. Single-connection max=1 reentrant + nested save/load inside withWorkspaceLock without pool starvation
+      inUse = 0;
+      const singlePool: any = {
+        connect: async () => {
+          if (inUse >= 1) {
+            throw new Error('Pool max=1 violated: nested call attempted second checkout');
+          }
+          inUse++;
+          let released = false;
+          return {
+            query: async (sql: string, params?: any[]) => {
+              clientQueries.push(sql);
+              if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+              if (sql.includes('pg_advisory_unlock')) return { rows: [{ pg_advisory_unlock: true }] };
+              if (sql.includes('FROM stores') && sql.includes('FOR UPDATE')) {
+                return {
+                  rows: [
+                    {
+                      id: 'store_single',
+                      tier: 'Free Audit',
+                      sku_limit: null,
+                      name: 'Single Store',
+                      domain: 'single.myshopify.com',
+                      currency: 'USD',
+                      sku_count: 0,
+                      catalog_completeness_avg: 0,
+                      truth_boundary_strictness: 'standard',
+                      connectors_json: '[]',
+                      catalog_version: 1,
+                    },
+                  ],
+                };
+              }
+              if (sql.includes('FROM stores')) {
+                return {
+                  rows: [
+                    {
+                      id: 'store_single',
+                      name: 'Single Store',
+                      domain: 'single.myshopify.com',
+                      currency: 'USD',
+                      skuCount: 0,
+                      skuLimit: null,
+                      catalogCompletenessAvg: 0,
+                      truthBoundaryStrictness: 'standard',
+                      tier: 'Free Audit',
+                      connectorsJson: [],
+                      catalogVersion: 1,
+                    },
+                  ],
+                };
+              }
+              return { rows: [], rowCount: 1 };
+            },
+            release: () => {
+              if (!released) {
+                released = true;
+                inUse--;
+              }
+            },
+          };
+        },
+      };
+
+      const singleRepo = new PostgresRepository(singlePool);
+      const nestedResult = await singleRepo.withWorkspaceLock('ws_single', async () => {
+        // Same-workspace reentrant call must reuse held client and unlock only once on outer exit
+        const inner = await singleRepo.withWorkspaceLock('ws_single', async () => {
+          await singleRepo.saveWorkspaceCatalog('ws_single', buildEmptyCatalog('Single'));
+          return await singleRepo.loadWorkspaceCatalog('ws_single');
+        });
+        assert.ok(inner);
+        return 'ok';
+      });
+      assert.equal(nestedResult, 'ok');
+      assert.equal(inUse, 0);
+      assert.equal(clientQueries.filter((q) => q.includes('pg_try_advisory_lock')).length, 1);
+      assert.equal(clientQueries.filter((q) => q.includes('pg_advisory_unlock')).length, 1);
+
+      // 2. 12 concurrent workspaces (> pool max 3) + contented tasks on same workspace release client before 25ms backoff
+      inUse = 0;
+      peakInUse = 0;
+      advisoryHeld.clear();
+      const boundedPool = createBoundedPool();
+      const repoBounded = new PostgresRepository(boundedPool);
+
+      const multiWsTasks = Array.from({ length: 12 }, (_, idx) =>
+        repoBounded.withWorkspaceLock(`ws_conc_${idx % 4}`, async () => {
+          await new Promise((r) => setTimeout(r, 30));
+          return idx;
+        })
+      );
+      const multiResults = await Promise.all(multiWsTasks);
+      assert.equal(multiResults.length, 12);
+      assert.equal(inUse, 0);
+      assert.ok(peakInUse <= MAX_POOL, `Pool max ${MAX_POOL} respected; peak was ${peakInUse}`);
+      assert.equal(advisoryHeld.size, 0);
+
+      // 3. When pg_advisory_unlock fails or returns false, client.release(true) destroys session
+      inUse = 0;
+      advisoryHeld.clear();
+      const failUnlockPool = createBoundedPool({ failUnlock: true });
+      const repoFailUnlock = new PostgresRepository(failUnlockPool);
+      const valOnUnlockErr = await repoFailUnlock.withWorkspaceLock('ws_destroy_1', async () => 'done');
+      assert.equal(valOnUnlockErr, 'done');
+      assert.equal(failUnlockPool.destroyedClients.length, 1, 'Failed unlock MUST destroy pool client via release(true)');
+
+      inUse = 0;
+      advisoryHeld.clear();
+      const falseUnlockPool = createBoundedPool({ unlockReturnsFalse: true });
+      const repoFalseUnlock = new PostgresRepository(falseUnlockPool);
+      await assert.rejects(
+        () =>
+          repoFalseUnlock.withWorkspaceLock('ws_destroy_2', async () => {
+            throw new Error('inner error');
+          }),
+        /inner error/
+      );
+      assert.equal(
+        falseUnlockPool.destroyedClients.length,
+        1,
+        'Unlock returning false after callback throw MUST destroy pool client via release(true)'
+      );
+    });
+
+    // -----------------------------------------------------------------------
+    // REMEDIATION D — CI Dependency Installation Consistency
+    // -----------------------------------------------------------------------
+    test('RD1. CI postgres-integration workflow installs with bun --frozen-lockfile matching committed bun.lock', () => {
+      const ciPath = path.join(process.cwd(), '.github/workflows/ci.yml');
+      const bunLockPath = path.join(process.cwd(), 'bun.lock');
+      assert.ok(fs.existsSync(ciPath), '.github/workflows/ci.yml must exist');
+      assert.ok(fs.existsSync(bunLockPath), 'bun.lock must exist');
+      const ciContent = fs.readFileSync(ciPath, 'utf8');
+      assert.doesNotMatch(ciContent, /\bnpm ci\b/, 'CI must not invoke npm ci when package-lock.json is absent');
+      assert.match(ciContent, /oven-sh\/setup-bun/);
+      assert.match(ciContent, /bun install --frozen-lockfile/);
+    });
+
+    // -----------------------------------------------------------------------
+    // REMEDIATION E — Production Authentication Rate-Limit Failure Policy
+    // -----------------------------------------------------------------------
+    test('RE1. Production authRateLimiter fails closed (503) on storage outage by default, permits explicit fallback_local override, recovers cleanly, and keeps health probes secret-free', async () => {
+      // 1. Policy resolver verification
+      assert.equal(resolveAuthRateLimitFailurePolicy('production', undefined).mode, 'fail_closed');
+      assert.equal(resolveAuthRateLimitFailurePolicy('production', 'fallback_local').mode, 'fallback_local');
+      assert.equal(resolveAuthRateLimitFailurePolicy('development', undefined).mode, 'fallback_local');
+      assert.equal(resolveAuthRateLimitFailurePolicy('production', 'invalid_mode').valid, false);
+
+      // 2. Production default: storage outage fails closed with HTTP 503 on both /api/auth/login and /api/auth/register
+      process.env.NODE_ENV = 'production';
+      delete process.env.AUTH_RATE_LIMIT_FAILURE_MODE;
+
+      let storageShouldFail = true;
+      const outageRepo = new MemoryRepository();
+      const origConsume = outageRepo.consumeRateLimit.bind(outageRepo);
+      outageRepo.consumeRateLimit = async (key: string, max: number, windowMs: number) => {
+        if (storageShouldFail) {
+          throw new Error('PG pool timeout postgres://user:SECRET_DB_PASS@host/db');
+        }
+        return origConsume(key, max, windowMs);
+      };
+
+      const appFailClosed = createApp(outageRepo);
+      const srv1 = await startTempAppServer(appFailClosed);
+      try {
+        const loginOutage = await fetch(`${srv1.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'user@example.com', password: 'pw' }),
+        });
+        assert.equal(loginOutage.status, 503);
+        const loginJson = await loginOutage.json();
+        assert.equal(loginJson.code, 'RATE_LIMITER_UNAVAILABLE');
+
+        const regOutage = await fetch(`${srv1.baseUrl}/api/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'new@example.com', password: 'Password123!', fullName: 'N', workspaceName: 'W' }),
+        });
+        assert.equal(regOutage.status, 503);
+        const regJson = await regOutage.json();
+        assert.equal(regJson.code, 'RATE_LIMITER_UNAVAILABLE');
+
+        const healthOutage = await fetch(`${srv1.baseUrl}/api/health`);
+        const healthRaw = await healthOutage.text();
+        assert.doesNotMatch(healthRaw, /SECRET_DB_PASS|user@example\.com|127\.0\.0\.1/);
+        const healthParsed = JSON.parse(healthRaw);
+        assert.equal(healthParsed.authRateLimiter.policy, 'fail_closed');
+        assert.equal(healthParsed.authRateLimiter.storageDegraded, true);
+
+        // Recover shared storage -> requests work normally and diagnostics clear degraded flag
+        storageShouldFail = false;
+        const loginRecovered = await fetch(`${srv1.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'user@example.com', password: 'pw' }),
+        });
+        assert.equal(loginRecovered.status, 401);
+        const diagAfterRecovery = getAuthRateLimiterDiagnostics();
+        assert.equal(diagAfterRecovery.storageDegraded, false);
+        assert.ok(diagAfterRecovery.lastRecoveredAt);
+      } finally {
+        await srv1.close();
+      }
+
+      // 3. Explicit production override fallback_local falls back cleanly & marks degraded in health probe
+      _resetRateLimiter();
+      storageShouldFail = true;
+      process.env.AUTH_RATE_LIMIT_FAILURE_MODE = 'fallback_local';
+      const appFallback = createApp(outageRepo);
+      const srv2 = await startTempAppServer(appFallback);
+      try {
+        const resFallback = await fetch(`${srv2.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: 'override@example.com', password: 'pw' }),
+        });
+        assert.equal(resFallback.status, 401);
+
+        const readyRes = await fetch(`${srv2.baseUrl}/api/health/ready`);
+        const readyJson = await readyRes.json();
+        assert.equal(readyJson.authRateLimiter.policy, 'fallback_local');
+        assert.equal(readyJson.authRateLimiter.storageDegraded, true);
+      } finally {
+        await srv2.close();
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // REMEDIATION F — Public AI Studio Artifact Exposure Blocking
+    // -----------------------------------------------------------------------
+    test('RF1. /assets/aistudio/* artifacts and normalized bypass paths return 404 while files remain preserved on disk', async () => {
+      const aistudioDir = path.join(process.cwd(), 'public/assets/aistudio');
+      const diskFiles = fs.readdirSync(aistudioDir);
+      assert.ok(diskFiles.includes('Paste_November_14__2026_-_8_30PM_b6c0943e'));
+      assert.ok(diskFiles.includes('Allbirds_Shopify_products_fdd9af86.txt'));
+
+      const repo = new MemoryRepository();
+      const app = createApp(repo);
+      const { baseUrl, close } = await startTempAppServer(app);
+      try {
+        const probePaths = [
+          '/assets/aistudio/Paste_November_14__2026_-_8_30PM_b6c0943e',
+          '/assets/aistudio/Allbirds_Shopify_products_fdd9af86.txt',
+          '/assets/aistudio/Paste_November_13__2026_-_6_26PM_97202dde',
+          '/assets/%61istudio/Paste_November_12__2026_-_6_20PM_bdc47db1',
+          '/assets/foo/../aistudio/Allbirds_Shopify_products_fdd9af86.txt',
+        ];
+        for (const p of probePaths) {
+          const r = await fetch(`${baseUrl}${p}`);
+          assert.equal(r.status, 404, `Artifact path ${p} must return 404`);
+          const j = await r.json();
+          assert.equal(j.code, 'RESOURCE_NOT_FOUND');
+        }
+      } finally {
+        await close();
+      }
     });
   });
 });

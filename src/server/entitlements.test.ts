@@ -621,6 +621,8 @@ describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suit
         ...catalogB,
         products: [],
       });
+      const updatedCatalogB = await repo.loadWorkspaceCatalog(workspaceIdB);
+      assert.ok(updatedCatalogB);
 
       // Launch simultaneous POST /import (2 SKUs) and PUT /catalog (2 SKUs) -> combined 4 > 3
       const reqImport = fetch(`${baseUrl}/api/catalog/import`, {
@@ -646,8 +648,9 @@ describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suit
           'X-Requested-With': 'XMLHttpRequest',
         },
         body: JSON.stringify({
+          expectedVersion: updatedCatalogB.catalogVersion,
           payload: {
-            ...catalogB,
+            ...updatedCatalogB,
             products: [
               buildCandidateProduct('cross_batch_put1', ['SKU-XP-1']),
               buildCandidateProduct('cross_batch_put2', ['SKU-XP-2']),

@@ -71,12 +71,32 @@ export interface SchemaReadinessResult {
 export class CatalogVersionConflictError extends Error {
   public readonly code = 'CATALOG_VERSION_CONFLICT';
   public readonly statusCode = 409;
+  public readonly workspaceId: string;
+  public readonly expectedVersion: number | null;
+  public readonly currentVersion: number;
 
-  constructor(workspaceId: string, expectedVersion: number, actualVersion: number) {
+  constructor(workspaceId: string, expectedVersion: number | null, actualVersion: number) {
     super(
-      `Catalog snapshot conflict for workspace "${workspaceId}": expected version ${expectedVersion}, current authoritative version is ${actualVersion}.`
+      expectedVersion === null
+        ? `Catalog snapshot version guard required for workspace "${workspaceId}": missing expectedVersion, current authoritative version is ${actualVersion}.`
+        : `Catalog snapshot conflict for workspace "${workspaceId}": expected version ${expectedVersion}, current authoritative version is ${actualVersion}.`
     );
     this.name = 'CatalogVersionConflictError';
+    this.workspaceId = workspaceId;
+    this.expectedVersion = expectedVersion;
+    this.currentVersion = actualVersion;
+  }
+}
+
+export class CatalogVersionValidationError extends Error {
+  public readonly code = 'INVALID_CATALOG_VERSION';
+  public readonly statusCode = 400;
+  public readonly currentVersion?: number;
+
+  constructor(message: string, currentVersion?: number) {
+    super(message);
+    this.name = 'CatalogVersionValidationError';
+    this.currentVersion = currentVersion;
   }
 }
 

@@ -10,7 +10,8 @@ import {
   AuditRunRecord,
   CreateAuditRunData,
   UpdateAuditRunData,
-  CatalogVersionConflictError
+  CatalogVersionConflictError,
+  CatalogVersionValidationError
 } from './repository';
 import {
   TopicPresenceState,
@@ -601,8 +602,31 @@ export class MemoryRepository implements DatabaseRepository {
     }
 
     const currentVersion = this.catalogVersions.get(workspaceId) || 1;
-    if (options?.expectedVersion !== undefined && options.expectedVersion !== currentVersion) {
-      throw new CatalogVersionConflictError(workspaceId, options.expectedVersion, currentVersion);
+    const rawExpected = options?.expectedVersion !== undefined ? options.expectedVersion : payload.catalogVersion;
+    const existingCat = this.catalogs.get(workspaceId);
+    const hasExistingItems = Boolean(
+      existingCat &&
+        (existingCat.products.length > 0 ||
+          existingCat.variants.length > 0 ||
+          existingCat.offers.length > 0 ||
+          existingCat.findings.length > 0 ||
+          existingCat.actions.length > 0 ||
+          existingCat.evidence.length > 0)
+    );
+    const isUninitialized = !this.catalogVersions.has(workspaceId) && currentVersion === 1 && !hasExistingItems;
+
+    if (rawExpected !== undefined) {
+      if (typeof rawExpected !== 'number' || !Number.isInteger(rawExpected) || rawExpected < 1) {
+        throw new CatalogVersionValidationError(
+          'expectedVersion must be a positive integer.',
+          currentVersion
+        );
+      }
+      if (rawExpected !== currentVersion) {
+        throw new CatalogVersionConflictError(workspaceId, rawExpected, currentVersion);
+      }
+    } else if (!isUninitialized) {
+      throw new CatalogVersionConflictError(workspaceId, null, currentVersion);
     }
 
     const store = this.stores.get(workspaceId);
@@ -1612,6 +1636,42 @@ export class MemoryRepository implements DatabaseRepository {
   }
 
   private visibilityObservationHistory: VisibilityObservationHistoryRecord[] = [];
+  private visibilityKeyLocks: Map<string, Promise<unknown>> = new Map();
+
+  private async withVisibilityKeysLock<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+    if (keys.length === 0) {
+      return await fn();
+    }
+    const sortedKeys = Array.from(new Set(keys)).sort();
+    const releases: Array<() => void> = [];
+    const tails: Array<{ key: string; tail: Promise<void> }> = [];
+
+    for (const key of sortedKeys) {
+      const prevLock = this.visibilityKeyLocks.get(key) || Promise.resolve();
+      let releaseCurrent: () => void;
+      const currentTurnPromise = new Promise<void>((resolve) => {
+        releaseCurrent = resolve;
+      });
+      const tail = prevLock.catch(() => {}).then(() => currentTurnPromise);
+      this.visibilityKeyLocks.set(key, tail);
+      tails.push({ key, tail });
+      await prevLock.catch(() => {});
+      releases.push(releaseCurrent!);
+    }
+
+    try {
+      return await fn();
+    } finally {
+      for (const rel of releases.reverse()) {
+        rel();
+      }
+      for (const { key, tail } of tails) {
+        if (this.visibilityKeyLocks.get(key) === tail) {
+          this.visibilityKeyLocks.delete(key);
+        }
+      }
+    }
+  }
 
   private resolveTopicKey(metric: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord): {
     topicValue: string | null;
@@ -1624,6 +1684,12 @@ export class MemoryRepository implements DatabaseRepository {
       return { topicValue: '', topicPresence: metric.topicPresence || 'explicit_blank' };
     }
     return { topicValue: metric.discoveryTopic, topicPresence: metric.topicPresence || 'specified' };
+  }
+
+  private buildCanonicalVisibilityLockKey(metric: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord): string {
+    const { topicValue } = this.resolveTopicKey(metric);
+    const topicPart = topicValue === null ? '__NULL__' : `STR:${topicValue}`;
+    return `${metric.workspaceId}::${metric.observationDate}::${metric.platform}::${topicPart}`;
   }
 
   async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
@@ -1661,14 +1727,19 @@ export class MemoryRepository implements DatabaseRepository {
     replacedCount?: number;
   }> {
     const policy: VisibilityConflictPolicy = options.conflictPolicy || 'reject_on_conflict';
+    const lockKeys = [
+      ...(record.contentHash ? [`hash::${record.workspaceId}::${record.contentHash}`] : []),
+      ...metrics.map((m) => this.buildCanonicalVisibilityLockKey(m)),
+    ];
 
-    // Atomic duplicate hash check across concurrent callers
-    if (record.contentHash && (record.status || 'completed') === 'completed') {
-      const existingDup = await this.getVisibilityImportByHash(record.workspaceId, record.contentHash);
-      if (existingDup) {
-        return { importRecord: existingDup, metricsSaved: 0, duplicateImport: true };
+    return this.withVisibilityKeysLock(lockKeys, async () => {
+      // Atomic duplicate hash check across concurrent callers
+      if (record.contentHash && (record.status || 'completed') === 'completed') {
+        const existingDup = await this.getVisibilityImportByHash(record.workspaceId, record.contentHash);
+        if (existingDup) {
+          return { importRecord: existingDup, metricsSaved: 0, duplicateImport: true };
+        }
       }
-    }
 
     const prevImports = new Map(this.visibilityImports);
     const prevMetrics = JSON.parse(JSON.stringify(this.visibilityMetrics));
@@ -1769,6 +1840,7 @@ export class MemoryRepository implements DatabaseRepository {
       this.visibilityObservationHistory = prevHistory;
       throw err;
     }
+    });
   }
 
   async getVisibilityObservationHistory(

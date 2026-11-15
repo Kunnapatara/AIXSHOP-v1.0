@@ -508,7 +508,15 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
         ],
       };
 
-      await fetch(`${baseUrl}/api/catalog`, {
+      const preUpdateCatRes = await fetch(`${baseUrl}/api/catalog`, {
+        headers: {
+          'Authorization': `Bearer ${tenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      });
+      const preUpdateCatData = await preUpdateCatRes.json();
+
+      const putResB = await fetch(`${baseUrl}/api/catalog`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -516,6 +524,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
           'X-Requested-With': 'XMLHttpRequest',
         },
         body: JSON.stringify({
+          expectedVersion: preUpdateCatData.catalog.catalogVersion,
           payload: {
             products: [modifiedProduct],
             variants: modifiedProduct.variants,
@@ -527,6 +536,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
           },
         }),
       });
+      assert.equal(putResB.status, 200);
 
       // 4. Run Audit B
       const runResB = await fetch(`${baseUrl}/api/audit/run`, {
@@ -717,7 +727,15 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
         ],
       };
 
-      await fetch(`${baseUrl}/api/catalog`, {
+      const preCompareCatRes = await fetch(`${baseUrl}/api/catalog`, {
+        headers: {
+          'Authorization': `Bearer ${tenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      });
+      const preCompareCatData = await preCompareCatRes.json();
+
+      const putResComp = await fetch(`${baseUrl}/api/catalog`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -725,6 +743,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
           'X-Requested-With': 'XMLHttpRequest',
         },
         body: JSON.stringify({
+          expectedVersion: preCompareCatData.catalog.catalogVersion,
           payload: {
             products: [p1Updated],
             variants: p1Updated.variants,
@@ -736,6 +755,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
           },
         }),
       });
+      assert.equal(putResComp.status, 200);
 
       // Run Target Audit
       const targetRunRes = await fetch(`${baseUrl}/api/audit/run`, {

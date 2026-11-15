@@ -47,14 +47,20 @@ class ApiClient {
 
     if (!res.ok) {
       let errMsg = `Request failed with status ${res.status}`;
+      let body: any = null;
       try {
-        const body = await res.json();
-        if (body.error) errMsg = body.error;
+        body = await res.json();
+        if (body?.error) errMsg = body.error;
       } catch {
         // use default status message
       }
       const error: any = new Error(errMsg);
       error.status = res.status;
+      if (body && typeof body === 'object') {
+        if (body.code !== undefined) error.code = body.code;
+        if (body.currentVersion !== undefined) error.currentVersion = body.currentVersion;
+        if (body.expectedVersion !== undefined) error.expectedVersion = body.expectedVersion;
+      }
       throw error;
     }
 
@@ -108,10 +114,16 @@ class ApiClient {
     return this.request<{ workspaceId: string; catalog: StoragePayloadV1 }>('/api/catalog');
   }
 
-  async saveCatalog(payload: StoragePayloadV1): Promise<{ success: boolean; skuCount: number; timestamp: string }> {
-    return this.request<{ success: boolean; skuCount: number; timestamp: string }>('/api/catalog', {
+  async saveCatalog(
+    payload: StoragePayloadV1,
+    expectedVersion?: number
+  ): Promise<{ success: boolean; skuCount: number; catalogVersion?: number; timestamp: string }> {
+    const resolvedExpected = expectedVersion !== undefined ? expectedVersion : payload.catalogVersion;
+    return this.request<{ success: boolean; skuCount: number; catalogVersion?: number; timestamp: string }>('/api/catalog', {
       method: 'PUT',
-      body: JSON.stringify({ payload }),
+      body: JSON.stringify(
+        resolvedExpected !== undefined ? { payload, expectedVersion: resolvedExpected } : { payload }
+      ),
     });
   }
 
@@ -141,9 +153,12 @@ class ApiClient {
     });
   }
 
-  async migrateDemoData(): Promise<{ success: boolean; message: string; skuCount: number }> {
-    return this.request<{ success: boolean; message: string; skuCount: number }>('/api/catalog/migrate-demo', {
+  async migrateDemoData(
+    expectedVersion?: number
+  ): Promise<{ success: boolean; message: string; skuCount: number; catalogVersion?: number }> {
+    return this.request<{ success: boolean; message: string; skuCount: number; catalogVersion?: number }>('/api/catalog/migrate-demo', {
       method: 'POST',
+      body: JSON.stringify(expectedVersion !== undefined ? { expectedVersion } : {}),
     });
   }
 

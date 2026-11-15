@@ -110,6 +110,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [storageLoadResult, setStorageLoadResult] = useState<StorageLoadResult | null>(null);
 
   const isInitializedRef = useRef<boolean>(false);
+  const catalogVersionRef = useRef<number | undefined>(undefined);
 
   // Check auth context safely (null if outside AuthProvider in test environments)
   let authContext: any = null;
@@ -170,6 +171,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   // Hydrate: Cloud API if authenticated in active workspace; otherwise local storage adapter
   useEffect(() => {
     if (!isCloudWorkspace) {
+      catalogVersionRef.current = undefined;
       if (!isInitializedRef.current) {
         isInitializedRef.current = true;
         const result = storageAdapter.load();
@@ -214,6 +216,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       try {
         const res = await apiClient.getCatalog();
         if (isCancelled) return;
+        catalogVersionRef.current = res.catalog.catalogVersion;
         setProducts(res.catalog.products);
         setFindings(res.catalog.findings);
         setActionItems(res.catalog.actions);
@@ -334,6 +337,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         const res = await apiClient.importCatalog(lastIngestionResult.candidateProducts);
         if (res.success && res.result) {
           const catRes = await apiClient.getCatalog();
+          catalogVersionRef.current = catRes.catalog.catalogVersion;
           setProducts(catRes.catalog.products);
           setFindings(catRes.catalog.findings);
           setActionItems(catRes.catalog.actions);
@@ -581,20 +585,37 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
     if (isCloudWorkspace) {
       try {
-        const saveRes = await apiClient.saveCatalog({
-          products: res.nextProducts,
-          variants: res.nextProducts.flatMap(p => p.variants || []),
-          offers: res.nextProducts.flatMap(p => p.offers || []),
-          findings,
-          actions: actionItems,
-          evidence: res.nextProducts.flatMap(p => p.evidenceDocuments || []),
-          storeProfile,
-        });
+        const expectedVersion = catalogVersionRef.current;
+        const saveRes = await apiClient.saveCatalog(
+          {
+            products: res.nextProducts,
+            variants: res.nextProducts.flatMap(p => p.variants || []),
+            offers: res.nextProducts.flatMap(p => p.offers || []),
+            findings,
+            actions: actionItems,
+            evidence: res.nextProducts.flatMap(p => p.evidenceDocuments || []),
+            storeProfile,
+            catalogVersion: expectedVersion,
+          },
+          expectedVersion
+        );
         if (!saveRes.success) {
           addToast('Persistence Failed', 'Could not persist product audit to cloud database.', 'error');
           return;
         }
+        if (typeof saveRes.catalogVersion === 'number') {
+          catalogVersionRef.current = saveRes.catalogVersion;
+        }
       } catch (err: any) {
+        if (err.status === 409 || err.code === 'CATALOG_VERSION_CONFLICT') {
+          await reloadWorkspaceCatalog();
+          addToast(
+            'Catalog Updated Remotely',
+            'Another change updated this workspace catalog. Reloaded the latest server state—please retry.',
+            'warning'
+          );
+          return;
+        }
         addToast('Persistence Failed', err.message || 'Could not persist product audit to cloud database.', 'error');
         return;
       }
@@ -729,6 +750,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       const res = await apiClient.migrateDemoData();
       if (res.success) {
         const catRes = await apiClient.getCatalog();
+        catalogVersionRef.current = catRes.catalog.catalogVersion;
         setProducts(catRes.catalog.products);
         setFindings(catRes.catalog.findings);
         setActionItems(catRes.catalog.actions);
@@ -752,6 +774,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       try {
         const res = await apiClient.runAudit();
         if (res.success && res.catalog) {
+          catalogVersionRef.current = res.catalog.catalogVersion;
           setProducts(res.catalog.products);
           setFindings(res.catalog.findings);
           setActionItems(res.catalog.actions);
@@ -823,6 +846,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     if (isCloudWorkspace) {
       try {
         const res = await apiClient.getCatalog();
+        catalogVersionRef.current = res.catalog.catalogVersion;
         setProducts(res.catalog.products);
         setFindings(res.catalog.findings);
         setActionItems(res.catalog.actions);

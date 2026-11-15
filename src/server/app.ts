@@ -1,3 +1,4 @@
+import path from 'path';
 import express, { Express } from 'express';
 import cookieParser from 'cookie-parser';
 import { DatabaseRepository } from './db/repository';
@@ -12,8 +13,31 @@ import { createDiscoveryRoutes } from './routes/discoveryRoutes';
 import { createBusinessProfileRoutes } from './routes/businessProfileRoutes';
 import { createFeedRoutes } from './routes/feedRoutes';
 import { createVisibilityRoutes } from './routes/visibilityRoutes';
-import { csrfProtection } from './middleware/auth';
+import { csrfProtection, getAuthRateLimiterDiagnostics } from './middleware/auth';
 import { parseTrustProxySetting, validateProductionConfig } from './config/productionConfig';
+
+/**
+ * Blocks public HTTP access to unreferenced internal AI Studio prompt/attachment artifacts
+ * under /assets/aistudio/* before dev Vite middleware or production static/SPA handlers run.
+ * Does not mutate or delete any files on disk.
+ */
+export function blockInternalPromptArtifactsMiddleware(req: any, res: any, next: any) {
+  const rawPath = String(req.path || req.originalUrl?.split('?')[0] || '');
+  let decodedPath = rawPath;
+  try {
+    decodedPath = decodeURIComponent(rawPath);
+  } catch {
+    decodedPath = rawPath;
+  }
+  const normalized = path.posix.normalize(decodedPath.replace(/\\/g, '/'));
+  if (/^\/+assets\/aistudio(\/|$)/i.test(normalized) || /\/Paste_November_/i.test(normalized)) {
+    return res.status(404).json({
+      error: 'Not found',
+      code: 'RESOURCE_NOT_FOUND',
+    });
+  }
+  return next();
+}
 
 export function createApp(customRepo?: DatabaseRepository): Express {
   const app = express();
@@ -21,6 +45,8 @@ export function createApp(customRepo?: DatabaseRepository): Express {
 
   const proxyConfig = parseTrustProxySetting();
   app.set('trust proxy', proxyConfig.value);
+
+  app.use(blockInternalPromptArtifactsMiddleware);
 
   // Narrowly scoped raw-body capture for billing and Shopify webhook routes
   // Preserves exact original request bytes for HMAC signature verification
@@ -138,6 +164,7 @@ export function createApp(customRepo?: DatabaseRepository): Express {
         environment: configValidation.environment,
         ...(configValidation.missingOrInvalid.length > 0 ? { missingOrInvalid: configValidation.missingOrInvalid } : {}),
       },
+      authRateLimiter: getAuthRateLimiterDiagnostics(),
       timestamp: new Date().toISOString(),
     });
   });
@@ -175,6 +202,7 @@ export function createApp(customRepo?: DatabaseRepository): Express {
         environment: configValidation.environment,
         ...(configValidation.missingOrInvalid.length > 0 ? { missingOrInvalid: configValidation.missingOrInvalid } : {}),
       },
+      authRateLimiter: getAuthRateLimiterDiagnostics(),
       timestamp: new Date().toISOString(),
     });
   });

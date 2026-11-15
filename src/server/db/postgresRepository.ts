@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Pool, PoolClient } from 'pg';
 import { 
   DatabaseRepository, 
@@ -12,12 +13,14 @@ import {
   AuditRunRecord,
   CreateAuditRunData,
   UpdateAuditRunData,
-  CatalogVersionConflictError
+  CatalogVersionConflictError,
+  CatalogVersionValidationError
 } from './repository';
 import { computeMigrationChecksum, getDefaultMigrationsDir } from './migrate';
 import {
   TopicPresenceState,
   VisibilityConflictPolicy,
+  VisibilityMetricRecord,
   VisibilityObservationConflict,
   VisibilityObservationConflictError,
   VisibilityObservationHistoryRecord,
@@ -51,8 +54,22 @@ import {
   PlanQuotaExceededError 
 } from '../services/entitlementService';
 
+class VisibilityDuplicateHashSentinel extends Error {
+  constructor() {
+    super('Duplicate visibility import content hash');
+  }
+}
+
+interface WorkspaceLockContext {
+  client: PoolClient;
+  heldWorkspaceLocks: Set<string>;
+  inTransaction: boolean;
+  savepointDepth: number;
+}
+
 export class PostgresRepository implements DatabaseRepository {
   private pool: Pool;
+  private lockStorage = new AsyncLocalStorage<WorkspaceLockContext>();
 
   constructor(pool: Pool) {
     this.pool = pool;
@@ -66,9 +83,80 @@ export class PostgresRepository implements DatabaseRepository {
     await this.pool.end();
   }
 
+  private getActiveClient(): PoolClient | null {
+    return this.lockStorage.getStore()?.client ?? null;
+  }
+
+  private async query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[]; rowCount: number | null }> {
+    const activeClient = this.getActiveClient();
+    if (activeClient) {
+      return activeClient.query(sql, params) as any;
+    }
+    return this.pool.query(sql, params) as any;
+  }
+
+  private async withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    const ctx = this.lockStorage.getStore();
+    if (ctx) {
+      if (!ctx.inTransaction) {
+        ctx.inTransaction = true;
+        await ctx.client.query('BEGIN');
+        try {
+          const result = await fn(ctx.client);
+          await ctx.client.query('COMMIT');
+          return result;
+        } catch (err) {
+          try {
+            await ctx.client.query('ROLLBACK');
+          } catch (rollbackErr) {
+            console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+          }
+          throw err;
+        } finally {
+          ctx.inTransaction = false;
+        }
+      } else {
+        ctx.savepointDepth += 1;
+        const spName = `aixshop_sp_${ctx.savepointDepth}`;
+        await ctx.client.query(`SAVEPOINT ${spName}`);
+        try {
+          const result = await fn(ctx.client);
+          await ctx.client.query(`RELEASE SAVEPOINT ${spName}`);
+          return result;
+        } catch (err) {
+          try {
+            await ctx.client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
+          } catch (rollbackErr) {
+            console.error('[AIXSHOP Database] Savepoint rollback failed:', rollbackErr);
+          }
+          throw err;
+        } finally {
+          ctx.savepointDepth -= 1;
+        }
+      }
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async ping(): Promise<boolean> {
     try {
-      const res = await this.pool.query('SELECT 1');
+      const res = await this.query('SELECT 1');
       return res.rowCount !== null && res.rowCount > 0;
     } catch {
       return false;
@@ -644,7 +732,7 @@ export class PostgresRepository implements DatabaseRepository {
     windowMs: number
   ): Promise<{ allowed: boolean; count: number; resetAt: number }> {
     const safeWindowMs = Math.max(1000, windowMs);
-    const res = await this.pool.query<{ attempt_count: number; reset_at: string | Date }>(
+    const res = await this.query<{ attempt_count: number; reset_at: string | Date }>(
       `INSERT INTO auth_rate_limits (rate_key, attempt_count, reset_at, updated_at)
        VALUES ($1, 1, clock_timestamp() + ($2 * INTERVAL '1 millisecond'), clock_timestamp())
        ON CONFLICT (rate_key) DO UPDATE SET
@@ -663,16 +751,14 @@ export class PostgresRepository implements DatabaseRepository {
 
     // Opportunistic bounded purge of expired keys (~5% chance) to keep table compact without creating write storms
     if (Math.random() < 0.05) {
-      await this.pool
-        .query(
-          `DELETE FROM auth_rate_limits
-           WHERE ctid IN (
-             SELECT ctid FROM auth_rate_limits
-             WHERE reset_at < clock_timestamp()
-             LIMIT 200
-           )`
-        )
-        .catch(() => {});
+      await this.query(
+        `DELETE FROM auth_rate_limits
+         WHERE ctid IN (
+           SELECT ctid FROM auth_rate_limits
+           WHERE reset_at < clock_timestamp()
+           LIMIT 200
+         )`
+      ).catch(() => {});
     }
 
     const row = res.rows[0];
@@ -686,9 +772,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async registerUser(data: RegisterUserData): Promise<RegisterUserResult> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    return this.withTransaction(async (client) => {
 
       // 1. Insert user
       const userRes = await client.query(
@@ -768,18 +852,8 @@ export class PostgresRepository implements DatabaseRepository {
       );
       const session: SessionRecord = sessRes.rows[0];
 
-      await client.query('COMMIT');
       return { user, workspace, membership, session };
-    } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error('[AIXSHOP Database] Registration rollback failed:', rollbackErr);
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async createUser(data: CreateUserData): Promise<UserRecord> {
@@ -788,7 +862,7 @@ export class PostgresRepository implements DatabaseRepository {
       VALUES ($1, $2, $3, $4, NOW(), NOW())
       RETURNING id, email, password_hash AS "passwordHash", full_name AS "fullName", created_at AS "createdAt", updated_at AS "updatedAt"
     `;
-    const res = await this.pool.query(query, [data.id, data.email, data.passwordHash, data.fullName]);
+    const res = await this.query(query, [data.id, data.email, data.passwordHash, data.fullName]);
     return res.rows[0];
   }
 
@@ -799,7 +873,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE LOWER(email) = LOWER($1)
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [email]);
+    const res = await this.query(query, [email]);
     return res.rows[0] || null;
   }
 
@@ -810,7 +884,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE id = $1
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [id]);
+    const res = await this.query(query, [id]);
     return res.rows[0] || null;
   }
 
@@ -818,9 +892,7 @@ export class PostgresRepository implements DatabaseRepository {
     data: CreateWorkspaceData, 
     ownerUserId: string
   ): Promise<{ workspace: WorkspaceRecord; membership: WorkspaceMembershipRecord }> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    return this.withTransaction(async (client) => {
       const wsQuery = `
         INSERT INTO workspaces (id, name, slug, created_at, updated_at)
         VALUES ($1, $2, $3, NOW(), NOW())
@@ -847,14 +919,8 @@ export class PostgresRepository implements DatabaseRepository {
       `;
       await client.query(storeQuery, [storeId, workspace.id, `${workspace.name} Store`, `${workspace.slug}.myshopify.com`]);
 
-      await client.query('COMMIT');
       return { workspace, membership };
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async getWorkspaceById(workspaceId: string): Promise<WorkspaceRecord | null> {
@@ -864,7 +930,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE id = $1
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [workspaceId]);
+    const res = await this.query(query, [workspaceId]);
     return res.rows[0] || null;
   }
 
@@ -876,7 +942,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE m.user_id = $1
       ORDER BY w.created_at ASC
     `;
-    const res = await this.pool.query(query, [userId]);
+    const res = await this.query(query, [userId]);
     return res.rows;
   }
 
@@ -887,7 +953,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE workspace_id = $1 AND user_id = $2
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [workspaceId, userId]);
+    const res = await this.query(query, [workspaceId, userId]);
     return res.rows[0] || null;
   }
 
@@ -897,7 +963,7 @@ export class PostgresRepository implements DatabaseRepository {
       VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), $6, $7)
       RETURNING id, session_token_hash AS "sessionTokenHash", user_id AS "userId", active_workspace_id AS "activeWorkspaceId", expires_at AS "expiresAt", created_at AS "createdAt", last_active_at AS "lastActiveAt", ip_address AS "ipAddress", user_agent AS "userAgent"
     `;
-    const res = await this.pool.query(query, [
+    const res = await this.query(query, [
       data.id,
       data.sessionTokenHash,
       data.userId,
@@ -916,20 +982,20 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE session_token_hash = $1 AND expires_at > NOW()
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [tokenHash]);
+    const res = await this.query(query, [tokenHash]);
     return res.rows[0] || null;
   }
 
   async deleteSession(tokenHash: string): Promise<void> {
-    await this.pool.query('DELETE FROM sessions WHERE session_token_hash = $1', [tokenHash]);
+    await this.query('DELETE FROM sessions WHERE session_token_hash = $1', [tokenHash]);
   }
 
   async deleteUserSessions(userId: string): Promise<void> {
-    await this.pool.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+    await this.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
   }
 
   async updateSessionWorkspace(sessionId: string, newWorkspaceId: string): Promise<void> {
-    await this.pool.query(
+    await this.query(
       'UPDATE sessions SET active_workspace_id = $1, last_active_at = NOW() WHERE id = $2',
       [newWorkspaceId, sessionId]
     );
@@ -942,7 +1008,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE workspace_id = $1
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [workspaceId]);
+    const res = await this.query(query, [workspaceId]);
     if (!res.rows[0]) return null;
     const r = res.rows[0];
     const parsedLimit = (typeof r.skuLimit === 'number' && !isNaN(r.skuLimit)) ? r.skuLimit : undefined;
@@ -983,7 +1049,7 @@ export class PostgresRepository implements DatabaseRepository {
         updated_at = NOW()
       RETURNING name, domain, currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
     `;
-    const res = await this.pool.query(query, [
+    const res = await this.query(query, [
       storeId,
       workspaceId,
       profile.name,
@@ -1362,18 +1428,36 @@ export class PostgresRepository implements DatabaseRepository {
   ): Promise<T> {
     const lockTimeoutMs = Math.max(250, options.lockTimeoutMs ?? 30_000);
     const deadline = Date.now() + lockTimeoutMs;
-    const client = await this.pool.connect();
-    let acquired = false;
 
-    try {
+    const existingCtx = this.lockStorage.getStore();
+    if (existingCtx) {
+      if (existingCtx.heldWorkspaceLocks.has(workspaceId)) {
+        return await fn();
+      }
+
       while (true) {
-        const res = await client.query<{ locked: boolean }>(
+        const res = await existingCtx.client.query<{ locked: boolean }>(
           `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
           [workspaceId]
         );
         if (res.rows[0]?.locked) {
-          acquired = true;
-          break;
+          existingCtx.heldWorkspaceLocks.add(workspaceId);
+          try {
+            return await fn();
+          } finally {
+            existingCtx.heldWorkspaceLocks.delete(workspaceId);
+            const unlockRes = await existingCtx.client
+              .query<{ pg_advisory_unlock: boolean }>(
+                `SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1)) AS pg_advisory_unlock`,
+                [workspaceId]
+              )
+              .catch(() => ({ rows: [{ pg_advisory_unlock: false }] }));
+            if (unlockRes.rows[0] && unlockRes.rows[0].pg_advisory_unlock === false) {
+              console.error(
+                `[AIXSHOP Workspace Lock] Failed to release nested PostgreSQL advisory lock for workspace "${workspaceId}".`
+              );
+            }
+          }
         }
         if (Date.now() >= deadline) {
           throw new Error(
@@ -1382,24 +1466,78 @@ export class PostgresRepository implements DatabaseRepository {
         }
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
+    }
 
-      return await fn();
-    } finally {
-      if (acquired) {
-        await client
-          .query(`SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1))`, [workspaceId])
-          .catch(() => {});
+    while (true) {
+      const client = await this.pool.connect();
+      let lockAcquiredNow = false;
+      try {
+        const res = await client.query<{ locked: boolean }>(
+          `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
+          [workspaceId]
+        );
+        lockAcquiredNow = Boolean(res.rows[0]?.locked);
+        if (!lockAcquiredNow) {
+          // Release connection immediately before backing off so waiters cannot exhaust the pool
+          client.release();
+        } else {
+          let destroyClient = false;
+          try {
+            return await this.lockStorage.run(
+              {
+                client,
+                heldWorkspaceLocks: new Set([workspaceId]),
+                inTransaction: false,
+                savepointDepth: 0,
+              },
+              fn
+            );
+          } finally {
+            try {
+              const unlockRes = await client.query<{ pg_advisory_unlock: boolean }>(
+                `SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1)) AS pg_advisory_unlock`,
+                [workspaceId]
+              );
+              if (unlockRes.rows[0] && unlockRes.rows[0].pg_advisory_unlock === false) {
+                destroyClient = true;
+              }
+            } catch {
+              destroyClient = true;
+            }
+            if (destroyClient) {
+              (client.release as any)(true);
+            } else {
+              client.release();
+            }
+          }
+        }
+      } catch (err) {
+        if (!lockAcquiredNow) {
+          try {
+            client.release();
+          } catch {
+            // ignore already released
+          }
+        }
+        throw err;
       }
-      client.release();
+
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `[AIXSHOP Workspace Lock] Timed out after ${lockTimeoutMs}ms waiting for distributed PostgreSQL lock on workspace "${workspaceId}".`
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
 
   async loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null> {
     const store = await this.getStoreByWorkspace(workspaceId);
     if (!store) return null;
-    const catalog = await this.loadCatalogRows(this.pool, workspaceId, store);
+    const queryable = this.getActiveClient() || this.pool;
+    const catalog = await this.loadCatalogRows(queryable, workspaceId, store);
     try {
-      const verRes = await this.pool.query<{ catalog_version: number }>(
+      const verRes = await this.query<{ catalog_version: number }>(
         'SELECT catalog_version FROM stores WHERE workspace_id = $1 LIMIT 1',
         [workspaceId]
       );
@@ -1417,9 +1555,7 @@ export class PostgresRepository implements DatabaseRepository {
     payload: StoragePayloadV1,
     options?: { expectedVersion?: number }
   ): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    return this.withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
       const storeId = `store_${workspaceId}`;
 
@@ -1475,8 +1611,41 @@ export class PostgresRepository implements DatabaseRepository {
       };
 
       const currentVersion = Number(lockedRow.catalog_version ?? 1);
-      if (options?.expectedVersion !== undefined && options.expectedVersion !== currentVersion) {
-        throw new CatalogVersionConflictError(workspaceId, options.expectedVersion, currentVersion);
+      const rawExpected = options?.expectedVersion !== undefined ? options.expectedVersion : payload.catalogVersion;
+
+      if (rawExpected !== undefined) {
+        if (typeof rawExpected !== 'number' || !Number.isInteger(rawExpected) || rawExpected < 1) {
+          throw new CatalogVersionValidationError(
+            'Invalid catalog expectedVersion: must be a positive integer (>= 1).',
+            currentVersion
+          );
+        }
+        if (rawExpected !== currentVersion) {
+          throw new CatalogVersionConflictError(workspaceId, rawExpected, currentVersion);
+        }
+      } else {
+        // Missing expectedVersion is only permitted once when initializing an empty/uninitialized catalog
+        let hasExistingItems = Number(lockedRow.sku_count || 0) > 0 || currentVersion > 1;
+        if (!hasExistingItems) {
+          const existsRes = await client.query<{
+            has_products: boolean;
+            has_findings: boolean;
+            has_actions: boolean;
+          }>(
+            `SELECT
+               EXISTS(SELECT 1 FROM products WHERE workspace_id = $1) AS has_products,
+               EXISTS(SELECT 1 FROM findings WHERE workspace_id = $1) AS has_findings,
+               EXISTS(SELECT 1 FROM action_items WHERE workspace_id = $1) AS has_actions`,
+            [workspaceId]
+          );
+          const row = existsRes.rows[0];
+          if (row && (row.has_products || row.has_findings || row.has_actions)) {
+            hasExistingItems = true;
+          }
+        }
+        if (hasExistingItems) {
+          throw new CatalogVersionConflictError(workspaceId, null, currentVersion);
+        }
       }
 
       const authoritativeStore: StoreProfile = {
@@ -1500,18 +1669,7 @@ export class PostgresRepository implements DatabaseRepository {
 
       // 3. Persist rows under the lock
       await this.saveCatalogRows(client, workspaceId, payload, storeId, authoritativeStore);
-
-      await client.query('COMMIT');
-    } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async mutateWorkspaceCatalog<T>(
@@ -1532,9 +1690,7 @@ export class PostgresRepository implements DatabaseRepository {
     ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T },
     options: { createStoreIfMissing?: boolean } = {}
   ): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    return this.withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
       const storeId = `store_${workspaceId}`;
 
@@ -1616,19 +1772,8 @@ export class PostgresRepository implements DatabaseRepository {
         await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, authoritativeStore);
       }
 
-      // 6. Commit
-      await client.query('COMMIT');
       return result;
-    } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   async approveAction(
@@ -1733,9 +1878,7 @@ export class PostgresRepository implements DatabaseRepository {
     workspaceId: string,
     candidates: any[]
   ): Promise<CatalogImportResult> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    return this.withTransaction(async (client) => {
       const storeId = `store_${workspaceId}`;
 
       // 1. Consistent lock order: Acquire row-level lock on stores table
@@ -1837,23 +1980,13 @@ export class PostgresRepository implements DatabaseRepository {
         );
       }
 
-      await client.query('COMMIT');
       return importRes;
-    } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   // Billing & Subscriptions
   async getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM subscriptions
        WHERE workspace_id = $1`,
@@ -1864,7 +1997,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getSubscriptionBySubscriptionId(subscriptionId: string): Promise<SubscriptionRecord | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId", tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd", cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM subscriptions
        WHERE subscription_id = $1`,
@@ -1875,7 +2008,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveSubscription(subscription: SubscriptionRecord): Promise<SubscriptionRecord> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `INSERT INTO subscriptions (id, workspace_id, provider, customer_id, subscription_id, tier, status, current_period_start, current_period_end, cancel_at_period_end, last_event_created, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
        ON CONFLICT (workspace_id) DO UPDATE SET
@@ -1908,7 +2041,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getBillingEventById(eventId: string): Promise<BillingEventRecord | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
               payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
               attempt_count AS "attemptCount", processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
@@ -1926,7 +2059,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveBillingEvent(event: BillingEventRecord): Promise<void> {
-    await this.pool.query(
+    await this.query(
       `INSERT INTO billing_events (
          id, provider, event_id, event_type, idempotency_key, payload_json, status,
          lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
@@ -1959,14 +2092,10 @@ export class PostgresRepository implements DatabaseRepository {
     event: BillingEventRecord,
     leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
   ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }> {
-    // Atomic insert-or-claim query with explicit durable lease ownership and expiration:
-    // 1. If row does not exist, inserts with status='processing', unique lease_owner, lease_expires_at, attempt_count=1.
-    // 2. If row exists and status='failed', or status='processing' whose lease_expires_at has elapsed (or legacy >5m), atomically steals/claims lease.
-    // 3. Otherwise returns 0 rows so active workers never overlap.
     const leaseDurationMs = Math.max(50, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
     const leaseOwner = leaseOptions?.leaseOwner || `worker_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `INSERT INTO billing_events (
          id, provider, event_id, event_type, idempotency_key, payload_json, status,
          lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
@@ -2025,7 +2154,7 @@ export class PostgresRepository implements DatabaseRepository {
     extendMs: number = 5 * 60 * 1000
   ): Promise<boolean> {
     const safeExtendMs = Math.max(50, extendMs);
-    const res = await this.pool.query<{ id: string }>(
+    const res = await this.query<{ id: string }>(
       `UPDATE billing_events
        SET lease_expires_at = clock_timestamp() + ($3 * INTERVAL '1 millisecond'),
            updated_at = clock_timestamp()
@@ -2070,7 +2199,7 @@ export class PostgresRepository implements DatabaseRepository {
         )`;
     }
 
-    const res = await this.pool.query(
+    const res = await this.query(
       `UPDATE billing_events
        SET ${setClauses.join(', ')}
        ${whereClause}`,
@@ -2089,10 +2218,7 @@ export class PostgresRepository implements DatabaseRepository {
     markProcessed?: boolean;
     leaseOwner?: string;
   }): Promise<void> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-
+    return this.withTransaction(async (client) => {
       // 0. Lock and verify billing event lease ownership and live wall-clock clock_timestamp() BEFORE applying entitlement changes
       if (params.leaseOwner) {
         const lockRes = await client.query<{
@@ -2192,14 +2318,7 @@ export class PostgresRepository implements DatabaseRepository {
           throw new Error(`Billing lease ownership lost or expired during commit for event ${params.eventId}.`);
         }
       }
-
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    });
   }
 
   // Catalog Audit Runs
@@ -2209,7 +2328,7 @@ export class PostgresRepository implements DatabaseRepository {
       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, NOW(), NOW())
       RETURNING id, workspace_id AS "workspaceId", status, products_evaluated AS "productsEvaluated", rules_evaluated AS "rulesEvaluated", findings_count AS "findingsCount", summary_json AS "summaryJson", metadata_json AS "metadataJson", error_message AS "errorMessage", started_at AS "startedAt", completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"
     `;
-    const res = await this.pool.query(query, [
+    const res = await this.query(query, [
       data.id,
       data.workspaceId,
       data.status,
@@ -2282,7 +2401,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE id = $1
       RETURNING id, workspace_id AS "workspaceId", status, products_evaluated AS "productsEvaluated", rules_evaluated AS "rulesEvaluated", findings_count AS "findingsCount", summary_json AS "summaryJson", metadata_json AS "metadataJson", error_message AS "errorMessage", started_at AS "startedAt", completed_at AS "completedAt", created_at AS "createdAt", updated_at AS "updatedAt"
     `;
-    const res = await this.pool.query(query, values);
+    const res = await this.query(query, values);
     if (!res.rows[0]) throw new Error(`Audit run ${id} not found`);
     const r = res.rows[0];
     return {
@@ -2309,7 +2428,7 @@ export class PostgresRepository implements DatabaseRepository {
       WHERE id = $1 AND workspace_id = $2
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [id, workspaceId]);
+    const res = await this.query(query, [id, workspaceId]);
     if (!res.rows[0]) return null;
     const r = res.rows[0];
     return {
@@ -2337,7 +2456,7 @@ export class PostgresRepository implements DatabaseRepository {
       ORDER BY created_at DESC
       LIMIT 1
     `;
-    const res = await this.pool.query(query, [workspaceId]);
+    const res = await this.query(query, [workspaceId]);
     if (!res.rows[0]) return null;
     const r = res.rows[0];
     return {
@@ -2366,9 +2485,8 @@ export class PostgresRepository implements DatabaseRepository {
       startedAt: new Date().toISOString(),
     });
 
-    const client = await this.pool.connect();
     try {
-      await client.query('BEGIN');
+      const nextCatalog = await this.withTransaction(async (client) => {
       const storeId = `store_${workspaceId}`;
 
       // Acquire exclusive row-level lock on store
@@ -2582,7 +2700,8 @@ export class PostgresRepository implements DatabaseRepository {
         ]
       );
 
-      await client.query('COMMIT');
+        return nextCatalog;
+      });
 
       auditRun = (await this.getAuditRunById(runId, workspaceId))!;
 
@@ -2591,7 +2710,6 @@ export class PostgresRepository implements DatabaseRepository {
         catalog: nextCatalog,
       };
     } catch (err: any) {
-      await client.query('ROLLBACK');
       try {
         await this.updateAuditRun(runId, {
           status: 'FAILED',
@@ -2602,8 +2720,6 @@ export class PostgresRepository implements DatabaseRepository {
         // preserve primary error
       }
       throw err;
-    } finally {
-      client.release();
     }
   }
 
@@ -2614,7 +2730,7 @@ export class PostgresRepository implements DatabaseRepository {
     const limit = Math.min(Math.max(options?.limit || 20, 1), 100);
 
     // Get total count of runs for workspace
-    const countRes = await this.pool.query<{ count: string }>(
+    const countRes = await this.query<{ count: string }>(
       'SELECT COUNT(*) AS count FROM audit_runs WHERE workspace_id = $1',
       [workspaceId]
     );
@@ -2645,7 +2761,7 @@ export class PostgresRepository implements DatabaseRepository {
     const params: any[] = [workspaceId];
 
     if (options?.cursor) {
-      const cursorRes = await this.pool.query<{ created_at: Date }>(
+      const cursorRes = await this.query<{ created_at: Date }>(
         'SELECT created_at FROM audit_runs WHERE id = $1 AND workspace_id = $2',
         [options.cursor, workspaceId]
       );
@@ -2658,7 +2774,7 @@ export class PostgresRepository implements DatabaseRepository {
     params.push(limit + 1);
     query += ` ORDER BY ar.created_at DESC LIMIT $${params.length}`;
 
-    const res = await this.pool.query(query, params);
+    const res = await this.query(query, params);
     const hasNext = res.rows.length > limit;
     const rows = hasNext ? res.rows.slice(0, limit) : res.rows;
     const nextCursor = hasNext && rows.length > 0 ? rows[rows.length - 1].id : null;
@@ -2695,13 +2811,13 @@ export class PostgresRepository implements DatabaseRepository {
     if (!auditRun) return null;
 
     // Check if snapshot manifest or completion record exists
-    const manifestRes = await this.pool.query<{ status: string }>(
+    const manifestRes = await this.query<{ status: string }>(
       'SELECT status FROM audit_run_manifests WHERE audit_run_id = $1 AND workspace_id = $2',
       [auditRunId, workspaceId]
     );
     const hasManifest = manifestRes.rows.length > 0 || (auditRun.metadata && auditRun.metadata.snapshotAvailable === true);
 
-    const findingsRes = await this.pool.query<any>(
+    const findingsRes = await this.query<any>(
       `SELECT 
         id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
         original_finding_id AS "originalFindingId", scope, product_id AS "productId",
@@ -2718,7 +2834,7 @@ export class PostgresRepository implements DatabaseRepository {
       [auditRunId, workspaceId]
     );
 
-    const productsRes = await this.pool.query<any>(
+    const productsRes = await this.query<any>(
       `SELECT 
         id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
         product_id AS "productId", title, brand, category, description, image,
@@ -2743,7 +2859,7 @@ export class PostgresRepository implements DatabaseRepository {
       };
     }
 
-    const evidenceRes = await this.pool.query<any>(
+    const evidenceRes = await this.query<any>(
       `SELECT 
         id, audit_run_id AS "auditRunId", workspace_id AS "workspaceId",
         original_evidence_id AS "originalEvidenceId", product_id AS "productId",
@@ -2827,7 +2943,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getShopifyConnection(workspaceId: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
         access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
@@ -2849,7 +2965,7 @@ export class PostgresRepository implements DatabaseRepository {
 
   async getShopifyConnectionByShop(shopDomain: string): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
     const normShop = shopDomain.trim().toLowerCase();
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
         access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
@@ -2870,7 +2986,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveShopifyConnection(conn: import('../shopify/types').ShopifyConnectionRecord): Promise<import('../shopify/types').ShopifyConnectionRecord> {
-    await this.pool.query(
+    await this.query(
       `INSERT INTO shopify_connections (
         id, workspace_id, shop_domain, access_token_encrypted, refresh_token_encrypted,
         token_expires_at, refresh_token_expires_at, last_refreshed_at, webhook_subscriptions_json,
@@ -2919,7 +3035,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async deleteShopifyConnection(workspaceId: string): Promise<void> {
-    await this.pool.query(
+    await this.query(
       `UPDATE shopify_connections
        SET status = 'disconnected',
            access_token_encrypted = '',
@@ -2931,7 +3047,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveShopifyOAuthState(state: { id: string; workspaceId: string; shopDomain: string; expiresAt: string }): Promise<void> {
-    await this.pool.query(
+    await this.query(
       `INSERT INTO shopify_oauth_states (id, workspace_id, shop_domain, expires_at, created_at)
        VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (id) DO UPDATE SET
@@ -2942,7 +3058,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getAndConsumeShopifyOAuthState(stateId: string): Promise<{ id: string; workspaceId: string; shopDomain: string; expiresAt: string } | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `DELETE FROM shopify_oauth_states
        WHERE id = $1
        RETURNING id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", expires_at AS "expiresAt"`,
@@ -2978,7 +3094,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async createShopifySyncRun(run: import('../shopify/types').ShopifySyncRunRecord): Promise<import('../shopify/types').ShopifySyncRunRecord> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `INSERT INTO shopify_sync_runs (
         id, workspace_id, shop_domain, status, products_discovered, products_imported,
         variants_imported, excluded_by_plan, cursor_resumed, error_message,
@@ -3082,7 +3198,7 @@ export class PostgresRepository implements DatabaseRepository {
       setClauses.push(`pagination_metadata_json = $${params.length}::jsonb`);
     }
 
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `UPDATE shopify_sync_runs
        SET ${setClauses.join(', ')}
        WHERE id = $1 AND workspace_id = $2
@@ -3108,7 +3224,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
@@ -3132,7 +3248,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getShopifySyncRunById(id: string, workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
@@ -3154,7 +3270,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getShopifySyncRuns(workspaceId: string, limit = 20): Promise<import('../shopify/types').ShopifySyncRunRecord[]> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain", status,
         products_discovered AS "productsDiscovered", products_imported AS "productsImported",
@@ -3183,7 +3299,7 @@ export class PostgresRepository implements DatabaseRepository {
     const leaseDurationMs = Math.max(50, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
     const leaseOwner = leaseOptions?.leaseOwner || `wh_worker_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `INSERT INTO shopify_webhook_events (
         id, workspace_id, shop_domain, event_id, topic, delivery_id,
         payload_json, status, retry_count, lease_owner, lease_expires_at, attempt_count, created_at, updated_at
@@ -3243,7 +3359,7 @@ export class PostgresRepository implements DatabaseRepository {
       };
     }
 
-    const existingRes = await this.pool.query<any>(
+    const existingRes = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
         event_id AS "eventId", topic, delivery_id AS "deliveryId",
@@ -3291,7 +3407,7 @@ export class PostgresRepository implements DatabaseRepository {
         )`;
     }
 
-    const res = await this.pool.query(
+    const res = await this.query(
       `UPDATE shopify_webhook_events
        SET status = $4,
            last_error = $5,
@@ -3316,9 +3432,7 @@ export class PostgresRepository implements DatabaseRepository {
       saveConnection: (conn: import('../shopify/types').ShopifyConnectionRecord) => Promise<import('../shopify/types').ShopifyConnectionRecord>
     ) => Promise<T>
   ): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
+    return this.withTransaction(async (client) => {
       const res = await client.query<any>(
         `SELECT 
           id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
@@ -3396,23 +3510,12 @@ export class PostgresRepository implements DatabaseRepository {
         return conn;
       };
 
-      const result = await fn(lockedConn, saveConnection);
-      await client.query('COMMIT');
-      return result;
-    } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error('[AIXSHOP PostgresRepository] Rollback error in withShopifyRefreshLock:', rollbackErr);
-      }
-      throw err;
-    } finally {
-      client.release();
-    }
+      return await fn(lockedConn, saveConnection);
+    });
   }
 
   async getWorkspaceBusinessProfile(workspaceId: string): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile | null> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId",
         legal_business_name AS "legalBusinessName",
@@ -3474,7 +3577,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveWorkspaceBusinessProfile(profile: import('../../domain/businessProfile/types').WorkspaceBusinessProfile): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `INSERT INTO workspace_business_profiles (
         id, workspace_id, legal_business_name, public_brand_name, brand_description,
         official_website, primary_domain, contact_email, contact_phone, business_address,
@@ -3540,7 +3643,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord> {
-    await this.pool.query(
+    await this.query(
       `INSERT INTO ai_visibility_imports (
         id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
         reporting_period_start, reporting_period_end, source_platform, created_at
@@ -3567,7 +3670,7 @@ export class PostgresRepository implements DatabaseRepository {
     contentHash: string
   ): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord | null> {
     if (!contentHash) return null;
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT
         id, workspace_id AS "workspaceId", filename, content_hash AS "contentHash",
         row_count AS "rowCount", rejected_row_count AS "rejectedRowCount", status,
@@ -3585,7 +3688,7 @@ export class PostgresRepository implements DatabaseRepository {
     return res.rows[0] || null;
   }
 
-  private resolveVisibilityTopicKey(metric: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord): {
+  private resolveVisibilityTopicKey(metric: VisibilityMetricRecord): {
     topicValue: string | null;
     topicPresence: TopicPresenceState;
   } {
@@ -3598,11 +3701,17 @@ export class PostgresRepository implements DatabaseRepository {
     return { topicValue: metric.discoveryTopic, topicPresence: metric.topicPresence || 'specified' };
   }
 
-  async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
+  private buildCanonicalVisibilityLockKey(metric: VisibilityMetricRecord): string {
+    const { topicValue } = this.resolveVisibilityTopicKey(metric);
+    const topicPart = topicValue === null ? '__NULL__' : `STR:${topicValue}`;
+    return `${metric.workspaceId}::${metric.observationDate}::${metric.platform}::${topicPart}`;
+  }
+
+  async saveVisibilityMetrics(metrics: VisibilityMetricRecord[]): Promise<void> {
     for (const m of metrics) {
       const { topicValue, topicPresence } = this.resolveVisibilityTopicKey(m);
       if (topicValue === null) {
-        await this.pool.query(
+        await this.query(
           `INSERT INTO ai_visibility_metrics (
             id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, NOW())
@@ -3627,7 +3736,7 @@ export class PostgresRepository implements DatabaseRepository {
           ]
         );
       } else {
-        await this.pool.query(
+        await this.query(
           `INSERT INTO ai_visibility_metrics (
             id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
@@ -3658,7 +3767,7 @@ export class PostgresRepository implements DatabaseRepository {
 
   async saveVisibilityImportAtomic(
     record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
-    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[],
+    metrics: VisibilityMetricRecord[],
     options: { conflictPolicy?: VisibilityConflictPolicy } = {}
   ): Promise<{
     importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord;
@@ -3667,207 +3776,224 @@ export class PostgresRepository implements DatabaseRepository {
     replacedCount?: number;
   }> {
     const policy: VisibilityConflictPolicy = options.conflictPolicy || 'reject_on_conflict';
-    const client = await this.pool.connect();
+
     try {
-      await client.query('BEGIN');
-
-      try {
-        await client.query(
-          `INSERT INTO ai_visibility_imports (
-            id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
-            reporting_period_start, reporting_period_end, source_platform, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())`,
-          [
-            record.id,
-            record.workspaceId,
-            record.filename,
-            record.contentHash || null,
-            record.rowCount,
-            record.rejectedRowCount ?? 0,
-            record.status || 'completed',
-            JSON.stringify(record.errors || []),
-            record.reportingPeriodStart || null,
-            record.reportingPeriodEnd || null,
-            record.sourcePlatform || 'merchant_upload',
-          ]
-        );
-      } catch (insertErr: any) {
-        const isHashDup =
-          insertErr?.code === '23505' &&
-          (!insertErr?.constraint || String(insertErr.constraint).includes('ai_visibility_imports_ws_hash'));
-        if (isHashDup && record.contentHash) {
-          await client.query('ROLLBACK').catch(() => {});
-          const existingImport = await this.getVisibilityImportByHash(record.workspaceId, record.contentHash);
-          if (existingImport) {
-            return {
-              importRecord: existingImport,
-              metricsSaved: 0,
-              duplicateImport: true,
-            };
-          }
-        }
-        throw insertErr;
-      }
-
-      const conflicts: VisibilityObservationConflict[] = [];
-      let replacedCount = 0;
-
-      for (const m of metrics) {
-        const { topicValue, topicPresence } = this.resolveVisibilityTopicKey(m);
-
-        // Lock matching existing observation (if any) without silently conflating NULL vs ''
-        const existingMetricRes = await client.query<{
-          id: string;
-          import_id: string | null;
-          brand_mentions: number;
-          product_mentions: number;
-          website_clicks: number;
-          topic_presence?: TopicPresenceState;
-        }>(
-          `SELECT id, import_id, brand_mentions, product_mentions, website_clicks, topic_presence
-           FROM ai_visibility_metrics
-           WHERE workspace_id = $1
-             AND observation_date = $2
-             AND platform = $3
-             AND discovery_topic IS NOT DISTINCT FROM $4
-           FOR UPDATE`,
-          [m.workspaceId, m.observationDate, m.platform, topicValue]
-        );
-
-        const existingMetric = existingMetricRes.rows[0];
-        if (existingMetric && existingMetric.import_id !== record.id) {
-          if (policy === 'reject_on_conflict') {
-            conflicts.push({
-              observationDate: m.observationDate,
-              platform: m.platform,
-              discoveryTopic: topicValue,
-              topicPresence,
-              existingImportId: existingMetric.import_id || null,
-              existingValues: {
-                brandMentions: Number(existingMetric.brand_mentions || 0),
-                productMentions: Number(existingMetric.product_mentions || 0),
-                websiteClicks: Number(existingMetric.website_clicks || 0),
-              },
-              incomingValues: {
-                brandMentions: m.brandMentions,
-                productMentions: m.productMentions,
-                websiteClicks: m.websiteClicks,
-              },
-            });
-            continue;
-          } else {
-            replacedCount++;
-          }
-        }
-
-        // Query latest immutable observation version to maintain append-only history lineage
-        const histVerRes = await client.query<{ id: string; version_number: number }>(
-          `SELECT id, version_number
-           FROM ai_visibility_observation_history
-           WHERE workspace_id = $1
-             AND observation_date = $2
-             AND platform = $3
-             AND discovery_topic IS NOT DISTINCT FROM $4
-           ORDER BY version_number DESC
-           LIMIT 1`,
-          [m.workspaceId, m.observationDate, m.platform, topicValue]
-        );
-        const prevHist = histVerRes.rows[0];
-        const nextVersion = Number(prevHist?.version_number || 0) + 1;
-
-        await client.query(
-          `INSERT INTO ai_visibility_observation_history (
-            id, workspace_id, import_id, observation_date, platform, discovery_topic, topic_presence,
-            brand_mentions, product_mentions, website_clicks, evidence_source, event_type, version_number, supersedes_history_id, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())`,
-          [
-            `vhist_${m.id}`,
-            m.workspaceId,
-            record.id,
-            m.observationDate,
-            m.platform,
-            topicValue,
-            topicPresence,
-            m.brandMentions,
-            m.productMentions,
-            m.websiteClicks,
-            m.evidenceSource || null,
-            existingMetric ? 'replaced' : 'recorded',
-            nextVersion,
-            prevHist?.id || null,
-          ]
-        );
-
-        if (topicValue === null) {
+      return await this.withTransaction(async (client) => {
+        try {
           await client.query(
-            `INSERT INTO ai_visibility_metrics (
-              id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, NOW())
-            ON CONFLICT (workspace_id, observation_date, platform) WHERE discovery_topic IS NULL DO UPDATE SET
-              import_id = EXCLUDED.import_id,
-              brand_mentions = EXCLUDED.brand_mentions,
-              product_mentions = EXCLUDED.product_mentions,
-              website_clicks = EXCLUDED.website_clicks,
-              topic_presence = EXCLUDED.topic_presence,
-              evidence_source = EXCLUDED.evidence_source`,
+            `INSERT INTO ai_visibility_imports (
+              id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
+              reporting_period_start, reporting_period_end, source_platform, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())`,
             [
-              m.id,
-              m.workspaceId,
-              m.importId || record.id,
-              m.observationDate,
-              m.platform,
-              m.brandMentions,
-              m.productMentions,
-              m.websiteClicks,
-              topicPresence,
-              m.evidenceSource || null,
+              record.id,
+              record.workspaceId,
+              record.filename,
+              record.contentHash || null,
+              record.rowCount,
+              record.rejectedRowCount ?? 0,
+              record.status || 'completed',
+              JSON.stringify(record.errors || []),
+              record.reportingPeriodStart || null,
+              record.reportingPeriodEnd || null,
+              record.sourcePlatform || 'merchant_upload',
             ]
           );
-        } else {
+        } catch (insertErr: any) {
+          const isHashDup =
+            insertErr?.code === '23505' &&
+            (!insertErr?.constraint || String(insertErr.constraint).includes('ai_visibility_imports_ws_hash'));
+          if (isHashDup && record.contentHash) {
+            throw new VisibilityDuplicateHashSentinel();
+          }
+          throw insertErr;
+        }
+
+        // Acquire sorted transaction-scoped advisory locks per canonical observation key
+        // BEFORE querying or inserting metrics so concurrent imports on nonexistent keys serialize cleanly
+        // without deadlocking and preserving NULL vs '' distinction.
+        const sortedLockKeys = Array.from(
+          new Set(metrics.map((m) => this.buildCanonicalVisibilityLockKey(m)))
+        ).sort();
+        for (const lockKey of sortedLockKeys) {
+          await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_vis'), hashtext($1))`, [lockKey]);
+        }
+
+        const existingByIdx: Array<{ id: string; import_id: string | null } | undefined> = [];
+        const conflicts: VisibilityObservationConflict[] = [];
+        let replacedCount = 0;
+
+        for (let i = 0; i < metrics.length; i++) {
+          const m = metrics[i];
+          const { topicValue, topicPresence } = this.resolveVisibilityTopicKey(m);
+
+          const existingMetricRes = await client.query<{
+            id: string;
+            import_id: string | null;
+            brand_mentions: number;
+            product_mentions: number;
+            website_clicks: number;
+            topic_presence?: TopicPresenceState;
+          }>(
+            `SELECT id, import_id, brand_mentions, product_mentions, website_clicks, topic_presence
+             FROM ai_visibility_metrics
+             WHERE workspace_id = $1
+               AND observation_date = $2
+               AND platform = $3
+               AND discovery_topic IS NOT DISTINCT FROM $4
+             FOR UPDATE`,
+            [m.workspaceId, m.observationDate, m.platform, topicValue]
+          );
+
+          const existingMetric = existingMetricRes.rows[0];
+          existingByIdx[i] = existingMetric;
+
+          if (existingMetric && existingMetric.import_id !== record.id) {
+            if (policy === 'reject_on_conflict') {
+              conflicts.push({
+                observationDate: m.observationDate,
+                platform: m.platform,
+                discoveryTopic: topicValue,
+                topicPresence,
+                existingImportId: existingMetric.import_id || null,
+                existingValues: {
+                  brandMentions: Number(existingMetric.brand_mentions || 0),
+                  productMentions: Number(existingMetric.product_mentions || 0),
+                  websiteClicks: Number(existingMetric.website_clicks || 0),
+                },
+                incomingValues: {
+                  brandMentions: m.brandMentions,
+                  productMentions: m.productMentions,
+                  websiteClicks: m.websiteClicks,
+                },
+              });
+            } else {
+              replacedCount++;
+            }
+          }
+        }
+
+        if (conflicts.length > 0) {
+          throw new VisibilityObservationConflictError(conflicts);
+        }
+
+        for (let i = 0; i < metrics.length; i++) {
+          const m = metrics[i];
+          const { topicValue, topicPresence } = this.resolveVisibilityTopicKey(m);
+          const existingMetric = existingByIdx[i];
+
+          // Query latest immutable observation version under FOR UPDATE to maintain append-only history lineage
+          const histVerRes = await client.query<{ id: string; version_number: number }>(
+            `SELECT id, version_number
+             FROM ai_visibility_observation_history
+             WHERE workspace_id = $1
+               AND observation_date = $2
+               AND platform = $3
+               AND discovery_topic IS NOT DISTINCT FROM $4
+             ORDER BY version_number DESC
+             LIMIT 1
+             FOR UPDATE`,
+            [m.workspaceId, m.observationDate, m.platform, topicValue]
+          );
+          const prevHist = histVerRes.rows[0];
+          const nextVersion = Number(prevHist?.version_number || 0) + 1;
+
           await client.query(
-            `INSERT INTO ai_visibility_metrics (
-              id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-            ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
-              import_id = EXCLUDED.import_id,
-              brand_mentions = EXCLUDED.brand_mentions,
-              product_mentions = EXCLUDED.product_mentions,
-              website_clicks = EXCLUDED.website_clicks,
-              topic_presence = EXCLUDED.topic_presence,
-              evidence_source = EXCLUDED.evidence_source`,
+            `INSERT INTO ai_visibility_observation_history (
+              id, workspace_id, import_id, observation_date, platform, discovery_topic, topic_presence,
+              brand_mentions, product_mentions, website_clicks, evidence_source, event_type, version_number, supersedes_history_id, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())`,
             [
-              m.id,
+              `vhist_${m.id}`,
               m.workspaceId,
-              m.importId || record.id,
+              record.id,
               m.observationDate,
               m.platform,
-              m.brandMentions,
-              m.productMentions,
-              m.websiteClicks,
               topicValue,
               topicPresence,
+              m.brandMentions,
+              m.productMentions,
+              m.websiteClicks,
               m.evidenceSource || null,
+              existingMetric ? 'replaced' : 'recorded',
+              nextVersion,
+              prevHist?.id || null,
             ]
           );
+
+          if (topicValue === null) {
+            await client.query(
+              `INSERT INTO ai_visibility_metrics (
+                id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, NOW())
+              ON CONFLICT (workspace_id, observation_date, platform) WHERE discovery_topic IS NULL DO UPDATE SET
+                import_id = EXCLUDED.import_id,
+                brand_mentions = EXCLUDED.brand_mentions,
+                product_mentions = EXCLUDED.product_mentions,
+                website_clicks = EXCLUDED.website_clicks,
+                topic_presence = EXCLUDED.topic_presence,
+                evidence_source = EXCLUDED.evidence_source`,
+              [
+                m.id,
+                m.workspaceId,
+                m.importId || record.id,
+                m.observationDate,
+                m.platform,
+                m.brandMentions,
+                m.productMentions,
+                m.websiteClicks,
+                topicPresence,
+                m.evidenceSource || null,
+              ]
+            );
+          } else {
+            await client.query(
+              `INSERT INTO ai_visibility_metrics (
+                id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+              ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+                import_id = EXCLUDED.import_id,
+                brand_mentions = EXCLUDED.brand_mentions,
+                product_mentions = EXCLUDED.product_mentions,
+                website_clicks = EXCLUDED.website_clicks,
+                topic_presence = EXCLUDED.topic_presence,
+                evidence_source = EXCLUDED.evidence_source`,
+              [
+                m.id,
+                m.workspaceId,
+                m.importId || record.id,
+                m.observationDate,
+                m.platform,
+                m.brandMentions,
+                m.productMentions,
+                m.websiteClicks,
+                topicValue,
+                topicPresence,
+                m.evidenceSource || null,
+              ]
+            );
+          }
+        }
+
+        return {
+          importRecord: record,
+          metricsSaved: metrics.length,
+          duplicateImport: false,
+          replacedCount,
+        };
+      });
+    } catch (err) {
+      if (err instanceof VisibilityDuplicateHashSentinel && record.contentHash) {
+        const existingImport = await this.getVisibilityImportByHash(record.workspaceId, record.contentHash);
+        if (existingImport) {
+          return {
+            importRecord: existingImport,
+            metricsSaved: 0,
+            duplicateImport: true,
+          };
         }
       }
-
-      if (conflicts.length > 0) {
-        throw new VisibilityObservationConflictError(conflicts);
-      }
-
-      await client.query('COMMIT');
-      return {
-        importRecord: record,
-        metricsSaved: metrics.length,
-        duplicateImport: false,
-        replacedCount,
-      };
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
       throw err;
-    } finally {
-      client.release();
     }
   }
 
@@ -3875,7 +4001,7 @@ export class PostgresRepository implements DatabaseRepository {
     workspaceId: string,
     limit = 100
   ): Promise<VisibilityObservationHistoryRecord[]> {
-    const res = await this.pool.query<any>(
+    const res = await this.query<any>(
       `SELECT
         id, workspace_id AS "workspaceId", import_id AS "importId",
         observation_date::text AS "observationDate", platform,
@@ -3894,7 +4020,7 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary> {
-    const metricsRes = await this.pool.query<any>(
+    const metricsRes = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", import_id AS "importId",
         observation_date::text AS "observationDate", platform,
@@ -3909,7 +4035,7 @@ export class PostgresRepository implements DatabaseRepository {
       [workspaceId]
     );
 
-    const importsRes = await this.pool.query<any>(
+    const importsRes = await this.query<any>(
       `SELECT 
         id, workspace_id AS "workspaceId", filename, content_hash AS "contentHash", row_count AS "rowCount",
         rejected_row_count AS "rejectedRowCount", status, errors_json AS "errors",

@@ -14,6 +14,64 @@ export interface ProductionConfigValidationResult {
     shopifyConfigValid: boolean;
     trustProxyValid: boolean;
     devOverridesDisabled: boolean;
+    rateLimitPolicyValid: boolean;
+  };
+}
+
+export type AuthRateLimitFailureMode = 'fail_closed' | 'fallback_local';
+
+/**
+ * Resolves the explicit failure policy for shared authentication rate limiting.
+ * - Default in production (`NODE_ENV=production`): 'fail_closed' (HTTP 503 on shared store outage).
+ * - Default in development/test: 'fallback_local' (bounded in-memory fallback).
+ * - Can be explicitly overridden with `AUTH_RATE_LIMIT_FAILURE_MODE=fail_closed|fallback_local`.
+ */
+export function resolveAuthRateLimitFailurePolicy(
+  env = process.env.NODE_ENV,
+  configuredMode = process.env.AUTH_RATE_LIMIT_FAILURE_MODE
+): {
+  valid: boolean;
+  mode: AuthRateLimitFailureMode;
+  failClosedOnStorageError: boolean;
+  explicitOverride: boolean;
+  error?: string;
+} {
+  const isProd = env === 'production';
+  const raw = configuredMode?.trim().toLowerCase();
+
+  if (!raw) {
+    return {
+      valid: true,
+      mode: isProd ? 'fail_closed' : 'fallback_local',
+      failClosedOnStorageError: isProd,
+      explicitOverride: false,
+    };
+  }
+
+  if (raw === 'fail_closed') {
+    return {
+      valid: true,
+      mode: 'fail_closed',
+      failClosedOnStorageError: true,
+      explicitOverride: true,
+    };
+  }
+
+  if (raw === 'fallback_local') {
+    return {
+      valid: true,
+      mode: 'fallback_local',
+      failClosedOnStorageError: false,
+      explicitOverride: true,
+    };
+  }
+
+  return {
+    valid: false,
+    mode: isProd ? 'fail_closed' : 'fallback_local',
+    failClosedOnStorageError: isProd,
+    explicitOverride: false,
+    error: `Unsupported AUTH_RATE_LIMIT_FAILURE_MODE setting "${configuredMode}". Expected "fail_closed" or "fallback_local".`,
   };
 }
 
@@ -288,6 +346,13 @@ export function validateProductionConfig(): ProductionConfigValidationResult {
     missingOrInvalid.push('Development security overrides must not be active in production');
   }
 
+  // 8. Auth rate limiter failure policy
+  const rateLimitPolicy = resolveAuthRateLimitFailurePolicy(env, process.env.AUTH_RATE_LIMIT_FAILURE_MODE);
+  const rateLimitPolicyValid = rateLimitPolicy.valid;
+  if (!rateLimitPolicyValid) {
+    missingOrInvalid.push('AUTH_RATE_LIMIT_FAILURE_MODE');
+  }
+
   return {
     valid: missingOrInvalid.length === 0,
     environment: env,
@@ -300,6 +365,7 @@ export function validateProductionConfig(): ProductionConfigValidationResult {
       shopifyConfigValid,
       trustProxyValid,
       devOverridesDisabled,
+      rateLimitPolicyValid,
     },
   };
 }
