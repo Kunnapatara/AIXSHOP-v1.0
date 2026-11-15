@@ -59,6 +59,7 @@ export const SettingsPage: React.FC = () => {
   const [strictness, setStrictness] = useState(storeProfile.truthBoundaryStrictness);
   const [isDiagnosticsUnlocked, setIsDiagnosticsUnlocked] = useState(false);
   const [isMigratingDemo, setIsMigratingDemo] = useState(false);
+  const [confirmingDemoOverwrite, setConfirmingDemoOverwrite] = useState(false);
 
   // Shopify Integration State
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatusResponse | null>(null);
@@ -521,25 +522,61 @@ export const SettingsPage: React.FC = () => {
             <p className="text-xs text-stone-600 leading-relaxed">
               Import the verified Solstice Mercantile demo catalog fixtures (184 products, variants, audit findings, and action items) directly into your cloud workspace database for evaluation.
             </p>
-            <button
-              disabled={isMigratingDemo}
-              onClick={async () => {
-                if (!isAuthenticated) {
-                  openAuthModal('register');
-                  return;
-                }
-                setIsMigratingDemo(true);
-                try {
-                  await migrateDemoDataToCloud();
-                } finally {
-                  setIsMigratingDemo(false);
-                }
-              }}
-              className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 disabled:opacity-50 cursor-pointer"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isMigratingDemo ? 'animate-spin' : ''}`} />
-              <span>{isMigratingDemo ? 'Importing Fixtures...' : 'Import Demo Catalog into Active Workspace'}</span>
-            </button>
+            {confirmingDemoOverwrite ? (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2.5">
+                <p className="text-xs text-amber-900 font-medium leading-relaxed">
+                  Your active cloud workspace currently has {products.length} product{products.length === 1 ? '' : 's'}. Replacing it with demo fixtures uses optimistic version verification and will reject automatically if another session updates the catalog first.
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    disabled={isMigratingDemo}
+                    onClick={async () => {
+                      setIsMigratingDemo(true);
+                      try {
+                        await migrateDemoDataToCloud();
+                      } finally {
+                        setIsMigratingDemo(false);
+                        setConfirmingDemoOverwrite(false);
+                      }
+                    }}
+                    className="px-3.5 py-1.5 bg-amber-700 hover:bg-amber-800 text-white text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    {isMigratingDemo ? 'Replacing Catalog...' : 'Confirm Replace Workspace Catalog'}
+                  </button>
+                  <button
+                    disabled={isMigratingDemo}
+                    onClick={() => setConfirmingDemoOverwrite(false)}
+                    className="px-3.5 py-1.5 bg-white border border-stone-300 hover:bg-stone-50 text-stone-700 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                disabled={isMigratingDemo}
+                onClick={async () => {
+                  if (!isAuthenticated) {
+                    openAuthModal('register');
+                    return;
+                  }
+                  if (isCloudWorkspace && products.length > 0) {
+                    setConfirmingDemoOverwrite(true);
+                    return;
+                  }
+                  setIsMigratingDemo(true);
+                  try {
+                    await migrateDemoDataToCloud();
+                  } finally {
+                    setIsMigratingDemo(false);
+                  }
+                }}
+                className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isMigratingDemo ? 'animate-spin' : ''}`} />
+                <span>{isMigratingDemo ? 'Importing Fixtures...' : 'Import Demo Catalog into Active Workspace'}</span>
+              </button>
+            )}
           </div>
 
           {/* Multi-Tenant Security & Durability Architecture */}

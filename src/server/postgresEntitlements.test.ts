@@ -1116,153 +1116,161 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
       ? 'SKIPPED: Live PostgreSQL infrastructure credentials (DATABASE_URL / SQL_HOST / PGHOST) not provisioned in current environment' 
       : undefined;
 
-    test('20. Live PostgreSQL: Real migration, schema readiness, and constraint check', { skip: skipReason }, async () => {
-      const { runMigrations } = await import('./db/migrate');
-      const pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
+    const buildLivePoolConfig = (max?: number) => {
+      if (process.env.DATABASE_URL) {
+        return {
+          connectionString: process.env.DATABASE_URL,
+          ...(max !== undefined ? { max } : {}),
+        };
+      }
+      return {
         host: process.env.SQL_HOST || process.env.PGHOST,
+        port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
         user: process.env.SQL_USER || process.env.PGUSER,
         password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
         database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
-      });
+        ...(max !== undefined ? { max } : {}),
+      };
+    };
 
-      const pgRepo = new PostgresRepository(pool);
-      assert.equal(await pgRepo.ping(), true, 'Live database must be reachable');
+    test('20. Live PostgreSQL: Real migration, schema readiness, and constraint check', { skip: skipReason }, async () => {
+      const { runMigrations } = await import('./db/migrate');
+      const pool = new Pool(buildLivePoolConfig());
 
-      // 1. Run migrations idempotently
-      const migResult = await runMigrations(pool);
-      assert.ok(migResult.totalMigrations >= 4, 'Must have at least 4 migrations applied');
+      try {
+        const pgRepo = new PostgresRepository(pool);
+        assert.equal(await pgRepo.ping(), true, 'Live database must be reachable');
 
-      // 2. Verify schema readiness probe
-      const ready = await pgRepo.checkSchemaReadiness();
-      assert.equal(ready.isReady, true, 'Schema must be reported ready after running migrations');
+        // 1. Run migrations idempotently
+        const migResult = await runMigrations(pool);
+        assert.ok(migResult.totalMigrations >= 4, 'Must have at least 4 migrations applied');
 
-      await pool.end();
+        // 2. Verify schema readiness probe
+        const ready = await pgRepo.checkSchemaReadiness();
+        assert.equal(ready.isReady, true, 'Schema must be reported ready after running migrations');
+      } finally {
+        await pool.end();
+      }
     });
 
     test('21. Live PostgreSQL: Real transactions, quota enforcement, and multi-connection concurrency', { skip: skipReason }, async () => {
-      const pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        host: process.env.SQL_HOST || process.env.PGHOST,
-        user: process.env.SQL_USER || process.env.PGUSER,
-        password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
-        database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
-        max: 5,
-      });
+      const pool = new Pool(buildLivePoolConfig(5));
 
-      const pgRepo = new PostgresRepository(pool);
-      const testWsId = `ws_live_${Date.now()}`;
-      const testUserId = `usr_live_${Date.now()}`;
-
-      // Initialize test user, workspace, and store in Starter tier (250 SKUs)
-      await pool.query(
-        'INSERT INTO users (id, email, password_hash, full_name) VALUES ($1, $2, $3, $4)',
-        [testUserId, `${testUserId}@example.com`, 'hash', 'Live Test User']
-      );
-      await pool.query(
-        'INSERT INTO workspaces (id, name, slug) VALUES ($1, $2, $3)',
-        [testWsId, 'Live Test Workspace', `live-${Date.now()}`]
-      );
-      await pool.query(
-        'INSERT INTO workspace_memberships (id, workspace_id, user_id, role) VALUES ($1, $2, $3, $4)',
-        [`mem_${testWsId}`, testWsId, testUserId, 'owner']
-      );
-      await pool.query(
-        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, tier, sku_limit, connectors_json)
-         VALUES ($1, $2, $3, $4, $5, 0, 'Starter', 250, '[]'::jsonb)`,
-        [`store_${testWsId}`, testWsId, 'Live Store', `${testWsId}.myshopify.com`, 'USD']
-      );
-
-      // Multi-connection concurrent test:
-      // Two connections simultaneously try to import candidate batches (150 SKUs each).
-      // Since Starter limit is 250, only one batch can succeed without oversubscribing!
-      const batchA = Array.from({ length: 15 }, (_, i) => ({
-        id: `p_a_${i}`,
-        title: `Product A ${i}`,
-        brand: 'Test',
-        category: 'Apparel',
-        description: 'Test Description',
-        image: '',
-        status: 'active',
-        completenessScore: 80,
-        evidenceCoverageScore: 80,
-        externalDiscoveryStatus: 'observed_in_sample',
-        attributes: {},
-        variants: Array.from({ length: 10 }, (_, j) => ({
-          id: `var_a_${i}_${j}`,
-          sku: `SKU-A-${i}-${j}`,
-          title: `V${j}`,
-          barcode: '',
-          price: 10,
-          inventoryCount: 1,
-          attributes: {},
-        })),
-        offers: [],
-        evidenceDocuments: [],
-        findingsCount: 0,
-        lastAudited: '',
-      })); // 15 products * 10 variants = 150 SKUs
-
-      const batchB = Array.from({ length: 15 }, (_, i) => ({
-        id: `p_b_${i}`,
-        title: `Product B ${i}`,
-        brand: 'Test',
-        category: 'Apparel',
-        description: 'Test Description',
-        image: '',
-        status: 'active',
-        completenessScore: 80,
-        evidenceCoverageScore: 80,
-        externalDiscoveryStatus: 'observed_in_sample',
-        attributes: {},
-        variants: Array.from({ length: 10 }, (_, j) => ({
-          id: `var_b_${i}_${j}`,
-          sku: `SKU-B-${i}-${j}`,
-          title: `V${j}`,
-          barcode: '',
-          price: 10,
-          inventoryCount: 1,
-          attributes: {},
-        })),
-        offers: [],
-        evidenceDocuments: [],
-        findingsCount: 0,
-        lastAudited: '',
-      })); // 15 products * 10 variants = 150 SKUs
-
-      // Execute concurrently
-      const results = await Promise.allSettled([
-        pgRepo.importCatalog(testWsId, batchA as any),
-        pgRepo.importCatalog(testWsId, batchB as any),
-      ]);
-
-      const fulfilled = results.filter(r => r.status === 'fulfilled');
-      const rejected = results.filter(r => r.status === 'rejected');
-
-      assert.equal(fulfilled.length, 1, 'Exactly one concurrent batch must succeed within 250 limit');
-      assert.equal(rejected.length, 1, 'Second concurrent batch must be rejected without oversubscribing quota');
-
-      // Verify authoritative store SKU count is exactly 150
-      const storeRes = await pool.query('SELECT sku_count FROM stores WHERE workspace_id = $1', [testWsId]);
-      assert.equal(storeRes.rows[0].sku_count, 150, 'Persisted stores.sku_count must record exactly 150 SKUs');
-
-      // Intentional transaction failure & rollback test
-      let rollbackThrew = false;
       try {
-        await (pgRepo as any).mutateCatalogUnderLock(testWsId, () => {
-          throw new Error('Intentional transaction abort for rollback verification');
-        });
-      } catch (err: any) {
-        rollbackThrew = true;
-        assert.match(err.message, /Intentional transaction abort/);
+        const pgRepo = new PostgresRepository(pool);
+        const testWsId = `ws_live_${Date.now()}`;
+        const testUserId = `usr_live_${Date.now()}`;
+
+        // Initialize test user, workspace, and store in Starter tier (250 SKUs)
+        await pool.query(
+          'INSERT INTO users (id, email, password_hash, full_name) VALUES ($1, $2, $3, $4)',
+          [testUserId, `${testUserId}@example.com`, 'hash', 'Live Test User']
+        );
+        await pool.query(
+          'INSERT INTO workspaces (id, name, slug) VALUES ($1, $2, $3)',
+          [testWsId, 'Live Test Workspace', `live-${Date.now()}`]
+        );
+        await pool.query(
+          'INSERT INTO workspace_memberships (id, workspace_id, user_id, role) VALUES ($1, $2, $3, $4)',
+          [`mem_${testWsId}`, testWsId, testUserId, 'owner']
+        );
+        await pool.query(
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, tier, sku_limit, connectors_json)
+           VALUES ($1, $2, $3, $4, $5, 0, 'Starter', 250, '[]'::jsonb)`,
+          [`store_${testWsId}`, testWsId, 'Live Store', `${testWsId}.myshopify.com`, 'USD']
+        );
+
+        // Multi-connection concurrent test:
+        // Two connections simultaneously try to import candidate batches (150 SKUs each).
+        // Since Starter limit is 250, only one batch can succeed without oversubscribing!
+        const batchA = Array.from({ length: 15 }, (_, i) => ({
+          id: `p_a_${i}`,
+          title: `Product A ${i}`,
+          brand: 'Test',
+          category: 'Apparel',
+          description: 'Test Description',
+          image: '',
+          status: 'active',
+          completenessScore: 80,
+          evidenceCoverageScore: 80,
+          externalDiscoveryStatus: 'observed_in_sample',
+          attributes: {},
+          variants: Array.from({ length: 10 }, (_, j) => ({
+            id: `var_a_${i}_${j}`,
+            sku: `SKU-A-${i}-${j}`,
+            title: `V${j}`,
+            barcode: '',
+            price: 10,
+            inventoryCount: 1,
+            attributes: {},
+          })),
+          offers: [],
+          evidenceDocuments: [],
+          findingsCount: 0,
+          lastAudited: '',
+        })); // 15 products * 10 variants = 150 SKUs
+
+        const batchB = Array.from({ length: 15 }, (_, i) => ({
+          id: `p_b_${i}`,
+          title: `Product B ${i}`,
+          brand: 'Test',
+          category: 'Apparel',
+          description: 'Test Description',
+          image: '',
+          status: 'active',
+          completenessScore: 80,
+          evidenceCoverageScore: 80,
+          externalDiscoveryStatus: 'observed_in_sample',
+          attributes: {},
+          variants: Array.from({ length: 10 }, (_, j) => ({
+            id: `var_b_${i}_${j}`,
+            sku: `SKU-B-${i}-${j}`,
+            title: `V${j}`,
+            barcode: '',
+            price: 10,
+            inventoryCount: 1,
+            attributes: {},
+          })),
+          offers: [],
+          evidenceDocuments: [],
+          findingsCount: 0,
+          lastAudited: '',
+        })); // 15 products * 10 variants = 150 SKUs
+
+        // Execute concurrently
+        const results = await Promise.allSettled([
+          pgRepo.importCatalog(testWsId, batchA as any),
+          pgRepo.importCatalog(testWsId, batchB as any),
+        ]);
+
+        const fulfilled = results.filter(r => r.status === 'fulfilled');
+        const rejected = results.filter(r => r.status === 'rejected');
+
+        assert.equal(fulfilled.length, 1, 'Exactly one concurrent batch must succeed within 250 limit');
+        assert.equal(rejected.length, 1, 'Second concurrent batch must be rejected without oversubscribing quota');
+
+        // Verify authoritative store SKU count is exactly 150
+        const storeRes = await pool.query('SELECT sku_count FROM stores WHERE workspace_id = $1', [testWsId]);
+        assert.equal(storeRes.rows[0].sku_count, 150, 'Persisted stores.sku_count must record exactly 150 SKUs');
+
+        // Intentional transaction failure & rollback test
+        let rollbackThrew = false;
+        try {
+          await (pgRepo as any).mutateCatalogUnderLock(testWsId, () => {
+            throw new Error('Intentional transaction abort for rollback verification');
+          });
+        } catch (err: any) {
+          rollbackThrew = true;
+          assert.match(err.message, /Intentional transaction abort/);
+        }
+        assert.equal(rollbackThrew, true, 'Error must propagate');
+
+        // Clean up test workspace
+        await pool.query('DELETE FROM workspaces WHERE id = $1', [testWsId]);
+        await pool.query('DELETE FROM users WHERE id = $1', [testUserId]);
+      } finally {
+        await pool.end();
       }
-      assert.equal(rollbackThrew, true, 'Error must propagate');
-
-      // Clean up test workspace
-      await pool.query('DELETE FROM workspaces WHERE id = $1', [testWsId]);
-      await pool.query('DELETE FROM users WHERE id = $1', [testUserId]);
-
-      await pool.end();
     });
   });
 });

@@ -186,6 +186,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         success: true,
         action: result.action,
         product: result.product,
+        catalogVersion: result.catalogVersion,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Action approval error:', err);
@@ -213,6 +214,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       return res.json({
         success: true,
         action: result.action,
+        catalogVersion: result.catalogVersion,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Action dismissal error:', err);
@@ -240,6 +242,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       return res.json({
         success: true,
         action: result.action,
+        catalogVersion: result.catalogVersion,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Action recheck error:', err);
@@ -283,10 +286,12 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         }
 
         const result = await repo.importCatalog(workspaceId, candidates);
+        const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
 
         return res.json({
           success: true,
           result,
+          catalogVersion: savedCatalog?.catalogVersion,
         });
       });
     } catch (err: any) {

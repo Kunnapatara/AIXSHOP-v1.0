@@ -100,6 +100,22 @@ export class CatalogVersionValidationError extends Error {
   }
 }
 
+export class WorkspaceLockOrderError extends Error {
+  public readonly code = 'WORKSPACE_LOCK_ORDER_VIOLATION';
+  public readonly statusCode = 409;
+  public readonly heldWorkspaces: string[];
+  public readonly requestedWorkspace: string;
+
+  constructor(heldWorkspaces: string[], requestedWorkspace: string) {
+    super(
+      `[AIXSHOP Workspace Lock] Cross-workspace lock order violation: cannot acquire "${requestedWorkspace}" while holding [${heldWorkspaces.join(', ')}]. Acquire multi-workspace locks in deterministic lexicographical order.`
+    );
+    this.name = 'WorkspaceLockOrderError';
+    this.heldWorkspaces = [...heldWorkspaces];
+    this.requestedWorkspace = requestedWorkspace;
+  }
+}
+
 export interface DatabaseRepository {
   // Database health & readiness
   ping(): Promise<boolean>;
@@ -167,17 +183,17 @@ export interface DatabaseRepository {
     workspaceId: string, 
     actionId: string, 
     customApprovedValue?: string
-  ): Promise<{ action: ActionItem; product?: Product }>;
+  ): Promise<{ action: ActionItem; product?: Product; catalogVersion?: number }>;
 
   dismissAction(
     workspaceId: string, 
     actionId: string
-  ): Promise<{ action: ActionItem }>;
+  ): Promise<{ action: ActionItem; catalogVersion?: number }>;
 
   recheckAction(
     workspaceId: string, 
     actionId: string
-  ): Promise<{ action: ActionItem }>;
+  ): Promise<{ action: ActionItem; catalogVersion?: number }>;
 
   importCatalog(
     workspaceId: string,

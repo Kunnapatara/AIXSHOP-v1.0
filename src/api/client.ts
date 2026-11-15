@@ -127,27 +127,27 @@ class ApiClient {
     });
   }
 
-  async approveAction(actionId: string, customApprovedValue?: string): Promise<{ success: boolean; action: ActionItem; product?: Product }> {
-    return this.request<{ success: boolean; action: ActionItem; product?: Product }>(`/api/catalog/actions/${encodeURIComponent(actionId)}/approve`, {
+  async approveAction(actionId: string, customApprovedValue?: string): Promise<{ success: boolean; action: ActionItem; product?: Product; catalogVersion?: number }> {
+    return this.request<{ success: boolean; action: ActionItem; product?: Product; catalogVersion?: number }>(`/api/catalog/actions/${encodeURIComponent(actionId)}/approve`, {
       method: 'POST',
       body: JSON.stringify({ customApprovedValue }),
     });
   }
 
-  async dismissAction(actionId: string): Promise<{ success: boolean; action: ActionItem }> {
-    return this.request<{ success: boolean; action: ActionItem }>(`/api/catalog/actions/${encodeURIComponent(actionId)}/dismiss`, {
+  async dismissAction(actionId: string): Promise<{ success: boolean; action: ActionItem; catalogVersion?: number }> {
+    return this.request<{ success: boolean; action: ActionItem; catalogVersion?: number }>(`/api/catalog/actions/${encodeURIComponent(actionId)}/dismiss`, {
       method: 'POST',
     });
   }
 
-  async recheckAction(actionId: string): Promise<{ success: boolean; action: ActionItem }> {
-    return this.request<{ success: boolean; action: ActionItem }>(`/api/catalog/actions/${encodeURIComponent(actionId)}/recheck`, {
+  async recheckAction(actionId: string): Promise<{ success: boolean; action: ActionItem; catalogVersion?: number }> {
+    return this.request<{ success: boolean; action: ActionItem; catalogVersion?: number }>(`/api/catalog/actions/${encodeURIComponent(actionId)}/recheck`, {
       method: 'POST',
     });
   }
 
-  async importCatalog(candidates: ProductCandidate[]): Promise<{ success: boolean; result: CatalogImportResult }> {
-    return this.request<{ success: boolean; result: CatalogImportResult }>('/api/catalog/import', {
+  async importCatalog(candidates: ProductCandidate[]): Promise<{ success: boolean; result: CatalogImportResult; catalogVersion?: number }> {
+    return this.request<{ success: boolean; result: CatalogImportResult; catalogVersion?: number }>('/api/catalog/import', {
       method: 'POST',
       body: JSON.stringify({ candidates }),
     });

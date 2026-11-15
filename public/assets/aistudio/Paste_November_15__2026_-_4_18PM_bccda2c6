@@ -1,0 +1,903 @@
+# AIXSHOP v1.0 — PostgreSQL CI Failure Fixes, Concurrency Hardening & Production Readiness Verification
+
+## 1. Mission
+
+Continue development of the existing AIXSHOP v1.0 codebase.
+
+This is a focused remediation and verification task. Do not rebuild the application, replace its architecture, simplify existing implementations, or discard previous development work.
+
+The objective is to resolve the outstanding PostgreSQL CI failures, complete the missing concurrency and transaction-safety protections, correct frontend/backend version propagation, and verify the production-readiness boundaries of the existing implementation.
+
+Use the existing codebase, architecture, repositories, tests, migration history, and established conventions.
+
+**The governing principle is: Zero Loss of Development Progress.**
+
+## 2. Mandatory Baseline
+
+GitHub repository:
+
+`https://github.com/Kunnapatara/AIXSHOP-v1.0`
+
+Current verified main baseline:
+
+`f101efb0a6fc33ad01518e267e2ec3c6b5715a6d`
+
+Previous baseline:
+
+`8908876523192b03a00053bd31ac39ad27f3c744`
+
+The current HEAD is one commit ahead of the previous baseline.
+
+Relevant commit:
+
+`https://github.com/Kunnapatara/AIXSHOP-v1.0/commit/f101efb0a6fc33ad01518e267e2ec3c6b5715a6d`
+
+Latest GitHub Actions Run #15:
+
+`https://github.com/Kunnapatara/AIXSHOP-v1.0/actions/runs/43697824509`
+
+PostgreSQL job:
+
+`https://github.com/Kunnapatara/AIXSHOP-v1.0/actions/runs/43697824509/job/132762168758`
+
+Normal CI job:
+
+`https://github.com/Kunnapatara/AIXSHOP-v1.0/actions/runs/43697824509/job/132762169028`
+
+### Baseline findings
+
+Normal CI:
+- Lint: PASS
+- Test: PASS
+- Build: PASS
+
+PostgreSQL CI:
+- Dependency installation: PASS
+- Database migration: PASS
+- Database status: PASS
+- Workstream I live PostgreSQL test: PASS
+- Workstream R tests: PASS
+- Full test suite: 408 passed / 2 failed / 0 skipped / 410 total
+- PostgreSQL job overall: FAIL
+
+The 12 existing migrations are already applied in the PostgreSQL CI environment.
+
+Do not rewrite, delete, renumber, or reset existing migrations.
+
+The previous implementation of Remediations A–F must be preserved and improved rather than replaced.
+
+## 3. Non-Negotiable Development Rules
+
+1. Inspect the actual current workspace and repository before changing anything.
+2. Establish the current Git state, available files, package manager, test commands, and current implementation.
+3. Preserve all existing features, business logic, UI, routes, API contracts, database schema, migration history, tests, and working code.
+4. Do not perform a destructive rewrite or architecture replacement.
+5. Do not remove tests to obtain a passing result.
+6. Do not weaken assertions, skip failing tests, mock away real PostgreSQL behavior, or change expected outcomes merely to make CI green.
+7. Do not introduce unrelated dependencies or unnecessary abstractions.
+8. Do not overwrite user data, environment files, credentials, or existing configuration.
+9. Do not expose secrets in logs, diagnostics, reports, or test output.
+10. Do not commit, push, merge, deploy, or publish changes. Stop after local implementation and verification.
+11. If Git metadata is unavailable in the workspace, explicitly report that limitation. Do not claim that a Git diff or commit was inspected.
+12. Do not claim that an external integration has passed unless it was actually executed and verified against the relevant service.
+
+Before editing, identify the exact files and functions involved in each task.
+
+For each change, explain:
+- The existing behavior.
+- The verified defect or missing protection.
+- The smallest safe correction.
+- The tests that prove the correction.
+- Any remaining limitations.
+
+---
+
+# 4. Workstream 1 — Fix the Two PostgreSQL CI Failures
+
+These are the first corrections to implement.
+
+Do not proceed by weakening the tests. Correct the test configuration and environment isolation.
+
+## 4.1 Failure A: PostgreSQL pool configuration test
+
+Location:
+
+`src/server/server.test.ts`
+
+Approximately around line 831.
+
+Test:
+
+`PostgreSQL pool configuration parses SSL securely...`
+
+Observed failure:
+
+Expected:
+
+`db.internal.example.com`
+
+Actual:
+
+`undefined`
+
+Root cause identified in the CI environment:
+
+The PostgreSQL CI job sets `DATABASE_URL`.
+
+The `getPostgresPoolConfig()` implementation prioritizes `DATABASE_URL` over individual `SQL_*` environment variables.
+
+The test expects the discrete SQL environment variables to be used, but it inherits the CI `DATABASE_URL`, causing its assumptions to become invalid.
+
+### Required correction
+
+Inspect:
+- `getPostgresPoolConfig()`
+- All related environment variable precedence rules.
+- The affected test setup and teardown.
+- Other tests that depend on `DATABASE_URL` or `SQL_*`.
+
+Correct the test isolation so that the test for individual SQL configuration variables executes with `DATABASE_URL` temporarily cleared.
+
+Requirements:
+- Save the original environment variable values.
+- Restore every modified environment variable in `finally` or equivalent cleanup.
+- Ensure cleanup also happens when an assertion fails.
+- Do not mutate global environment state in a way that leaks into other tests.
+- Preserve the actual production precedence behavior unless source inspection proves it is incorrect.
+
+Add a separate explicit test verifying `DATABASE_URL` precedence where appropriate.
+
+The final test suite must verify both configuration paths independently:
+1. `DATABASE_URL` configuration.
+2. Individual `SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, `SQL_DB_NAME`, and related settings.
+
+Do not simply remove the host assertion.
+
+## 4.2 Failure B: PostgreSQL live infrastructure status check
+
+Location:
+
+`src/server/server.test.ts`
+
+Approximately around line 2378.
+
+Test:
+
+`PostgreSQL live infrastructure status check`
+
+Observed failure:
+
+Expected:
+
+`true`
+
+Actual:
+
+`false`
+
+PostgreSQL log:
+
+`FATAL: role "root" does not exist`
+
+Problematic configuration pattern:
+
+```ts
+new Pool({
+  connectionString: process.env.DATABASE_URL,
+  host: process.env.SQL_HOST,
+  user: process.env.SQL_USER,
+  password: process.env.SQL_PASSWORD,
+  database: process.env.SQL_DB_NAME,
+});
+```
+
+When `DATABASE_URL` is present, explicitly passing other configuration fields with undefined values can override values parsed from the connection string or cause unintended fallback to environment defaults.
+
+### Required correction
+
+Construct PostgreSQL Pool configuration conditionally.
+
+If `DATABASE_URL` is defined:
+- Use the connection string as the authoritative configuration.
+- Do not pass undefined `host`, `user`, `password`, or `database` fields that could override parsed connection information.
+
+If `DATABASE_URL` is not defined:
+- Construct the Pool configuration from the discrete SQL environment variables.
+- Preserve the existing SSL and port behavior.
+
+Also inspect:
+- `getPostgresPoolConfig()`
+- The infrastructure health/status check.
+- Test setup and teardown.
+- Connection error handling.
+- Pool cleanup and resource release.
+
+Requirements:
+- Do not hardcode the CI database username.
+- Do not hardcode a local developer database.
+- Do not suppress connection failures.
+- Do not turn a real infrastructure failure into a false success.
+- Ensure the Pool is closed in test cleanup.
+- Ensure test environment changes are restored.
+
+### Required regression tests
+
+Test at least:
+1. `DATABASE_URL` only.
+2. Discrete SQL environment variables only.
+3. `DATABASE_URL` plus conflicting or undefined SQL variables.
+4. Invalid database credentials.
+5. Unreachable PostgreSQL server.
+6. Correct cleanup after success and failure.
+
+The infrastructure status check must report the actual database connectivity state.
+
+## 4.3 Required result for Workstream 1
+
+Rerun the real PostgreSQL CI job.
+
+Do not use a local mocked database as a substitute.
+
+Expected:
+- Both previous failures are resolved for the correct reasons.
+- All existing PostgreSQL integration tests remain enabled.
+- No tests are skipped to conceal failures.
+- Normal CI remains green.
+- PostgreSQL CI becomes green.
+
+Report exact test counts and the actual GitHub Actions result.
+
+---
+
+# 5. Workstream 2 — Complete Visibility Import Concurrency and Transaction Safety
+
+Relevant implementation:
+- `postgresRepository.ts`
+- `memoryRepository.ts`
+- `repository.ts`
+- `catalogRoutes.ts`
+- Associated tests.
+
+Previous implementation already introduced:
+- PostgreSQL transaction-based visibility imports.
+- Import record insertion before observation processing.
+- Hash race sentinel.
+- Sorted transaction advisory locks by canonical observation keys.
+- Conflict pre-scan for `reject_on_conflict`.
+- Append-only history and version lineage for `replace_versioned`.
+- Sorted per-key locks in MemoryRepository.
+
+Preserve these implementations.
+
+## 5.1 PostgreSQL replace_versioned concurrency
+
+The existing live PostgreSQL I1 test verifies:
+- Two-connection advisory lock behavior.
+- `clock_timestamp()` lease expiry rollback.
+- Concurrent visibility hash race.
+
+However, this does not establish complete live PostgreSQL correctness for concurrent `replace_versioned` imports.
+
+Add real PostgreSQL integration tests covering:
+
+1. Two concurrent imports targeting the same canonical observation key.
+2. Two concurrent imports targeting overlapping observation keys in different input orders.
+3. `replace_versioned` creates the correct version lineage.
+4. Existing historical versions remain intact.
+5. Only the intended active version is selected.
+6. Duplicate hashes are handled consistently.
+7. Conflicting imports using `reject_on_conflict` are rejected before writes.
+8. A transaction failure during replacement rolls back all related changes.
+9. An import record cannot remain in an inconsistent partial state.
+10. Retry behavior does not create unintended duplicate lineage.
+
+Use separate database connections where concurrency needs to be demonstrated.
+
+Do not simulate concurrency using sequential calls.
+
+## 5.2 Deterministic lock ordering
+
+Verify that canonical observation keys are normalized and sorted consistently before acquiring transaction advisory locks.
+
+Test that concurrent requests with the same logical keys but different input order do not introduce lock-order inversion.
+
+## 5.3 MemoryRepository parity
+
+Verify that MemoryRepository preserves equivalent logical behavior for:
+- Duplicate detection.
+- Conflict rejection.
+- Replacement history.
+- Version lineage.
+- Concurrent operations.
+- Failure handling.
+
+Do not assume MemoryRepository tests prove PostgreSQL correctness.
+
+## 5.4 Required reporting
+
+Report separately:
+- MemoryRepository test results.
+- Live PostgreSQL test results.
+- Transaction rollback test results.
+- Remaining differences between in-memory and PostgreSQL implementations.
+
+Workstream A must not be reported as fully verified until the live PostgreSQL replacement and rollback tests pass.
+
+---
+
+# 6. Workstream 3 — Complete Catalog Version Guard
+
+Relevant files:
+- `postgresRepository.ts`
+- `memoryRepository.ts`
+- `repository.ts`
+- `catalogRoutes.ts`
+- `AppContext.tsx`
+- `client.ts`
+- Related tests.
+
+Existing implementation:
+- Positive `expectedVersion` required for initialized catalogs.
+- Unversioned requests permitted only for initial empty-catalog initialization.
+- Concurrent unversioned initialization permits only one winner.
+- API returns appropriate 400/409 errors.
+- Frontend contains `catalogVersionRef`.
+
+Preserve existing behavior.
+
+## 6.1 Add live PostgreSQL concurrency tests
+
+Use independent connections to verify:
+
+1. Two clients read the same catalog version.
+2. Client A updates successfully.
+3. Client B attempts to update using the stale version.
+4. Client B receives the expected conflict response.
+5. The catalog does not lose Client A's update.
+6. Concurrent initialization allows only one winner.
+7. An unversioned update cannot overwrite an initialized catalog.
+8. Failed updates do not partially mutate catalog data.
+
+Test both repository behavior and API behavior where feasible.
+
+## 6.2 Verify frontend version propagation
+
+Inspect every catalog mutation route and every frontend call site.
+
+Confirm that:
+- The current catalog version is initialized correctly.
+- Successful mutations update the local version reference.
+- Failed mutations do not advance the local version reference.
+- Concurrent or repeated operations cannot silently use an obsolete version.
+- Version conflicts are surfaced to the user and do not silently overwrite data.
+
+Do not add a workaround that removes backend version validation.
+
+Workstream B must be reported as partially verified until real PostgreSQL stale-write tests pass.
+
+---
+
+# 7. Workstream 4 — Harden PostgreSQL Workspace Advisory Locks
+
+Relevant files:
+- `postgresRepository.ts`
+- `repository.ts`
+- Related tests.
+
+Existing implementation includes:
+- AsyncLocalStorage context.
+- Reuse of a held client.
+- Nested savepoints.
+- Nested same-workspace support.
+- Same-client lock reuse.
+- Client release before contention backoff.
+- Client destruction when outer unlock fails.
+
+Preserve these behaviors.
+
+Two additional risks require correction.
+
+## 7.1 Nested advisory unlock failure
+
+Current concern:
+
+Outer unlock failure destroys the client, but nested unlock failure appears to log the failure without marking the active connection for destruction.
+
+A session-level advisory lock can remain attached to a pooled connection.
+
+If that connection is returned to the pool, another request may inherit a connection with an unexpected lock state.
+
+### Required correction
+
+Inspect all nested and outer lock acquisition and release paths.
+
+Implement safe failure handling so that:
+- A failed nested unlock marks the connection as unsafe.
+- The active connection is destroyed rather than returned as a healthy pooled connection.
+- Cleanup errors do not hide the original operation error.
+- Original operation errors remain observable.
+- Nested savepoint cleanup and advisory lock cleanup are both handled.
+- A failed unlock cannot silently return a contaminated connection to the pool.
+
+Add tests for:
+1. Outer unlock failure.
+2. Nested unlock failure.
+3. Nested operation failure followed by cleanup.
+4. Nested savepoint rollback failure.
+5. Connection destruction after unlock failure.
+6. Pool reuse after a failed lock operation.
+7. Normal successful nested operation.
+
+Use a real PostgreSQL integration test where necessary to verify session-level advisory lock state.
+
+## 7.2 Cross-workspace nested lock inversion
+
+Potential deadlock scenario:
+
+Worker A:
+- Acquires workspace X.
+- Attempts to acquire workspace Y.
+
+Worker B:
+- Acquires workspace Y.
+- Attempts to acquire workspace X.
+
+This can cause lock inversion and deadlock or timeout.
+
+### Required correction
+
+Inspect the current nested locking contract and call sites.
+
+Choose a safe, consistent policy:
+- Enforce deterministic workspace lock ordering; or
+- Disallow nested acquisition that violates the established ordering.
+
+Do not silently change the semantics of unrelated repository operations.
+
+If reverse ordering is disallowed:
+- Return a clear, deterministic error.
+- Ensure already-held locks are released safely.
+- Ensure the connection is not returned in an unsafe state.
+
+Add tests for:
+1. Same-workspace nested acquisition.
+2. Multiple workspaces acquired in deterministic order.
+3. Reverse-order nested acquisition.
+4. Concurrent opposing acquisition attempts.
+5. Timeout and cancellation behavior.
+6. Lock cleanup after rejection.
+7. No leaked session-level advisory locks.
+
+## 7.3 Preserve pool.max=1 behavior
+
+The existing RC1 test verifies:
+- `pool.max=1`.
+- Nested lock/save/mutate/load.
+- Releasing the client before contention backoff.
+- Destroying the client if outer unlock fails.
+
+Keep this regression coverage.
+
+Extend it to cover nested unlock failure and cross-workspace ordering.
+
+---
+
+# 8. Workstream 5 — Fix Demo Data Migration Version Propagation
+
+Relevant files:
+- `src/context/AppContext.tsx`
+- `src/client.ts`
+- Backend route for `POST /api/catalog/migrate-demo`
+- Related tests.
+
+Existing frontend call:
+
+```ts
+const res = await apiClient.migrateDemoData();
+```
+
+Backend behavior:
+- Initial empty-catalog initialization may accept an unversioned request.
+- Updating an initialized catalog requires the correct expected version.
+- An unversioned update to an initialized catalog is rejected with `409 CATALOG_VERSION_CONFLICT`.
+
+This means the existing frontend call may fail when the user attempts demo migration in a populated workspace.
+
+### Required investigation
+
+Determine the intended product behavior.
+
+Do not assume that demo migration should overwrite a populated catalog.
+
+Inspect:
+- The UI entry point for demo migration.
+- Existing confirmation dialogs.
+- Whether demo migration is intended only for empty workspaces.
+- Whether it is allowed to update populated workspaces.
+- Current catalog version state.
+- All other callers of the migration API.
+
+### Required implementation
+
+If demo migration is allowed for an initialized catalog:
+- Pass the current `catalogVersionRef.current` or the correct authoritative expected version.
+- Update the local version reference only after a successful response.
+- Handle stale-version conflicts explicitly.
+- Do not automatically retry using a newer version without user awareness.
+- Do not silently overwrite user data.
+
+If demo migration is intended only for an empty catalog:
+- Enforce that restriction in the UI and backend.
+- Explain the restriction to the user.
+- Ensure the frontend does not repeatedly issue an invalid request.
+
+In either case:
+- Keep backend optimistic concurrency protection.
+- Preserve existing data.
+- Add API and frontend regression tests.
+- Verify that the version remains correct after success and failure.
+
+---
+
+# 9. Workstream 6 — Verify Production Authentication Rate Limiter
+
+Relevant files:
+- `productionConfig.ts`
+- `auth.ts`
+- `app.ts`
+- Related tests.
+
+Previous implementation:
+- Production rate limiter fails closed by default.
+- `fallback_local` is an explicit alternative.
+- Diagnostics are exposed.
+
+Preserve this behavior.
+
+### Required investigation
+
+Verify:
+1. Production defaults.
+2. Local development behavior.
+3. Explicit fallback configuration.
+4. Shared PostgreSQL-backed rate-limit storage.
+5. Database/storage outages.
+6. Multiple application instances.
+7. Concurrent requests.
+8. Recovery after storage returns.
+9. Whether diagnostics reveal secrets or sensitive configuration.
+
+### Required multi-instance tests
+
+Where possible, run two independent application instances against the same PostgreSQL-backed rate-limit storage.
+
+Verify:
+- A request counted by instance A is visible to instance B.
+- Limits cannot be bypassed simply by alternating instances.
+- Storage outage does not silently switch production to an insecure local-only limiter.
+- Recovery does not reset or bypass the intended enforcement policy.
+- Fallback behavior only occurs when explicitly configured.
+- Diagnostics accurately describe the active mode.
+
+If real multi-instance execution is unavailable, clearly distinguish unit-test evidence from unverified deployment behavior.
+
+Workstream E must not be marked fully verified based only on unit tests.
+
+---
+
+# 10. Workstream 7 — Verify Public Artifact Exposure and Build Packaging
+
+Previous implementation introduced HTTP middleware that blocks:
+- `/assets/aistudio/*`
+- `/Paste_November_*`
+
+It applies to development and production Express requests.
+
+Existing files under `public/assets/aistudio/` were preserved.
+
+Do not delete user artifacts without establishing their dependencies.
+
+### Required investigation
+
+Inspect:
+- Express middleware order.
+- Vite public asset handling.
+- Production build output.
+- Static hosting assumptions.
+- CDN or reverse-proxy deployment paths.
+- All source-code references to the protected assets.
+- Whether files are copied into `dist/`.
+- Whether static hosting can serve them without passing through Express middleware.
+
+### Required tests
+
+Verify:
+1. Protected routes return the intended blocked response through Express.
+2. Normal public assets remain accessible.
+3. Protected files are not accidentally exposed through an alternate application route.
+4. Production build output is inspected.
+5. Any CDN/static-hosting bypass is documented.
+6. Existing application assets still work.
+
+### Cleanup policy
+
+Do not delete or overwrite the original files.
+
+If the artifacts are unnecessary and are copied into a public production bundle:
+- First prove that the application does not depend on them.
+- Identify the exact affected files.
+- Propose a safe, non-destructive relocation outside the public directory.
+- Preserve original content and provide a clear migration/recovery path.
+
+Do not claim that Express middleware protects files served directly by an independent CDN or static host.
+
+Workstream F must distinguish:
+- Express route protection.
+- Production build packaging.
+- External static-hosting protection.
+
+---
+
+# 11. Workstream 8 — Full Regression and Integration Verification
+
+Run the existing test suites after implementation.
+
+Do not replace the project's established test commands or test framework.
+
+At minimum, verify:
+
+## 11.1 Standard CI
+
+- Dependency installation using the project's lockfile.
+- TypeScript checks.
+- Full test suite.
+- Lint.
+- Production build.
+
+## 11.2 Live PostgreSQL CI
+
+- Frozen dependency installation.
+- Migration command.
+- Database status command.
+- Existing live PostgreSQL integration tests.
+- New concurrency tests.
+- Transaction rollback tests.
+- Version guard tests.
+- Workspace lock tests.
+- Infrastructure health/status tests.
+- Full test suite.
+- Lint and build if the workflow includes them.
+
+## 11.3 Database migration safety
+
+Verify:
+- Existing migrations 001–012 remain intact.
+- No accidental destructive schema operation.
+- Migration status is consistent.
+- Repeated migration execution is safe.
+- Existing database records remain intact.
+
+Do not reset the CI database merely to make the tests pass unless the workflow explicitly provisions a disposable test database.
+
+## 11.4 Test quality
+
+For every new test, identify whether it is:
+- Unit test.
+- Integration test.
+- Live PostgreSQL test.
+- Multi-instance integration test.
+- External service test.
+
+Do not label a mocked test as a live integration test.
+
+Report exact pass/fail/skip counts.
+
+---
+
+# 12. Workstream 9 — External Integration and Security Verification
+
+The following are separate from local test success and must not be claimed as verified without actual execution.
+
+## 12.1 Shopify
+
+Verify the existing implementation and identify what still requires real credentials.
+
+Required evidence where credentials are available:
+- OAuth installation.
+- OAuth callback and state validation.
+- Token storage and isolation.
+- Admin API access.
+- GraphQL request handling.
+- Pagination.
+- API error handling.
+- Rate-limit handling.
+- Shop/tenant isolation.
+- Disconnect and revocation behavior.
+
+Do not invent successful Shopify test results if no real Shopify credentials are available.
+
+## 12.2 Stripe
+
+Verify the existing implementation and identify what still requires Stripe Test Mode credentials.
+
+Required evidence where credentials are available:
+- Checkout session creation.
+- Successful payment.
+- Failed payment.
+- Cancelled checkout.
+- Webhook signature verification.
+- Duplicate webhook delivery.
+- Idempotency.
+- Subscription lifecycle.
+- Entitlement changes.
+- Refund or cancellation behavior.
+- Tenant/account isolation.
+
+Do not claim payment readiness based only on mocked Stripe tests.
+
+## 12.3 Security tools
+
+Check whether the established security tools are available:
+- Semgrep.
+- Trivy.
+
+Use the existing security-review workflow where available.
+
+If a tool is unavailable:
+- Report that it was unavailable.
+- Do not invent scan results.
+- Do not silently replace it with a different tool.
+- Do not state that a security scan passed.
+
+Review dependency vulnerabilities and application-specific security risks separately from unit-test results.
+
+---
+
+# 13. Required Final Acceptance Criteria
+
+Do not declare the application production-ready until all relevant evidence is available.
+
+### CI acceptance
+
+- Normal CI is green.
+- PostgreSQL CI is green.
+- No unexplained skipped tests.
+- The two original PostgreSQL failures are fixed for the correct reasons.
+- New concurrency and rollback tests pass.
+- Lint and production build pass.
+
+### Data integrity acceptance
+
+- Visibility imports are transactionally safe.
+- Concurrent replacement preserves correct version lineage.
+- Rollback leaves no partial records.
+- Catalog stale writes are rejected.
+- Demo migration uses the correct version policy.
+- Workspace locks cannot silently leak.
+- Unsafe pooled connections are destroyed.
+
+### Production configuration acceptance
+
+- Production rate limiter fails closed by default.
+- Shared storage behavior is verified or clearly marked unverified.
+- Public artifact exposure is assessed across the actual deployment path.
+- Database migrations remain safe and intact.
+
+### External service acceptance
+
+- Shopify integration is verified using real credentials, or explicitly marked blocked.
+- Stripe integration is verified in Test Mode, or explicitly marked blocked.
+- Security scans are actually run, or explicitly marked unavailable.
+
+### Final status must use one of these states
+
+1. **VERIFIED** — The relevant implementation and required tests have passed with evidence.
+2. **PARTIALLY VERIFIED** — Some evidence exists, but important scenarios remain untested.
+3. **BLOCKED** — Verification cannot be completed because required external credentials, services, infrastructure, or tools are unavailable.
+4. **FAILED** — A required test or behavior currently fails.
+
+Do not use the term READY FOR PRODUCTION unless all required production acceptance criteria have been satisfied.
+
+---
+
+# 14. Required Final Report
+
+Return a structured report containing:
+
+## A. Baseline
+- Repository and branch.
+- Starting commit.
+- Actual workspace Git status.
+- Whether the workspace contains Git metadata.
+
+## B. Changes implemented
+For each workstream:
+- Files changed.
+- Functions changed.
+- Defect addressed.
+- Exact correction.
+- Tests added or modified.
+
+## C. Verification results
+
+Provide a table:
+
+| Verification | Result | Evidence |
+|---|---|---|
+| Standard CI | | |
+| PostgreSQL CI | | |
+| TypeScript | | |
+| Full test suite | | |
+| Lint | | |
+| Production build | | |
+| Visibility concurrency | | |
+| replace_versioned lineage | | |
+| Transaction rollback | | |
+| Catalog version guard | | |
+| Workspace lock cleanup | | |
+| Cross-workspace lock ordering | | |
+| Demo migration version | | |
+| Multi-instance rate limiter | | |
+| Public artifact packaging | | |
+| Shopify live integration | | |
+| Stripe Test Mode | | |
+| Semgrep | | |
+| Trivy | | |
+
+## D. Exact test counts
+Report:
+- Passed.
+- Failed.
+- Skipped.
+- Total.
+- Test execution environment.
+- Whether PostgreSQL was real or mocked.
+
+## E. Remaining risks
+Separate:
+- Confirmed defects.
+- Unverified behavior.
+- External integration blockers.
+- Deployment assumptions.
+
+## F. Production readiness decision
+Use only the four status definitions in Section 13.
+
+Explain precisely what evidence supports the decision.
+
+## G. Preservation confirmation
+Confirm:
+- No destructive rewrite.
+- Existing migrations preserved.
+- Existing functionality preserved.
+- No tests removed or weakened.
+- No user data intentionally deleted.
+- No commit, push, merge, or deployment performed.
+
+If any item cannot be confirmed, state that explicitly.
+
+---
+
+# 15. Execution Order
+
+Follow this order:
+
+1. Inspect the actual current workspace and baseline.
+2. Fix the two PostgreSQL CI configuration/test failures.
+3. Run the PostgreSQL job and verify both original failures are resolved.
+4. Complete visibility `replace_versioned` concurrency and rollback verification.
+5. Complete live PostgreSQL catalog version-guard tests.
+6. Fix nested advisory unlock failure handling.
+7. Fix cross-workspace lock inversion protection.
+8. Correct Demo Migration version propagation or enforce its empty-workspace restriction.
+9. Verify multi-instance rate limiter behavior.
+10. Verify public artifact packaging and static-hosting exposure.
+11. Run the complete standard and PostgreSQL regression suites.
+12. Assess Shopify, Stripe, Semgrep, and Trivy evidence.
+13. Produce the final report.
+
+If a stage reveals a regression, stop and correct that regression before continuing.
+
+Do not hide incomplete work behind a successful local build.
+
+**Final instruction:** Work on the existing AIXSHOP v1.0 implementation from the specified baseline. Make only focused, evidence-driven changes. Preserve all development progress. Verify the actual behavior, not merely the presence of code or passing mocked tests. Stop without committing, pushing, merging, or deploying.

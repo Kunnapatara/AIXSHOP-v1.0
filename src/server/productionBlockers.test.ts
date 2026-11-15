@@ -11,6 +11,7 @@ import { PostgresRepository } from './db/postgresRepository';
 import {
   CatalogVersionConflictError,
   CatalogVersionValidationError,
+  WorkspaceLockOrderError,
 } from './db/repository';
 import { createApp } from './app';
 import { processShopifyWebhook } from './shopify/webhookService';
@@ -1285,6 +1286,432 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         await singleConnPool.end();
       }
     });
+
+    test('I2. [Live PG - Workstream 2] Two-connection concurrent replace_versioned, opposite key ordering, lineage, duplicate retry, reject_on_conflict & TX rollback', async () => {
+      const wsId = `ws_vis_live_${Date.now()}`;
+      const usrId = `usr_vis_live_${Date.now()}`;
+      await repoA.registerUser({
+        user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Vis Live' },
+        workspace: { id: wsId, name: 'Vis Live WS', slug: wsId },
+        session: {
+          id: `sess_vis_${Date.now()}`,
+          sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
+          userId: usrId,
+          activeWorkspaceId: wsId,
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      const makeImp = (id: string, seed: string) => ({
+        id,
+        workspaceId: wsId,
+        filename: `${id}.csv`,
+        contentHash: crypto.createHash('sha256').update(`${seed}_${wsId}`).digest('hex'),
+        rowCount: 2,
+        rejectedRowCount: 0,
+        status: 'completed' as const,
+        errors: [],
+        reportingPeriodStart: '2026-10-10',
+        reportingPeriodEnd: '2026-10-12',
+        sourcePlatform: 'merchant_csv',
+        createdAt: new Date().toISOString(),
+      });
+      const makeMetric = (impId: string, date: string, topic: string | null, mentions: number) => ({
+        id: `vm_${impId}_${date}`,
+        workspaceId: wsId,
+        importId: impId,
+        observationDate: date,
+        platform: 'ChatGPT Search',
+        brandMentions: mentions,
+        productMentions: mentions + 1,
+        websiteClicks: mentions + 2,
+        discoveryTopic: topic,
+        topicPresence: (topic === null ? 'unspecified' : 'specified') as 'unspecified' | 'specified',
+        evidenceSource: `${impId}.csv`,
+        createdAt: new Date().toISOString(),
+      });
+
+      // 1. Seed initial v1 on keys K1 ('2026-10-10', null) & K2 ('2026-10-11', 'running')
+      const imp1 = makeImp('vimp_v1', 'seed_v1');
+      await repoA.saveVisibilityImportAtomic(imp1, [
+        makeMetric('vimp_v1', '2026-10-10', null, 10),
+        makeMetric('vimp_v1', '2026-10-11', 'running', 20),
+      ]);
+
+      // 2. Concurrent replace_versioned across Pool A ([K1, K2]) and Pool B ([K2, K1] opposite order)
+      const [repA, repB] = await Promise.all([
+        repoA.saveVisibilityImportAtomic(
+          makeImp('vimp_v2a', 'rep_a'),
+          [
+            makeMetric('vimp_v2a', '2026-10-10', null, 100),
+            makeMetric('vimp_v2a', '2026-10-11', 'running', 200),
+          ],
+          { conflictPolicy: 'replace_versioned' }
+        ),
+        repoB.saveVisibilityImportAtomic(
+          makeImp('vimp_v2b', 'rep_b'),
+          [
+            makeMetric('vimp_v2b', '2026-10-11', 'running', 400),
+            makeMetric('vimp_v2b', '2026-10-10', null, 300),
+          ],
+          { conflictPolicy: 'replace_versioned' }
+        ),
+      ]);
+      assert.equal(repA.replacedCount, 2);
+      assert.equal(repB.replacedCount, 2);
+
+      // 3. Verify lineage v1 -> v2 -> v3 intact and supersedes_history_id chain valid
+      const hist = await repoA.getVisibilityObservationHistory(wsId, 50);
+      const k1Hist = hist.filter((h) => h.observationDate === '2026-10-10').sort((a, b) => a.versionNumber - b.versionNumber);
+      const k2Hist = hist.filter((h) => h.observationDate === '2026-10-11').sort((a, b) => a.versionNumber - b.versionNumber);
+      assert.deepEqual(k1Hist.map((h) => h.versionNumber), [1, 2, 3]);
+      assert.deepEqual(k2Hist.map((h) => h.versionNumber), [1, 2, 3]);
+      assert.equal(k1Hist[0].eventType, 'recorded');
+      assert.equal(k1Hist[1].eventType, 'replaced');
+      assert.equal(k1Hist[1].supersedesHistoryId, k1Hist[0].id);
+      assert.equal(k1Hist[2].supersedesHistoryId, k1Hist[1].id);
+      assert.equal(k2Hist[2].supersedesHistoryId, k2Hist[1].id);
+
+      // Active metric matches v3 exactly
+      const summary = await repoB.getVisibilitySummary(wsId);
+      const k1Active = summary.recentObservations.find((m) => m.observationDate === '2026-10-10')!;
+      const k2Active = summary.recentObservations.find((m) => m.observationDate === '2026-10-11')!;
+      assert.equal(k1Active.brandMentions, k1Hist[2].brandMentions);
+      assert.equal(k2Active.brandMentions, k2Hist[2].brandMentions);
+
+      // 4. Retry same content_hash returns duplicate_noop without creating duplicate history rows
+      const retryDup = await repoA.saveVisibilityImportAtomic(
+        makeImp('vimp_v2b_retry', 'rep_b'),
+        [
+          makeMetric('vimp_v2b_retry', '2026-10-10', null, 300),
+          makeMetric('vimp_v2b_retry', '2026-10-11', 'running', 400),
+        ],
+        { conflictPolicy: 'replace_versioned' }
+      );
+      assert.equal(retryDup.duplicateImport, true);
+      const histAfterRetry = await repoA.getVisibilityObservationHistory(wsId, 50);
+      assert.equal(histAfterRetry.length, 6, 'Duplicate retry must not emit additional history rows');
+
+      // 5. reject_on_conflict leaves zero partial import rows
+      await assert.rejects(
+        () =>
+          repoB.saveVisibilityImportAtomic(
+            makeImp('vimp_reject', 'reject_seed'),
+            [makeMetric('vimp_reject', '2026-10-10', null, 999)],
+            { conflictPolicy: 'reject_on_conflict' }
+          ),
+        (err: any) => err instanceof VisibilityObservationConflictError && err.statusCode === 409
+      );
+      const impCheck = await poolA.query(`SELECT id FROM ai_visibility_imports WHERE id = 'vimp_reject'`);
+      assert.equal(impCheck.rows.length, 0, 'Rejected conflict import must roll back completely');
+
+      // 6. Mid-TX replacement failure (forced SQL error on 2nd metric inside replace_versioned) rolls back import, history, and v3 active metric
+      await assert.rejects(
+        () =>
+          repoA.saveVisibilityImportAtomic(
+            makeImp('vimp_tx_abort', 'abort_seed'),
+            [
+              makeMetric('vimp_tx_abort', '2026-10-10', null, 777),
+              {
+                ...makeMetric('vimp_tx_abort', '2026-10-11', 'running', 888),
+                platform: null as any, // triggers NOT NULL violation inside same TX after 1st metric wrote
+              },
+            ],
+            { conflictPolicy: 'replace_versioned' }
+          ),
+        (err: any) => Boolean(err)
+      );
+      const abortImpRes = await poolA.query(`SELECT id FROM ai_visibility_imports WHERE id = 'vimp_tx_abort'`);
+      assert.equal(abortImpRes.rows.length, 0, 'Aborted TX import header must be rolled back');
+      const histAfterAbort = await repoA.getVisibilityObservationHistory(wsId, 50);
+      assert.equal(histAfterAbort.length, 6, 'Aborted replacement must leave zero partial history rows');
+      const summaryAfterAbort = await repoA.getVisibilitySummary(wsId);
+      const k1AfterAbort = summaryAfterAbort.recentObservations.find((m) => m.observationDate === '2026-10-10')!;
+      assert.notEqual(k1AfterAbort.brandMentions, 777, 'First metric write inside aborted TX must be rolled back');
+    });
+
+    test('I3. [Live PG - Workstream 3] Two-connection catalogVersion concurrency, single initialization winner, unversioned overwrite rejection, and TX non-mutation', async () => {
+      const wsId = `ws_ver_live_${Date.now()}`;
+      const usrId = `usr_ver_live_${Date.now()}`;
+      await repoA.registerUser({
+        user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Ver Live' },
+        workspace: { id: wsId, name: 'Ver Live WS', slug: wsId },
+        session: {
+          id: `sess_ver_${Date.now()}`,
+          sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
+          userId: usrId,
+          activeWorkspaceId: wsId,
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      const makeCat = (id: string, sku: string, ver?: number): StoragePayloadV1 => ({
+        products: [
+          {
+            id,
+            title: `Product ${id}`,
+            brand: 'LiveBrand',
+            category: 'Home',
+            description: 'Live PG product',
+            image: '',
+            status: 'active',
+            completenessScore: 90,
+            evidenceCoverageScore: 0,
+            externalDiscoveryStatus: 'observed_in_sample',
+            attributes: {},
+            variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 42, inventoryCount: 3, attributes: {} }],
+            offers: [],
+            evidenceDocuments: [],
+            findingsCount: 0,
+            lastAudited: new Date().toISOString(),
+          },
+        ],
+        variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 42, inventoryCount: 3, attributes: {} }],
+        offers: [],
+        findings: [],
+        actions: [],
+        evidence: [],
+        storeProfile: {
+          name: 'Ver Store',
+          domain: `${wsId}.myshopify.com`,
+          currency: 'USD',
+          skuCount: 1,
+          catalogCompletenessAvg: 90,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Free Audit',
+          connectors: [],
+        },
+        ...(ver !== undefined ? { catalogVersion: ver } : {}),
+      });
+
+      // 1. Concurrent unversioned init on empty catalog across Pool A & Pool B -> single winner
+      const initSettled = await Promise.allSettled([
+        repoA.saveWorkspaceCatalog(wsId, makeCat('p_initA', 'SKU-IA')),
+        repoB.saveWorkspaceCatalog(wsId, makeCat('p_initB', 'SKU-IB')),
+      ]);
+      assert.equal(initSettled.filter((r) => r.status === 'fulfilled').length, 1);
+      assert.equal(initSettled.filter((r) => r.status === 'rejected').length, 1);
+
+      const catA = (await repoA.loadWorkspaceCatalog(wsId))!;
+      const catB = (await repoB.loadWorkspaceCatalog(wsId))!;
+      assert.equal(catA.catalogVersion, 2);
+      assert.equal(catB.catalogVersion, 2);
+
+      // 2. Client A updates with expectedVersion=2 -> succeeds (version 3); Client B updates with stale expectedVersion=2 -> 409
+      await repoA.saveWorkspaceCatalog(wsId, makeCat('p_winA', 'SKU-WINA', 2), { expectedVersion: 2 });
+      await assert.rejects(
+        () => repoB.saveWorkspaceCatalog(wsId, makeCat('p_staleB', 'SKU-STALEB', 2), { expectedVersion: 2 }),
+        (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409 && err.currentVersion === 3
+      );
+
+      // 3. Unversioned update cannot overwrite initialized catalog
+      await assert.rejects(
+        () => repoB.saveWorkspaceCatalog(wsId, makeCat('p_unver', 'SKU-UNVER')),
+        (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409 && err.currentVersion === 3
+      );
+
+      // 4. Failed quota update does not mutate catalog or advance version
+      const overQuotaProducts = Array.from({ length: 120 }, (_, i) => ({
+        ...makeCat(`p_oq_${i}`, `SKU-OQ-${i}`).products[0],
+      }));
+      await assert.rejects(
+        () =>
+          repoA.saveWorkspaceCatalog(
+            wsId,
+            { ...makeCat('p_oq', 'SKU-OQ', 3), products: overQuotaProducts },
+            { expectedVersion: 3 }
+          ),
+        (err: any) => err.code === 'PLAN_QUOTA_EXCEEDED'
+      );
+
+      const verifiedCat = (await repoB.loadWorkspaceCatalog(wsId))!;
+      assert.equal(verifiedCat.catalogVersion, 3);
+      assert.equal(verifiedCat.products[0].id, 'p_winA');
+
+      // 5. executeWorkspaceAudit increments catalogVersion and returns updated catalogVersion
+      const auditOut = await repoA.executeWorkspaceAudit(wsId);
+      assert.equal(auditOut.catalog.catalogVersion, 4);
+    });
+
+    test('I4. [Live PG - Workstream 4] Nested unlock failure destroys pooled backend PID (0 pg_locks leaks) & cross-workspace lock ordering enforces deterministic order', async () => {
+      const wsBase = `ws_lock_${Date.now()}`;
+      const wsA = `${wsBase}_a`;
+      const wsB = `${wsBase}_b`;
+
+      // 1. Same-workspace nested acquisition + deterministic ascending cross-workspace (wsA -> wsB) succeed with 0 leaked advisory locks
+      await repoA.withWorkspaceLock(wsA, async () => {
+        await repoA.withWorkspaceLock(wsA, async () => {
+          await repoA.withWorkspaceLock(wsB, async () => true);
+        });
+      });
+      const leakCheck1 = await poolA.query<{ cnt: number }>(
+        `SELECT count(*)::int AS cnt FROM pg_locks WHERE locktype = 'advisory'`
+      );
+      assert.equal(leakCheck1.rows[0].cnt, 0, 'Zero advisory locks may remain after normal nested & ordered locks');
+
+      // 2. Reverse-order cross-workspace acquisition (wsB -> wsA) rejects deterministically with WorkspaceLockOrderError & releases wsB cleanly
+      await assert.rejects(
+        () =>
+          repoA.withWorkspaceLock(wsB, async () => {
+            await repoA.withWorkspaceLock(wsA, async () => 'unreachable');
+          }),
+        (err: any) => err instanceof WorkspaceLockOrderError && err.code === 'WORKSPACE_LOCK_ORDER_VIOLATION'
+      );
+      // Confirm wsB lock is released so Pool B can immediately acquire wsB
+      const bAcquiredAfterReject = await repoB.withWorkspaceLock(wsB, async () => 'acquired', { lockTimeoutMs: 500 });
+      assert.equal(bAcquiredAfterReject, 'acquired');
+
+      // 3. Nested unlock failure on max=1 live PG pool marks connection poisoned -> outer exit calls release(true) destroying backend PID!
+      const singleCfg = process.env.DATABASE_URL
+        ? { connectionString: process.env.DATABASE_URL, max: 1, connectionTimeoutMillis: 2000 }
+        : {
+            host: process.env.SQL_HOST || process.env.PGHOST,
+            port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
+            user: process.env.SQL_USER || process.env.PGUSER,
+            password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
+            database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
+            max: 1,
+            connectionTimeoutMillis: 2000,
+          };
+      const trackedPool = new Pool(singleCfg);
+      try {
+        const origConnect = trackedPool.connect.bind(trackedPool);
+        let firstPid = 0;
+        let injectedNestedUnlockFailure = false;
+        (trackedPool as any).connect = async () => {
+          const client = await origConnect();
+          if (!injectedNestedUnlockFailure) {
+            const pidRes = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+            firstPid = pidRes.rows[0].pid;
+            const origQuery = client.query.bind(client);
+            (client as any).query = async (sql: any, params?: any[]) => {
+              if (
+                typeof sql === 'string' &&
+                sql.includes('pg_advisory_unlock') &&
+                Array.isArray(params) &&
+                params[0] === wsB &&
+                !injectedNestedUnlockFailure
+              ) {
+                injectedNestedUnlockFailure = true;
+                return { rows: [{ pg_advisory_unlock: false }] };
+              }
+              return origQuery(sql, params);
+            };
+          }
+          return client;
+        };
+
+        const trackedRepo = new PostgresRepository(trackedPool);
+        await assert.rejects(
+          () =>
+            trackedRepo.withWorkspaceLock(wsA, async () => {
+              return trackedRepo.withWorkspaceLock(wsB, async () => {
+                throw new Error('primary_nested_op_error');
+              });
+            }),
+          /primary_nested_op_error/
+        );
+
+        // Next checkout on pool.max=1 must receive a fresh PostgreSQL backend PID and wsB/wsA locks must both be free
+        const nextClient = await trackedPool.connect();
+        try {
+          const pid2Res = await nextClient.query<{ pid: number; adv: number }>(
+            `SELECT pg_backend_pid() AS pid, (SELECT count(*)::int FROM pg_locks WHERE locktype = 'advisory') AS adv`
+          );
+          assert.notEqual(pid2Res.rows[0].pid, firstPid, 'Poisoned PG backend session MUST be destroyed rather than reused');
+          assert.equal(pid2Res.rows[0].adv, 0, 'Session destruction must release any stuck advisory lock');
+        } finally {
+          nextClient.release();
+        }
+      } finally {
+        await trackedPool.end();
+      }
+    });
+
+    test('I5. [Live PG - Workstream 6] Two independent Express instances share live PostgreSQL auth_rate_limits table, fail closed 503 on outage, and recover cleanly', async () => {
+      const savedNodeEnv = process.env.NODE_ENV;
+      const savedFailureMode = process.env.AUTH_RATE_LIMIT_FAILURE_MODE;
+      const savedSessionSecret = process.env.SESSION_SECRET;
+      const savedAppUrl = process.env.APP_URL;
+
+      process.env.NODE_ENV = 'production';
+      delete process.env.AUTH_RATE_LIMIT_FAILURE_MODE;
+      process.env.SESSION_SECRET = 'live_pg_test_session_secret_value_32_bytes_minimum';
+      process.env.APP_URL = 'https://app.aixshop.example.com';
+      _resetRateLimiter();
+
+      const testIp = `203.0.113.${Math.floor(Math.random() * 200) + 10}`;
+      const srvA = await startTempAppServer(createApp(repoA));
+      const srvB = await startTempAppServer(createApp(repoB));
+      try {
+        // Send 20 alternating failed login requests across Instance A (Pool A) & Instance B (Pool B)
+        for (let i = 0; i < 20; i++) {
+          const targetBase = i % 2 === 0 ? srvA.baseUrl : srvB.baseUrl;
+          const r = await fetch(`${targetBase}/api/auth/login`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Forwarded-For': testIp,
+            },
+            body: JSON.stringify({ email: `no_such_user_${i}@example.com`, password: 'wrong' }),
+          });
+          assert.equal(r.status, 401, `Attempt ${i + 1} across alternating instances must count normally`);
+        }
+
+        // 21st request hits Instance B -> must be rejected 429 because Instance A & Instance B share PostgreSQL auth_rate_limits!
+        const blockedOnB = await fetch(`${srvB.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Forwarded-For': testIp,
+          },
+          body: JSON.stringify({ email: 'blocked@example.com', password: 'wrong' }),
+        });
+        assert.equal(blockedOnB.status, 429);
+        const blockedJson = await blockedOnB.json();
+        assert.equal(blockedJson.code, 'RATE_LIMITED');
+
+        // Storage outage on Pool A fails closed 503 (does NOT silently degrade to local fallback)
+        const origConsume = repoA.consumeRateLimit.bind(repoA);
+        let simulateOutage = true;
+        repoA.consumeRateLimit = async (key, max, windowMs) => {
+          if (simulateOutage) throw new Error('Simulated live PG outage postgres://secret:pass@db/prod');
+          return origConsume(key, max, windowMs);
+        };
+        const outageRes = await fetch(`${srvA.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.77' },
+          body: JSON.stringify({ email: 'outage@example.com', password: 'wrong' }),
+        });
+        assert.equal(outageRes.status, 503);
+        const outageJson = await outageRes.json();
+        assert.equal(outageJson.code, 'RATE_LIMITER_UNAVAILABLE');
+
+        // Recover & confirm cleanup
+        simulateOutage = false;
+        const recoveredRes = await fetch(`${srvA.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.77' },
+          body: JSON.stringify({ email: 'recovered@example.com', password: 'wrong' }),
+        });
+        assert.equal(recoveredRes.status, 401);
+        assert.equal(getAuthRateLimiterDiagnostics().storageDegraded, false);
+      } finally {
+        await srvA.close();
+        await srvB.close();
+        await poolA.query(`DELETE FROM auth_rate_limits WHERE rate_key LIKE $1`, [`%${testIp}%`]).catch(() => {});
+        await poolA.query(`DELETE FROM auth_rate_limits WHERE rate_key LIKE '%198.51.100.77%'`).catch(() => {});
+        _resetRateLimiter();
+        if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = savedNodeEnv;
+        if (savedFailureMode === undefined) delete process.env.AUTH_RATE_LIMIT_FAILURE_MODE;
+        else process.env.AUTH_RATE_LIMIT_FAILURE_MODE = savedFailureMode;
+        if (savedSessionSecret === undefined) delete process.env.SESSION_SECRET;
+        else process.env.SESSION_SECRET = savedSessionSecret;
+        if (savedAppUrl === undefined) delete process.env.APP_URL;
+        else process.env.APP_URL = savedAppUrl;
+      }
+    });
   });
 
   // =========================================================================
@@ -1720,6 +2147,186 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       );
     });
 
+    test('RA3. [MemoryRepository Parity — Workstream 2] Sorted replace_versioned concurrency, unsorted history lineage & atomic TX rollback', async () => {
+      const mem = new MemoryRepository(true);
+      await mem.registerUser({
+        user: { id: 'u_ra3', email: 'ra3@example.com', passwordHash: 'h', fullName: 'RA3' },
+        workspace: { id: 'ws_ra3', name: 'RA3 WS', slug: 'ws-ra3' },
+        session: {
+          id: 'sess_ra3',
+          sessionTokenHash: crypto.createHash('sha256').update('tok_ra3').digest('hex'),
+          userId: 'u_ra3',
+          activeWorkspaceId: 'ws_ra3',
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      const makeImp = (id: string, seed: string) => ({
+        id,
+        workspaceId: 'ws_ra3',
+        filename: `${id}.csv`,
+        contentHash: crypto.createHash('sha256').update(seed).digest('hex'),
+        rowCount: 2,
+        rejectedRowCount: 0,
+        status: 'completed' as const,
+        errors: [],
+        reportingPeriodStart: '2026-10-01',
+        reportingPeriodEnd: '2026-10-02',
+        sourcePlatform: 'merchant_csv',
+        createdAt: new Date().toISOString(),
+      });
+      const makeM = (impId: string, date: string, topic: string | null, mentions: number) => ({
+        id: `vm_${impId}_${date}`,
+        workspaceId: 'ws_ra3',
+        importId: impId,
+        observationDate: date,
+        platform: 'Perplexity',
+        brandMentions: mentions,
+        productMentions: mentions,
+        websiteClicks: mentions,
+        discoveryTopic: topic,
+        topicPresence: (topic === null ? 'unspecified' : 'specified') as 'unspecified' | 'specified',
+        evidenceSource: `${impId}.csv`,
+        createdAt: new Date().toISOString(),
+      });
+
+      await mem.saveVisibilityImportAtomic(makeImp('i1', 's1'), [
+        makeM('i1', '2026-10-01', null, 1),
+        makeM('i1', '2026-10-02', 'topicA', 2),
+      ]);
+
+      // Concurrent opposite-order replacements
+      await Promise.all([
+        mem.saveVisibilityImportAtomic(
+          makeImp('i2a', 's2a'),
+          [makeM('i2a', '2026-10-01', null, 10), makeM('i2a', '2026-10-02', 'topicA', 20)],
+          { conflictPolicy: 'replace_versioned' }
+        ),
+        mem.saveVisibilityImportAtomic(
+          makeImp('i2b', 's2b'),
+          [makeM('i2b', '2026-10-02', 'topicA', 40), makeM('i2b', '2026-10-01', null, 30)],
+          { conflictPolicy: 'replace_versioned' }
+        ),
+      ]);
+
+      const hist = (await mem.getVisibilityObservationHistory('ws_ra3', 50))
+        .filter((h) => h.observationDate === '2026-10-01')
+        .sort((a, b) => a.versionNumber - b.versionNumber);
+      assert.deepEqual(hist.map((h) => h.versionNumber), [1, 2, 3]);
+      assert.equal(hist[1].supersedesHistoryId, hist[0].id);
+      assert.equal(hist[2].supersedesHistoryId, hist[1].id);
+
+      // Simulate mid-save failure in replace_versioned and verify full rollback
+      const origSaveMetrics = mem.saveVisibilityMetrics.bind(mem);
+      mem.saveVisibilityMetrics = async () => {
+        throw new Error('simulated metric write failure');
+      };
+      await assert.rejects(
+        () =>
+          mem.saveVisibilityImportAtomic(
+            makeImp('i_abort', 'abort'),
+            [makeM('i_abort', '2026-10-01', null, 999)],
+            { conflictPolicy: 'replace_versioned' }
+          ),
+        /simulated metric write failure/
+      );
+      mem.saveVisibilityMetrics = origSaveMetrics;
+      const histAfterAbort = (await mem.getVisibilityObservationHistory('ws_ra3', 50)).filter(
+        (h) => h.observationDate === '2026-10-01'
+      );
+      assert.equal(histAfterAbort.length, 3, 'Aborted replacement must roll back history completely');
+      const dupSummary = await mem.getVisibilitySummary('ws_ra3');
+      assert.equal(dupSummary.imports.some((i) => i.id === 'i_abort'), false);
+    });
+
+    test('RB3. [Workstream 3 & 5] Action mutations, import, audit run & migrate-demo propagate catalogVersion cleanly and block stale overwrites', async () => {
+      const repo = new MemoryRepository(true);
+      await repo.registerUser({
+        user: { id: 'u_rb3', email: 'rb3@example.com', passwordHash: 'h', fullName: 'RB3' },
+        workspace: { id: 'ws_rb3', name: 'RB3 WS', slug: 'ws-rb3' },
+        session: {
+          id: 'sess_rb3',
+          sessionTokenHash: crypto.createHash('sha256').update('tok_rb3').digest('hex'),
+          userId: 'u_rb3',
+          activeWorkspaceId: 'ws_rb3',
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      const app = createApp(repo);
+      const { baseUrl, close } = await startTempAppServer(app);
+      try {
+        const headers = {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer tok_rb3',
+          'X-Requested-With': 'XMLHttpRequest',
+        };
+
+        // 1. Seed initial demo catalog cleanly on empty workspace -> catalogVersion becomes 2
+        const seedRes = await fetch(`${baseUrl}/api/catalog/migrate-demo`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({}),
+        });
+        assert.equal(seedRes.status, 200);
+        const seedJson = await seedRes.json();
+        let currentVersion = seedJson.catalogVersion;
+        assert.equal(currentVersion, 2);
+
+        // 2. Run audit -> propagates incremented catalogVersion
+        const auditRes = await fetch(`${baseUrl}/api/audit/run`, { method: 'POST', headers });
+        assert.equal(auditRes.status, 200);
+        const auditJson = await auditRes.json();
+        assert.equal(auditJson.catalog.catalogVersion, currentVersion + 1);
+        currentVersion = auditJson.catalog.catalogVersion;
+
+        // 3. Approve, dismiss, or recheck action -> propagates updated catalogVersion so PUT succeeds without 409!
+        const action = auditJson.catalog.actions.find((a: any) => a.status === 'pending') || auditJson.catalog.actions[0];
+        if (action) {
+          const dismissRes = await fetch(`${baseUrl}/api/catalog/actions/${action.id}/dismiss`, {
+            method: 'POST',
+            headers,
+          });
+          assert.equal(dismissRes.status, 200);
+          const dismissJson = await dismissRes.json();
+          assert.equal(dismissJson.catalogVersion, currentVersion + 1);
+          currentVersion = dismissJson.catalogVersion;
+        }
+
+        // 4. Subsequent PUT using propagated currentVersion succeeds
+        const latestCat = await (await fetch(`${baseUrl}/api/catalog`, { headers })).json();
+        const putRes = await fetch(`${baseUrl}/api/catalog`, {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify({ expectedVersion: currentVersion, payload: latestCat.catalog }),
+        });
+        assert.equal(putRes.status, 200);
+        const putJson = await putRes.json();
+        assert.equal(putJson.catalogVersion, currentVersion + 1);
+        const latestVer = putJson.catalogVersion;
+
+        // 5. Stale migrate-demo with outdated expectedVersion rejects 409 without overwriting user catalog
+        const staleDemoRes = await fetch(`${baseUrl}/api/catalog/migrate-demo`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ expectedVersion: currentVersion }),
+        });
+        assert.equal(staleDemoRes.status, 409);
+        const staleDemoJson = await staleDemoRes.json();
+        assert.equal(staleDemoJson.code, 'CATALOG_VERSION_CONFLICT');
+        assert.equal(staleDemoJson.currentVersion, latestVer);
+
+        // Verify frontend AppContext sends expectedVersion and handles 409 safely without auto-retry
+        const appCtxSrc = fs.readFileSync(path.join(process.cwd(), 'src/context/AppContext.tsx'), 'utf8');
+        assert.match(appCtxSrc, /apiClient\.migrateDemoData\(expectedVersion\)/);
+        assert.match(appCtxSrc, /CATALOG_VERSION_CONFLICT[\s\S]*reloadWorkspaceCatalog/);
+        const settingsSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/SettingsPage.tsx'), 'utf8');
+        assert.match(settingsSrc, /confirmingDemoOverwrite/);
+      } finally {
+        await close();
+      }
+    });
+
     // -----------------------------------------------------------------------
     // REMEDIATION C — PostgreSQL Advisory Lock & Connection Pool Safety
     // -----------------------------------------------------------------------
@@ -1958,6 +2565,143 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       );
     });
 
+    test('RC2. [Workstream 4] Nested unlock failure & savepoint rollback failure poison connection for release(true) and deterministic cross-workspace lock ordering prevents deadlock', async () => {
+      // 1. Track pooled clients across nested unlock failure & savepoint rollback failure
+      let nextId = 1;
+      const destroyedIds: number[] = [];
+      const releasedIds: number[] = [];
+      const activePoolIds = new Set<number>();
+
+      const makeMockPool = (opts: {
+        failNestedUnlock?: boolean;
+        nestedUnlockFalse?: boolean;
+        failSavepointRollback?: boolean;
+      }) => ({
+        connect: async () => {
+          const cid = nextId++;
+          activePoolIds.add(cid);
+          let released = false;
+          const heldKeys = new Set<string>();
+          return {
+            cid,
+            query: async (sql: string, params?: any[]) => {
+              const key = String(params?.[0] || '');
+              if (sql.includes('pg_try_advisory_lock')) {
+                heldKeys.add(key);
+                return { rows: [{ locked: true }] };
+              }
+              if (sql.includes('pg_advisory_unlock')) {
+                if (key === 'ws_b_inner') {
+                  if (opts.failNestedUnlock) throw new Error('nested unlock connection error');
+                  if (opts.nestedUnlockFalse) return { rows: [{ pg_advisory_unlock: false }] };
+                }
+                heldKeys.delete(key);
+                return { rows: [{ pg_advisory_unlock: true }] };
+              }
+              if (sql.startsWith('ROLLBACK TO SAVEPOINT') && opts.failSavepointRollback) {
+                throw new Error('savepoint rollback lost');
+              }
+              return { rows: [], rowCount: 1 };
+            },
+            release: (destroy?: boolean) => {
+              if (released) return;
+              released = true;
+              activePoolIds.delete(cid);
+              if (destroy) destroyedIds.push(cid);
+              else releasedIds.push(cid);
+            },
+          };
+        },
+      });
+
+      // A. Nested unlock returning false marks connection poisoned -> outer exit destroys client (even though outer unlock returned true)
+      const pFalse = makeMockPool({ nestedUnlockFalse: true });
+      const repoFalse = new PostgresRepository(pFalse as any);
+      const okNested = await repoFalse.withWorkspaceLock('ws_a_outer', async () =>
+        repoFalse.withWorkspaceLock('ws_b_inner', async () => 'nested_ok')
+      );
+      assert.equal(okNested, 'nested_ok');
+      assert.equal(destroyedIds.length, 1, 'Failed nested unlock must poison and destroy pooled client');
+      assert.equal(releasedIds.length, 0);
+
+      // B. Nested unlock throwing when inner operation fails MUST preserve original error AND destroy client
+      destroyedIds.length = 0;
+      releasedIds.length = 0;
+      const pThrow = makeMockPool({ failNestedUnlock: true });
+      const repoThrow = new PostgresRepository(pThrow as any);
+      await assert.rejects(
+        () =>
+          repoThrow.withWorkspaceLock('ws_a_outer', async () =>
+            repoThrow.withWorkspaceLock('ws_b_inner', async () => {
+              throw new Error('original_operation_failure');
+            })
+          ),
+        /original_operation_failure/
+      );
+      assert.equal(destroyedIds.length, 1);
+
+      // Next operation on repoThrow still works on a healthy new client
+      const recovered = await repoThrow.withWorkspaceLock('ws_a_outer', async () => 'clean_new_client');
+      assert.equal(recovered, 'clean_new_client');
+      assert.equal(releasedIds.length, 1);
+
+      // C. Savepoint rollback failure inside nested transaction marks client poisoned -> destroyed on outer unlock
+      destroyedIds.length = 0;
+      releasedIds.length = 0;
+      const pSp = makeMockPool({ failSavepointRollback: true });
+      const repoSp = new PostgresRepository(pSp as any);
+      await assert.rejects(
+        () =>
+          repoSp.withWorkspaceLock('ws_a_outer', async () =>
+            (repoSp as any).withTransaction(async () =>
+              (repoSp as any).withTransaction(async () => {
+                throw new Error('inner_sp_failure');
+              })
+            )
+          ),
+        /inner_sp_failure/
+      );
+      assert.equal(destroyedIds.length, 1, 'Failed savepoint rollback must destroy pooled client');
+
+      // D. Cross-workspace deterministic lock ordering on PostgresRepository AND MemoryRepository
+      releasedIds.length = 0;
+      destroyedIds.length = 0;
+      const pOrder = makeMockPool({});
+      const repoOrder = new PostgresRepository(pOrder as any);
+      // Ascending order works
+      assert.equal(
+        await repoOrder.withWorkspaceLock('ws_alpha', async () =>
+          repoOrder.withWorkspaceLock('ws_zeta', async () => 'ordered_ok')
+        ),
+        'ordered_ok'
+      );
+      // Reverse order rejects deterministically BEFORE attempting inner lock
+      await assert.rejects(
+        () =>
+          repoOrder.withWorkspaceLock('ws_zeta', async () =>
+            repoOrder.withWorkspaceLock('ws_alpha', async () => 'unreachable')
+          ),
+        (err: any) => err instanceof WorkspaceLockOrderError && err.code === 'WORKSPACE_LOCK_ORDER_VIOLATION'
+      );
+      assert.equal(activePoolIds.size, 0, 'Outer client must always be released cleanly after order error');
+
+      // MemoryRepository parity: same-workspace reentrant works, ascending works, reverse rejects
+      const memOrder = new MemoryRepository(true);
+      await memOrder.withWorkspaceLock('ws_m_a', async () =>
+        memOrder.withWorkspaceLock('ws_m_a', async () =>
+          memOrder.withWorkspaceLock('ws_m_b', async () => 'ok')
+        )
+      );
+      await assert.rejects(
+        () =>
+          memOrder.withWorkspaceLock('ws_m_b', async () =>
+            memOrder.withWorkspaceLock('ws_m_a', async () => 'unreachable')
+          ),
+        (err: any) => err instanceof WorkspaceLockOrderError
+      );
+      assert.equal(memOrder.getActiveWorkspaceLockCount(), 0);
+    });
+
     // -----------------------------------------------------------------------
     // REMEDIATION D — CI Dependency Installation Consistency
     // -----------------------------------------------------------------------
@@ -2062,6 +2806,41 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       }
     });
 
+    test('RE2. [Multi-Instance Shared-Store HTTP] Alternating instances share rate-limit budget cleanly and cannot bypass limits across instances', async () => {
+      process.env.NODE_ENV = 'production';
+      delete process.env.AUTH_RATE_LIMIT_FAILURE_MODE;
+      _resetRateLimiter();
+
+      const sharedRepoA = new MemoryRepository(true);
+      const sharedRepoB = new MemoryRepository(true);
+      // Share identical backing rate-limit state across independent Express app instances
+      sharedRepoB.consumeRateLimit = sharedRepoA.consumeRateLimit.bind(sharedRepoA);
+
+      const srvA = await startTempAppServer(createApp(sharedRepoA));
+      const srvB = await startTempAppServer(createApp(sharedRepoB));
+      try {
+        for (let i = 0; i < 20; i++) {
+          const base = i % 2 === 0 ? srvA.baseUrl : srvB.baseUrl;
+          const r = await fetch(`${base}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.42' },
+            body: JSON.stringify({ email: `u${i}@example.com`, password: 'wrong' }),
+          });
+          assert.equal(r.status, 401);
+        }
+        // 21st request hits Instance B -> must be 429 globally
+        const r21 = await fetch(`${srvB.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.42' },
+          body: JSON.stringify({ email: 'u21@example.com', password: 'wrong' }),
+        });
+        assert.equal(r21.status, 429);
+      } finally {
+        await srvA.close();
+        await srvB.close();
+      }
+    });
+
     // -----------------------------------------------------------------------
     // REMEDIATION F — Public AI Studio Artifact Exposure Blocking
     // -----------------------------------------------------------------------
@@ -2081,6 +2860,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
           '/assets/aistudio/Paste_November_13__2026_-_6_26PM_97202dde',
           '/assets/%61istudio/Paste_November_12__2026_-_6_20PM_bdc47db1',
           '/assets/foo/../aistudio/Allbirds_Shopify_products_fdd9af86.txt',
+          '/assets/aistudio/Paste_November_15__2026_-_4_18PM_bccda2c6',
         ];
         for (const p of probePaths) {
           const r = await fetch(`${baseUrl}${p}`);
@@ -2090,6 +2870,62 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         }
       } finally {
         await close();
+      }
+    });
+
+    test('RF2. [Workstream 7] Express blocks encoded/traversal artifact variants while serving normal assets/API cleanly, and source code has zero runtime dependencies on public/assets/aistudio', async () => {
+      // 1. Verify zero runtime source code imports or references to /assets/aistudio or Paste_November_ outside tests
+      const srcFiles: string[] = [];
+      const walk = (dir: string) => {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else if (/\.(ts|tsx|js|jsx|html|css)$/.test(entry.name) && !entry.name.endsWith('.test.ts')) {
+            srcFiles.push(full);
+          }
+        }
+      };
+      walk(path.join(process.cwd(), 'src'));
+      srcFiles.push(path.join(process.cwd(), 'index.html'));
+      srcFiles.push(path.join(process.cwd(), 'server.ts'));
+
+      for (const file of srcFiles) {
+        const rel = path.relative(process.cwd(), file);
+        if (rel === 'src/server/app.ts') continue; // contains blocker regex only
+        const txt = fs.readFileSync(file, 'utf8');
+        assert.doesNotMatch(
+          txt,
+          /assets\/aistudio|Paste_November_|Allbirds_Shopify_products_/,
+          `Runtime file ${rel} must not depend on internal AI Studio artifacts`
+        );
+      }
+
+      // 2. Verify normal Express public/health endpoints succeed while protected artifact variants return 404
+      const repo = new MemoryRepository();
+      const app = createApp(repo);
+      const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-public-test-'));
+      fs.writeFileSync(path.join(staticDir, 'health-asset.txt'), 'ok-public-asset');
+      app.use((await import('express')).default.static(staticDir));
+      const { baseUrl, close } = await startTempAppServer(app);
+      try {
+        const allowed = await fetch(`${baseUrl}/health-asset.txt`);
+        assert.equal(allowed.status, 200);
+        assert.equal(await allowed.text(), 'ok-public-asset');
+
+        const blockedVariants = [
+          '/assets/aistudio',
+          '/assets/aistudio/',
+          '/ASSETS/AISTUDIO/Paste_November_15__2026_-_4_18PM_bccda2c6',
+          '//assets//aistudio/Paste_November_08__2026_-_11_00AM_d49897db',
+          '/assets\\aistudio\\Paste_November_09__2026_-_5_21PM_aa5dc47b',
+        ];
+        for (const p of blockedVariants) {
+          const r = await fetch(`${baseUrl}${p}`);
+          assert.equal(r.status, 404, `Variant ${p} must be blocked by Express middleware`);
+        }
+      } finally {
+        await close();
+        fs.rmSync(staticDir, { recursive: true, force: true });
       }
     });
   });

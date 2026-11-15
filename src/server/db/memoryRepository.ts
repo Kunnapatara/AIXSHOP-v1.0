@@ -11,7 +11,8 @@ import {
   CreateAuditRunData,
   UpdateAuditRunData,
   CatalogVersionConflictError,
-  CatalogVersionValidationError
+  CatalogVersionValidationError,
+  WorkspaceLockOrderError
 } from './repository';
 import {
   TopicPresenceState,
@@ -543,6 +544,13 @@ export class MemoryRepository implements DatabaseRepository {
     if (heldLocks?.has(workspaceId)) {
       return await fn();
     }
+    if (heldLocks && heldLocks.size > 0) {
+      const held = Array.from(heldLocks).sort();
+      const maxHeld = held[held.length - 1];
+      if (maxHeld !== undefined && workspaceId < maxHeld) {
+        throw new WorkspaceLockOrderError(held, workspaceId);
+      }
+    }
 
     const prevLock = this.workspaceLocks.get(workspaceId) || Promise.resolve();
     let releaseCurrent: () => void;
@@ -679,7 +687,7 @@ export class MemoryRepository implements DatabaseRepository {
     workspaceId: string, 
     actionId: string, 
     customApprovedValue?: string
-  ): Promise<{ action: ActionItem; product?: Product }> {
+  ): Promise<{ action: ActionItem; product?: Product; catalogVersion?: number }> {
     return this.withWorkspaceLock(workspaceId, async () => {
       const catalog = await this.loadWorkspaceCatalog(workspaceId);
       if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
@@ -711,11 +719,11 @@ export class MemoryRepository implements DatabaseRepository {
         ? result.nextProducts.find(p => p.id === updatedAction.productId)
         : undefined;
 
-      return { action: updatedAction, product: updatedProduct };
+      return { action: updatedAction, product: updatedProduct, catalogVersion: this.catalogVersions.get(workspaceId) };
     });
   }
 
-  async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
+  async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem; catalogVersion?: number }> {
     return this.withWorkspaceLock(workspaceId, async () => {
       const catalog = await this.loadWorkspaceCatalog(workspaceId);
       if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
@@ -739,11 +747,11 @@ export class MemoryRepository implements DatabaseRepository {
 
       const updatedAction = result.nextActions.find(a => a.id === actionId);
       if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-      return { action: updatedAction };
+      return { action: updatedAction, catalogVersion: this.catalogVersions.get(workspaceId) };
     });
   }
 
-  async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
+  async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem; catalogVersion?: number }> {
     return this.withWorkspaceLock(workspaceId, async () => {
       const catalog = await this.loadWorkspaceCatalog(workspaceId);
       if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
@@ -768,7 +776,7 @@ export class MemoryRepository implements DatabaseRepository {
 
       const updatedAction = result.nextActions.find(a => a.id === actionId);
       if (!updatedAction) throw new Error(`Action ${actionId} not found`);
-      return { action: updatedAction };
+      return { action: updatedAction, catalogVersion: this.catalogVersions.get(workspaceId) };
     });
   }
 
@@ -1130,6 +1138,7 @@ export class MemoryRepository implements DatabaseRepository {
 
         // Persist updated catalog atomically
         await this.saveWorkspaceCatalogInternal(workspaceId, updatedCatalog);
+        updatedCatalog.catalogVersion = this.catalogVersions.get(workspaceId);
 
         // Workstream B: Create immutable historical snapshots for this Audit Run
         const snapshotTime = new Date().toISOString();
@@ -1795,16 +1804,18 @@ export class MemoryRepository implements DatabaseRepository {
 
       for (const m of metrics) {
         const { topicValue, topicPresence } = this.resolveTopicKey(m);
-        const existingHistory = this.visibilityObservationHistory.filter((h) => {
-          const hKey = h.discoveryTopic ?? null;
-          return (
-            h.workspaceId === m.workspaceId &&
-            h.observationDate === m.observationDate &&
-            h.platform === m.platform &&
-            hKey === topicValue &&
-            h.topicPresence === topicPresence
-          );
-        });
+        const existingHistory = this.visibilityObservationHistory
+          .filter((h) => {
+            const hKey = h.discoveryTopic ?? null;
+            return (
+              h.workspaceId === m.workspaceId &&
+              h.observationDate === m.observationDate &&
+              h.platform === m.platform &&
+              hKey === topicValue &&
+              h.topicPresence === topicPresence
+            );
+          })
+          .sort((a, b) => a.versionNumber - b.versionNumber);
         const maxVer = existingHistory.reduce((max, h) => Math.max(max, h.versionNumber), 0);
         const lastHist = existingHistory[existingHistory.length - 1];
 

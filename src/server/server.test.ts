@@ -818,24 +818,93 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
 
     test('PostgreSQL pool configuration parses SSL securely without disabling verification indiscriminately', () => {
-      process.env.SQL_HOST = 'db.internal.example.com';
-      process.env.SQL_PORT = '5432';
-      process.env.SQL_USER = 'app_user';
-      process.env.SQL_PASSWORD = 'secret_password';
-      process.env.SQL_DB_NAME = 'aixshop_db';
-      process.env.DATABASE_SSL = 'true';
-      delete process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+      const savedEnv = {
+        DATABASE_URL: process.env.DATABASE_URL,
+        SQL_HOST: process.env.SQL_HOST,
+        SQL_PORT: process.env.SQL_PORT,
+        SQL_USER: process.env.SQL_USER,
+        SQL_PASSWORD: process.env.SQL_PASSWORD,
+        SQL_DB_NAME: process.env.SQL_DB_NAME,
+        PGHOST: process.env.PGHOST,
+        PGPORT: process.env.PGPORT,
+        PGUSER: process.env.PGUSER,
+        PGPASSWORD: process.env.PGPASSWORD,
+        PGDATABASE: process.env.PGDATABASE,
+        DATABASE_SSL: process.env.DATABASE_SSL,
+        DATABASE_SSL_REJECT_UNAUTHORIZED: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED,
+        PGSSLMODE: process.env.PGSSLMODE,
+      };
 
-      const poolConfig = getPostgresPoolConfig();
-      assert.ok(poolConfig);
-      assert.equal((poolConfig as any).host, 'db.internal.example.com');
-      // Must enforce certificate verification by default
-      assert.deepEqual((poolConfig as any).ssl, { rejectUnauthorized: true });
+      try {
+        delete process.env.DATABASE_URL;
+        delete process.env.PGHOST;
+        delete process.env.PGPORT;
+        delete process.env.PGUSER;
+        delete process.env.PGPASSWORD;
+        delete process.env.PGDATABASE;
+        delete process.env.PGSSLMODE;
 
-      // Only allows relaxed verification when explicitly requested by operator
-      process.env.DATABASE_SSL_REJECT_UNAUTHORIZED = 'false';
-      const relaxedConfig = getPostgresPoolConfig();
-      assert.deepEqual((relaxedConfig as any).ssl, { rejectUnauthorized: false });
+        process.env.SQL_HOST = 'db.internal.example.com';
+        process.env.SQL_PORT = '5432';
+        process.env.SQL_USER = 'app_user';
+        process.env.SQL_PASSWORD = 'secret_password';
+        process.env.SQL_DB_NAME = 'aixshop_db';
+        process.env.DATABASE_SSL = 'true';
+        delete process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+
+        const poolConfig = getPostgresPoolConfig();
+        assert.ok(poolConfig);
+        assert.equal((poolConfig as any).host, 'db.internal.example.com');
+        // Must enforce certificate verification by default
+        assert.deepEqual((poolConfig as any).ssl, { rejectUnauthorized: true });
+
+        // Only allows relaxed verification when explicitly requested by operator
+        process.env.DATABASE_SSL_REJECT_UNAUTHORIZED = 'false';
+        const relaxedConfig = getPostgresPoolConfig();
+        assert.deepEqual((relaxedConfig as any).ssl, { rejectUnauthorized: false });
+      } finally {
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+
+    test('DATABASE_URL takes precedence over discrete SQL_* variables with SSL enabled', () => {
+      const savedEnv = {
+        DATABASE_URL: process.env.DATABASE_URL,
+        SQL_HOST: process.env.SQL_HOST,
+        SQL_PORT: process.env.SQL_PORT,
+        SQL_USER: process.env.SQL_USER,
+        SQL_PASSWORD: process.env.SQL_PASSWORD,
+        SQL_DB_NAME: process.env.SQL_DB_NAME,
+        DATABASE_SSL: process.env.DATABASE_SSL,
+        DATABASE_SSL_REJECT_UNAUTHORIZED: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED,
+      };
+
+      try {
+        process.env.DATABASE_URL = 'postgresql://ci_user:ci_pass@db-url.internal:5432/ci_db';
+        process.env.SQL_HOST = 'conflicting-sql.internal';
+        process.env.SQL_USER = 'conflicting_user';
+        process.env.SQL_PASSWORD = 'conflicting_password';
+        process.env.SQL_DB_NAME = 'conflicting_db';
+        process.env.DATABASE_SSL = 'true';
+        delete process.env.DATABASE_SSL_REJECT_UNAUTHORIZED;
+
+        const poolConfig = getPostgresPoolConfig();
+        assert.ok(poolConfig);
+        assert.equal((poolConfig as any).connectionString, 'postgresql://ci_user:ci_pass@db-url.internal:5432/ci_db');
+        assert.equal((poolConfig as any).host, undefined);
+        assert.equal((poolConfig as any).user, undefined);
+        assert.equal((poolConfig as any).password, undefined);
+        assert.equal((poolConfig as any).database, undefined);
+        assert.deepEqual((poolConfig as any).ssl, { rejectUnauthorized: true });
+      } finally {
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
     });
   });
 
@@ -2360,24 +2429,168 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
   });
 
-  // 9. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance)
+  // 9. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance & Workstream 1)
   describe('Live PostgreSQL Infrastructure Verification', () => {
-    const hasLivePg = Boolean(process.env.DATABASE_URL || process.env.SQL_HOST);
+    const hasLivePg = Boolean(process.env.DATABASE_URL || process.env.SQL_HOST || process.env.PGHOST);
 
-    test('PostgreSQL live infrastructure status check', { skip: !hasLivePg ? 'SKIPPED: Live PostgreSQL infrastructure credentials (DATABASE_URL / SQL_HOST) not provisioned in current environment' : undefined }, async () => {
-      const pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        host: process.env.SQL_HOST,
-        user: process.env.SQL_USER,
-        password: process.env.SQL_PASSWORD,
-        database: process.env.SQL_DB_NAME,
+    function buildConditionalPgPoolConfig(): Record<string, any> {
+      const cfg = getPostgresPoolConfig();
+      if (cfg) return cfg;
+      if (process.env.DATABASE_URL) {
+        return { connectionString: process.env.DATABASE_URL };
+      }
+      return {
+        host: process.env.SQL_HOST || process.env.PGHOST,
+        port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
+        user: process.env.SQL_USER || process.env.PGUSER,
+        password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
+        database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
+      };
+    }
+
+    test('PostgreSQL live infrastructure status check', { skip: !hasLivePg ? 'SKIPPED: Live PostgreSQL infrastructure credentials (DATABASE_URL / SQL_HOST / PGHOST) not provisioned in current environment' : undefined }, async () => {
+      const pool = new Pool(buildConditionalPgPoolConfig());
+      try {
+        const pgRepo = new PostgresRepository(pool);
+        const isConnected = await pgRepo.ping();
+        assert.equal(isConnected, true);
+      } finally {
+        await pool.end();
+      }
+      assert.equal((pool as any).ended, true);
+    });
+
+    test('DATABASE_URL only vs conflicting/undefined SQL_* configuration preserves connectionString authority', async () => {
+      const savedEnv = {
+        DATABASE_URL: process.env.DATABASE_URL,
+        SQL_HOST: process.env.SQL_HOST,
+        SQL_PORT: process.env.SQL_PORT,
+        SQL_USER: process.env.SQL_USER,
+        SQL_PASSWORD: process.env.SQL_PASSWORD,
+        SQL_DB_NAME: process.env.SQL_DB_NAME,
+      };
+
+      try {
+        // 1. DATABASE_URL only (discrete SQL_* cleared/undefined) -> no undefined host/user keys leaked into PoolConfig
+        delete process.env.SQL_HOST;
+        delete process.env.SQL_PORT;
+        delete process.env.SQL_USER;
+        delete process.env.SQL_PASSWORD;
+        delete process.env.SQL_DB_NAME;
+        process.env.DATABASE_URL =
+          savedEnv.DATABASE_URL || 'postgresql://aixshop_url_user:pw@url-only.internal:5432/aixshop_test';
+
+        const urlOnlyConfig = getPostgresPoolConfig();
+        assert.ok(urlOnlyConfig);
+        assert.equal(urlOnlyConfig.connectionString, process.env.DATABASE_URL);
+        assert.equal('host' in urlOnlyConfig, false);
+        assert.equal('user' in urlOnlyConfig, false);
+        assert.equal('password' in urlOnlyConfig, false);
+        assert.equal('database' in urlOnlyConfig, false);
+
+        // 2. DATABASE_URL plus conflicting SQL_* vars still gives DATABASE_URL authority
+        process.env.SQL_HOST = 'wrong-host.internal';
+        process.env.SQL_USER = 'wrong_role';
+        process.env.SQL_PASSWORD = 'wrong_password';
+        process.env.SQL_DB_NAME = 'wrong_db';
+        const conflictingConfig = getPostgresPoolConfig();
+        assert.ok(conflictingConfig);
+        assert.equal(conflictingConfig.connectionString, process.env.DATABASE_URL);
+        assert.equal('user' in conflictingConfig, false);
+
+        // If running against real PG via DATABASE_URL, conflicting SQL_* vars must NOT break live ping or leak into root role
+        if (savedEnv.DATABASE_URL) {
+          const pool = new Pool(conflictingConfig);
+          try {
+            const pgRepo = new PostgresRepository(pool);
+            assert.equal(await pgRepo.ping(), true);
+          } finally {
+            await pool.end();
+          }
+          assert.equal((pool as any).ended, true);
+        }
+
+        // 3. Discrete SQL_* only (when DATABASE_URL is absent)
+        delete process.env.DATABASE_URL;
+        process.env.SQL_HOST = savedEnv.SQL_HOST || 'discrete.internal';
+        process.env.SQL_PORT = savedEnv.SQL_PORT || '5432';
+        process.env.SQL_USER = savedEnv.SQL_USER || 'discrete_user';
+        process.env.SQL_PASSWORD = savedEnv.SQL_PASSWORD || 'discrete_pw';
+        process.env.SQL_DB_NAME = savedEnv.SQL_DB_NAME || 'discrete_db';
+        const discreteConfig = getPostgresPoolConfig();
+        assert.ok(discreteConfig);
+        assert.equal('connectionString' in discreteConfig, false);
+        assert.equal(discreteConfig.host, process.env.SQL_HOST);
+        assert.equal(discreteConfig.user, process.env.SQL_USER);
+        assert.equal(discreteConfig.database, process.env.SQL_DB_NAME);
+      } finally {
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+
+    test('Infrastructure ping returns false on unreachable PostgreSQL server and cleans up pool', async () => {
+      const unreachablePool = new Pool({
+        host: '127.0.0.1',
+        port: 59999,
+        user: 'unreachable_user',
+        password: 'unreachable_password',
+        database: 'unreachable_db',
+        connectionTimeoutMillis: 250,
       });
+      try {
+        const pgRepo = new PostgresRepository(unreachablePool);
+        const reachable = await pgRepo.ping();
+        assert.equal(reachable, false, 'Unreachable PostgreSQL server must report false without false positive');
+      } finally {
+        await unreachablePool.end();
+      }
+      assert.equal((unreachablePool as any).ended, true, 'Pool must be cleanly closed after unreachable check');
+    });
 
-      const pgRepo = new PostgresRepository(pool);
-      const isConnected = await pgRepo.ping();
-      assert.equal(isConnected, true);
-      await pool.end();
+    test('Invalid database credentials report connectivity false and clean up pool', async () => {
+      // Simulate invalid credentials when running with live PG endpoint, or reject deterministically against mock pool failure
+      if (hasLivePg && process.env.DATABASE_URL) {
+        const parsed = new URL(process.env.DATABASE_URL);
+        parsed.username = 'nonexistent_invalid_role';
+        parsed.password = 'definitely_wrong_password';
+        const badCredPool = new Pool({
+          connectionString: parsed.toString(),
+          connectionTimeoutMillis: 1500,
+        });
+        try {
+          const pgRepo = new PostgresRepository(badCredPool);
+          const connected = await pgRepo.ping();
+          assert.equal(connected, false, 'Invalid credentials against live PostgreSQL must return false');
+        } finally {
+          await badCredPool.end();
+        }
+        assert.equal((badCredPool as any).ended, true);
+      } else {
+        let ended = false;
+        const mockBadCredPool: any = {
+          query: async () => {
+            const err: any = new Error('password authentication failed for user "bad_role"');
+            err.code = '28P01';
+            throw err;
+          },
+          end: async () => {
+            ended = true;
+          },
+        };
+        try {
+          const pgRepo = new PostgresRepository(mockBadCredPool);
+          const connected = await pgRepo.ping();
+          assert.equal(connected, false);
+        } finally {
+          await mockBadCredPool.end();
+        }
+        assert.equal(ended, true);
+      }
     });
   });
 });
+
 

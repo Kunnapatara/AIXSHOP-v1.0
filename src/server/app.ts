@@ -30,7 +30,11 @@ export function blockInternalPromptArtifactsMiddleware(req: any, res: any, next:
     decodedPath = rawPath;
   }
   const normalized = path.posix.normalize(decodedPath.replace(/\\/g, '/'));
-  if (/^\/+assets\/aistudio(\/|$)/i.test(normalized) || /\/Paste_November_/i.test(normalized)) {
+  if (
+    /^\/+assets\/aistudio(\/|$)/i.test(normalized) ||
+    /\/Paste_November_/i.test(normalized) ||
+    /\/Allbirds_Shopify_products_/i.test(normalized)
+  ) {
     return res.status(404).json({
       error: 'Not found',
       code: 'RESOURCE_NOT_FOUND',

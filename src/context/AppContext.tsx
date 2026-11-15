@@ -414,6 +414,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       try {
         const res = await apiClient.approveAction(actionId, customApprovedValue);
         if (res.success && res.action) {
+          if (typeof res.catalogVersion === 'number') {
+            catalogVersionRef.current = res.catalogVersion;
+          } else {
+            await reloadWorkspaceCatalog();
+          }
           setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
           if (res.product) {
             setProducts(prev => prev.map(p => p.id === res.product!.id ? res.product! : p));
@@ -479,6 +484,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       try {
         const res = await apiClient.dismissAction(actionId);
         if (res.success && res.action) {
+          if (typeof res.catalogVersion === 'number') {
+            catalogVersionRef.current = res.catalogVersion;
+          } else {
+            await reloadWorkspaceCatalog();
+          }
           setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
           addToast('Action Dismissed', 'Action dismissed and durably persisted.', 'info');
         }
@@ -525,6 +535,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       try {
         const res = await apiClient.recheckAction(actionId);
         if (res.success && res.action) {
+          if (typeof res.catalogVersion === 'number') {
+            catalogVersionRef.current = res.catalogVersion;
+          } else {
+            await reloadWorkspaceCatalog();
+          }
           setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
           addToast('Action Re-checked', 'Action evaluated and durably updated.', 'info');
         }
@@ -747,10 +762,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
 
     try {
-      const res = await apiClient.migrateDemoData();
+      const expectedVersion = catalogVersionRef.current;
+      const res = await apiClient.migrateDemoData(expectedVersion);
       if (res.success) {
         const catRes = await apiClient.getCatalog();
-        catalogVersionRef.current = catRes.catalog.catalogVersion;
+        catalogVersionRef.current =
+          typeof res.catalogVersion === 'number'
+            ? res.catalogVersion
+            : catRes.catalog.catalogVersion;
         setProducts(catRes.catalog.products);
         setFindings(catRes.catalog.findings);
         setActionItems(catRes.catalog.actions);
@@ -764,6 +783,15 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       }
       return false;
     } catch (err: any) {
+      if (err?.status === 409 || err?.code === 'CATALOG_VERSION_CONFLICT') {
+        await reloadWorkspaceCatalog();
+        addToast(
+          'Catalog Version Conflict',
+          'Another update modified this workspace catalog before demo migration could apply. The latest server catalog has been reloaded without overwriting data.',
+          'warning'
+        );
+        return false;
+      }
       addToast('Migration Failed', err.message || 'Failed to migrate demo data to workspace.', 'error');
       return false;
     }

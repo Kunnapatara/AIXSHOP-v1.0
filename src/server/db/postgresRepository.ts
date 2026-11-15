@@ -14,7 +14,8 @@ import {
   CreateAuditRunData,
   UpdateAuditRunData,
   CatalogVersionConflictError,
-  CatalogVersionValidationError
+  CatalogVersionValidationError,
+  WorkspaceLockOrderError
 } from './repository';
 import { computeMigrationChecksum, getDefaultMigrationsDir } from './migrate';
 import {
@@ -65,6 +66,7 @@ interface WorkspaceLockContext {
   heldWorkspaceLocks: Set<string>;
   inTransaction: boolean;
   savepointDepth: number;
+  poisoned: boolean;
 }
 
 export class PostgresRepository implements DatabaseRepository {
@@ -109,7 +111,8 @@ export class PostgresRepository implements DatabaseRepository {
           try {
             await ctx.client.query('ROLLBACK');
           } catch (rollbackErr) {
-            console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+            ctx.poisoned = true;
+            console.error('[AIXSHOP Database] Rollback failed; connection marked for destruction:', rollbackErr);
           }
           throw err;
         } finally {
@@ -127,7 +130,8 @@ export class PostgresRepository implements DatabaseRepository {
           try {
             await ctx.client.query(`ROLLBACK TO SAVEPOINT ${spName}`);
           } catch (rollbackErr) {
-            console.error('[AIXSHOP Database] Savepoint rollback failed:', rollbackErr);
+            ctx.poisoned = true;
+            console.error('[AIXSHOP Database] Savepoint rollback failed; connection marked for destruction:', rollbackErr);
           }
           throw err;
         } finally {
@@ -1241,7 +1245,7 @@ export class PostgresRepository implements DatabaseRepository {
     payload: StoragePayloadV1,
     storeId: string,
     authoritativeStore: StoreProfile
-  ): Promise<void> {
+  ): Promise<number> {
     const authoritativeSkuCount = countCatalogSkus(payload.products);
     authoritativeStore.skuCount = authoritativeSkuCount;
     if (payload.storeProfile) {
@@ -1249,7 +1253,7 @@ export class PostgresRepository implements DatabaseRepository {
     }
 
     // Update store profile, preserving server-managed tier and sku_limit, and advance catalog_version
-    await client.query(
+    const storeUpsertRes = await client.query<{ catalog_version?: number }>(
       `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, catalog_version, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 1, NOW(), NOW())
        ON CONFLICT (id) DO UPDATE SET
@@ -1263,7 +1267,8 @@ export class PostgresRepository implements DatabaseRepository {
          sku_limit = EXCLUDED.sku_limit,
          connectors_json = EXCLUDED.connectors_json,
          catalog_version = COALESCE(stores.catalog_version, 1) + 1,
-         updated_at = NOW()`,
+         updated_at = NOW()
+       RETURNING catalog_version`,
       [
         storeId,
         workspaceId,
@@ -1278,6 +1283,8 @@ export class PostgresRepository implements DatabaseRepository {
         JSON.stringify(payload.storeProfile?.connectors || authoritativeStore.connectors || []),
       ]
     );
+    const nextVersion = Number(storeUpsertRes.rows[0]?.catalog_version ?? 1);
+    payload.catalogVersion = nextVersion;
 
     // Clean old child records for this workspace in transaction
     await client.query('DELETE FROM action_items WHERE workspace_id = $1', [workspaceId]);
@@ -1419,6 +1426,8 @@ export class PostgresRepository implements DatabaseRepository {
         ]
       );
     }
+
+    return nextVersion;
   }
 
   async withWorkspaceLock<T>(
@@ -1435,6 +1444,13 @@ export class PostgresRepository implements DatabaseRepository {
         return await fn();
       }
 
+      // Prevent cross-workspace lock-order inversion deadlocks by enforcing deterministic lexicographical acquisition order
+      const held = Array.from(existingCtx.heldWorkspaceLocks).sort();
+      const maxHeld = held[held.length - 1];
+      if (maxHeld !== undefined && workspaceId < maxHeld) {
+        throw new WorkspaceLockOrderError(held, workspaceId);
+      }
+
       while (true) {
         const res = await existingCtx.client.query<{ locked: boolean }>(
           `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
@@ -1442,22 +1458,40 @@ export class PostgresRepository implements DatabaseRepository {
         );
         if (res.rows[0]?.locked) {
           existingCtx.heldWorkspaceLocks.add(workspaceId);
+          let operationResult: T;
+          let operationError: unknown;
+          let hasOperationError = false;
           try {
-            return await fn();
-          } finally {
-            existingCtx.heldWorkspaceLocks.delete(workspaceId);
-            const unlockRes = await existingCtx.client
-              .query<{ pg_advisory_unlock: boolean }>(
-                `SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1)) AS pg_advisory_unlock`,
-                [workspaceId]
-              )
-              .catch(() => ({ rows: [{ pg_advisory_unlock: false }] }));
+            operationResult = await fn();
+          } catch (err) {
+            operationError = err;
+            hasOperationError = true;
+          }
+
+          existingCtx.heldWorkspaceLocks.delete(workspaceId);
+          try {
+            const unlockRes = await existingCtx.client.query<{ pg_advisory_unlock: boolean }>(
+              `SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1)) AS pg_advisory_unlock`,
+              [workspaceId]
+            );
             if (unlockRes.rows[0] && unlockRes.rows[0].pg_advisory_unlock === false) {
+              existingCtx.poisoned = true;
               console.error(
-                `[AIXSHOP Workspace Lock] Failed to release nested PostgreSQL advisory lock for workspace "${workspaceId}".`
+                `[AIXSHOP Workspace Lock] Nested pg_advisory_unlock returned false for workspace "${workspaceId}"; connection marked for destruction.`
               );
             }
+          } catch (unlockErr) {
+            existingCtx.poisoned = true;
+            console.error(
+              `[AIXSHOP Workspace Lock] Failed to release nested PostgreSQL advisory lock for workspace "${workspaceId}"; connection marked for destruction:`,
+              unlockErr
+            );
           }
+
+          if (hasOperationError) {
+            throw operationError;
+          }
+          return operationResult!;
         }
         if (Date.now() >= deadline) {
           throw new Error(
@@ -1481,18 +1515,20 @@ export class PostgresRepository implements DatabaseRepository {
           // Release connection immediately before backing off so waiters cannot exhaust the pool
           client.release();
         } else {
+          const lockCtx: WorkspaceLockContext = {
+            client,
+            heldWorkspaceLocks: new Set([workspaceId]),
+            inTransaction: false,
+            savepointDepth: 0,
+            poisoned: false,
+          };
           let destroyClient = false;
           try {
-            return await this.lockStorage.run(
-              {
-                client,
-                heldWorkspaceLocks: new Set([workspaceId]),
-                inTransaction: false,
-                savepointDepth: 0,
-              },
-              fn
-            );
+            return await this.lockStorage.run(lockCtx, fn);
           } finally {
+            if (lockCtx.poisoned) {
+              destroyClient = true;
+            }
             try {
               const unlockRes = await client.query<{ pg_advisory_unlock: boolean }>(
                 `SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1)) AS pg_advisory_unlock`,
@@ -1504,7 +1540,7 @@ export class PostgresRepository implements DatabaseRepository {
             } catch {
               destroyClient = true;
             }
-            if (destroyClient) {
+            if (destroyClient || lockCtx.poisoned) {
               (client.release as any)(true);
             } else {
               client.release();
@@ -1672,16 +1708,6 @@ export class PostgresRepository implements DatabaseRepository {
     });
   }
 
-  async mutateWorkspaceCatalog<T>(
-    workspaceId: string,
-    mutator: (
-      catalog: StoragePayloadV1,
-      authoritativeStore: StoreProfile
-    ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T }
-  ): Promise<T> {
-    return this.mutateCatalogUnderLock(workspaceId, mutator, { createStoreIfMissing: true });
-  }
-
   private async mutateCatalogUnderLock<T>(
     workspaceId: string,
     mutator: (
@@ -1689,7 +1715,7 @@ export class PostgresRepository implements DatabaseRepository {
       authoritativeStore: StoreProfile
     ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T },
     options: { createStoreIfMissing?: boolean } = {}
-  ): Promise<T> {
+  ): Promise<{ result: T; catalogVersion?: number }> {
     return this.withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
       const storeId = `store_${workspaceId}`;
@@ -1760,6 +1786,7 @@ export class PostgresRepository implements DatabaseRepository {
       // 3. Apply the requested mutation to the latest authoritative state
       const { nextCatalog, result } = await mutator(catalog, authoritativeStore);
 
+      let persistedVersion: number | undefined = catalog.catalogVersion;
       if (nextCatalog) {
         // 4. Validate quota under the lock
         const proposedSkus = countCatalogSkus(nextCatalog.products);
@@ -1769,19 +1796,31 @@ export class PostgresRepository implements DatabaseRepository {
         }
 
         // 5. Persist the updated catalog through transaction-aware helper reusing the same client
-        await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, authoritativeStore);
+        persistedVersion = await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, authoritativeStore);
+        nextCatalog.catalogVersion = persistedVersion;
       }
 
-      return result;
+      return { result, catalogVersion: persistedVersion };
     });
+  }
+
+  async mutateWorkspaceCatalog<T>(
+    workspaceId: string,
+    mutator: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T }
+  ): Promise<T> {
+    const wrapped = await this.mutateCatalogUnderLock(workspaceId, mutator, { createStoreIfMissing: true });
+    return wrapped.result;
   }
 
   async approveAction(
     workspaceId: string, 
     actionId: string, 
     customApprovedValue?: string
-  ): Promise<{ action: ActionItem; product?: Product }> {
-    return this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
+  ): Promise<{ action: ActionItem; product?: Product; catalogVersion?: number }> {
+    const { result, catalogVersion } = await this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
       const result = executeActionApproval(actionId, customApprovedValue, {
         products: catalog.products,
         findings: catalog.findings,
@@ -1813,10 +1852,11 @@ export class PostgresRepository implements DatabaseRepository {
         result: { action: updatedAction, product: updatedProduct },
       };
     });
+    return { ...result, catalogVersion };
   }
 
-  async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
-    return this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
+  async dismissAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem; catalogVersion?: number }> {
+    const { result, catalogVersion } = await this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
       const result = executeActionDismissal(actionId, {
         products: catalog.products,
         findings: catalog.findings,
@@ -1842,10 +1882,11 @@ export class PostgresRepository implements DatabaseRepository {
         result: { action: updatedAction },
       };
     });
+    return { ...result, catalogVersion };
   }
 
-  async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem }> {
-    return this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
+  async recheckAction(workspaceId: string, actionId: string): Promise<{ action: ActionItem; catalogVersion?: number }> {
+    const { result, catalogVersion } = await this.mutateCatalogUnderLock(workspaceId, (catalog, authoritativeStore) => {
       const result = executeActionRecheck(actionId, {
         products: catalog.products,
         findings: catalog.findings,
@@ -1872,6 +1913,7 @@ export class PostgresRepository implements DatabaseRepository {
         result: { action: updatedAction },
       };
     });
+    return { ...result, catalogVersion };
   }
 
   async importCatalog(
@@ -2540,8 +2582,9 @@ export class PostgresRepository implements DatabaseRepository {
         storeProfile: auditResult.updatedStoreProfile,
       };
 
-      // Save catalog rows atomically within this transaction
-      await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, auditResult.updatedStoreProfile);
+      // Save catalog rows atomically within this transaction and capture incremented version
+      const nextVersion = await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, auditResult.updatedStoreProfile);
+      nextCatalog.catalogVersion = nextVersion;
 
       // Workstream B: Persist immutable historical snapshots in PostgreSQL transaction
       // 1. audit_run_findings
