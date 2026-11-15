@@ -5,47 +5,7 @@ import { AuthRequest } from '../types';
 import { getBillingProvider } from '../billing/providerAdapter';
 import { BillingService } from '../services/billingService';
 import { AUTHORITATIVE_PLANS, IBillingProvider } from '../billing/types';
-
-/**
- * Derives trusted base URL from application configuration (APP_URL)
- * or falls back to verified request origin / host for local development.
- */
-function getTrustedBaseUrl(req: Request): string {
-  if (process.env.APP_URL) {
-    return process.env.APP_URL.replace(/\/$/, '');
-  }
-  const host = req.headers.host || 'localhost:3000';
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  return `${protocol}://${host}`;
-}
-
-/**
- * Validates and resolves redirect URLs against trusted application base URL.
- * Arbitrary third-party redirect URLs are rejected to prevent open redirect vulnerabilities.
- */
-function resolveTrustedRedirectUrl(baseUrl: string, clientUrl: string | undefined, defaultPath: string): string {
-  if (!clientUrl || typeof clientUrl !== 'string') {
-    return `${baseUrl}${defaultPath}`;
-  }
-
-  // Safe relative paths (e.g. /settings?tab=subscription) are appended to trusted baseUrl
-  if (clientUrl.startsWith('/')) {
-    return `${baseUrl}${clientUrl}`;
-  }
-
-  try {
-    const parsedClient = new URL(clientUrl);
-    const parsedBase = new URL(baseUrl);
-    // Only accept absolute URLs whose origin strictly matches the trusted application origin
-    if (parsedClient.origin === parsedBase.origin) {
-      return clientUrl;
-    }
-  } catch {
-    // Malformed URL, fall back to trusted default
-  }
-
-  return `${baseUrl}${defaultPath}`;
-}
+import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/productionConfig';
 
 export function createBillingRoutes(repo: DatabaseRepository, customProvider?: IBillingProvider): Router {
   const router = Router();
@@ -122,7 +82,8 @@ export function createBillingRoutes(repo: DatabaseRepository, customProvider?: I
       });
     } catch (err: any) {
       console.error('[AIXSHOP Billing] Error creating checkout session:', err?.message || err);
-      return res.status(400).json({ error: err.message || 'Failed to create checkout session' });
+      const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
+      return res.status(status).json({ error: err.message || 'Failed to create checkout session', code: err?.code });
     }
   });
 
@@ -149,7 +110,8 @@ export function createBillingRoutes(repo: DatabaseRepository, customProvider?: I
       });
     } catch (err: any) {
       console.error('[AIXSHOP Billing] Error creating portal session:', err?.message || err);
-      return res.status(400).json({ error: err.message || 'Failed to create customer portal session' });
+      const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
+      return res.status(status).json({ error: err.message || 'Failed to create customer portal session', code: err?.code });
     }
   });
 

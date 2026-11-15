@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { DatabaseRepository } from '../db/repository';
+import { CatalogVersionConflictError, DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
@@ -12,7 +12,6 @@ import {
   calculateImportUsage,
   checkPlanQuota,
   countCatalogSkus,
-  withWorkspaceLock
 } from '../services/entitlementService';
 
 export function createCatalogRoutes(repo: DatabaseRepository): Router {
@@ -68,7 +67,10 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Invalid catalog payload format' });
       }
 
-      return await withWorkspaceLock(workspaceId, async () => {
+      const rawExpected = req.body?.expectedVersion ?? payload.catalogVersion;
+      const expectedVersion = typeof rawExpected === 'number' && Number.isInteger(rawExpected) ? rawExpected : undefined;
+
+      return await repo.withWorkspaceLock(workspaceId, async () => {
         // Enforce authoritative plan quota on full catalog payload
         const store = await repo.getStoreByWorkspace(workspaceId);
         const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
@@ -96,7 +98,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         }
 
         // Never trust user-supplied storeId or workspaceId in body; derive from server session
-        await repo.saveWorkspaceCatalog(workspaceId, payload);
+        await repo.saveWorkspaceCatalog(workspaceId, payload, { expectedVersion });
 
         return res.json({
           success: true,
@@ -106,6 +108,12 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       });
     } catch (err: any) {
+      if (err instanceof CatalogVersionConflictError || err.code === 'CATALOG_VERSION_CONFLICT') {
+        return res.status(409).json({
+          error: err.message,
+          code: 'CATALOG_VERSION_CONFLICT',
+        });
+      }
       if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
         return res.status(403).json({
           error: err.message,
@@ -217,8 +225,8 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Invalid candidates array' });
       }
 
-      // Serialize concurrent import requests per workspace to prevent quota race conditions
-      return await withWorkspaceLock(workspaceId, async () => {
+      // Serialize concurrent import requests per workspace via distributed repository lock
+      return await repo.withWorkspaceLock(workspaceId, async () => {
         // Authoritative server-side store & catalog resolution (ignoring any client-supplied body params)
         const store = await repo.getStoreByWorkspace(workspaceId);
         const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
@@ -271,7 +279,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
     try {
       const workspaceId = req.workspace!.id;
 
-      return await withWorkspaceLock(workspaceId, async () => {
+      return await repo.withWorkspaceLock(workspaceId, async () => {
         const currentStore = await repo.getStoreByWorkspace(workspaceId);
         const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
 

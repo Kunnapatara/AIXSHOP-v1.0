@@ -4,9 +4,12 @@ import { DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import {
+  TopicPresenceState,
+  VisibilityConflictPolicy,
   VisibilityImportRecord,
   VisibilityImportRowError,
   VisibilityMetricRecord,
+  VisibilityObservationConflictError,
 } from '../../domain/monitoring/aiVisibilityTypes';
 
 const MAX_CSV_BYTES = 1_048_576; // 1 MB safety limit
@@ -216,7 +219,9 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
   router.post('/upload', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
-      const { csvContent, filename, sourcePlatform } = req.body || {};
+      const { csvContent, filename, sourcePlatform, conflictPolicy } = req.body || {};
+      const resolvedConflictPolicy: VisibilityConflictPolicy =
+        conflictPolicy === 'replace_versioned' ? 'replace_versioned' : 'reject_on_conflict';
 
       if (!csvContent || typeof csvContent !== 'string') {
         return res.status(400).json({ error: 'Missing csvContent string in request body' });
@@ -371,10 +376,17 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
           continue;
         }
 
-        const topic = (topicIdx >= 0 && row[topicIdx] ? row[topicIdx] : '').trim();
+        const hasTopicColumn = topicIdx >= 0;
+        const rawTopic = hasTopicColumn ? (row[topicIdx] ?? '').trim() : '';
+        const topicPresence: TopicPresenceState = !hasTopicColumn
+          ? 'unspecified'
+          : rawTopic === ''
+          ? 'explicit_blank'
+          : 'specified';
+        const discoveryTopic: string | null = !hasTopicColumn ? null : rawTopic;
         const evidenceSource = evidenceIdx >= 0 && row[evidenceIdx] ? row[evidenceIdx].trim() : filename || 'merchant_csv';
 
-        const dedupeKey = `${rawDate}::${canonicalPlatform!.toLowerCase()}::${topic.toLowerCase()}`;
+        const dedupeKey = `${rawDate}::${canonicalPlatform!.toLowerCase()}::${topicPresence}::${(discoveryTopic ?? '').toLowerCase()}`;
         const existing = dedupeMap.get(dedupeKey);
 
         if (existing) {
@@ -391,7 +403,8 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
             brandMentions,
             productMentions,
             websiteClicks,
-            discoveryTopic: topic || null,
+            discoveryTopic,
+            topicPresence,
             evidenceSource,
             createdAt: nowIso,
           });
@@ -447,20 +460,44 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
         createdAt: nowIso,
       };
 
-      await repo.saveVisibilityImportAtomic(importRecord, parsedMetrics);
+      const saveResult = await repo.saveVisibilityImportAtomic(importRecord, parsedMetrics, {
+        conflictPolicy: resolvedConflictPolicy,
+      });
+
+      if (saveResult.duplicateImport) {
+        const summary = await repo.getVisibilitySummary(workspaceId);
+        return res.json({
+          success: true,
+          duplicateImport: true,
+          action: 'duplicate_noop',
+          acceptedRowCount: 0,
+          rejectedRowCount: 0,
+          message: 'Identical CSV content was already imported; existing visibility metrics preserved without double-counting.',
+          import: saveResult.importRecord,
+          summary,
+        });
+      }
 
       const summary = await repo.getVisibilitySummary(workspaceId);
 
       return res.json({
         success: true,
         duplicateImport: false,
-        action: 'imported',
+        action: saveResult.replacedCount && saveResult.replacedCount > 0 ? 'replaced_versioned' : 'imported',
+        replacedCount: saveResult.replacedCount || 0,
         acceptedRowCount: parsedMetrics.length,
         rejectedRowCount: 0,
-        import: importRecord,
+        import: saveResult.importRecord,
         summary,
       });
     } catch (err: any) {
+      if (err instanceof VisibilityObservationConflictError || err?.code === 'VISIBILITY_OBSERVATION_CONFLICT') {
+        return res.status(409).json({
+          error: err.message,
+          code: 'VISIBILITY_OBSERVATION_CONFLICT',
+          conflicts: err.conflicts || [],
+        });
+      }
       console.error('[Visibility API] Error uploading CSV:', err);
       return res.status(500).json({ error: 'Failed to process visibility data upload' });
     }

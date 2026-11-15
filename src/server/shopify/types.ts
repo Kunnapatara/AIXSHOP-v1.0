@@ -92,6 +92,13 @@ export interface ShopifySyncRunRecord {
   updatedAt: string;
 }
 
+export type WebhookClaimOutcome =
+  | 'CLAIMED'
+  | 'ALREADY_PROCESSED'
+  | 'CURRENTLY_PROCESSING'
+  | 'RETRYABLE_FAILED'
+  | 'DATABASE_ERROR';
+
 export interface ShopifyWebhookEventRecord {
   id: string;
   workspaceId: string;
@@ -102,10 +109,21 @@ export interface ShopifyWebhookEventRecord {
   payload: any;
   status: 'processing' | 'processed' | 'failed' | 'ignored';
   retryCount: number;
+  leaseOwner?: string | null;
+  leaseExpiresAt?: string | null;
+  attemptCount?: number;
   lastError?: string | null;
   processedAt?: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ShopifyWebhookClaimResult {
+  claimed: boolean;
+  outcome: WebhookClaimOutcome;
+  leaseOwner?: string;
+  event: ShopifyWebhookEventRecord | null;
+  error?: string;
 }
 
 export interface ShopifyOAuthStateRecord {

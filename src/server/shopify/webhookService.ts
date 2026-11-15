@@ -6,9 +6,9 @@ import { Product, Variant } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { parseSourcePrice } from '../../domain/validation/price';
 import { calculateProductCompleteness } from '../../domain/catalog/completeness';
-import { resolveWorkspacePlanEntitlement, countCatalogSkus, withWorkspaceLock } from '../services/entitlementService';
+import { resolveWorkspacePlanEntitlement, countCatalogSkus } from '../services/entitlementService';
 import { detectProductConflict } from '../../domain/ingestion/storeIngestion';
-import { PaginationCompletenessStatus, WebhookStatusCategory } from './types';
+import { PaginationCompletenessStatus, WebhookClaimOutcome, WebhookStatusCategory } from './types';
 
 export const DEFAULT_SHOPIFY_WEBHOOK_TOPICS = [
   'PRODUCTS_CREATE',
@@ -549,6 +549,8 @@ export async function verifyShopifyWebhookSubscriptionsLive(
 export interface WebhookProcessResult {
   processed: boolean;
   duplicate: boolean;
+  inProgress?: boolean;
+  outcome?: WebhookClaimOutcome;
   topic: string;
   shopDomain: string;
   message?: string;
@@ -703,166 +705,205 @@ export async function processShopifyWebhook(
 
   const eventId = deliveryId || String(payload.id || `${Date.now()}_${Math.random()}`);
 
-  // 3. Atomically claim webhook event for idempotency
-  const claimResult = await repo.claimShopifyWebhookEvent({
-    id: `whevt_${shop}_${topic.replace(/\//g, '_')}_${eventId}`,
-    workspaceId,
-    shopDomain: shop,
-    eventId,
-    topic,
-    deliveryId: deliveryId || null,
-    payload,
-    status: 'processing',
-    retryCount: 0,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
+  // 3. Atomically claim webhook event for idempotency & lease ownership
+  let claimResult: import('./types').ShopifyWebhookClaimResult;
+  try {
+    claimResult = await repo.claimShopifyWebhookEvent({
+      id: `whevt_${shop}_${topic.replace(/\//g, '_')}_${eventId}`,
+      workspaceId,
+      shopDomain: shop,
+      eventId,
+      topic,
+      deliveryId: deliveryId || null,
+      payload,
+      status: 'processing',
+      retryCount: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (claimErr: any) {
+    const dbErr: any = new Error(
+      `[AIXSHOP Webhook Error] Durable webhook claim failed: ${claimErr?.message || 'Database unavailable'}`
+    );
+    dbErr.statusCode = 503;
+    dbErr.code = 'WEBHOOK_CLAIM_DATABASE_ERROR';
+    throw dbErr;
+  }
 
   if (!claimResult.claimed) {
-    // Duplicate delivery already processed or processing
+    if (claimResult.outcome === 'DATABASE_ERROR') {
+      const dbErr: any = new Error('[AIXSHOP Webhook Error] Database error claiming webhook delivery.');
+      dbErr.statusCode = 503;
+      dbErr.code = 'WEBHOOK_CLAIM_DATABASE_ERROR';
+      throw dbErr;
+    }
+
+    if (claimResult.outcome === 'CURRENTLY_PROCESSING') {
+      // Another active worker currently holds a valid lease; return inProgress (202 Accepted) rather than falsely reporting completed
+      return {
+        processed: false,
+        duplicate: true,
+        inProgress: true,
+        outcome: 'CURRENTLY_PROCESSING',
+        topic,
+        shopDomain: shop,
+        message: 'Duplicate webhook delivery is currently being processed by another worker.',
+      };
+    }
+
     return {
       processed: true,
       duplicate: true,
+      inProgress: false,
+      outcome: claimResult.outcome || 'ALREADY_PROCESSED',
       topic,
       shopDomain: shop,
       message: 'Duplicate webhook delivery acknowledged and skipped.',
     };
   }
 
-  // 4. Process event based on topic with workspace isolation
+  const leaseOwner = claimResult.leaseOwner;
+  const claimOutcome = claimResult.outcome || 'CLAIMED';
+
+  // 4. Process event based on topic with distributed workspace lock and authoritative DB catalog reload
   try {
-    await withWorkspaceLock(workspaceId, async () => {
-      const catalog: StoragePayloadV1 = (await repo.loadWorkspaceCatalog(workspaceId)) || {
-        storeProfile: {
-          name: 'Merchant Store',
-          domain: shop,
-          currency: 'USD',
-          catalogCompletenessAvg: 0,
-          truthBoundaryStrictness: 'standard',
-          connectors: [],
-          tier: 'Free Audit',
-          skuLimit: 2500,
-          skuCount: 0,
-        },
-        products: [],
-        variants: [],
-        offers: [],
-        findings: [],
-        actions: [],
-        evidence: [],
-      };
+    let outcomeStatus: 'processed' | 'ignored' = 'processed';
+    let ignoredReason: string | undefined;
 
-      if (topic === 'app/uninstalled') {
+    if (topic === 'app/uninstalled') {
+      await repo.withWorkspaceLock(workspaceId, async () => {
         await disconnectShopify(repo, workspaceId);
-      } else if (topic === 'products/create' || topic === 'products/update') {
-        const storeProfile = await repo.getStoreByWorkspace(workspaceId);
-        const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
-        const entitlement = resolveWorkspacePlanEntitlement(storeProfile, subscription);
+      });
+    } else if (topic === 'products/create' || topic === 'products/update' || topic === 'products/delete') {
+      const mutationOutcome = await repo.mutateWorkspaceCatalog<{ status: 'processed' | 'ignored'; reason?: string }>(
+        workspaceId,
+        async (catalog, authoritativeStore) => {
+          const storeProfile = catalog.storeProfile || authoritativeStore;
 
-        const incomingProduct = mapWebhookPayloadToDomainProduct(payload, storeProfile?.currency || 'USD', shop);
-        const incomingSkus = incomingProduct.variants.length || 1;
+          if (topic === 'products/create' || topic === 'products/update') {
+            const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
+            const entitlement = resolveWorkspacePlanEntitlement(storeProfile, subscription);
 
-        const currentProducts = [...catalog.products];
-        const existingIdx = currentProducts.findIndex(
-          p => p.id === incomingProduct.id || p.attributes?.sourceProductId === incomingProduct.attributes?.sourceProductId
-        );
+            const incomingProduct = mapWebhookPayloadToDomainProduct(payload, storeProfile?.currency || 'USD', shop);
+            const incomingSkus = incomingProduct.variants.length || 1;
 
-        if (existingIdx >= 0) {
-          // Update: preserve merchant edits and check for out-of-order delivery
-          const existing = currentProducts[existingIdx];
-
-          // Out-of-order delivery protection: discard older updates
-          if (payload.updated_at && existing.attributes?.shopifyUpdatedAt) {
-            const incomingTime = new Date(payload.updated_at).getTime();
-            const existingTime = new Date(existing.attributes.shopifyUpdatedAt).getTime();
-            if (!isNaN(incomingTime) && !isNaN(existingTime) && incomingTime < existingTime) {
-              console.warn(`[AIXSHOP Webhook] Out-of-order webhook event discarded for product ${incomingProduct.id}. Incoming: ${payload.updated_at}, Existing: ${existing.attributes.shopifyUpdatedAt}`);
-              await repo.updateShopifyWebhookEventStatus(
-                eventId,
-                shop,
-                topic,
-                'ignored',
-                'Stale out-of-order event skipped: payload updated_at is older than existing product state.'
-              );
-              return;
-            }
-          }
-
-          const conflict = detectProductConflict(incomingProduct, existing);
-          const updatedProduct: Product = {
-            ...incomingProduct,
-            title: conflict.isConflict ? existing.title : incomingProduct.title,
-            brand: conflict.isConflict ? existing.brand : incomingProduct.brand,
-            category: conflict.isConflict ? existing.category : incomingProduct.category,
-            description: conflict.isConflict ? existing.description : incomingProduct.description,
-            image: incomingProduct.image || existing.image,
-            evidenceDocuments: existing.evidenceDocuments || [],
-            findingsCount: existing.findingsCount || 0,
-          };
-          updatedProduct.completenessScore = calculateProductCompleteness(updatedProduct);
-          currentProducts[existingIdx] = updatedProduct;
-        } else {
-          // Create: check plan quota
-          const currentUsage = countCatalogSkus(currentProducts);
-          if (!entitlement.isUnlimited && currentUsage + incomingSkus > entitlement.skuLimit) {
-            // Exceeds quota: fail safely without crashing
-            console.warn(`[AIXSHOP Webhook] Product ${incomingProduct.id} rejected: exceeds workspace SKU quota (${entitlement.skuLimit}).`);
-            await repo.updateShopifyWebhookEventStatus(
-              eventId,
-              shop,
-              topic,
-              'ignored',
-              `Product creation skipped: workspace reached SKU limit of ${entitlement.skuLimit}.`
+            const currentProducts = [...catalog.products];
+            const existingIdx = currentProducts.findIndex(
+              p => p.id === incomingProduct.id || p.attributes?.sourceProductId === incomingProduct.attributes?.sourceProductId
             );
-            return;
+
+            if (existingIdx >= 0) {
+              const existing = currentProducts[existingIdx];
+
+              // Out-of-order delivery protection: discard older updates
+              if (payload.updated_at && existing.attributes?.shopifyUpdatedAt) {
+                const incomingTime = new Date(payload.updated_at).getTime();
+                const existingTime = new Date(existing.attributes.shopifyUpdatedAt).getTime();
+                if (!isNaN(incomingTime) && !isNaN(existingTime) && incomingTime < existingTime) {
+                  console.warn(`[AIXSHOP Webhook] Out-of-order webhook event discarded for product ${incomingProduct.id}. Incoming: ${payload.updated_at}, Existing: ${existing.attributes.shopifyUpdatedAt}`);
+                  return {
+                    result: {
+                      status: 'ignored',
+                      reason: 'Stale out-of-order event skipped: payload updated_at is older than existing product state.',
+                    },
+                  };
+                }
+              }
+
+              const conflict = detectProductConflict(incomingProduct, existing);
+              const updatedProduct: Product = {
+                ...incomingProduct,
+                title: conflict.isConflict ? existing.title : incomingProduct.title,
+                brand: conflict.isConflict ? existing.brand : incomingProduct.brand,
+                category: conflict.isConflict ? existing.category : incomingProduct.category,
+                description: conflict.isConflict ? existing.description : incomingProduct.description,
+                image: incomingProduct.image || existing.image,
+                evidenceDocuments: existing.evidenceDocuments || [],
+                findingsCount: existing.findingsCount || 0,
+              };
+              updatedProduct.completenessScore = calculateProductCompleteness(updatedProduct);
+              currentProducts[existingIdx] = updatedProduct;
+            } else {
+              // Create: check plan quota against authoritative SKU count inside lock
+              const currentUsage = countCatalogSkus(currentProducts);
+              if (!entitlement.isUnlimited && currentUsage + incomingSkus > entitlement.skuLimit) {
+                console.warn(`[AIXSHOP Webhook] Product ${incomingProduct.id} rejected: exceeds workspace SKU quota (${entitlement.skuLimit}).`);
+                return {
+                  result: {
+                    status: 'ignored',
+                    reason: `Product creation skipped: workspace reached SKU limit of ${entitlement.skuLimit}.`,
+                  },
+                };
+              }
+              currentProducts.push(incomingProduct);
+            }
+
+            const nextCatalog: StoragePayloadV1 = {
+              ...catalog,
+              products: currentProducts,
+              storeProfile: {
+                ...storeProfile,
+                skuCount: countCatalogSkus(currentProducts),
+              },
+            };
+
+            return {
+              nextCatalog,
+              result: { status: 'processed' },
+            };
+          } else {
+            // products/delete
+            const numericId = String(payload.id || '');
+            const targetId = `p_shopify_${numericId}`;
+            const currentProducts = catalog.products.filter(
+              (p: Product) => p.id !== targetId && p.attributes?.sourceProductId !== numericId
+            );
+
+            const nextCatalog: StoragePayloadV1 = {
+              ...catalog,
+              products: currentProducts,
+              storeProfile: {
+                ...storeProfile,
+                skuCount: countCatalogSkus(currentProducts),
+              },
+            };
+
+            return {
+              nextCatalog,
+              result: { status: 'processed' },
+            };
           }
-          currentProducts.push(incomingProduct);
         }
+      );
 
-        await repo.saveWorkspaceCatalog(workspaceId, {
-          ...catalog,
-          products: currentProducts,
-        });
+      outcomeStatus = mutationOutcome.status;
+      ignoredReason = mutationOutcome.reason;
+    }
 
-        if (storeProfile) {
-          await repo.saveStoreProfile(workspaceId, {
-            ...storeProfile,
-            skuCount: countCatalogSkus(currentProducts),
-          });
-        }
-      } else if (topic === 'products/delete') {
-        const numericId = String(payload.id || '');
-        const targetId = `p_shopify_${numericId}`;
-        const currentProducts = catalog.products.filter(
-          (p: Product) => p.id !== targetId && p.attributes?.sourceProductId !== numericId
-        );
-
-        await repo.saveWorkspaceCatalog(workspaceId, {
-          ...catalog,
-          products: currentProducts,
-        });
-
-        const storeProfile = await repo.getStoreByWorkspace(workspaceId);
-        if (storeProfile) {
-          await repo.saveStoreProfile(workspaceId, {
-            ...storeProfile,
-            skuCount: countCatalogSkus(currentProducts),
-          });
-        }
-      }
-    });
-
-    await repo.updateShopifyWebhookEventStatus(eventId, shop, topic, 'processed');
+    await repo.updateShopifyWebhookEventStatus(
+      eventId,
+      shop,
+      topic,
+      outcomeStatus,
+      ignoredReason,
+      leaseOwner
+    );
 
     return {
-      processed: true,
+      processed: outcomeStatus === 'processed',
       duplicate: false,
+      inProgress: false,
+      outcome: claimOutcome,
       topic,
       shopDomain: shop,
-      message: `Successfully processed Shopify webhook for ${topic}.`,
+      message: outcomeStatus === 'ignored'
+        ? ignoredReason
+        : `Successfully processed Shopify webhook for ${topic}.`,
     };
   } catch (err: any) {
-    await repo.updateShopifyWebhookEventStatus(eventId, shop, topic, 'failed', err?.message);
+    await repo
+      .updateShopifyWebhookEventStatus(eventId, shop, topic, 'failed', err?.message, leaseOwner)
+      .catch(() => {});
     throw err;
   }
 }

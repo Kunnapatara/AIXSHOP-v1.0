@@ -13,10 +13,14 @@ import { createBusinessProfileRoutes } from './routes/businessProfileRoutes';
 import { createFeedRoutes } from './routes/feedRoutes';
 import { createVisibilityRoutes } from './routes/visibilityRoutes';
 import { csrfProtection } from './middleware/auth';
+import { parseTrustProxySetting, validateProductionConfig } from './config/productionConfig';
 
 export function createApp(customRepo?: DatabaseRepository): Express {
   const app = express();
   const repo = customRepo || getDatabaseRepository();
+
+  const proxyConfig = parseTrustProxySetting();
+  app.set('trust proxy', proxyConfig.value);
 
   // Narrowly scoped raw-body capture for billing and Shopify webhook routes
   // Preserves exact original request bytes for HMAC signature verification
@@ -113,7 +117,10 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   // 2. Dedicated Readiness probe (Kubernetes / Cloud Run readiness probe)
   app.get('/api/health/ready', async (req, res) => {
     const readiness = await checkReadiness(repo);
-    const isReady = readiness.connected && readiness.schemaReady;
+    const configValidation = validateProductionConfig();
+    const isProd = process.env.NODE_ENV === 'production';
+    const configReady = isProd ? configValidation.valid : true;
+    const isReady = readiness.connected && readiness.schemaReady && configReady;
 
     res.status(isReady ? 200 : 503).json({
       status: isReady ? 'ok' : 'unavailable',
@@ -125,6 +132,11 @@ export function createApp(customRepo?: DatabaseRepository): Express {
         connected: readiness.connected,
         schemaReady: readiness.schemaReady,
         ...(readiness.reason ? { reason: readiness.reason } : {}),
+      },
+      config: {
+        valid: configValidation.valid,
+        environment: configValidation.environment,
+        ...(configValidation.missingOrInvalid.length > 0 ? { missingOrInvalid: configValidation.missingOrInvalid } : {}),
       },
       timestamp: new Date().toISOString(),
     });
@@ -143,7 +155,10 @@ export function createApp(customRepo?: DatabaseRepository): Express {
     }
 
     const readiness = await checkReadiness(repo);
-    const isReady = readiness.connected && readiness.schemaReady;
+    const configValidation = validateProductionConfig();
+    const isProd = process.env.NODE_ENV === 'production';
+    const configReady = isProd ? configValidation.valid : true;
+    const isReady = readiness.connected && readiness.schemaReady && configReady;
 
     return res.status(isReady ? 200 : 503).json({
       status: isReady ? 'ok' : 'unavailable',
@@ -154,6 +169,11 @@ export function createApp(customRepo?: DatabaseRepository): Express {
         connected: readiness.connected,
         schemaReady: readiness.schemaReady,
         ...(readiness.reason ? { reason: readiness.reason } : {}),
+      },
+      config: {
+        valid: configValidation.valid,
+        environment: configValidation.environment,
+        ...(configValidation.missingOrInvalid.length > 0 ? { missingOrInvalid: configValidation.missingOrInvalid } : {}),
       },
       timestamp: new Date().toISOString(),
     });

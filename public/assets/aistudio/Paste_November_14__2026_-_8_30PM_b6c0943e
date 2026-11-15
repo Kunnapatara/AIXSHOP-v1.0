@@ -1,0 +1,1305 @@
+# AIXSHOP v1.0 — Complete Production Blocker Remediation & Verification
+## Google AI Studio — Build Mode Implementation Prompt
+
+Repository: https://github.com/Kunnapatara/AIXSHOP-v1.0
+
+Current audit baseline commit:
+`bed040a7e9f4d4aa50e2f2eb1d36da438a813501`
+
+---
+
+# 1. MISSION
+
+Perform a complete, evidence-driven remediation of all identified production blockers and supporting integrity, concurrency, billing, security, migration, and deployment issues in AIXSHOP v1.0.
+
+This is an existing product with substantial implementation already completed.
+
+Your responsibility is to:
+
+1. Inspect the complete current repository and establish the actual baseline.
+2. Verify every reported issue against the current source code.
+3. Preserve all existing working functionality and development progress.
+4. Implement all confirmed fixes in the existing architecture.
+5. Add meaningful automated regression, concurrency, integration, and failure-recovery tests.
+6. Verify database migrations and historical data safety.
+7. Verify Shopify and Stripe integrations using their official test environments where credentials and access are available.
+8. Run available security and production-readiness checks.
+9. Produce a detailed evidence-based completion report.
+
+Do not merely produce a review report or recommendations. Implement the confirmed fixes and verify them.
+
+Do not expand the product into unrelated features.
+
+The objective is to make the existing AIXSHOP implementation more reliable, transactionally safe, secure, and suitable for real production deployment without losing existing functionality.
+
+# 2. NON-NEGOTIABLE DEVELOPMENT RULES
+
+## 2.1 Zero Loss of Development Progress
+
+- Preserve all existing source code, working features, architecture, database functionality, migrations, tests, documentation, and user-facing functionality unless a specific change is necessary to fix a verified issue.
+- Do not rewrite the application from scratch.
+- Do not replace existing services with simplified implementations.
+- Do not remove functionality to make tests pass.
+- Do not replace real database operations with in-memory mocks in production code.
+- Do not weaken validation, authorization, tenancy isolation, billing enforcement, or security controls.
+- Do not delete tests simply because they fail after a change.
+- Do not reduce test coverage to obtain a passing result.
+- Do not modify unrelated components.
+- Maintain backward compatibility wherever practical.
+- Preserve the existing design system and user interface.
+- Avoid unnecessary dependencies.
+
+## 2.2 Baseline Before Modification
+
+Before editing any file:
+
+1. Inspect the current repository structure.
+2. Identify the actual current Git commit and branch.
+3. Inspect all modified and uncommitted files.
+4. Inspect package configuration, scripts, environment requirements, and CI workflows.
+5. Inspect all database migrations from 001 through the latest migration.
+6. Inspect the relevant services, repositories, routes, middleware, and tests.
+7. Run the existing available baseline tests and build checks.
+8. Record the baseline results.
+
+Do not assume that the repository still matches the audit commit. Verify the actual current implementation first.
+
+If a reported issue has already been fixed, verify the fix and its regression coverage. Do not duplicate or overwrite a correct implementation.
+
+If a reported issue cannot be reproduced, document the source evidence and explain why.
+
+## 2.3 Git Safety
+
+- Do not execute destructive Git operations.
+- Do not reset, clean, force checkout, or discard user changes.
+- Do not overwrite unrelated uncommitted work.
+- Do not commit, push, merge, release, or deploy without explicit user authorization.
+- Preserve the current branch and existing development history.
+- Do not expose secrets, access tokens, Shopify credentials, Stripe credentials, or environment variables in logs or reports.
+
+## 2.4 Implementation Quality
+
+- Follow the existing TypeScript architecture and coding conventions.
+- Prefer minimal, well-scoped changes.
+- Use real PostgreSQL behavior for database correctness tests.
+- Use deterministic tests where possible.
+- Test both successful and failed execution paths.
+- Test concurrent execution, transaction rollback, retry behavior, and process failures.
+- Avoid timing-based tests that are unreliable.
+- Add regression tests for every confirmed production blocker.
+
+Do not claim a feature is production-ready merely because TypeScript compilation or unit tests pass.
+
+# 3. WORKSTREAM A — SHOPIFY WEBHOOK RELIABILITY
+
+Relevant files:
+
+- `src/server/db/postgresRepository.ts`
+- `src/server/shopify/webhookService.ts`
+- `src/server/routes/shopifyRoutes.ts`
+
+## 3.1 Verify Existing Webhook Event Lifecycle
+
+Inspect:
+
+- Webhook event identity and uniqueness.
+- Event registration and claiming.
+- Existing event statuses.
+- Database transaction boundaries.
+- Retry behavior.
+- Error handling.
+- HTTP responses to Shopify.
+- Duplicate event handling.
+- Recovery after process termination.
+- Behavior when PostgreSQL is temporarily unavailable.
+
+Determine whether the reported failure remains present.
+
+## 3.2 Implement Explicit Webhook Claim Outcomes
+
+Do not represent every unsuccessful claim as `claimed: false`.
+
+Implement an explicit and type-safe result that distinguishes at least:
+
+- `CLAIMED`
+- `ALREADY_PROCESSED`
+- `CURRENTLY_PROCESSING`
+- `RETRYABLE_FAILED`
+- `DATABASE_ERROR`
+
+Additional states may be added if justified by the existing architecture.
+
+Required behavior:
+
+**CLAIMED**
+
+The current worker successfully obtains the right to process the event.
+
+**ALREADY_PROCESSED**
+
+The event has completed successfully. Do not process it again.
+
+**CURRENTLY_PROCESSING**
+
+Another valid worker currently owns the processing lease. Do not execute the event concurrently.
+
+**RETRYABLE_FAILED**
+
+The previous processing attempt failed and the event is eligible for recovery. The current worker must be able to reclaim it safely.
+
+**DATABASE_ERROR**
+
+The system cannot determine or persist the event's processing state. Propagate the error rather than treating it as a duplicate.
+
+## 3.3 Implement Safe Retry and Lease Recovery
+
+Requirements:
+
+- Failed webhook events must be eligible for controlled retry.
+- Use database-backed ownership and lease expiration.
+- Prevent two workers from processing the same event simultaneously.
+- Use atomic claim and reclaim operations.
+- Track attempt count and processing timestamps.
+- Preserve failure reason without exposing sensitive data.
+- Handle expired processing leases after a crashed worker.
+- Prevent stale workers from completing events owned by a newer worker.
+- Make event processing idempotent.
+- Preserve Shopify's webhook event identity and existing deduplication rules.
+
+A worker must verify its ownership before committing a final event status.
+
+Do not mark a failed event as successfully processed.
+
+Do not acknowledge an event merely because its unique key already exists.
+
+## 3.4 Correct HTTP Response Behavior
+
+Verify the route behavior for every outcome.
+
+- Successfully processed events: return an appropriate successful response.
+- Already processed duplicate events: return a successful response without repeating side effects.
+- Events currently being processed: follow a documented safe acknowledgment strategy that does not create concurrent processing.
+- Events that cannot be safely accepted because of a database or infrastructure failure: return HTTP 5xx.
+- Retryable failures must remain recoverable.
+
+Do not return HTTP 200 for an event that the system has neither safely processed nor durably accepted.
+
+Preserve Shopify's required webhook verification and HMAC validation.
+
+## 3.5 Webhook Regression Tests
+
+Add tests for:
+
+1. First-time event processing.
+2. Successful duplicate delivery.
+3. Retry after an earlier failed attempt.
+4. Retry after an expired processing lease.
+5. Two concurrent workers claiming the same event.
+6. Worker crash after claim.
+7. Stale worker attempting to finalize after lease reassignment.
+8. PostgreSQL error during claim.
+9. PostgreSQL error during finalization.
+10. Database recovery and subsequent retry.
+11. Invalid webhook HMAC.
+12. Correct HTTP status for each relevant failure condition.
+
+Use PostgreSQL integration tests for actual uniqueness, locking, and transaction behavior.
+
+Acceptance criteria:
+
+- Failed events are not permanently classified as successful duplicates.
+- Database failures cannot silently become successful duplicate acknowledgments.
+- Concurrent processing is controlled.
+- Recovery is demonstrably possible.
+- Existing webhook behavior remains compatible.
+
+# 4. WORKSTREAM B — DISTRIBUTED WORKSPACE LOCK AND CATALOG CONSISTENCY
+
+Relevant files:
+
+- `src/server/services/entitlementService.ts`
+- `src/server/shopify/syncService.ts`
+- `src/server/shopify/webhookService.ts`
+- `src/server/db/postgresRepository.ts`
+
+## 4.1 Inspect Existing Lock Implementation
+
+Inspect `withWorkspaceLock()` and every operation that depends on it.
+
+Determine:
+
+- Which operations use the lock.
+- Whether locks are process-local.
+- Whether the lock protects both Sync and Webhook operations.
+- Whether multiple server instances can execute the same workspace operation concurrently.
+- Whether lock ownership survives process termination.
+- Whether stale catalog snapshots can overwrite newer data.
+
+Do not assume that a JavaScript Promise Map provides distributed synchronization.
+
+## 4.2 Implement Database-Level Coordination
+
+Replace or supplement process-local synchronization with a PostgreSQL-backed locking mechanism.
+
+Choose an implementation appropriate to the existing database architecture, such as:
+
+- PostgreSQL transaction-level advisory locks.
+- PostgreSQL session-level advisory locks with carefully controlled connection ownership.
+- A database-backed workspace lease with owner identity and expiry.
+
+The implementation must:
+
+- Scope locks to the correct workspace.
+- Prevent conflicting operations across separate server instances.
+- Release locks safely.
+- Handle worker crashes and abandoned locks.
+- Avoid lock leaks.
+- Define lock acquisition timeout behavior.
+- Avoid deadlocks through consistent lock ordering.
+- Ensure the lock and transaction use the correct PostgreSQL connection.
+
+A process-local lock may remain as an optimization, but it must not be the only correctness mechanism.
+
+## 4.3 Eliminate Stale Catalog Snapshot Overwrites
+
+Inspect `saveWorkspaceCatalog()`.
+
+The reported risk is:
+
+1. Instance A reads an existing catalog.
+2. Instance B reads the same old catalog.
+3. Instance A modifies and saves its snapshot.
+4. Instance B later saves its older snapshot.
+5. Instance B deletes and recreates catalog records using stale data.
+6. Instance A's newer changes may disappear.
+
+Fix the underlying consistency problem.
+
+Requirements:
+
+- Do not delete and recreate the entire catalog from an unverified stale snapshot.
+- Obtain the appropriate database lock before reading the authoritative catalog state.
+- Perform required reads and mutations within a consistent transaction.
+- Use targeted inserts, updates, and deletes.
+- Preserve unrelated product, variant, offer, finding, and other catalog records.
+- Apply explicit conflict-resolution rules.
+- Maintain workspace isolation.
+- Maintain referential integrity.
+- Preserve existing audit history.
+
+If full replacement is genuinely required for a specific operation, enforce version checks or another safe optimistic-concurrency mechanism so stale snapshots cannot overwrite newer data.
+
+## 4.4 Multi-Instance Concurrency Tests
+
+Use at least two independent PostgreSQL connections.
+
+Where feasible, run separate application instances or isolated workers.
+
+Test:
+
+1. Concurrent Shopify Sync and Webhook operations for one workspace.
+2. Concurrent catalog mutations from separate instances.
+3. Different workspaces executing simultaneously.
+4. Lock expiration and worker crash recovery.
+5. Lock acquisition timeout.
+6. Stale snapshot rejection or safe reconciliation.
+7. Concurrent product and variant changes.
+8. Rollback after a failed catalog mutation.
+
+Acceptance criteria:
+
+- No lost updates caused by stale snapshots.
+- No cross-workspace data leakage.
+- Conflicting workspace operations are serialized or safely reconciled.
+- Independent workspaces are not unnecessarily blocked.
+- Database state remains consistent after failures.
+
+# 5. WORKSTREAM C — BILLING LEASE AND TRANSACTION SAFETY
+
+Relevant files:
+
+- `src/server/services/billingService.ts`
+- `src/server/db/postgresRepository.ts`
+
+## 5.1 Inspect Current Billing Lifecycle
+
+Inspect:
+
+- Billing lease acquisition.
+- Lease owner.
+- Lease expiration.
+- Heartbeat.
+- Heartbeat shutdown.
+- Billing transition execution.
+- Transaction boundaries.
+- Entitlement mutation.
+- Finalization and rollback.
+- Duplicate billing event handling.
+
+Identify every point where a worker can act after losing lease ownership.
+
+## 5.2 Correct PostgreSQL Time Semantics
+
+The reported issue concerns `NOW()`.
+
+In PostgreSQL, `NOW()` represents the transaction start timestamp. It does not advance during the transaction.
+
+Where the correctness requirement is to evaluate the actual current time after waiting for a row lock, use `clock_timestamp()`.
+
+Requirements:
+
+1. Acquire the relevant row lock.
+2. Evaluate lease ownership and expiration using actual database time after obtaining the lock.
+3. Reject a worker whose lease has expired.
+4. Validate the lease again at the appropriate authoritative point immediately before applying or committing the entitlement transition.
+5. Roll back all related changes if lease ownership is no longer valid.
+
+Do not rely on a timestamp captured before a potentially long lock wait.
+
+Use database time as the authoritative clock for lease decisions.
+
+## 5.3 Heartbeat and Lease Ownership
+
+Review whether stopping the heartbeat before entering a potentially long transaction is safe.
+
+Implement a clear lease strategy.
+
+Possible approaches include:
+
+- Safe heartbeat renewal while a worker is processing.
+- A sufficiently designed lease extension before entering a transaction.
+- Explicit lease validation at transaction boundaries.
+- A combination of these mechanisms.
+
+Avoid introducing a heartbeat that competes with a transaction for the same database connection and causes deadlocks.
+
+A worker must not be allowed to apply a billing transition solely because it held a valid lease when the transaction started.
+
+Use an owner token or fencing mechanism so an expired worker cannot finalize a transition after another worker has acquired ownership.
+
+## 5.4 Billing Tests
+
+Add real PostgreSQL tests for:
+
+1. Normal billing transition.
+2. Expired lease before transaction start.
+3. Lease expiration while waiting for `SELECT ... FOR UPDATE`.
+4. Lease ownership changing while an operation is in progress.
+5. Heartbeat renewal.
+6. Heartbeat failure.
+7. Stale worker attempting entitlement mutation.
+8. Rollback after lease validation failure.
+9. Concurrent processing of the same billing event.
+10. Duplicate billing event delivery.
+
+The lock-wait test must demonstrate the actual PostgreSQL time behavior rather than mocking `NOW()`.
+
+Acceptance criteria:
+
+- An expired worker cannot apply an entitlement transition.
+- Lease validation uses actual database time at the required points.
+- A stale worker cannot finalize after ownership changes.
+- Failed lease validation rolls back all related changes.
+- Existing billing idempotency and subscription lifecycle behavior remain intact.
+
+# 6. WORKSTREAM D — VISIBILITY CSV DEDUPLICATION AND DATA HISTORY
+
+Relevant files:
+
+- `src/server/db/migrations/011_corrective_integrity_and_visibility_provenance.sql`
+- `src/server/routes/visibilityRoutes.ts`
+- `src/server/db/postgresRepository.ts`
+
+## 6.1 Fix Atomic CSV Deduplication
+
+Inspect the existing content hash generation, duplicate lookup, transaction, and insert logic.
+
+The existing pattern of checking for a hash and then inserting is not sufficient to prevent concurrent duplicate requests.
+
+Implement database-enforced atomic deduplication.
+
+Requirements:
+
+- Define the intended uniqueness scope.
+- Preserve workspace isolation.
+- Prevent concurrent identical imports from creating duplicate import records.
+- Handle uniqueness conflicts as a normal, explicit duplicate result.
+- Do not silently discard unrelated data.
+- Do not rely solely on application-level pre-insert checks.
+
+Evaluate an appropriate unique constraint or unique partial index on:
+
+`(workspace_id, content_hash)`
+
+where `content_hash IS NOT NULL`.
+
+Before creating the index:
+
+- Inspect existing duplicates.
+- Determine how to resolve existing duplicate records.
+- Preserve provenance and historical references.
+- Avoid silently deleting historical data.
+- Provide a safe migration strategy.
+
+If an existing migration has already been applied in a production environment, do not rewrite its historical contents. Use a new forward migration.
+
+## 6.2 Define Observation Key Collision Semantics
+
+Inspect `saveVisibilityImportAtomic()` and its `ON CONFLICT` behavior.
+
+The current concern is that two different CSV files may contain the same observation key and overwrite existing metric values.
+
+Do not assume that overwriting is correct.
+
+Determine what an observation represents in the current product model.
+
+Explicitly document the intended behavior for:
+
+- Re-importing the same CSV.
+- Importing a different CSV containing the same observation.
+- Importing a newer measurement for the same observation.
+- Importing historical measurements.
+- Importing conflicting metric values.
+
+Choose and implement a data-preserving policy.
+
+Possible policies include:
+
+- Append immutable observations with import provenance.
+- Replace only under an explicit versioned replacement operation.
+- Aggregate according to a documented rule.
+- Reject conflicting observations and report the conflict.
+
+The correct choice must preserve the product's existing business meaning and avoid accidental loss of history.
+
+Do not introduce silent last-write-wins behavior unless it is explicitly justified and approved by the existing data model.
+
+## 6.3 Visibility Import Tests
+
+Test:
+
+1. Normal CSV import.
+2. Identical CSV imported twice.
+3. Two identical CSV requests submitted concurrently.
+4. Different workspaces importing identical files.
+5. Different CSV files with the same observation key.
+6. Conflicting observation values.
+7. Transaction rollback.
+8. Duplicate database constraint handling.
+9. Import provenance preservation.
+10. Re-import behavior.
+
+Acceptance criteria:
+
+- Identical concurrent imports cannot create duplicate records.
+- Different workspaces remain isolated.
+- Historical observations are not silently overwritten.
+- Duplicate and conflict responses are explicit.
+- Existing CSV functionality remains compatible.
+
+# 7. WORKSTREAM E — MIGRATION 011 AND HISTORICAL DATA SAFETY
+
+Relevant file:
+
+`src/server/db/migrations/011_corrective_integrity_and_visibility_provenance.sql`
+
+Reported statement:
+
+```sql
+UPDATE ai_visibility_metrics
+SET discovery_topic = ''
+WHERE discovery_topic IS NULL;
+```
+
+## 7.1 Determine Whether NULL and Empty String Are Equivalent
+
+Do not assume they have identical business meaning.
+
+Inspect:
+
+- Existing schema.
+- Application validation.
+- Data ingestion.
+- Query filters.
+- Unique constraints.
+- Historical records.
+- Reporting and aggregation.
+- Visibility observation semantics.
+
+Determine whether:
+
+- NULL means unknown or unavailable.
+- Empty string means explicitly blank.
+- Both represent the same valid business state.
+
+Document the evidence.
+
+## 7.2 Historical Migration Rules
+
+Before changing any historical data:
+
+1. Determine whether Migration 011 has already been applied.
+2. Inspect the migration tracking mechanism.
+3. Inspect the number of affected rows.
+4. Check for existing empty-string values.
+5. Evaluate possible unique-key collisions.
+6. Preserve a recoverable backup or equivalent provenance.
+7. Document the expected before-and-after data state.
+
+Do not rewrite a migration that has already been applied in an existing environment.
+
+If correction is necessary, create a new forward migration.
+
+If NULL and empty string are not demonstrably equivalent, preserve their distinction or use a schema design that accurately represents the intended meaning.
+
+If owner approval is required to make a business-semantic decision, do not silently make the decision.
+
+Prepare the safe implementation and clearly identify the specific decision that remains pending.
+
+## 7.3 Migration Verification
+
+Test:
+
+- Clean database migration from 001 through the latest migration.
+- Upgrade from a database already at migration 010.
+- Upgrade from a database already at migration 011.
+- Migration rerun behavior.
+- Existing NULL records.
+- Existing empty-string records.
+- Duplicate-key scenarios.
+- Migration rollback or recovery procedures where supported.
+
+Acceptance criteria:
+
+- Existing applied migration history remains immutable.
+- No unapproved historical data transformation.
+- No unexpected duplicate-key failure.
+- Migration behavior is reproducible.
+- Data changes are auditable.
+
+# 8. WORKSTREAM F — CHECKOUT REDIRECT SECURITY
+
+Relevant file:
+
+`src/server/routes/billingRoutes.ts`
+
+Reported concern:
+
+`getTrustedBaseUrl()` can fall back to Request Host or forwarded protocol when `APP_URL` is absent.
+
+## 8.1 Production URL Requirements
+
+Inspect how Checkout success and cancel URLs are constructed.
+
+Implement the following:
+
+- Require a valid `APP_URL` in production.
+- Validate the configured URL.
+- Require HTTPS in production.
+- Reject untrusted host values.
+- Do not trust arbitrary `Host`, `X-Forwarded-Host`, or forwarded protocol headers.
+- Ensure proxy trust configuration is explicit.
+- Validate allowed origins.
+- Preserve valid local development behavior.
+- Avoid breaking existing Stripe Checkout flows.
+
+Do not allow an untrusted request header to determine a production payment redirect destination.
+
+## 8.2 Tests
+
+Test:
+
+1. Valid production APP_URL.
+2. Missing production APP_URL.
+3. Invalid APP_URL.
+4. HTTP URL in production.
+5. Malicious Host header.
+6. Malicious forwarded host.
+7. Untrusted origin.
+8. Valid development configuration.
+9. Checkout success URL.
+10. Checkout cancellation URL.
+
+Acceptance criteria:
+
+- Production Checkout URLs always use a trusted configured origin.
+- Missing or invalid production configuration fails safely.
+- Existing valid payment flows remain functional.
+
+# 9. WORKSTREAM G — AUTH RATE LIMITING
+
+Relevant file:
+
+`src/server/middleware/auth.ts`
+
+Reported concerns:
+
+- Rate limiter is process-local.
+- Multiple instances do not share counters.
+- Entry pruning does not enforce a strict memory cap when all entries remain active.
+
+## 9.1 Implement Safe Rate Limiting
+
+Inspect the existing authentication flows and rate-limit keys.
+
+Implement a production-appropriate shared rate limiter using infrastructure already available in the project where possible.
+
+Requirements:
+
+- Rate-limit state must be shared across production instances.
+- Define a strict maximum memory bound for any local fallback.
+- Handle expired entries.
+- Handle high-cardinality requests.
+- Avoid unbounded Map growth.
+- Define behavior during shared storage failure.
+- Protect login and other sensitive authentication endpoints.
+- Avoid allowing attackers to bypass limits by changing a trivial request identifier.
+- Preserve legitimate users and existing authentication behavior.
+
+Do not introduce a mandatory paid service without documenting the operational and cost implications.
+
+If PostgreSQL is selected, ensure the implementation does not create excessive database load.
+
+If a local fallback remains, document its limitations and enforce an actual hard cap.
+
+## 9.2 Tests
+
+Test:
+
+- Normal rate limiting.
+- Multiple instances sharing the same limit.
+- Expired counter cleanup.
+- High-cardinality requests.
+- Strict memory cap.
+- Storage failure.
+- Concurrent counter updates.
+- Legitimate authentication after the limit window expires.
+
+Acceptance criteria:
+
+- Production rate limits are shared across instances.
+- Memory usage is bounded.
+- Storage failures follow a documented fail-safe policy.
+- Existing authentication and session security remain intact.
+
+# 10. WORKSTREAM H — MIGRATION INTEGRITY VERIFICATION
+
+Inspect the migration runner and migration tracking implementation.
+
+Reported concern:
+
+Migration tracking records migration filenames but does not verify file checksums.
+
+## 10.1 Add Migration Integrity Verification
+
+Implement checksum-based migration integrity verification.
+
+Requirements:
+
+- Calculate a cryptographic checksum for each migration file.
+- Record the checksum when a migration is successfully applied.
+- Compare the stored checksum with the current migration file on subsequent startup or migration verification.
+- Detect modified historical migration files.
+- Detect unexpected changes to already-applied migrations.
+- Preserve compatibility with existing migration tracking records.
+- Provide a safe upgrade path for databases that already have migration history but no checksums.
+- Never silently treat a changed historical migration as an unchanged migration.
+
+Use an explicit and auditable policy for legacy migrations that lack stored checksums.
+
+Do not automatically rewrite historical migration records to conceal differences.
+
+## 10.2 Tests
+
+Test:
+
+1. New migration checksum creation.
+2. Successful checksum verification.
+3. Modified applied migration.
+4. Missing migration file.
+5. New unapplied migration.
+6. Existing legacy migration record without checksum.
+7. Checksum mismatch during deployment.
+8. Clean database installation.
+
+Acceptance criteria:
+
+- Modified applied migrations are detected.
+- Existing installations can be upgraded safely.
+- Migration history remains auditable.
+- Deployment cannot silently execute an altered historical migration.
+
+# 11. WORKSTREAM I — REAL POSTGRESQL INTEGRATION AND CONCURRENCY TESTING
+
+The existing unit test suite is not sufficient to prove database locking and concurrency correctness.
+
+Implement or improve a real PostgreSQL integration test environment.
+
+## 11.1 Required Test Infrastructure
+
+- Use a real supported PostgreSQL version.
+- Use independent database connections.
+- Test actual transactions and row locks.
+- Test unique constraints.
+- Test advisory locks where used.
+- Test transaction rollback.
+- Test migration execution.
+- Test multiple concurrent workers.
+- Clean up test data reliably.
+- Keep test credentials separate from production credentials.
+
+Use the existing test framework and repository architecture.
+
+Do not replace database correctness tests with mocked repository behavior.
+
+## 11.2 Required Coverage
+
+Include integration tests for:
+
+- Webhook claiming and retry.
+- Webhook event lease recovery.
+- Cross-instance workspace locking.
+- Catalog stale snapshot protection.
+- Billing lease expiration.
+- Billing lock-wait scenarios.
+- Visibility CSV atomic deduplication.
+- Observation history preservation.
+- Migration 001 through the latest migration.
+- Migration integrity checks.
+- Workspace and tenant isolation.
+
+If the current CI infrastructure supports PostgreSQL services, configure a dedicated test service.
+
+If not, provide a reproducible documented PostgreSQL test command and environment configuration.
+
+Do not report PostgreSQL integration tests as passed unless they actually execute against PostgreSQL.
+
+# 12. WORKSTREAM J — SHOPIFY DEVELOPMENT STORE VERIFICATION
+
+The source audit identified Shopify OAuth and read-catalog functionality, but did not establish that the full external integration has passed live verification.
+
+Use Shopify's official Development Store or another authorized Shopify test environment.
+
+## 12.1 Verify Existing Implemented Capabilities
+
+Verify:
+
+- OAuth installation.
+- OAuth state and HMAC validation.
+- Required access scopes.
+- Store identity.
+- Credential encryption and storage.
+- Product pagination.
+- Variant pagination.
+- Cursor handling.
+- Missing cursor behavior.
+- Repeated cursor behavior.
+- Incomplete sync status.
+- Webhook registration.
+- Webhook HMAC verification.
+- Webhook event deduplication.
+- Retry and recovery.
+- Workspace isolation.
+
+Record actual test evidence.
+
+## 12.2 Important Capability Boundary
+
+Do not claim that approved product fixes are written back to Shopify unless a real Shopify write implementation exists and has been tested.
+
+The previously inspected implementation showed:
+
+- Default Shopify OAuth scope: `read_products`.
+- No confirmed `productUpdate` or `productSet` implementation in the inspected Shopify integration paths.
+- Existing Catalog Mutation functionality appears to modify AIXSHOP's internal catalog model.
+
+Do not silently expand the OAuth scopes or add Shopify write operations as part of this reliability remediation.
+
+Shopify write-back is outside this task unless the existing source already contains a clearly implemented and authorized capability requiring only correction.
+
+Document the verified capability boundary accurately.
+
+# 13. WORKSTREAM K — STRIPE TEST MODE AND SUBSCRIPTION LIFECYCLE
+
+The existing source contains billing and Stripe integration code, but source presence alone does not prove a successful external payment lifecycle.
+
+Use Stripe Test Mode when valid credentials are available.
+
+## 13.1 Verify the Existing Lifecycle
+
+Test:
+
+1. Checkout session creation.
+2. Trusted success and cancel URLs.
+3. Successful payment.
+4. Subscription creation.
+5. Webhook signature verification.
+6. Duplicate webhook delivery.
+7. Subscription renewal.
+8. Payment failure.
+9. Subscription cancellation.
+10. Refund behavior where implemented.
+11. Entitlement activation.
+12. Entitlement expiration or downgrade.
+13. Duplicate billing event handling.
+14. Recovery after temporary database failure.
+
+Preserve the existing pricing and entitlement model.
+
+Do not change pricing, plan limits, or commercial policy without explicit authorization.
+
+## 13.2 External Verification Rules
+
+- Use Stripe Test Mode only.
+- Never use live payment credentials for automated tests.
+- Never expose Stripe secrets.
+- Record actual test results.
+- Clearly distinguish local unit tests from successful Stripe Test Mode verification.
+
+If credentials or a test account are unavailable, complete the code-level and automated test work, then report the external verification as BLOCKED BY MISSING ACCESS.
+
+Do not fabricate a successful payment.
+
+# 14. WORKSTREAM L — SEMGREP AND TRIVY SECURITY VERIFICATION
+
+Run security checks against the current codebase and relevant dependencies.
+
+## 14.1 Semgrep
+
+Use an appropriate maintained Semgrep configuration.
+
+Inspect for:
+
+- Authentication weaknesses.
+- Authorization bypass.
+- Tenant isolation defects.
+- SQL injection.
+- Unsafe input handling.
+- Secret exposure.
+- Insecure cryptography.
+- Unsafe redirects.
+- Webhook verification defects.
+- Dangerous deserialization.
+- Improper error handling.
+- Insecure file upload and CSV processing.
+- Race conditions where detectable.
+
+Review findings and distinguish actual vulnerabilities from false positives.
+
+Do not suppress a finding merely to obtain a clean report.
+
+## 14.2 Trivy
+
+Run applicable Trivy checks for:
+
+- Dependency vulnerabilities.
+- Filesystem vulnerabilities.
+- Misconfiguration.
+- Exposed secrets.
+- Container image vulnerabilities if a production image exists.
+
+Document:
+
+- Scanner version.
+- Scan scope.
+- Execution result.
+- Findings.
+- Severity.
+- Fix or mitigation.
+- Accepted risks requiring owner review.
+
+Do not claim a clean security scan if the scanner did not execute successfully.
+
+# 15. WORKSTREAM M — PRODUCTION DEPLOYMENT AND READINESS
+
+Inspect the complete production deployment path.
+
+Relevant areas include:
+
+- Application startup.
+- Environment validation.
+- Database connection.
+- Migration execution.
+- Health endpoints.
+- Readiness checks.
+- Shutdown behavior.
+- Logging.
+- Error reporting.
+- Reverse proxy configuration.
+- HTTPS.
+- Persistent storage.
+- Database backup and recovery.
+- Stripe webhook endpoint.
+- Shopify webhook endpoint.
+- Rate limiting.
+- Production configuration.
+
+## 15.1 `/api/health/ready`
+
+Inspect the actual readiness endpoint.
+
+It must report whether the application is ready to serve real traffic.
+
+Check the relevant dependencies, including:
+
+- Application initialization.
+- PostgreSQL connectivity.
+- Required database schema or migration state.
+- Critical configuration.
+- Any other mandatory production dependency already used by the application.
+
+Do not expose secrets, internal credentials, or sensitive database details.
+
+Distinguish:
+
+- Liveness: whether the process is running.
+- Readiness: whether the application can safely serve requests.
+
+A database-dependent application must not report ready when its required database is unavailable.
+
+## 15.2 Production Configuration
+
+Verify:
+
+- PostgreSQL is mandatory where required.
+- Production does not silently fall back to MemoryRepository.
+- APP_URL is configured and valid.
+- Shopify credentials are validated.
+- Stripe configuration is validated.
+- Encryption keys are present and sufficiently strong.
+- Session and cookie security settings are appropriate.
+- Proxy trust is configured explicitly.
+- No development-only configuration is active in production.
+
+## 15.3 Deployment Verification
+
+Provide a reproducible deployment checklist.
+
+Do not deploy or modify live production infrastructure without explicit authorization.
+
+If no production environment is available, report which deployment checks remain unverified.
+
+# 16. PRODUCT CAPABILITY ACCURACY — DO NOT OVERCLAIM
+
+This remediation task must not create misleading product claims.
+
+Preserve the distinction between implemented, tested, externally verified, and planned capabilities.
+
+Based on the previous source audit, the following capability boundaries must be checked again against the current repository.
+
+| Capability | Existing audit baseline |
+|---|---|
+| Shopify OAuth / Read Catalog | Implemented |
+| Catalog Audit | Implemented |
+| Product Health / Completeness | Implemented |
+| Feed Validation / Export | Implemented as local structural validation |
+| AI Discovery Readiness | Deterministic rule engine |
+| AI Visibility CSV Import | Implemented |
+| Fix / Recheck inside AIXSHOP | Existing internal functionality |
+| Push Approved Fix back to Shopify | No confirmed implementation |
+| Automatic AI Platform Visibility Monitoring | No confirmed implementation |
+| Stripe Subscription | Code exists; live Test Mode not yet verified |
+
+Reinspect each capability before using this table in the final report.
+
+Specific restrictions:
+
+1. Do not describe local feed validation as guaranteed acceptance by Google Merchant Center or another external platform.
+2. Do not describe deterministic AI Discovery rules as live AI platform querying.
+3. Do not describe CSV import as automatic AI platform monitoring.
+4. Do not describe internal catalog changes as Shopify write-back.
+5. Do not describe Stripe integration as externally verified until Stripe Test Mode evidence exists.
+
+Do not implement new AI platform integrations or Shopify write-back as an unrelated expansion of this task.
+
+# 17. REQUIRED IMPLEMENTATION SEQUENCE
+
+Follow this sequence while keeping the entire remediation scope in view.
+
+Phase 1 — Baseline and Source Verification
+
+- Inspect repository and current commit.
+- Inspect all relevant code.
+- Inspect all migrations.
+- Inspect existing tests.
+- Establish baseline test and build results.
+- Identify already-fixed issues.
+
+Phase 2 — Data and Transaction Correctness
+
+- Shopify Webhook retry and claim lifecycle.
+- Distributed workspace locking.
+- Catalog stale snapshot protection.
+- Billing lease time correctness.
+- Visibility CSV atomic deduplication.
+- Visibility metric history semantics.
+- Migration 011 historical data safety.
+- Migration checksum integrity.
+
+Phase 3 — Security and External Boundary Hardening
+
+- Checkout redirect validation.
+- Shared authentication rate limiting.
+- Webhook failure behavior.
+- Tenant isolation verification.
+- Production environment validation.
+
+Phase 4 — Automated Verification
+
+- Unit regression tests.
+- PostgreSQL integration tests.
+- Multi-connection concurrency tests.
+- Migration tests.
+- Rollback and failure-recovery tests.
+- Build and type checks.
+
+Phase 5 — External Verification
+
+- Shopify Development Store.
+- Stripe Test Mode.
+- Semgrep.
+- Trivy.
+
+Phase 6 — Production Readiness
+
+- Health and readiness verification.
+- Production configuration audit.
+- Deployment checklist.
+- Final evidence-based assessment.
+
+Do not skip a phase simply because another phase passes.
+
+# 18. ACCEPTANCE CRITERIA
+
+The remediation is complete only when the following conditions are met.
+
+## Application Integrity
+
+- Existing features continue to work.
+- No unrelated feature has been removed.
+- No destructive rewrite has occurred.
+- Existing tenant isolation is preserved.
+- No unintended data loss is introduced.
+
+## Shopify Webhooks
+
+- Failed events can be retried.
+- Duplicate events are distinguished from failed events.
+- Database errors cannot silently become HTTP 200 duplicates.
+- Event processing is safe under concurrent delivery.
+- Expired worker leases can be recovered.
+
+## Workspace Concurrency
+
+- Locking works across multiple server instances.
+- Stale catalog snapshots cannot overwrite newer changes.
+- Concurrent operations preserve catalog consistency.
+- Workspace isolation is maintained.
+
+## Billing
+
+- PostgreSQL lease validation uses correct time semantics.
+- Expired workers cannot mutate entitlements.
+- Lock-wait scenarios are tested.
+- Rollback works when lease validation fails.
+- Billing idempotency is preserved.
+
+## Visibility
+
+- Concurrent identical imports cannot create duplicate import records.
+- Different CSV imports cannot silently destroy historical observations.
+- Import provenance is preserved.
+- Collision behavior is explicitly documented and tested.
+
+## Database Migrations
+
+- Existing applied migrations are not silently rewritten.
+- Historical data transformations are documented.
+- Migration checksum verification works.
+- Migration 001 through the latest migration can be verified on PostgreSQL.
+
+## Security
+
+- Production Checkout redirects use trusted URLs.
+- Rate limiting works across instances.
+- Rate limiter memory is bounded.
+- Semgrep and Trivy results are recorded honestly.
+
+## External Integration
+
+- Shopify Development Store tests are recorded when access is available.
+- Stripe Test Mode tests are recorded when access is available.
+- Missing external credentials are reported as blockers, not assumed successes.
+
+## Production
+
+- Production configuration is validated.
+- PostgreSQL is required where appropriate.
+- Readiness reflects actual application dependencies.
+- Deployment steps are reproducible.
+- No live deployment occurs without approval.
+
+# 19. REQUIRED FINAL REPORT
+
+After completing the work, produce a comprehensive report in Thai.
+
+Use the following structure.
+
+## A. Baseline
+
+- Actual repository commit before modification.
+- Branch.
+- Existing uncommitted changes, if any.
+- Existing test results.
+- Existing build results.
+- Relevant existing functionality preserved.
+
+## B. Changes Implemented
+
+For every changed file, report:
+
+- File path.
+- Problem addressed.
+- Technical change.
+- Why the change is safe.
+- Related tests.
+
+## C. Production Blocker Verification
+
+Provide a table:
+
+| Issue | Source finding | Fix implemented | Regression test | PostgreSQL verification | Result |
+|---|---|---|---|---|---|
+
+Include every issue in this prompt.
+
+## D. Database and Historical Data
+
+Report:
+
+- Migrations added or changed.
+- Whether existing migrations were preserved.
+- Historical row counts inspected.
+- Data transformations performed.
+- Backup or recovery strategy.
+- NULL versus empty-string decision.
+- Unique constraints and indexes.
+- Migration checksum results.
+
+Explicitly identify any business-semantic decision that still requires owner approval.
+
+## E. Test Results
+
+Report actual results for:
+
+- TypeScript.
+- Lint.
+- Unit tests.
+- Regression tests.
+- PostgreSQL integration tests.
+- Concurrency tests.
+- Migration tests.
+- Production build.
+
+Include:
+
+- Total passed.
+- Total failed.
+- Total skipped.
+- Commands executed.
+- Any environment limitations.
+
+Never invent test counts.
+
+## F. External Integration Results
+
+Report separately:
+
+- Shopify Development Store.
+- Stripe Test Mode.
+- Webhook delivery and recovery.
+- Checkout lifecycle.
+- Any tests blocked by missing credentials or external access.
+
+Clearly distinguish local tests from actual external verification.
+
+## G. Security Results
+
+Report:
+
+- Semgrep version and result.
+- Trivy version and result.
+- Findings.
+- Remediation.
+- Accepted risks.
+- Unverified areas.
+
+## H. Production Readiness
+
+Evaluate:
+
+- Application startup.
+- PostgreSQL.
+- Migrations.
+- Authentication.
+- Tenant isolation.
+- Shopify.
+- Billing.
+- Visibility.
+- Security.
+- Health and readiness.
+- Deployment.
+
+Use only these result labels:
+
+- VERIFIED
+- PASS
+- PARTIAL
+- BLOCKED
+- FAIL
+- NOT TESTED
+
+Do not label the entire product production-ready merely because CI passes.
+
+## I. Remaining Work
+
+List every unresolved issue with:
+
+- Exact file or system.
+- Reason it remains unresolved.
+- What is required to complete it.
+- Whether it requires owner approval.
+- Whether it requires external credentials or infrastructure.
+
+## J. Git Summary
+
+Report:
+
+- Changed files.
+- New files.
+- Deleted files, if any, with justification.
+- Migration files.
+- Test files.
+- Current branch and commit.
+
+Do not commit or push.
+
+# 20. FINAL EXECUTION RULE
+
+Start with the actual repository baseline and proceed through the complete remediation scope.
+
+Do not stop after producing a plan.
+
+Do not report a task as completed until the corresponding source changes and verification evidence exist.
+
+If a required operation cannot be performed because credentials, external infrastructure, PostgreSQL, or user approval are unavailable:
+
+1. Complete all work that can safely be completed.
+2. Do not fabricate the missing result.
+3. Record the exact blocker.
+4. Provide the precise command or owner action required to finish verification.
+5. Preserve all existing work.
+
+The final objective is a technically defensible AIXSHOP v1.0 remediation, with reliable data integrity, safe concurrency, correct billing lifecycle behavior, recoverable Shopify webhooks, secure production configuration, and verifiable deployment readiness.
+
+**Zero Loss of Development Progress. No destructive rewrite. No unsupported claims. No unverified production-readiness claims.**

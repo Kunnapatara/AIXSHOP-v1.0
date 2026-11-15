@@ -1,3 +1,7 @@
+export type TopicPresenceState = 'specified' | 'explicit_blank' | 'unspecified' | 'legacy_ambiguous';
+
+export type VisibilityConflictPolicy = 'reject_on_conflict' | 'replace_versioned';
+
 export interface VisibilityMetricRecord {
   id: string;
   workspaceId: string;
@@ -8,8 +12,60 @@ export interface VisibilityMetricRecord {
   productMentions: number;
   websiteClicks: number;
   discoveryTopic?: string | null;
+  topicPresence?: TopicPresenceState;
   evidenceSource?: string | null;
   createdAt: string;
+}
+
+export interface VisibilityObservationHistoryRecord {
+  id: string;
+  workspaceId: string;
+  importId: string;
+  observationDate: string;
+  platform: string;
+  discoveryTopic?: string | null;
+  topicPresence: TopicPresenceState;
+  brandMentions: number;
+  productMentions: number;
+  websiteClicks: number;
+  evidenceSource?: string | null;
+  eventType: 'recorded' | 'superseded' | 'replaced';
+  versionNumber: number;
+  supersedesHistoryId?: string | null;
+  createdAt: string;
+}
+
+export interface VisibilityObservationConflict {
+  observationDate: string;
+  platform: string;
+  discoveryTopic: string | null;
+  topicPresence: TopicPresenceState;
+  existingImportId: string | null;
+  existingValues: {
+    brandMentions: number;
+    productMentions: number;
+    websiteClicks: number;
+  };
+  incomingValues: {
+    brandMentions: number;
+    productMentions: number;
+    websiteClicks: number;
+  };
+}
+
+export class VisibilityObservationConflictError extends Error {
+  public readonly code = 'VISIBILITY_OBSERVATION_CONFLICT';
+  public readonly statusCode = 409;
+  public readonly conflicts: VisibilityObservationConflict[];
+
+  constructor(conflicts: VisibilityObservationConflict[], message?: string) {
+    super(
+      message ||
+        `Visibility import conflicts with ${conflicts.length} existing observation(s). Pass conflictPolicy="replace_versioned" for explicit versioned replacement instead of overwriting historical measurements.`
+    );
+    this.name = 'VisibilityObservationConflictError';
+    this.conflicts = conflicts;
+  }
 }
 
 export interface VisibilityImportRowError {

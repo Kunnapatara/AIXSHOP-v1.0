@@ -3,10 +3,11 @@ import { AuthRequest, WorkspaceRole } from '../types';
 import { DatabaseRepository } from '../db/repository';
 import { hashSessionToken } from '../security/tokens';
 
-// Bounded in-memory rate limiting store with active TTL cleanup
+// Bounded in-memory rate limiting store with active TTL cleanup and FIFO eviction under load
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const resetHooks = new Set<() => void>();
 let lastPruneAt = Date.now();
-const MAX_RATE_LIMITER_ENTRIES = 5000;
+const DEFAULT_MAX_RATE_LIMITER_ENTRIES = 5000;
 
 function pruneExpiredRateLimitEntries(now: number) {
   for (const [key, value] of loginAttempts.entries()) {
@@ -16,8 +17,53 @@ function pruneExpiredRateLimitEntries(now: number) {
   }
 }
 
+function consumeLocalBoundedRateLimit(
+  key: string,
+  maxAttempts: number,
+  windowMs: number,
+  maxEntries: number
+): { allowed: boolean; count: number; resetAt: number } {
+  const now = Date.now();
+
+  if (now - lastPruneAt > 60000 || loginAttempts.size >= maxEntries) {
+    pruneExpiredRateLimitEntries(now);
+    lastPruneAt = now;
+  }
+
+  const existing = loginAttempts.get(key);
+  if (existing && now <= existing.resetAt) {
+    // Refresh insertion order for LRU behavior
+    loginAttempts.delete(key);
+    if (existing.count >= maxAttempts) {
+      loginAttempts.set(key, existing);
+      return { allowed: false, count: existing.count, resetAt: existing.resetAt };
+    }
+    const nextEntry = { count: existing.count + 1, resetAt: existing.resetAt };
+    loginAttempts.set(key, nextEntry);
+    return { allowed: true, count: nextEntry.count, resetAt: nextEntry.resetAt };
+  }
+
+  // Evict oldest entries if at strict cap even with active non-expired keys
+  while (loginAttempts.size >= maxEntries) {
+    const oldestKey = loginAttempts.keys().next().value;
+    if (oldestKey === undefined) break;
+    loginAttempts.delete(oldestKey);
+  }
+
+  const resetAt = now + windowMs;
+  loginAttempts.set(key, { count: 1, resetAt });
+  return { allowed: true, count: 1, resetAt };
+}
+
 export function _resetRateLimiter(): void {
   loginAttempts.clear();
+  for (const hook of resetHooks) {
+    try {
+      hook();
+    } catch {
+      // ignore
+    }
+  }
 }
 
 export function _getRateLimiterSize(): number {
@@ -128,41 +174,89 @@ export function requireRole(allowedRoles: WorkspaceRole[]) {
   };
 }
 
-/**
- * IP rate limiter for authentication endpoints (prevent brute-force).
- * Implements bounded memory growth with active expiration pruning.
- * Note: In-memory rate limiting is scoped to a single process instance.
- */
-export function authRateLimiter(maxAttempts = 15, windowMs = 15 * 60 * 1000) {
-  return (req: any, res: Response, next: NextFunction) => {
-    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
-    const now = Date.now();
+export interface AuthRateLimiterOptions {
+  keyPrefix?: string;
+  maxMemoryEntries?: number;
+  failClosedOnStorageError?: boolean;
+}
 
-    // Active prune every minute or when capacity threshold reached
-    if (now - lastPruneAt > 60000 || loginAttempts.size > MAX_RATE_LIMITER_ENTRIES) {
-      pruneExpiredRateLimitEntries(now);
-      lastPruneAt = now;
+/**
+ * Shared rate limiter for authentication endpoints (brute-force & high-cardinality flood protection).
+ * - Uses shared PostgreSQL / Repository storage via repo.consumeRateLimit when provided.
+ * - Falls back safely to a strictly capacity-bounded local Map (LRU/FIFO eviction under capacity)
+ *   or fails closed (503) if failClosedOnStorageError=true.
+ * - Applies trusted Express req.ip (respecting configured 'trust proxy') + normalized account email bucket.
+ */
+export function authRateLimiter(
+  maxAttempts = 15,
+  windowMs = 15 * 60 * 1000,
+  repo?: DatabaseRepository,
+  options: AuthRateLimiterOptions = {}
+) {
+  const keyPrefix = options.keyPrefix || 'auth';
+  const maxEntries = Math.max(10, options.maxMemoryEntries ?? DEFAULT_MAX_RATE_LIMITER_ENTRIES);
+
+  if (repo && typeof (repo as any).clearRateLimits === 'function') {
+    resetHooks.add(() => (repo as any).clearRateLimits());
+  }
+
+  return async (req: any, res: Response, next: NextFunction) => {
+    // Express resolves req.ip safely according to app.set('trust proxy', ...) — never blindly parse raw X-Forwarded-For
+    const rawIp = String(req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress || 'unknown').trim();
+    const ipKey = `rl:${keyPrefix}:ip:${rawIp}`;
+
+    const rawEmail = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const keysToCheck = [ipKey];
+    if (rawEmail) {
+      keysToCheck.push(`rl:${keyPrefix}:acct:${rawEmail}`);
     }
 
-    const entry = loginAttempts.get(ip);
-
-    if (entry) {
-      if (now > entry.resetAt) {
-        loginAttempts.set(ip, { count: 1, resetAt: now + windowMs });
+    try {
+      if (repo && typeof repo.consumeRateLimit === 'function') {
+        for (const k of keysToCheck) {
+          const result = await repo.consumeRateLimit(k, maxAttempts, windowMs);
+          // Mirror key presence into bounded local tracker for memory-mode observability
+          if (repo.getBackendType() === 'memory') {
+            while (loginAttempts.size >= maxEntries && !loginAttempts.has(k)) {
+              const oldest = loginAttempts.keys().next().value;
+              if (oldest === undefined) break;
+              loginAttempts.delete(oldest);
+            }
+            loginAttempts.set(k, { count: result.count, resetAt: result.resetAt });
+          }
+          if (!result.allowed) {
+            return res.status(429).json({
+              error: 'Too many authentication attempts. Please try again later.',
+              code: 'RATE_LIMITED',
+              retryAfterSeconds: Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000)),
+            });
+          }
+        }
         return next();
       }
-      if (entry.count >= maxAttempts) {
-        return res.status(429).json({ 
-          error: 'Too many authentication attempts. Please try again later.',
-          code: 'RATE_LIMITED' 
+    } catch (storageErr: any) {
+      console.error('[AIXSHOP Auth RateLimit] Shared rate-limit storage error:', storageErr?.message || storageErr);
+      if (options.failClosedOnStorageError) {
+        return res.status(503).json({
+          error: 'Authentication rate limiter temporarily unavailable. Please retry shortly.',
+          code: 'RATE_LIMITER_UNAVAILABLE',
         });
       }
-      entry.count += 1;
-    } else {
-      loginAttempts.set(ip, { count: 1, resetAt: now + windowMs });
+      // Fall through to bounded local limiter fallback below
     }
 
-    next();
+    for (const k of keysToCheck) {
+      const localRes = consumeLocalBoundedRateLimit(k, maxAttempts, windowMs, maxEntries);
+      if (!localRes.allowed) {
+        return res.status(429).json({
+          error: 'Too many authentication attempts. Please try again later.',
+          code: 'RATE_LIMITED',
+          retryAfterSeconds: Math.max(1, Math.ceil((localRes.resetAt - Date.now()) / 1000)),
+        });
+      }
+    }
+
+    return next();
   };
 }
 

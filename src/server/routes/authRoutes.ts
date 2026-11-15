@@ -32,7 +32,7 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
   };
 
   // POST /api/auth/register
-  router.post('/register', authRateLimiter(20), async (req, res) => {
+  router.post('/register', authRateLimiter(20, 15 * 60 * 1000, repo, { keyPrefix: 'register' }), async (req, res) => {
     try {
       const { email, password, fullName, workspaceName } = req.body || {};
 
@@ -117,7 +117,7 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/auth/login
-  router.post('/login', authRateLimiter(20), async (req, res) => {
+  router.post('/login', authRateLimiter(20, 15 * 60 * 1000, repo, { keyPrefix: 'login' }), async (req, res) => {
     try {
       const { email, password } = req.body || {};
 

@@ -789,7 +789,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
 
       assert.equal(released, true, 'PG client must always be released');
       assert.equal(queries[0], 'BEGIN');
-      assert.match(queries[1], /lease_expires_at < NOW\(\)/);
+      assert.match(queries[1], /lease_expires_at < clock_timestamp\(\)/);
       assert.match(queries[1], /FOR UPDATE/);
       assert.equal(queries.includes('ROLLBACK'), true);
       assert.equal(queries.some(q => q.includes('UPDATE stores')), false, 'Must NEVER touch stores table after expired lease');
@@ -841,7 +841,8 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         'subscriptions', 'billing_events', 'audit_runs', 'audit_run_manifests', 'audit_run_findings',
         'audit_run_evidence', 'audit_run_products', 'shopify_connections', 'shopify_sync_runs',
         'shopify_webhook_events', 'shopify_oauth_states', 'workspace_business_profiles',
-        'ai_visibility_imports', 'ai_visibility_metrics',
+        'ai_visibility_imports', 'ai_visibility_metrics', 'ai_visibility_observation_history',
+        'auth_rate_limits',
       ];
       const validCols = [
         { table_name: 'variants', column_name: 'price', data_type: 'numeric', numeric_precision: 14, numeric_scale: 2, is_nullable: 'NO', character_maximum_length: null },
@@ -854,6 +855,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql',
         '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql',
         '011_corrective_integrity_and_visibility_provenance.sql',
+        '012_production_blockers_integrity.sql',
       ];
       const baseConstraints = [
         { source_schema: 'tenant_prod', source_table: 'stores', target_schema: '', target_table: '', constraint_name: 'uq_stores_ws_id', constraint_type: 'u', source_columns: 'workspace_id,id', target_columns: '', is_partial_index: false },

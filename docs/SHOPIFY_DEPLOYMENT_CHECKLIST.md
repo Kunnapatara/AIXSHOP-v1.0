@@ -41,6 +41,8 @@ Ensure the following variables are configured in production:
 NODE_ENV="production"
 PORT="3000"
 APP_URL="https://your-domain.run.app"
+ALLOWED_APP_ORIGINS=""
+TRUST_PROXY="1"
 
 # Database (PostgreSQL required in production)
 DATABASE_URL="postgresql://user:password@cloudsql-or-pg-host:5432/aixshop_db?sslmode=require"
@@ -77,12 +79,23 @@ Run migrations to ensure tables and composite referential integrity are in place
 ```bash
 npm run db:migrate
 npm run db:status
+# Opt-in audit backfill for pre-012 rows with NULL checksum (only after DBA verification):
+npx tsx src/server/db/migrate.ts --backfill-legacy-checksums
+```
+
+To run the reproducible live multi-connection PostgreSQL integration tests:
+```bash
+DATABASE_URL="postgresql://user:pass@localhost:5432/aixshop_test" npm test
 ```
 
 Expected schema elements:
 - `shopify_connections`: Stores AES-256-GCM encrypted access and refresh tokens, scopes, and expiration timestamps per `workspace_id`.
 - `shopify_sync_runs`: Tracks catalog sync runs, pagination cursors (`cursor_resumed`), discovered/imported counts, and quota enforcement.
-- `shopify_webhook_events`: Idempotent delivery tracking with `UNIQUE(shop_domain, topic, event_id)` to deduplicate Shopify deliveries.
+- `shopify_webhook_events`: Idempotent delivery tracking with `UNIQUE(shop_domain, topic, event_id)`, `lease_owner`, `lease_expires_at`, and `attempt_count`.
+- `stores`: Includes `catalog_version` for optimistic concurrency + transactional `pg_advisory_xact_lock` catalog mutations.
+- `auth_rate_limits`: Shared distributed PostgreSQL auth rate-limit storage.
+- `ai_visibility_imports` & `ai_visibility_metrics` & `ai_visibility_observation_history`: Content-hash deduplication, conflict detection, append-only version history, and `topic_presence` (`NULL` vs `''` distinction).
+- `schema_migrations`: SHA-256 migration checksum verification (`checksum`, `checksum_verified_at`).
 - `audit_runs(id, workspace_id)` and `audit_history_snapshots(id, workspace_id, audit_run_id)` composite foreign key integrity.
 
 ---

@@ -16,6 +16,7 @@ import {
   verifyShopifyWebhookSubscriptionsLive 
 } from '../shopify/webhookService';
 import { ShopifyPublicStatus } from '../shopify/types';
+import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/productionConfig';
 
 export function createShopifyRoutes(repo: DatabaseRepository): Router {
   const router = Router();
@@ -181,7 +182,13 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
 
   // 3. GET /api/shopify/callback — Shopify OAuth redirect callback
   router.get('/callback', async (req, res) => {
-    const { appUrl } = getShopifyOAuthEnv();
+    const resolveRedirectBase = (): string => {
+      const { appUrl } = getShopifyOAuthEnv();
+      if (process.env.NODE_ENV === 'production') {
+        return getTrustedBaseUrl(req);
+      }
+      return appUrl || getTrustedBaseUrl(req);
+    };
 
     try {
       const result = await handleShopifyCallback(repo, req.query);
@@ -189,7 +196,13 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
       // If request accepts HTML/browser redirect:
       const acceptHeader = req.headers.accept || '';
       if (acceptHeader.includes('text/html')) {
-        return res.redirect(`${appUrl}/?page=settings&tab=connectors&shopify=connected&shop=${encodeURIComponent(result.shopDomain)}`);
+        const base = resolveRedirectBase();
+        const redirectTarget = resolveTrustedRedirectUrl(
+          base,
+          `/?page=settings&tab=connectors&shopify=connected&shop=${encodeURIComponent(result.shopDomain)}`,
+          '/?page=settings&tab=connectors'
+        );
+        return res.redirect(redirectTarget);
       }
 
       return res.json({
@@ -202,7 +215,17 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
       console.error('[AIXSHOP Shopify Routes] OAuth callback error:', err);
       const acceptHeader = req.headers.accept || '';
       if (acceptHeader.includes('text/html')) {
-        return res.redirect(`${appUrl}/?page=settings&tab=connectors&shopify_error=${encodeURIComponent(err.message || 'Connection failed')}`);
+        try {
+          const base = resolveRedirectBase();
+          const redirectTarget = resolveTrustedRedirectUrl(
+            base,
+            `/?page=settings&tab=connectors&shopify_error=${encodeURIComponent(err.message || 'Connection failed')}`,
+            '/?page=settings&tab=connectors'
+          );
+          return res.redirect(redirectTarget);
+        } catch (cfgErr: any) {
+          return res.status(500).json({ error: cfgErr.message || 'Trusted application URL configuration invalid' });
+        }
       }
 
       return res.status(400).json({
@@ -369,14 +392,26 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
       }
 
       const result = await processShopifyWebhook(repo, rawBody, req.headers);
+      if (result.outcome === 'CURRENTLY_PROCESSING' || result.inProgress) {
+        return res.status(202).json({
+          success: false,
+          inProgress: true,
+          ...result,
+        });
+      }
+
       return res.status(200).json({
         success: true,
         ...result,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Webhook] Webhook processing error:', err.message);
-      // Return 401 for invalid HMAC, 500 for processing errors
-      const status = err.message?.includes('HMAC') ? 401 : 500;
+      const status =
+        typeof err.statusCode === 'number'
+          ? err.statusCode
+          : err.message?.includes('HMAC')
+          ? 401
+          : 500;
       return res.status(status).json({ error: err.message || 'Webhook processing failed' });
     }
   });

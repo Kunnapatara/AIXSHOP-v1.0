@@ -11,10 +11,9 @@ import { decryptCredential } from '../security/encryption';
 import { getValidShopifyAccessToken } from './oauthService';
 import { parseSourcePrice } from '../../domain/validation/price';
 import { calculateProductCompleteness } from '../../domain/catalog/completeness';
-import { 
-  resolveWorkspacePlanEntitlement, 
-  countCatalogSkus, 
-  withWorkspaceLock 
+import {
+  resolveWorkspacePlanEntitlement,
+  countCatalogSkus,
 } from '../services/entitlementService';
 import { detectProductConflict } from '../../domain/ingestion/storeIngestion';
 
@@ -373,6 +372,7 @@ async function executeSyncShopifyCatalog(
       isEarlyCursorBreak ||
       hasIncompleteVariants;
 
+    // Map fetched raw Shopify nodes outside the DB write transaction, then merge onto authoritative latest catalog under PG lock
     const finalStatus = isPartiallyCompleted ? 'partially_completed' : 'completed';
     const message = planLimitHit
       ? `Imported ${importedProductsCount} products (${importedVariantsCount} SKUs). Reached ${entitlement.tier} plan limit of ${skuLimit} SKUs. ${excludedSkusCount} SKU(s) excluded.`
@@ -382,12 +382,80 @@ async function executeSyncShopifyCatalog(
       ? `Partially completed: ${incompleteVariants.length} product(s) have incomplete variants (${worstCompletenessStatus}).${cursor ? ` Pass cursor '${cursor}' to resume.` : ''}`
       : `Successfully imported ${importedProductsCount} products and ${importedVariantsCount} variants from ${shop}.`;
 
-    // Persist updated catalog
-    const updatedCatalog: StoragePayloadV1 = {
-      ...existingCatalog,
-      products: finalCatalogProducts,
-    };
-    await repo.saveWorkspaceCatalog(workspaceId, updatedCatalog);
+    const fetchedNodeMap = new Map<string, Product>();
+    for (const p of mergedProducts) {
+      fetchedNodeMap.set(p.id, p);
+    }
+
+    // Re-read authoritative catalog & store inside transaction/advisory lock before saving so concurrent edits/webhooks are never clobbered
+    await repo.mutateWorkspaceCatalog(workspaceId, async (latestCatalog, authoritativeStore) => {
+      const latestProducts = latestCatalog.products || [];
+      const latestMap = new Map<string, Product>();
+      for (const lp of latestProducts) {
+        if (lp.id) latestMap.set(lp.id, lp);
+        if (lp.attributes?.sourceProductId) latestMap.set(`shopify_${lp.attributes.sourceProductId}`, lp);
+      }
+
+      const freshlyMerged: Product[] = [];
+      for (const synced of fetchedNodeMap.values()) {
+        const latestMatch =
+          latestMap.get(synced.id) ||
+          (synced.attributes?.sourceProductId ? latestMap.get(`shopify_${synced.attributes.sourceProductId}`) : undefined);
+        if (latestMatch) {
+          const conflict = detectProductConflict(synced, latestMatch);
+          const mergedItem: Product = {
+            ...synced,
+            title: conflict.isConflict ? latestMatch.title : synced.title,
+            brand: conflict.isConflict ? latestMatch.brand : synced.brand,
+            category: conflict.isConflict ? latestMatch.category : synced.category,
+            description: conflict.isConflict ? latestMatch.description : synced.description,
+            image: synced.image || latestMatch.image,
+            evidenceDocuments: latestMatch.evidenceDocuments || [],
+            findingsCount: latestMatch.findingsCount || 0,
+          };
+          mergedItem.completenessScore = calculateProductCompleteness(mergedItem);
+          freshlyMerged.push(mergedItem);
+        } else {
+          freshlyMerged.push(synced);
+        }
+      }
+
+      const updatedIds = new Set(freshlyMerged.map((p) => p.id));
+      const untouchedLatest = latestProducts.filter((p) => !updatedIds.has(p.id));
+      const mergedCatalogProducts = [...untouchedLatest, ...freshlyMerged];
+
+      const effectiveStore = latestCatalog.storeProfile || authoritativeStore || storeProfile;
+      const connectors = effectiveStore?.connectors || [];
+      const shopifyConnectorIdx = connectors.findIndex((c) => c.id === 'shopify');
+      const updatedConnector = {
+        id: 'shopify',
+        name: `Shopify (${shop})`,
+        type: 'shopify' as const,
+        status: 'connected' as const,
+        productCountSynced: importedVariantsCount,
+        lastSync: new Date().toISOString(),
+        writeBackAuthorized: false,
+      };
+      const nextConnectors = [...connectors];
+      if (shopifyConnectorIdx >= 0) {
+        nextConnectors[shopifyConnectorIdx] = updatedConnector;
+      } else {
+        nextConnectors.push(updatedConnector);
+      }
+
+      return {
+        nextCatalog: {
+          ...latestCatalog,
+          products: mergedCatalogProducts,
+          storeProfile: {
+            ...effectiveStore,
+            connectors: nextConnectors,
+            skuCount: countCatalogSkus(mergedCatalogProducts),
+          },
+        },
+        result: undefined,
+      };
+    });
 
     // Update sync run in database with strict workspace scoping
     syncRun = await repo.updateShopifySyncRun(syncRunId, workspaceId, {
@@ -414,34 +482,6 @@ async function executeSyncShopifyCatalog(
       completedAt: new Date().toISOString(),
       errorMessage: isPartiallyCompleted ? message : null,
     });
-
-    // Update connector on store profile
-    if (storeProfile) {
-      const connectors = storeProfile.connectors || [];
-      const shopifyConnectorIdx = connectors.findIndex(c => c.id === 'shopify');
-      const updatedConnector = {
-        id: 'shopify',
-        name: `Shopify (${shop})`,
-        type: 'shopify' as const,
-        status: 'connected' as const,
-        productCountSynced: importedVariantsCount,
-        lastSync: new Date().toISOString(),
-        writeBackAuthorized: false,
-      };
-
-      const nextConnectors = [...connectors];
-      if (shopifyConnectorIdx >= 0) {
-        nextConnectors[shopifyConnectorIdx] = updatedConnector;
-      } else {
-        nextConnectors.push(updatedConnector);
-      }
-
-      await repo.saveStoreProfile(workspaceId, {
-        ...storeProfile,
-        connectors: nextConnectors,
-        skuCount: countCatalogSkus(finalCatalogProducts),
-      });
-    }
 
     return {
       syncRun,
@@ -480,7 +520,7 @@ export async function syncShopifyCatalog(
   workspaceId: string,
   options: SyncCatalogOptions = {}
 ): Promise<SyncCatalogResult> {
-  return withWorkspaceLock(workspaceId, () => executeSyncShopifyCatalog(repo, workspaceId, options));
+  return repo.withWorkspaceLock(workspaceId, () => executeSyncShopifyCatalog(repo, workspaceId, options));
 }
 
 export interface ResumeSyncOptions {
@@ -501,7 +541,7 @@ export async function resumeShopifySync(
   workspaceId: string,
   options: ResumeSyncOptions = {}
 ): Promise<SyncCatalogResult> {
-  return withWorkspaceLock(workspaceId, async () => {
+  return repo.withWorkspaceLock(workspaceId, async () => {
     const recentRuns = await repo.getShopifySyncRuns(workspaceId, 50);
 
     const activeRun = recentRuns.find(r => r.status === 'pending' || r.status === 'syncing');

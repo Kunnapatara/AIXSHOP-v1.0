@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { Pool, PoolClient } from 'pg';
 import { 
   DatabaseRepository, 
@@ -9,8 +11,17 @@ import {
   SchemaReadinessResult,
   AuditRunRecord,
   CreateAuditRunData,
-  UpdateAuditRunData
+  UpdateAuditRunData,
+  CatalogVersionConflictError
 } from './repository';
+import { computeMigrationChecksum, getDefaultMigrationsDir } from './migrate';
+import {
+  TopicPresenceState,
+  VisibilityConflictPolicy,
+  VisibilityObservationConflict,
+  VisibilityObservationConflictError,
+  VisibilityObservationHistoryRecord,
+} from '../../domain/monitoring/aiVisibilityTypes';
 import { executeCatalogAudit } from '../../domain/audit/auditEngine';
 import { 
   UserRecord, 
@@ -92,6 +103,8 @@ export class PostgresRepository implements DatabaseRepository {
       'workspace_business_profiles',
       'ai_visibility_imports',
       'ai_visibility_metrics',
+      'ai_visibility_observation_history',
+      'auth_rate_limits',
     ];
 
     try {
@@ -136,7 +149,8 @@ export class PostgresRepository implements DatabaseRepository {
             AND (
               (table_name = 'variants' AND column_name = 'price') OR
               (table_name = 'sessions' AND column_name = 'session_token_hash') OR
-              (table_name = 'products' AND column_name = 'workspace_id')
+              (table_name = 'products' AND column_name = 'workspace_id') OR
+              (table_name = 'schema_migrations' AND column_name = 'checksum')
             )
         `);
 
@@ -307,7 +321,7 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify applied migrations (001, 002, 003, and 004 are all required for current version)
+        // Verify applied migrations (001 through 012 are all required for current version)
         const migRes = await client.query<{ id: string }>(
           'SELECT id FROM schema_migrations ORDER BY id ASC'
         );
@@ -325,6 +339,7 @@ export class PostgresRepository implements DatabaseRepository {
           '009_durable_sync_runs_and_ai_discovery.sql',
           '010_remediation_integrity_and_leases.sql',
           '011_corrective_integrity_and_visibility_provenance.sql',
+          '012_production_blockers_integrity.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -334,6 +349,34 @@ export class PostgresRepository implements DatabaseRepository {
             pendingMigrations,
             error: `Required migration "${pendingMigrations[0]}" has not been applied. Run "npm run db:migrate".`,
           };
+        }
+
+        // Verify stored migration SHA-256 checksums when checksum column is present
+        if (colMap.has('schema_migrations.checksum')) {
+          const checksumRes = await client.query<{ id: string; checksum: string | null }>(
+            'SELECT id, checksum FROM schema_migrations ORDER BY id ASC'
+          );
+          const migrationsDir = getDefaultMigrationsDir();
+          if (fs.existsSync(migrationsDir)) {
+            for (const row of checksumRes.rows) {
+              const migPath = path.join(migrationsDir, row.id);
+              if (!fs.existsSync(migPath)) {
+                return {
+                  isReady: false,
+                  error: `Database migration integrity error: applied migration file "${row.id}" is missing on disk.`,
+                };
+              }
+              if (row.checksum) {
+                const diskChecksum = computeMigrationChecksum(fs.readFileSync(migPath, 'utf8'));
+                if (row.checksum !== diskChecksum) {
+                  return {
+                    isReady: false,
+                    error: `Database migration integrity error: checksum mismatch for applied migration "${row.id}".`,
+                  };
+                }
+              }
+            }
+          }
         }
 
         // Verify required composite foreign-key and unique constraints in catalog metadata
@@ -593,6 +636,53 @@ export class PostgresRepository implements DatabaseRepository {
         error: `Database schema readiness check failed: ${err.message || 'Connection error'}`,
       };
     }
+  }
+
+  async consumeRateLimit(
+    key: string,
+    maxAttempts: number,
+    windowMs: number
+  ): Promise<{ allowed: boolean; count: number; resetAt: number }> {
+    const safeWindowMs = Math.max(1000, windowMs);
+    const res = await this.pool.query<{ attempt_count: number; reset_at: string | Date }>(
+      `INSERT INTO auth_rate_limits (rate_key, attempt_count, reset_at, updated_at)
+       VALUES ($1, 1, clock_timestamp() + ($2 * INTERVAL '1 millisecond'), clock_timestamp())
+       ON CONFLICT (rate_key) DO UPDATE SET
+         attempt_count = CASE
+           WHEN auth_rate_limits.reset_at <= clock_timestamp() THEN 1
+           ELSE auth_rate_limits.attempt_count + 1
+         END,
+         reset_at = CASE
+           WHEN auth_rate_limits.reset_at <= clock_timestamp() THEN clock_timestamp() + ($2 * INTERVAL '1 millisecond')
+           ELSE auth_rate_limits.reset_at
+         END,
+         updated_at = clock_timestamp()
+       RETURNING attempt_count, reset_at`,
+      [key, safeWindowMs]
+    );
+
+    // Opportunistic bounded purge of expired keys (~5% chance) to keep table compact without creating write storms
+    if (Math.random() < 0.05) {
+      await this.pool
+        .query(
+          `DELETE FROM auth_rate_limits
+           WHERE ctid IN (
+             SELECT ctid FROM auth_rate_limits
+             WHERE reset_at < clock_timestamp()
+             LIMIT 200
+           )`
+        )
+        .catch(() => {});
+    }
+
+    const row = res.rows[0];
+    const count = Number(row?.attempt_count ?? 1);
+    const resetAt = row?.reset_at ? new Date(row.reset_at).getTime() : Date.now() + safeWindowMs;
+    return {
+      allowed: count <= maxAttempts,
+      count,
+      resetAt,
+    };
   }
 
   async registerUser(data: RegisterUserData): Promise<RegisterUserResult> {
@@ -1092,10 +1182,10 @@ export class PostgresRepository implements DatabaseRepository {
       payload.storeProfile.skuCount = authoritativeSkuCount;
     }
 
-    // Update store profile, preserving server-managed tier and sku_limit
+    // Update store profile, preserving server-managed tier and sku_limit, and advance catalog_version
     await client.query(
-      `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW(), NOW())
+      `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, catalog_version, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 1, NOW(), NOW())
        ON CONFLICT (id) DO UPDATE SET
          name = EXCLUDED.name,
          domain = EXCLUDED.domain,
@@ -1106,6 +1196,7 @@ export class PostgresRepository implements DatabaseRepository {
          tier = EXCLUDED.tier,
          sku_limit = EXCLUDED.sku_limit,
          connectors_json = EXCLUDED.connectors_json,
+         catalog_version = COALESCE(stores.catalog_version, 1) + 1,
          updated_at = NOW()`,
       [
         storeId,
@@ -1264,16 +1355,72 @@ export class PostgresRepository implements DatabaseRepository {
     }
   }
 
+  async withWorkspaceLock<T>(
+    workspaceId: string,
+    fn: () => Promise<T>,
+    options: { lockTimeoutMs?: number } = {}
+  ): Promise<T> {
+    const lockTimeoutMs = Math.max(250, options.lockTimeoutMs ?? 30_000);
+    const deadline = Date.now() + lockTimeoutMs;
+    const client = await this.pool.connect();
+    let acquired = false;
+
+    try {
+      while (true) {
+        const res = await client.query<{ locked: boolean }>(
+          `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
+          [workspaceId]
+        );
+        if (res.rows[0]?.locked) {
+          acquired = true;
+          break;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `[AIXSHOP Workspace Lock] Timed out after ${lockTimeoutMs}ms waiting for distributed PostgreSQL lock on workspace "${workspaceId}".`
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      return await fn();
+    } finally {
+      if (acquired) {
+        await client
+          .query(`SELECT pg_advisory_unlock(hashtext('aixshop_ws'), hashtext($1))`, [workspaceId])
+          .catch(() => {});
+      }
+      client.release();
+    }
+  }
+
   async loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null> {
     const store = await this.getStoreByWorkspace(workspaceId);
     if (!store) return null;
-    return this.loadCatalogRows(this.pool, workspaceId, store);
+    const catalog = await this.loadCatalogRows(this.pool, workspaceId, store);
+    try {
+      const verRes = await this.pool.query<{ catalog_version: number }>(
+        'SELECT catalog_version FROM stores WHERE workspace_id = $1 LIMIT 1',
+        [workspaceId]
+      );
+      if (verRes.rows[0]?.catalog_version !== undefined) {
+        catalog.catalogVersion = Number(verRes.rows[0].catalog_version);
+      }
+    } catch {
+      // Ignore on minimal mocks or pre-012 tables
+    }
+    return catalog;
   }
 
-  async saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
+  async saveWorkspaceCatalog(
+    workspaceId: string,
+    payload: StoragePayloadV1,
+    options?: { expectedVersion?: number }
+  ): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
       const storeId = `store_${workspaceId}`;
 
       // 1. Consistent lock order: Acquire row-level lock on stores table
@@ -1288,8 +1435,9 @@ export class PostgresRepository implements DatabaseRepository {
         catalog_completeness_avg: number;
         truth_boundary_strictness: string;
         connectors_json: any;
+        catalog_version?: number;
       }>(
-        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
          FROM stores
          WHERE workspace_id = $1
          FOR UPDATE`,
@@ -1304,7 +1452,7 @@ export class PostgresRepository implements DatabaseRepository {
           [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
         );
         storeRes = await client.query(
-          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
            FROM stores
            WHERE workspace_id = $1
            FOR UPDATE`,
@@ -1323,7 +1471,14 @@ export class PostgresRepository implements DatabaseRepository {
         catalog_completeness_avg: 0,
         truth_boundary_strictness: 'standard',
         connectors_json: '[]',
+        catalog_version: 1,
       };
+
+      const currentVersion = Number(lockedRow.catalog_version ?? 1);
+      if (options?.expectedVersion !== undefined && options.expectedVersion !== currentVersion) {
+        throw new CatalogVersionConflictError(workspaceId, options.expectedVersion, currentVersion);
+      }
+
       const authoritativeStore: StoreProfile = {
         name: lockedRow.name || payload.storeProfile?.name || 'Store',
         domain: lockedRow.domain || payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
@@ -1359,13 +1514,28 @@ export class PostgresRepository implements DatabaseRepository {
     }
   }
 
+  async mutateWorkspaceCatalog<T>(
+    workspaceId: string,
+    mutator: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T }
+  ): Promise<T> {
+    return this.mutateCatalogUnderLock(workspaceId, mutator, { createStoreIfMissing: true });
+  }
+
   private async mutateCatalogUnderLock<T>(
     workspaceId: string,
-    mutator: (catalog: StoragePayloadV1, authoritativeStore: StoreProfile) => { nextCatalog: StoragePayloadV1; result: T }
+    mutator: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T },
+    options: { createStoreIfMissing?: boolean } = {}
   ): Promise<T> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
       const storeId = `store_${workspaceId}`;
 
       // 1. Consistent lock order: Acquire row-level lock on stores table first
@@ -1380,13 +1550,30 @@ export class PostgresRepository implements DatabaseRepository {
         catalog_completeness_avg: number;
         truth_boundary_strictness: string;
         connectors_json: any;
+        catalog_version?: number;
       }>(
-        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
          FROM stores
          WHERE workspace_id = $1
          FOR UPDATE`,
         [workspaceId]
       );
+
+      if (storeRes.rows.length === 0 && options.createStoreIfMissing) {
+        await client.query(
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+           ON CONFLICT (id) DO NOTHING`,
+          [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
+        );
+        storeRes = await client.query(
+          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+           FROM stores
+           WHERE workspace_id = $1
+           FOR UPDATE`,
+          [workspaceId]
+        );
+      }
 
       if (storeRes.rows.length === 0) {
         throw new Error(`Workspace ${workspaceId} catalog not found`);
@@ -1410,19 +1597,24 @@ export class PostgresRepository implements DatabaseRepository {
       if (!catalog) {
         throw new Error(`Workspace ${workspaceId} catalog not found`);
       }
-
-      // 3. Apply the requested mutation to the latest authoritative state
-      const { nextCatalog, result } = mutator(catalog, authoritativeStore);
-
-      // 4. Validate quota under the lock
-      const proposedSkus = countCatalogSkus(nextCatalog.products);
-      const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
-      if (!quotaCheck.allowed) {
-        throw new PlanQuotaExceededError(quotaCheck);
+      if (lockedRow.catalog_version !== undefined) {
+        catalog.catalogVersion = Number(lockedRow.catalog_version);
       }
 
-      // 5. Persist the updated catalog through transaction-aware helper reusing the same client
-      await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, authoritativeStore);
+      // 3. Apply the requested mutation to the latest authoritative state
+      const { nextCatalog, result } = await mutator(catalog, authoritativeStore);
+
+      if (nextCatalog) {
+        // 4. Validate quota under the lock
+        const proposedSkus = countCatalogSkus(nextCatalog.products);
+        const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
+        if (!quotaCheck.allowed) {
+          throw new PlanQuotaExceededError(quotaCheck);
+        }
+
+        // 5. Persist the updated catalog through transaction-aware helper reusing the same client
+        await this.saveCatalogRows(client, workspaceId, nextCatalog, storeId, authoritativeStore);
+      }
 
       // 6. Commit
       await client.query('COMMIT');
@@ -1779,20 +1971,20 @@ export class PostgresRepository implements DatabaseRepository {
          id, provider, event_id, event_type, idempotency_key, payload_json, status,
          lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
        )
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', $7, NOW() + ($8 * INTERVAL '1 millisecond'), 1, NOW(), NOW(), NOW())
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', $7, clock_timestamp() + ($8 * INTERVAL '1 millisecond'), 1, clock_timestamp(), clock_timestamp(), clock_timestamp())
        ON CONFLICT (provider, event_id) DO UPDATE SET
          status = 'processing',
          lease_owner = EXCLUDED.lease_owner,
-         lease_expires_at = NOW() + ($8 * INTERVAL '1 millisecond'),
+         lease_expires_at = clock_timestamp() + ($8 * INTERVAL '1 millisecond'),
          attempt_count = COALESCE(billing_events.attempt_count, 0) + 1,
          payload_json = CASE WHEN EXCLUDED.payload_json <> '{}'::jsonb THEN EXCLUDED.payload_json ELSE billing_events.payload_json END,
-         processed_at = NOW(),
-         updated_at = NOW()
+         processed_at = clock_timestamp(),
+         updated_at = clock_timestamp()
        WHERE billing_events.status = 'failed'
           OR (
             billing_events.status = 'processing' AND (
-              (billing_events.lease_expires_at IS NOT NULL AND billing_events.lease_expires_at < NOW())
-              OR (billing_events.lease_expires_at IS NULL AND billing_events.processed_at < NOW() - INTERVAL '5 minutes')
+              (billing_events.lease_expires_at IS NOT NULL AND billing_events.lease_expires_at < clock_timestamp())
+              OR (billing_events.lease_expires_at IS NULL AND billing_events.processed_at < clock_timestamp() - INTERVAL '5 minutes')
             )
           )
        RETURNING id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
@@ -1835,14 +2027,14 @@ export class PostgresRepository implements DatabaseRepository {
     const safeExtendMs = Math.max(50, extendMs);
     const res = await this.pool.query<{ id: string }>(
       `UPDATE billing_events
-       SET lease_expires_at = NOW() + ($3 * INTERVAL '1 millisecond'),
-           updated_at = NOW()
+       SET lease_expires_at = clock_timestamp() + ($3 * INTERVAL '1 millisecond'),
+           updated_at = clock_timestamp()
        WHERE event_id = $1
          AND lease_owner = $2
          AND status = 'processing'
          AND (
-           (lease_expires_at IS NOT NULL AND lease_expires_at >= NOW())
-           OR (lease_expires_at IS NULL AND processed_at >= NOW() - INTERVAL '5 minutes')
+           (lease_expires_at IS NOT NULL AND lease_expires_at >= clock_timestamp())
+           OR (lease_expires_at IS NULL AND processed_at >= clock_timestamp() - INTERVAL '5 minutes')
          )
        RETURNING id`,
       [eventId, leaseOwner, safeExtendMs]
@@ -1857,7 +2049,7 @@ export class PostgresRepository implements DatabaseRepository {
     leaseOwner?: string
   ): Promise<void> {
     const params: any[] = [eventId, status];
-    const setClauses = ['status = $2', 'updated_at = NOW()'];
+    const setClauses = ['status = $2', 'updated_at = clock_timestamp()'];
     if (status !== 'processing') {
       setClauses.push('lease_expires_at = NULL');
     }
@@ -1873,8 +2065,8 @@ export class PostgresRepository implements DatabaseRepository {
         AND lease_owner = $${params.length}
         AND status = 'processing'
         AND (
-          (lease_expires_at IS NOT NULL AND lease_expires_at >= NOW())
-          OR (lease_expires_at IS NULL AND processed_at >= NOW() - INTERVAL '5 minutes')
+          (lease_expires_at IS NOT NULL AND lease_expires_at >= clock_timestamp())
+          OR (lease_expires_at IS NULL AND processed_at >= clock_timestamp() - INTERVAL '5 minutes')
         )`;
     }
 
@@ -1901,7 +2093,7 @@ export class PostgresRepository implements DatabaseRepository {
     try {
       await client.query('BEGIN');
 
-      // 0. Lock and verify billing event lease ownership and DB-clock non-expiration BEFORE applying entitlement changes
+      // 0. Lock and verify billing event lease ownership and live wall-clock clock_timestamp() BEFORE applying entitlement changes
       if (params.leaseOwner) {
         const lockRes = await client.query<{
           status: string;
@@ -1911,8 +2103,8 @@ export class PostgresRepository implements DatabaseRepository {
           `SELECT status,
                   lease_owner,
                   (
-                    (lease_expires_at IS NOT NULL AND lease_expires_at < NOW())
-                    OR (lease_expires_at IS NULL AND processed_at < NOW() - INTERVAL '5 minutes')
+                    (lease_expires_at IS NOT NULL AND lease_expires_at < clock_timestamp())
+                    OR (lease_expires_at IS NULL AND processed_at < clock_timestamp() - INTERVAL '5 minutes')
                   ) AS is_expired
            FROM billing_events
            WHERE event_id = $1
@@ -1928,7 +2120,7 @@ export class PostgresRepository implements DatabaseRepository {
       // 1. Upsert subscription record
       await client.query(
         `INSERT INTO subscriptions (id, workspace_id, provider, customer_id, subscription_id, tier, status, current_period_start, current_period_end, cancel_at_period_end, last_event_created, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, clock_timestamp(), clock_timestamp())
          ON CONFLICT (workspace_id) DO UPDATE SET
            provider = EXCLUDED.provider,
            customer_id = EXCLUDED.customer_id,
@@ -1939,7 +2131,7 @@ export class PostgresRepository implements DatabaseRepository {
            current_period_end = EXCLUDED.current_period_end,
            cancel_at_period_end = EXCLUDED.cancel_at_period_end,
            last_event_created = EXCLUDED.last_event_created,
-           updated_at = NOW()`,
+           updated_at = clock_timestamp()`,
         [
           params.subscription.id,
           params.subscription.workspaceId,
@@ -1961,7 +2153,7 @@ export class PostgresRepository implements DatabaseRepository {
           `UPDATE stores
            SET tier = $2,
                sku_limit = $3,
-               updated_at = NOW()
+               updated_at = clock_timestamp()
            WHERE workspace_id = $1`,
           [
             params.subscription.workspaceId,
@@ -1971,26 +2163,26 @@ export class PostgresRepository implements DatabaseRepository {
         );
       }
 
-      // 3. Mark billing event processed strictly by non-expired lease owner if provided
+      // 3. Re-verify non-expiration against clock_timestamp() right before COMMIT and mark billing event processed
       if (params.markProcessed !== false) {
         const updateQuery = params.leaseOwner
           ? `UPDATE billing_events
              SET status = 'processed',
                  lease_expires_at = NULL,
-                 processed_at = NOW(),
-                 updated_at = NOW()
+                 processed_at = clock_timestamp(),
+                 updated_at = clock_timestamp()
              WHERE event_id = $1
                AND lease_owner = $2
                AND status = 'processing'
                AND (
-                 (lease_expires_at IS NOT NULL AND lease_expires_at >= NOW())
-                 OR (lease_expires_at IS NULL AND processed_at >= NOW() - INTERVAL '5 minutes')
+                 (lease_expires_at IS NOT NULL AND lease_expires_at >= clock_timestamp())
+                 OR (lease_expires_at IS NULL AND processed_at >= clock_timestamp() - INTERVAL '5 minutes')
                )`
           : `UPDATE billing_events
              SET status = 'processed',
                  lease_expires_at = NULL,
-                 processed_at = NOW(),
-                 updated_at = NOW()
+                 processed_at = clock_timestamp(),
+                 updated_at = clock_timestamp()
              WHERE event_id = $1`;
         const updateRes = await client.query(
           updateQuery,
@@ -2984,61 +3176,137 @@ export class PostgresRepository implements DatabaseRepository {
     return res.rows.map(r => this.mapShopifySyncRunRow(r));
   }
 
-  async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
-    try {
-      const res = await this.pool.query<any>(
-        `INSERT INTO shopify_webhook_events (
-          id, workspace_id, shop_domain, event_id, topic, delivery_id,
-          payload_json, status, retry_count, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, NOW(), NOW())
-        ON CONFLICT (shop_domain, topic, event_id) DO NOTHING
-        RETURNING id`,
-        [
-          event.id,
-          event.workspaceId,
-          event.shopDomain,
-          event.eventId,
-          event.topic,
-          event.deliveryId || null,
-          JSON.stringify(event.payload || {}),
-          event.status,
-          event.retryCount,
-        ]
-      );
+  async claimShopifyWebhookEvent(
+    event: import('../shopify/types').ShopifyWebhookEventRecord,
+    leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<import('../shopify/types').ShopifyWebhookClaimResult> {
+    const leaseDurationMs = Math.max(50, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseOwner = leaseOptions?.leaseOwner || `wh_worker_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-      if (res.rowCount === 0) {
-        // Event already exists
-        const existingRes = await this.pool.query<any>(
-          `SELECT 
-            id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
-            event_id AS "eventId", topic, delivery_id AS "deliveryId",
-            payload_json AS "payload", status, retry_count AS "retryCount",
-            last_error AS "lastError", processed_at AS "processedAt",
-            created_at AS "createdAt", updated_at AS "updatedAt"
-           FROM shopify_webhook_events
-           WHERE shop_domain = $1 AND topic = $2 AND event_id = $3`,
-          [event.shopDomain, event.topic, event.eventId]
-        );
-        return { claimed: false, event: existingRes.rows[0] || null };
-      }
+    const res = await this.pool.query<any>(
+      `INSERT INTO shopify_webhook_events (
+        id, workspace_id, shop_domain, event_id, topic, delivery_id,
+        payload_json, status, retry_count, lease_owner, lease_expires_at, attempt_count, created_at, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7::jsonb, 'processing', 0, $8, clock_timestamp() + ($9 * INTERVAL '1 millisecond'), 1, clock_timestamp(), clock_timestamp()
+      )
+      ON CONFLICT (shop_domain, topic, event_id) DO UPDATE SET
+        status = 'processing',
+        payload_json = CASE WHEN EXCLUDED.payload_json <> '{}'::jsonb THEN EXCLUDED.payload_json ELSE shopify_webhook_events.payload_json END,
+        delivery_id = COALESCE(EXCLUDED.delivery_id, shopify_webhook_events.delivery_id),
+        lease_owner = EXCLUDED.lease_owner,
+        lease_expires_at = clock_timestamp() + ($9 * INTERVAL '1 millisecond'),
+        attempt_count = COALESCE(shopify_webhook_events.attempt_count, 0) + 1,
+        retry_count = COALESCE(shopify_webhook_events.retry_count, 0) + 1,
+        updated_at = clock_timestamp()
+      WHERE shopify_webhook_events.status = 'failed'
+         OR (
+           shopify_webhook_events.status = 'processing' AND (
+             (shopify_webhook_events.lease_expires_at IS NOT NULL AND shopify_webhook_events.lease_expires_at < clock_timestamp())
+             OR (shopify_webhook_events.lease_expires_at IS NULL AND shopify_webhook_events.updated_at < clock_timestamp() - INTERVAL '5 minutes')
+           )
+         )
+      RETURNING
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+        event_id AS "eventId", topic, delivery_id AS "deliveryId",
+        payload_json AS "payload", status, retry_count AS "retryCount",
+        lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
+        attempt_count AS "attemptCount", last_error AS "lastError",
+        processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [
+        event.id,
+        event.workspaceId,
+        event.shopDomain,
+        event.eventId,
+        event.topic,
+        event.deliveryId || null,
+        JSON.stringify(event.payload || {}),
+        leaseOwner,
+        leaseDurationMs,
+      ]
+    );
 
-      return { claimed: true, event };
-    } catch (err: any) {
-      console.error('[AIXSHOP PostgresRepository] Error claiming webhook event:', err);
-      return { claimed: false, event: null };
+    if (res.rows.length > 0) {
+      const row = res.rows[0];
+      const attemptCount = Number(row.attemptCount ?? 1);
+      return {
+        claimed: true,
+        outcome: attemptCount > 1 ? 'RETRYABLE_FAILED' : 'CLAIMED',
+        leaseOwner,
+        event: {
+          ...row,
+          leaseExpiresAt: row.leaseExpiresAt ? new Date(row.leaseExpiresAt).toISOString() : null,
+          processedAt: row.processedAt ? new Date(row.processedAt).toISOString() : null,
+          createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : event.createdAt,
+          updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : event.updatedAt,
+        },
+      };
     }
+
+    const existingRes = await this.pool.query<any>(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+        event_id AS "eventId", topic, delivery_id AS "deliveryId",
+        payload_json AS "payload", status, retry_count AS "retryCount",
+        lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
+        attempt_count AS "attemptCount", last_error AS "lastError",
+        processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_webhook_events
+       WHERE shop_domain = $1 AND topic = $2 AND event_id = $3`,
+      [event.shopDomain, event.topic, event.eventId]
+    );
+    const existing = existingRes.rows[0] || null;
+    if (existing && existing.status === 'processing') {
+      return {
+        claimed: false,
+        outcome: 'CURRENTLY_PROCESSING',
+        event: existing,
+      };
+    }
+    return {
+      claimed: false,
+      outcome: 'ALREADY_PROCESSED',
+      event: existing,
+    };
   }
 
-  async updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void> {
-    await this.pool.query(
+  async updateShopifyWebhookEventStatus(
+    eventId: string,
+    shopDomain: string,
+    topic: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    error?: string,
+    leaseOwner?: string
+  ): Promise<void> {
+    const params: any[] = [shopDomain, topic, eventId, status, error || null];
+    let whereClause = 'WHERE shop_domain = $1 AND topic = $2 AND event_id = $3';
+    if (leaseOwner) {
+      params.push(leaseOwner);
+      whereClause += `
+        AND lease_owner = $${params.length}
+        AND status = 'processing'
+        AND (
+          (lease_expires_at IS NOT NULL AND lease_expires_at >= clock_timestamp())
+          OR (lease_expires_at IS NULL AND updated_at >= clock_timestamp() - INTERVAL '5 minutes')
+        )`;
+    }
+
+    const res = await this.pool.query(
       `UPDATE shopify_webhook_events
        SET status = $4,
            last_error = $5,
-           processed_at = CASE WHEN $4 = 'processed' THEN NOW() ELSE processed_at END,
-           updated_at = NOW()
-       WHERE shop_domain = $1 AND topic = $2 AND event_id = $3`,
-      [shopDomain, topic, eventId, status, error || null]
+           lease_expires_at = CASE WHEN $4 <> 'processing' THEN NULL ELSE lease_expires_at END,
+           processed_at = CASE WHEN $4 = 'processed' THEN clock_timestamp() ELSE processed_at END,
+           updated_at = clock_timestamp()
+       ${whereClause}`,
+      params
     );
+
+    if (leaseOwner && res.rowCount === 0) {
+      throw new Error(
+        `Shopify webhook lease ownership lost or expired for event ${eventId}: stale worker "${leaseOwner}" rejected.`
+      );
+    }
   }
 
   async withShopifyRefreshLock<T>(
@@ -3317,71 +3585,33 @@ export class PostgresRepository implements DatabaseRepository {
     return res.rows[0] || null;
   }
 
-  async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
-    for (const m of metrics) {
-      await this.pool.query(
-        `INSERT INTO ai_visibility_metrics (
-          id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, evidence_source, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-        ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
-          import_id = EXCLUDED.import_id,
-          brand_mentions = EXCLUDED.brand_mentions,
-          product_mentions = EXCLUDED.product_mentions,
-          website_clicks = EXCLUDED.website_clicks,
-          evidence_source = EXCLUDED.evidence_source`,
-        [
-          m.id,
-          m.workspaceId,
-          m.importId || null,
-          m.observationDate,
-          m.platform,
-          m.brandMentions,
-          m.productMentions,
-          m.websiteClicks,
-          m.discoveryTopic || '',
-          m.evidenceSource || null,
-        ]
-      );
+  private resolveVisibilityTopicKey(metric: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord): {
+    topicValue: string | null;
+    topicPresence: TopicPresenceState;
+  } {
+    if (metric.discoveryTopic === null || metric.discoveryTopic === undefined) {
+      return { topicValue: null, topicPresence: metric.topicPresence || 'unspecified' };
     }
+    if (metric.discoveryTopic === '') {
+      return { topicValue: '', topicPresence: metric.topicPresence || 'explicit_blank' };
+    }
+    return { topicValue: metric.discoveryTopic, topicPresence: metric.topicPresence || 'specified' };
   }
 
-  async saveVisibilityImportAtomic(
-    record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
-    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]
-  ): Promise<{ importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord; metricsSaved: number }> {
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(
-        `INSERT INTO ai_visibility_imports (
-          id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
-          reporting_period_start, reporting_period_end, source_platform, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())`,
-        [
-          record.id,
-          record.workspaceId,
-          record.filename,
-          record.contentHash || null,
-          record.rowCount,
-          record.rejectedRowCount ?? 0,
-          record.status || 'completed',
-          JSON.stringify(record.errors || []),
-          record.reportingPeriodStart || null,
-          record.reportingPeriodEnd || null,
-          record.sourcePlatform || 'merchant_upload',
-        ]
-      );
-
-      for (const m of metrics) {
-        await client.query(
+  async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
+    for (const m of metrics) {
+      const { topicValue, topicPresence } = this.resolveVisibilityTopicKey(m);
+      if (topicValue === null) {
+        await this.pool.query(
           `INSERT INTO ai_visibility_metrics (
-            id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, evidence_source, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-          ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+            id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, NOW())
+          ON CONFLICT (workspace_id, observation_date, platform) WHERE discovery_topic IS NULL DO UPDATE SET
             import_id = EXCLUDED.import_id,
             brand_mentions = EXCLUDED.brand_mentions,
             product_mentions = EXCLUDED.product_mentions,
             website_clicks = EXCLUDED.website_clicks,
+            topic_presence = EXCLUDED.topic_presence,
             evidence_source = EXCLUDED.evidence_source`,
           [
             m.id,
@@ -3392,20 +3622,275 @@ export class PostgresRepository implements DatabaseRepository {
             m.brandMentions,
             m.productMentions,
             m.websiteClicks,
-            m.discoveryTopic || '',
+            topicPresence,
+            m.evidenceSource || null,
+          ]
+        );
+      } else {
+        await this.pool.query(
+          `INSERT INTO ai_visibility_metrics (
+            id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+          ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+            import_id = EXCLUDED.import_id,
+            brand_mentions = EXCLUDED.brand_mentions,
+            product_mentions = EXCLUDED.product_mentions,
+            website_clicks = EXCLUDED.website_clicks,
+            topic_presence = EXCLUDED.topic_presence,
+            evidence_source = EXCLUDED.evidence_source`,
+          [
+            m.id,
+            m.workspaceId,
+            m.importId || null,
+            m.observationDate,
+            m.platform,
+            m.brandMentions,
+            m.productMentions,
+            m.websiteClicks,
+            topicValue,
+            topicPresence,
             m.evidenceSource || null,
           ]
         );
       }
+    }
+  }
+
+  async saveVisibilityImportAtomic(
+    record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
+    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[],
+    options: { conflictPolicy?: VisibilityConflictPolicy } = {}
+  ): Promise<{
+    importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord;
+    metricsSaved: number;
+    duplicateImport?: boolean;
+    replacedCount?: number;
+  }> {
+    const policy: VisibilityConflictPolicy = options.conflictPolicy || 'reject_on_conflict';
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      try {
+        await client.query(
+          `INSERT INTO ai_visibility_imports (
+            id, workspace_id, filename, content_hash, row_count, rejected_row_count, status, errors_json,
+            reporting_period_start, reporting_period_end, source_platform, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, NOW())`,
+          [
+            record.id,
+            record.workspaceId,
+            record.filename,
+            record.contentHash || null,
+            record.rowCount,
+            record.rejectedRowCount ?? 0,
+            record.status || 'completed',
+            JSON.stringify(record.errors || []),
+            record.reportingPeriodStart || null,
+            record.reportingPeriodEnd || null,
+            record.sourcePlatform || 'merchant_upload',
+          ]
+        );
+      } catch (insertErr: any) {
+        const isHashDup =
+          insertErr?.code === '23505' &&
+          (!insertErr?.constraint || String(insertErr.constraint).includes('ai_visibility_imports_ws_hash'));
+        if (isHashDup && record.contentHash) {
+          await client.query('ROLLBACK').catch(() => {});
+          const existingImport = await this.getVisibilityImportByHash(record.workspaceId, record.contentHash);
+          if (existingImport) {
+            return {
+              importRecord: existingImport,
+              metricsSaved: 0,
+              duplicateImport: true,
+            };
+          }
+        }
+        throw insertErr;
+      }
+
+      const conflicts: VisibilityObservationConflict[] = [];
+      let replacedCount = 0;
+
+      for (const m of metrics) {
+        const { topicValue, topicPresence } = this.resolveVisibilityTopicKey(m);
+
+        // Lock matching existing observation (if any) without silently conflating NULL vs ''
+        const existingMetricRes = await client.query<{
+          id: string;
+          import_id: string | null;
+          brand_mentions: number;
+          product_mentions: number;
+          website_clicks: number;
+          topic_presence?: TopicPresenceState;
+        }>(
+          `SELECT id, import_id, brand_mentions, product_mentions, website_clicks, topic_presence
+           FROM ai_visibility_metrics
+           WHERE workspace_id = $1
+             AND observation_date = $2
+             AND platform = $3
+             AND discovery_topic IS NOT DISTINCT FROM $4
+           FOR UPDATE`,
+          [m.workspaceId, m.observationDate, m.platform, topicValue]
+        );
+
+        const existingMetric = existingMetricRes.rows[0];
+        if (existingMetric && existingMetric.import_id !== record.id) {
+          if (policy === 'reject_on_conflict') {
+            conflicts.push({
+              observationDate: m.observationDate,
+              platform: m.platform,
+              discoveryTopic: topicValue,
+              topicPresence,
+              existingImportId: existingMetric.import_id || null,
+              existingValues: {
+                brandMentions: Number(existingMetric.brand_mentions || 0),
+                productMentions: Number(existingMetric.product_mentions || 0),
+                websiteClicks: Number(existingMetric.website_clicks || 0),
+              },
+              incomingValues: {
+                brandMentions: m.brandMentions,
+                productMentions: m.productMentions,
+                websiteClicks: m.websiteClicks,
+              },
+            });
+            continue;
+          } else {
+            replacedCount++;
+          }
+        }
+
+        // Query latest immutable observation version to maintain append-only history lineage
+        const histVerRes = await client.query<{ id: string; version_number: number }>(
+          `SELECT id, version_number
+           FROM ai_visibility_observation_history
+           WHERE workspace_id = $1
+             AND observation_date = $2
+             AND platform = $3
+             AND discovery_topic IS NOT DISTINCT FROM $4
+           ORDER BY version_number DESC
+           LIMIT 1`,
+          [m.workspaceId, m.observationDate, m.platform, topicValue]
+        );
+        const prevHist = histVerRes.rows[0];
+        const nextVersion = Number(prevHist?.version_number || 0) + 1;
+
+        await client.query(
+          `INSERT INTO ai_visibility_observation_history (
+            id, workspace_id, import_id, observation_date, platform, discovery_topic, topic_presence,
+            brand_mentions, product_mentions, website_clicks, evidence_source, event_type, version_number, supersedes_history_id, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())`,
+          [
+            `vhist_${m.id}`,
+            m.workspaceId,
+            record.id,
+            m.observationDate,
+            m.platform,
+            topicValue,
+            topicPresence,
+            m.brandMentions,
+            m.productMentions,
+            m.websiteClicks,
+            m.evidenceSource || null,
+            existingMetric ? 'replaced' : 'recorded',
+            nextVersion,
+            prevHist?.id || null,
+          ]
+        );
+
+        if (topicValue === null) {
+          await client.query(
+            `INSERT INTO ai_visibility_metrics (
+              id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, NOW())
+            ON CONFLICT (workspace_id, observation_date, platform) WHERE discovery_topic IS NULL DO UPDATE SET
+              import_id = EXCLUDED.import_id,
+              brand_mentions = EXCLUDED.brand_mentions,
+              product_mentions = EXCLUDED.product_mentions,
+              website_clicks = EXCLUDED.website_clicks,
+              topic_presence = EXCLUDED.topic_presence,
+              evidence_source = EXCLUDED.evidence_source`,
+            [
+              m.id,
+              m.workspaceId,
+              m.importId || record.id,
+              m.observationDate,
+              m.platform,
+              m.brandMentions,
+              m.productMentions,
+              m.websiteClicks,
+              topicPresence,
+              m.evidenceSource || null,
+            ]
+          );
+        } else {
+          await client.query(
+            `INSERT INTO ai_visibility_metrics (
+              id, workspace_id, import_id, observation_date, platform, brand_mentions, product_mentions, website_clicks, discovery_topic, topic_presence, evidence_source, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+            ON CONFLICT (workspace_id, observation_date, platform, discovery_topic) DO UPDATE SET
+              import_id = EXCLUDED.import_id,
+              brand_mentions = EXCLUDED.brand_mentions,
+              product_mentions = EXCLUDED.product_mentions,
+              website_clicks = EXCLUDED.website_clicks,
+              topic_presence = EXCLUDED.topic_presence,
+              evidence_source = EXCLUDED.evidence_source`,
+            [
+              m.id,
+              m.workspaceId,
+              m.importId || record.id,
+              m.observationDate,
+              m.platform,
+              m.brandMentions,
+              m.productMentions,
+              m.websiteClicks,
+              topicValue,
+              topicPresence,
+              m.evidenceSource || null,
+            ]
+          );
+        }
+      }
+
+      if (conflicts.length > 0) {
+        throw new VisibilityObservationConflictError(conflicts);
+      }
 
       await client.query('COMMIT');
-      return { importRecord: record, metricsSaved: metrics.length };
+      return {
+        importRecord: record,
+        metricsSaved: metrics.length,
+        duplicateImport: false,
+        replacedCount,
+      };
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally {
       client.release();
     }
+  }
+
+  async getVisibilityObservationHistory(
+    workspaceId: string,
+    limit = 100
+  ): Promise<VisibilityObservationHistoryRecord[]> {
+    const res = await this.pool.query<any>(
+      `SELECT
+        id, workspace_id AS "workspaceId", import_id AS "importId",
+        observation_date::text AS "observationDate", platform,
+        discovery_topic AS "discoveryTopic", topic_presence AS "topicPresence",
+        brand_mentions AS "brandMentions", product_mentions AS "productMentions",
+        website_clicks AS "websiteClicks", evidence_source AS "evidenceSource",
+        event_type AS "eventType", version_number AS "versionNumber",
+        supersedes_history_id AS "supersedesHistoryId", created_at AS "createdAt"
+       FROM ai_visibility_observation_history
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [workspaceId, limit]
+    );
+    return res.rows;
   }
 
   async getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary> {
@@ -3415,6 +3900,7 @@ export class PostgresRepository implements DatabaseRepository {
         observation_date::text AS "observationDate", platform,
         brand_mentions AS "brandMentions", product_mentions AS "productMentions",
         website_clicks AS "websiteClicks", discovery_topic AS "discoveryTopic",
+        topic_presence AS "topicPresence",
         evidence_source AS "evidenceSource", created_at AS "createdAt"
        FROM ai_visibility_metrics
        WHERE workspace_id = $1

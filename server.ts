@@ -4,6 +4,7 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createApp } from './src/server/app';
 import { getDatabaseRepository } from './src/server/db/index';
+import { validateProductionConfig } from './src/server/config/productionConfig';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +17,14 @@ async function start() {
   const repo = getDatabaseRepository();
 
   if (isProd) {
+    console.log('[AIXSHOP Startup] Validating production environment configuration...');
+    const configCheck = validateProductionConfig();
+    if (!configCheck.valid) {
+      throw new Error(
+        `[AIXSHOP Fatal Startup Error] Invalid or incomplete production configuration: ${configCheck.missingOrInvalid.join(', ')}`
+      );
+    }
+
     console.log('[AIXSHOP Startup] Verifying PostgreSQL connection for production...');
     const isConnected = await repo.ping();
     if (!isConnected) {

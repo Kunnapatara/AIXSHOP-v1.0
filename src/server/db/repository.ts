@@ -68,12 +68,31 @@ export interface SchemaReadinessResult {
   };
 }
 
+export class CatalogVersionConflictError extends Error {
+  public readonly code = 'CATALOG_VERSION_CONFLICT';
+  public readonly statusCode = 409;
+
+  constructor(workspaceId: string, expectedVersion: number, actualVersion: number) {
+    super(
+      `Catalog snapshot conflict for workspace "${workspaceId}": expected version ${expectedVersion}, current authoritative version is ${actualVersion}.`
+    );
+    this.name = 'CatalogVersionConflictError';
+  }
+}
+
 export interface DatabaseRepository {
   // Database health & readiness
   ping(): Promise<boolean>;
   checkSchemaReadiness(): Promise<SchemaReadinessResult>;
   getBackendType(): 'postgres' | 'memory';
   close?(): Promise<void>;
+
+  // Shared distributed rate limiting (Workstream G)
+  consumeRateLimit(
+    key: string,
+    maxAttempts: number,
+    windowMs: number
+  ): Promise<{ allowed: boolean; count: number; resetAt: number }>;
 
   // Atomic Registration
   registerUser(data: RegisterUserData): Promise<RegisterUserResult>;
@@ -100,9 +119,28 @@ export interface DatabaseRepository {
   getStoreByWorkspace(workspaceId: string): Promise<StoreProfile | null>;
   saveStoreProfile(workspaceId: string, profile: StoreProfile): Promise<StoreProfile>;
 
+  // Distributed Workspace Lock & Authoritative Catalog Mutation (Workstream B)
+  withWorkspaceLock<T>(
+    workspaceId: string,
+    fn: () => Promise<T>,
+    options?: { lockTimeoutMs?: number }
+  ): Promise<T>;
+
+  mutateWorkspaceCatalog<T>(
+    workspaceId: string,
+    mutator: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T }
+  ): Promise<T>;
+
   // Catalog
   loadWorkspaceCatalog(workspaceId: string): Promise<StoragePayloadV1 | null>;
-  saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void>;
+  saveWorkspaceCatalog(
+    workspaceId: string,
+    payload: StoragePayloadV1,
+    options?: { expectedVersion?: number }
+  ): Promise<void>;
   
   // Specific Catalog Mutations (atomic, server-side validated)
   approveAction(
@@ -191,8 +229,18 @@ export interface DatabaseRepository {
   getShopifySyncRunById(id: string, workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
   getLatestShopifySyncRun(workspaceId: string): Promise<import('../shopify/types').ShopifySyncRunRecord | null>;
   getShopifySyncRuns(workspaceId: string, limit?: number): Promise<import('../shopify/types').ShopifySyncRunRecord[]>;
-  claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }>;
-  updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void>;
+  claimShopifyWebhookEvent(
+    event: import('../shopify/types').ShopifyWebhookEventRecord,
+    leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<import('../shopify/types').ShopifyWebhookClaimResult>;
+  updateShopifyWebhookEventStatus(
+    eventId: string,
+    shopDomain: string,
+    topic: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    error?: string,
+    leaseOwner?: string
+  ): Promise<void>;
   withShopifyRefreshLock<T>(
     workspaceId: string,
     fn: (
@@ -207,8 +255,18 @@ export interface DatabaseRepository {
   saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void>;
   saveVisibilityImportAtomic(
     record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
-    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]
-  ): Promise<{ importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord; metricsSaved: number }>;
+    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[],
+    options?: { conflictPolicy?: import('../../domain/monitoring/aiVisibilityTypes').VisibilityConflictPolicy }
+  ): Promise<{
+    importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord;
+    metricsSaved: number;
+    duplicateImport?: boolean;
+    replacedCount?: number;
+  }>;
+  getVisibilityObservationHistory?(
+    workspaceId: string,
+    limit?: number
+  ): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityObservationHistoryRecord[]>;
   getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary>;
 }
 

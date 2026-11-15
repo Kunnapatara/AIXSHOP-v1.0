@@ -19,6 +19,7 @@ export interface StoragePayloadV1 {
   actions: ActionItem[];
   evidence: EvidenceDocument[];
   storeProfile: StoreProfile;
+  catalogVersion?: number;
 }
 
 export interface StorageEnvelopeV1 {

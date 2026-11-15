@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { 
   DatabaseRepository, 
   CreateUserData, 
@@ -8,8 +9,16 @@ import {
   SchemaReadinessResult,
   AuditRunRecord,
   CreateAuditRunData,
-  UpdateAuditRunData
+  UpdateAuditRunData,
+  CatalogVersionConflictError
 } from './repository';
+import {
+  TopicPresenceState,
+  VisibilityConflictPolicy,
+  VisibilityObservationConflict,
+  VisibilityObservationConflictError,
+  VisibilityObservationHistoryRecord,
+} from '../../domain/monitoring/aiVisibilityTypes';
 import { executeCatalogAudit } from '../../domain/audit/auditEngine';
 import { 
   UserRecord, 
@@ -89,6 +98,52 @@ export class MemoryRepository implements DatabaseRepository {
   private isConnected: boolean = true;
   private isSchemaReady: boolean = true;
   private schemaReadyError?: string;
+  private rateLimits: Map<string, { count: number; resetAt: number }> = new Map();
+  private static readonly MAX_RATE_LIMIT_ENTRIES = 5000;
+
+  async consumeRateLimit(
+    key: string,
+    maxAttempts: number,
+    windowMs: number
+  ): Promise<{ allowed: boolean; count: number; resetAt: number }> {
+    const now = Date.now();
+    // Prune expired entries opportunistically and enforce strict hard cap
+    if (this.rateLimits.size >= MemoryRepository.MAX_RATE_LIMIT_ENTRIES) {
+      for (const [k, v] of this.rateLimits.entries()) {
+        if (now > v.resetAt) this.rateLimits.delete(k);
+      }
+    }
+
+    const existing = this.rateLimits.get(key);
+    if (existing && now <= existing.resetAt) {
+      this.rateLimits.delete(key);
+      if (existing.count >= maxAttempts) {
+        this.rateLimits.set(key, existing);
+        return { allowed: false, count: existing.count, resetAt: existing.resetAt };
+      }
+      const next = { count: existing.count + 1, resetAt: existing.resetAt };
+      this.rateLimits.set(key, next);
+      return { allowed: true, count: next.count, resetAt: next.resetAt };
+    }
+
+    while (this.rateLimits.size >= MemoryRepository.MAX_RATE_LIMIT_ENTRIES) {
+      const oldest = this.rateLimits.keys().next().value;
+      if (oldest === undefined) break;
+      this.rateLimits.delete(oldest);
+    }
+
+    const resetAt = now + windowMs;
+    this.rateLimits.set(key, { count: 1, resetAt });
+    return { allowed: true, count: 1, resetAt };
+  }
+
+  clearRateLimits(): void {
+    this.rateLimits.clear();
+  }
+
+  getRateLimitStoreSize(): number {
+    return this.rateLimits.size;
+  }
 
   setConnected(connected: boolean): void {
     this.isConnected = connected;
@@ -464,6 +519,7 @@ export class MemoryRepository implements DatabaseRepository {
         actions: [],
         evidence: [],
         storeProfile: store,
+        catalogVersion: this.catalogVersions.get(workspaceId) || 1,
       };
       this.catalogs.set(workspaceId, initialCatalog);
       return JSON.parse(JSON.stringify(initialCatalog));
@@ -473,8 +529,20 @@ export class MemoryRepository implements DatabaseRepository {
   }
 
   private workspaceLocks: Map<string, Promise<unknown>> = new Map();
+  private activeLockWorkspaces = new AsyncLocalStorage<Set<string>>();
 
-  async withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+  private catalogVersions: Map<string, number> = new Map();
+
+  async withWorkspaceLock<T>(
+    workspaceId: string,
+    fn: () => Promise<T>,
+    _options?: { lockTimeoutMs?: number }
+  ): Promise<T> {
+    const heldLocks = this.activeLockWorkspaces.getStore();
+    if (heldLocks?.has(workspaceId)) {
+      return await fn();
+    }
+
     const prevLock = this.workspaceLocks.get(workspaceId) || Promise.resolve();
     let releaseCurrent: () => void;
     const currentTurnPromise = new Promise<void>((resolve) => {
@@ -486,7 +554,9 @@ export class MemoryRepository implements DatabaseRepository {
 
     try {
       await prevLock.catch(() => {});
-      return await fn();
+      const nextHeld = new Set(heldLocks || []);
+      nextHeld.add(workspaceId);
+      return await this.activeLockWorkspaces.run(nextHeld, fn);
     } finally {
       releaseCurrent!();
       if (this.workspaceLocks.get(workspaceId) === chainTail) {
@@ -499,10 +569,40 @@ export class MemoryRepository implements DatabaseRepository {
     return this.workspaceLocks.size;
   }
 
-  private async saveWorkspaceCatalogInternal(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
+  async mutateWorkspaceCatalog<T>(
+    workspaceId: string,
+    mutator: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{ nextCatalog?: StoragePayloadV1; result: T }> | { nextCatalog?: StoragePayloadV1; result: T }
+  ): Promise<T> {
+    return this.withWorkspaceLock(workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(workspaceId);
+      if (!catalog) {
+        throw new Error(`Workspace ${workspaceId} catalog not found`);
+      }
+      const authoritativeStore = this.stores.get(workspaceId) || catalog.storeProfile;
+      const { nextCatalog, result } = await mutator(catalog, authoritativeStore);
+      if (nextCatalog) {
+        await this.saveWorkspaceCatalogInternal(workspaceId, nextCatalog);
+      }
+      return result;
+    });
+  }
+
+  private async saveWorkspaceCatalogInternal(
+    workspaceId: string,
+    payload: StoragePayloadV1,
+    options?: { expectedVersion?: number }
+  ): Promise<void> {
     // Validate workspace exists
     if (!this.workspaces.has(workspaceId)) {
       throw new Error(`Workspace ${workspaceId} does not exist`);
+    }
+
+    const currentVersion = this.catalogVersions.get(workspaceId) || 1;
+    if (options?.expectedVersion !== undefined && options.expectedVersion !== currentVersion) {
+      throw new CatalogVersionConflictError(workspaceId, options.expectedVersion, currentVersion);
     }
 
     const store = this.stores.get(workspaceId);
@@ -531,16 +631,23 @@ export class MemoryRepository implements DatabaseRepository {
       skuCount: proposedSkus,
     };
 
+    const nextVersion = currentVersion + 1;
     const payloadToStore: StoragePayloadV1 = JSON.parse(JSON.stringify(payload));
     payloadToStore.storeProfile = updatedStoreProfile;
+    payloadToStore.catalogVersion = nextVersion;
 
     this.catalogs.set(workspaceId, payloadToStore);
     this.stores.set(workspaceId, updatedStoreProfile);
+    this.catalogVersions.set(workspaceId, nextVersion);
   }
 
-  async saveWorkspaceCatalog(workspaceId: string, payload: StoragePayloadV1): Promise<void> {
+  async saveWorkspaceCatalog(
+    workspaceId: string,
+    payload: StoragePayloadV1,
+    options?: { expectedVersion?: number }
+  ): Promise<void> {
     return this.withWorkspaceLock(workspaceId, async () => {
-      await this.saveWorkspaceCatalogInternal(workspaceId, payload);
+      await this.saveWorkspaceCatalogInternal(workspaceId, payload, options);
     });
   }
 
@@ -1319,26 +1426,105 @@ export class MemoryRepository implements DatabaseRepository {
     return JSON.parse(JSON.stringify(runs));
   }
 
-  async claimShopifyWebhookEvent(event: import('../shopify/types').ShopifyWebhookEventRecord): Promise<{ claimed: boolean; event: import('../shopify/types').ShopifyWebhookEventRecord | null }> {
+  async claimShopifyWebhookEvent(
+    event: import('../shopify/types').ShopifyWebhookEventRecord,
+    leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
+  ): Promise<import('../shopify/types').ShopifyWebhookClaimResult> {
     const key = `${event.shopDomain}:${event.topic}:${event.eventId}`;
     const existing = this.shopifyWebhookEvents.get(key);
+    const now = Date.now();
+    const leaseDurationMs = Math.max(50, leaseOptions?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseOwner = leaseOptions?.leaseOwner || `wh_worker_${now}_${Math.random().toString(36).slice(2, 10)}`;
+    const leaseExpiresAt = new Date(now + leaseDurationMs).toISOString();
+
     if (existing) {
-      return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+      const existingExpired =
+        existing.status === 'processing' &&
+        (existing.leaseExpiresAt
+          ? new Date(existing.leaseExpiresAt).getTime() < now
+          : new Date(existing.updatedAt).getTime() < now - 5 * 60 * 1000);
+
+      if (existing.status === 'failed' || existingExpired) {
+        const reclaimed: import('../shopify/types').ShopifyWebhookEventRecord = {
+          ...existing,
+          payload: event.payload || existing.payload,
+          deliveryId: event.deliveryId ?? existing.deliveryId,
+          status: 'processing',
+          leaseOwner,
+          leaseExpiresAt,
+          attemptCount: (existing.attemptCount ?? existing.retryCount ?? 1) + 1,
+          retryCount: (existing.retryCount ?? 0) + 1,
+          updatedAt: new Date(now).toISOString(),
+        };
+        this.shopifyWebhookEvents.set(key, reclaimed);
+        return {
+          claimed: true,
+          outcome: existing.status === 'failed' ? 'RETRYABLE_FAILED' : 'CLAIMED',
+          leaseOwner,
+          event: JSON.parse(JSON.stringify(reclaimed)),
+        };
+      }
+
+      if (existing.status === 'processing') {
+        return {
+          claimed: false,
+          outcome: 'CURRENTLY_PROCESSING',
+          event: JSON.parse(JSON.stringify(existing)),
+        };
+      }
+
+      return {
+        claimed: false,
+        outcome: 'ALREADY_PROCESSED',
+        event: JSON.parse(JSON.stringify(existing)),
+      };
     }
-    const copy = JSON.parse(JSON.stringify(event));
+
+    const copy: import('../shopify/types').ShopifyWebhookEventRecord = {
+      ...JSON.parse(JSON.stringify(event)),
+      status: 'processing',
+      leaseOwner,
+      leaseExpiresAt,
+      attemptCount: 1,
+    };
     this.shopifyWebhookEvents.set(key, copy);
-    return { claimed: true, event: JSON.parse(JSON.stringify(copy)) };
+    return {
+      claimed: true,
+      outcome: 'CLAIMED',
+      leaseOwner,
+      event: JSON.parse(JSON.stringify(copy)),
+    };
   }
 
-  async updateShopifyWebhookEventStatus(eventId: string, shopDomain: string, topic: string, status: 'processing' | 'processed' | 'failed' | 'ignored', error?: string): Promise<void> {
+  async updateShopifyWebhookEventStatus(
+    eventId: string,
+    shopDomain: string,
+    topic: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    error?: string,
+    leaseOwner?: string
+  ): Promise<void> {
     const key = `${shopDomain}:${topic}:${eventId}`;
     const existing = this.shopifyWebhookEvents.get(key);
-    if (existing) {
-      existing.status = status;
-      if (error) existing.lastError = error;
-      if (status === 'processed') existing.processedAt = new Date().toISOString();
-      existing.updatedAt = new Date().toISOString();
+    if (!existing) return;
+
+    if (leaseOwner) {
+      const now = Date.now();
+      const expired = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() < now : false;
+      if (existing.status !== 'processing' || existing.leaseOwner !== leaseOwner || expired) {
+        throw new Error(
+          `Shopify webhook lease lost or expired for event ${eventId}: stale worker "${leaseOwner}" rejected.`
+        );
+      }
     }
+
+    existing.status = status;
+    if (status !== 'processing') {
+      existing.leaseExpiresAt = null;
+    }
+    if (error !== undefined) existing.lastError = error;
+    if (status === 'processed') existing.processedAt = new Date().toISOString();
+    existing.updatedAt = new Date().toISOString();
   }
 
   private shopifyRefreshLocks = new Map<string, Promise<any>>();
@@ -1425,16 +1611,37 @@ export class MemoryRepository implements DatabaseRepository {
     return matches[0] ? JSON.parse(JSON.stringify(matches[0])) : null;
   }
 
+  private visibilityObservationHistory: VisibilityObservationHistoryRecord[] = [];
+
+  private resolveTopicKey(metric: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord): {
+    topicValue: string | null;
+    topicPresence: TopicPresenceState;
+  } {
+    if (metric.discoveryTopic === null || metric.discoveryTopic === undefined) {
+      return { topicValue: null, topicPresence: metric.topicPresence || 'unspecified' };
+    }
+    if (metric.discoveryTopic === '') {
+      return { topicValue: '', topicPresence: metric.topicPresence || 'explicit_blank' };
+    }
+    return { topicValue: metric.discoveryTopic, topicPresence: metric.topicPresence || 'specified' };
+  }
+
   async saveVisibilityMetrics(metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]): Promise<void> {
     for (const m of metrics) {
+      const { topicValue, topicPresence } = this.resolveTopicKey(m);
       const idx = this.visibilityMetrics.findIndex(
-        (existing) =>
-          existing.workspaceId === m.workspaceId &&
-          existing.observationDate === m.observationDate &&
-          existing.platform === m.platform &&
-          (existing.discoveryTopic || '') === (m.discoveryTopic || '')
+        (existing) => {
+          const exKey = this.resolveTopicKey(existing);
+          return (
+            existing.workspaceId === m.workspaceId &&
+            existing.observationDate === m.observationDate &&
+            existing.platform === m.platform &&
+            exKey.topicValue === topicValue &&
+            exKey.topicPresence === topicPresence
+          );
+        }
       );
-      const copy = JSON.parse(JSON.stringify(m));
+      const copy = { ...JSON.parse(JSON.stringify(m)), discoveryTopic: topicValue, topicPresence };
       if (idx >= 0) {
         this.visibilityMetrics[idx] = copy;
       } else {
@@ -1445,19 +1652,137 @@ export class MemoryRepository implements DatabaseRepository {
 
   async saveVisibilityImportAtomic(
     record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord,
-    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[]
-  ): Promise<{ importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord; metricsSaved: number }> {
+    metrics: import('../../domain/monitoring/aiVisibilityTypes').VisibilityMetricRecord[],
+    options: { conflictPolicy?: VisibilityConflictPolicy } = {}
+  ): Promise<{
+    importRecord: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord;
+    metricsSaved: number;
+    duplicateImport?: boolean;
+    replacedCount?: number;
+  }> {
+    const policy: VisibilityConflictPolicy = options.conflictPolicy || 'reject_on_conflict';
+
+    // Atomic duplicate hash check across concurrent callers
+    if (record.contentHash && (record.status || 'completed') === 'completed') {
+      const existingDup = await this.getVisibilityImportByHash(record.workspaceId, record.contentHash);
+      if (existingDup) {
+        return { importRecord: existingDup, metricsSaved: 0, duplicateImport: true };
+      }
+    }
+
     const prevImports = new Map(this.visibilityImports);
     const prevMetrics = JSON.parse(JSON.stringify(this.visibilityMetrics));
+    const prevHistory = JSON.parse(JSON.stringify(this.visibilityObservationHistory));
+
     try {
+      const conflicts: VisibilityObservationConflict[] = [];
+      let replacedCount = 0;
+
+      for (const m of metrics) {
+        const { topicValue, topicPresence } = this.resolveTopicKey(m);
+        const existingMetric = this.visibilityMetrics.find((ex) => {
+          const exKey = this.resolveTopicKey(ex);
+          return (
+            ex.workspaceId === m.workspaceId &&
+            ex.observationDate === m.observationDate &&
+            ex.platform === m.platform &&
+            exKey.topicValue === topicValue &&
+            exKey.topicPresence === topicPresence
+          );
+        });
+
+        if (existingMetric && existingMetric.importId !== record.id) {
+          if (policy === 'reject_on_conflict') {
+            conflicts.push({
+              observationDate: m.observationDate,
+              platform: m.platform,
+              discoveryTopic: topicValue,
+              topicPresence,
+              existingImportId: existingMetric.importId || null,
+              existingValues: {
+                brandMentions: existingMetric.brandMentions,
+                productMentions: existingMetric.productMentions,
+                websiteClicks: existingMetric.websiteClicks,
+              },
+              incomingValues: {
+                brandMentions: m.brandMentions,
+                productMentions: m.productMentions,
+                websiteClicks: m.websiteClicks,
+              },
+            });
+          } else {
+            replacedCount++;
+          }
+        }
+      }
+
+      if (conflicts.length > 0) {
+        throw new VisibilityObservationConflictError(conflicts);
+      }
+
       const savedImport = await this.saveVisibilityImport(record);
+
+      for (const m of metrics) {
+        const { topicValue, topicPresence } = this.resolveTopicKey(m);
+        const existingHistory = this.visibilityObservationHistory.filter((h) => {
+          const hKey = h.discoveryTopic ?? null;
+          return (
+            h.workspaceId === m.workspaceId &&
+            h.observationDate === m.observationDate &&
+            h.platform === m.platform &&
+            hKey === topicValue &&
+            h.topicPresence === topicPresence
+          );
+        });
+        const maxVer = existingHistory.reduce((max, h) => Math.max(max, h.versionNumber), 0);
+        const lastHist = existingHistory[existingHistory.length - 1];
+
+        this.visibilityObservationHistory.push({
+          id: `vhist_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          workspaceId: m.workspaceId,
+          importId: savedImport.id,
+          observationDate: m.observationDate,
+          platform: m.platform,
+          discoveryTopic: topicValue,
+          topicPresence,
+          brandMentions: m.brandMentions,
+          productMentions: m.productMentions,
+          websiteClicks: m.websiteClicks,
+          evidenceSource: m.evidenceSource || null,
+          eventType: maxVer > 0 ? 'replaced' : 'recorded',
+          versionNumber: maxVer + 1,
+          supersedesHistoryId: lastHist ? lastHist.id : null,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
       await this.saveVisibilityMetrics(metrics);
-      return { importRecord: savedImport, metricsSaved: metrics.length };
+      return {
+        importRecord: savedImport,
+        metricsSaved: metrics.length,
+        duplicateImport: false,
+        replacedCount,
+      };
     } catch (err) {
       this.visibilityImports = prevImports;
       this.visibilityMetrics = prevMetrics;
+      this.visibilityObservationHistory = prevHistory;
       throw err;
     }
+  }
+
+  async getVisibilityObservationHistory(
+    workspaceId: string,
+    limit = 100
+  ): Promise<VisibilityObservationHistoryRecord[]> {
+    return JSON.parse(
+      JSON.stringify(
+        this.visibilityObservationHistory
+          .filter((h) => h.workspaceId === workspaceId)
+          .slice(-limit)
+          .reverse()
+      )
+    );
   }
 
   async getVisibilitySummary(workspaceId: string): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilitySummary> {
