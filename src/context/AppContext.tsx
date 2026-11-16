@@ -74,6 +74,8 @@ export interface AppContextType {
   isDurableStorage: boolean;
   isCloudWorkspace: boolean;
   cloudCatalogStatus: CloudCatalogLoadStatus;
+  loadedWorkspaceId?: string | null;
+  cloudCatalogError?: string | null;
   catalogVersion?: number;
   demoOverwriteProtection: DemoOverwriteProtectionEvaluation;
   setMobileMenuOpen: (open: boolean) => void;
@@ -98,6 +100,20 @@ export interface AppContextType {
 }
 
 export const AppContext = createContext<AppContextType | undefined>(undefined);
+
+function buildEmptyCloudStoreProfile(workspace?: { name?: string; slug?: string } | null): StoreProfile {
+  return {
+    name: workspace?.name ? `${workspace.name} Store` : '',
+    domain: workspace?.slug ? `${workspace.slug}.myshopify.com` : '',
+    currency: 'USD',
+    skuCount: 0,
+    skuLimit: 2500,
+    catalogCompletenessAvg: 0,
+    truthBoundaryStrictness: 'standard',
+    tier: 'Free Audit',
+    connectors: [],
+  };
+}
 
 export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?: CatalogStorageAdapter }> = ({ 
   children, 
@@ -126,10 +142,17 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [readOnlyReason, setReadOnlyReason] = useState<string | null>(null);
   const [storageLoadResult, setStorageLoadResult] = useState<StorageLoadResult | null>(null);
   const [cloudCatalogStatus, setCloudCatalogStatus] = useState<CloudCatalogLoadStatus>('idle');
+  const [loadedWorkspaceId, setLoadedWorkspaceId] = useState<string | null>(null);
+  const [loadedCloudIdentity, setLoadedCloudIdentity] = useState<string | null>(null);
+  const [cloudCatalogError, setCloudCatalogError] = useState<string | null>(null);
+  const [cloudCatalogErrorIdentity, setCloudCatalogErrorIdentity] = useState<string | null>(null);
   const [catalogVersion, setCatalogVersion] = useState<number | undefined>(undefined);
 
   const isInitializedRef = useRef<boolean>(false);
+  const wasCloudSessionRef = useRef<boolean>(false);
   const catalogVersionRef = useRef<number | undefined>(undefined);
+  const cloudRequestGenRef = useRef<number>(0);
+  const toastTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
   // Check auth context safely (null if outside AuthProvider in test environments)
   let authContext: any = null;
@@ -140,14 +163,49 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   }
 
   const isCloudWorkspace = Boolean(authContext?.isAuthenticated && authContext?.activeWorkspace);
-  const activeWorkspaceId = authContext?.activeWorkspace?.id;
+  const activeWorkspaceId: string | undefined = authContext?.activeWorkspace?.id;
+  const activeUserId: string | undefined = authContext?.user?.id;
+  const currentCloudIdentity =
+    isCloudWorkspace && activeWorkspaceId ? `${activeUserId ?? ''}:${activeWorkspaceId}` : null;
+
+  const activeIdentityRef = useRef<{
+    isCloudWorkspace: boolean;
+    workspaceId?: string;
+    userId?: string;
+    identity: string | null;
+  }>({
+    isCloudWorkspace,
+    workspaceId: activeWorkspaceId,
+    userId: activeUserId,
+    identity: currentCloudIdentity,
+  });
+  activeIdentityRef.current = {
+    isCloudWorkspace,
+    workspaceId: activeWorkspaceId,
+    userId: activeUserId,
+    identity: currentCloudIdentity,
+  };
+
+  useEffect(() => {
+    return () => {
+      for (const timer of toastTimersRef.current) {
+        clearTimeout(timer);
+      }
+      toastTimersRef.current.clear();
+    };
+  }, []);
 
   const addToast = (title: string, message: string, type: ToastMessage['type'] = 'info') => {
     const id = `toast_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     setToasts(prev => [...prev, { id, title, message, type }]);
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      toastTimersRef.current.delete(timer);
       setToasts(prev => prev.filter(t => t.id !== id));
     }, 4500);
+    if (typeof (timer as any).unref === 'function') {
+      (timer as any).unref();
+    }
+    toastTimersRef.current.add(timer);
   };
 
   const removeToast = (id: string) => {
@@ -187,7 +245,48 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     return res;
   };
 
-  const applyCatalogSnapshot = (cat: StoragePayloadV1) => {
+  const isCurrentCloudRequest = (
+    reqGen: number,
+    expectedWorkspaceId?: string,
+    expectedUserId?: string,
+    responseWorkspaceId?: string
+  ): boolean => {
+    if (reqGen !== cloudRequestGenRef.current) return false;
+    const active = activeIdentityRef.current;
+    if (!active.isCloudWorkspace || !active.workspaceId) return false;
+    if (expectedWorkspaceId !== active.workspaceId) return false;
+    if (expectedUserId !== active.userId) return false;
+    if (responseWorkspaceId && responseWorkspaceId !== active.workspaceId) return false;
+    return true;
+  };
+
+  const clearCloudCatalogState = (workspace?: { name?: string; slug?: string } | null) => {
+    catalogVersionRef.current = undefined;
+    setCatalogVersion(undefined);
+    setLoadedWorkspaceId(null);
+    setLoadedCloudIdentity(null);
+    setProducts([]);
+    setVariants([]);
+    setOffers([]);
+    setFindings([]);
+    setActionItems([]);
+    setEvidence([]);
+    setStoreProfile(buildEmptyCloudStoreProfile(workspace));
+    setSelectedProductId(null);
+    setSelectedActionId(null);
+    setQuickCheckResult(null);
+    setLastIngestionResult(null);
+    setIsCheckingStore(false);
+    setIsReadOnlyMode(false);
+    setReadOnlyReason(null);
+    setCurrentPage(prev => (prev === 'product-detail' ? 'products' : prev));
+  };
+
+  const applyCatalogSnapshot = (
+    cat: StoragePayloadV1,
+    ownerWorkspaceId?: string,
+    ownerUserId?: string
+  ) => {
     catalogVersionRef.current = cat.catalogVersion;
     setCatalogVersion(cat.catalogVersion);
     setProducts(cat.products);
@@ -197,78 +296,157 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     setActionItems(cat.actions);
     setEvidence(cat.evidence && cat.evidence.length > 0 ? cat.evidence : cat.products.flatMap(p => p.evidenceDocuments || []));
     setStoreProfile(cat.storeProfile);
+    setSelectedProductId(prev =>
+      prev && cat.products.some(p => p.id === prev) ? prev : (cat.products[0]?.id ?? null)
+    );
+    if (ownerWorkspaceId) {
+      setLoadedWorkspaceId(ownerWorkspaceId);
+      setLoadedCloudIdentity(`${ownerUserId ?? ''}:${ownerWorkspaceId}`);
+    }
+    setCloudCatalogError(null);
+    setCloudCatalogErrorIdentity(null);
   };
 
-  // Hydrate: Cloud API if authenticated in active workspace; otherwise local storage adapter
-  useEffect(() => {
-    if (!isCloudWorkspace) {
-      catalogVersionRef.current = undefined;
-      setCatalogVersion(undefined);
-      setCloudCatalogStatus('idle');
-      if (!isInitializedRef.current) {
-        isInitializedRef.current = true;
-        const result = storageAdapter.load();
-        setStorageLoadResult(result);
+  const hydrateLocalDemoCatalog = (isLogoutTransition: boolean) => {
+    setIsReadOnlyMode(false);
+    setReadOnlyReason(null);
+    setSelectedActionId(null);
+    setQuickCheckResult(null);
+    setLastIngestionResult(null);
+    setIsCheckingStore(false);
+    setCurrentPage(prev => (prev === 'product-detail' ? 'products' : prev));
 
-        if (result.type === 'valid') {
-          const p = result.envelope.payload;
-          setProducts(p.products);
-          setVariants(p.variants && p.variants.length > 0 ? p.variants : p.products.flatMap(pr => pr.variants || []));
-          setOffers(p.offers && p.offers.length > 0 ? p.offers : p.products.flatMap(pr => pr.offers || []));
-          setFindings(p.findings);
-          setActionItems(p.actions);
-          setEvidence(p.evidence && p.evidence.length > 0 ? p.evidence : p.products.flatMap(pr => pr.evidenceDocuments || []));
-          setStoreProfile(p.storeProfile);
-          addToast('Demo Session Loaded', 'Your local demo workspace catalog has been loaded.', 'info');
-        } else if (result.type === 'not_found') {
-          persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
-        } else if (result.type === 'corrupt') {
-          console.warn(`[AIXSHOP Storage] Corrupted local data detected and preserved in backup: ${result.backupKey}`);
-          addToast(
-            'Workspace Restored',
-            'A problem was detected with local session data. Restored with default catalog items.',
-            'warning'
-          );
-        } else if (result.type === 'unsupported_version') {
-          console.warn(`[AIXSHOP Storage] Future schema version (${result.foundVersion}) detected. Enabling read-only mode.`);
-          setIsReadOnlyMode(true);
-          setReadOnlyReason(storageAdapter.getReadOnlyReason());
-          addToast(
-            'Read-Only Mode Active',
-            'This catalog was updated in a newer version. Editing is temporarily paused to protect your store data.',
-            'warning'
-          );
-        } else if (result.type === 'storage_failure') {
-          console.warn(`[AIXSHOP Storage] Storage error: ${result.error}`);
-          addToast('Storage Restricted', 'Local storage is currently restricted. Your catalog is available for this session.', 'warning');
-        }
+    const result = storageAdapter.load();
+    setStorageLoadResult(result);
+
+    if (result.type === 'valid') {
+      const p = result.envelope.payload;
+      setProducts(p.products);
+      setVariants(p.variants && p.variants.length > 0 ? p.variants : p.products.flatMap(pr => pr.variants || []));
+      setOffers(p.offers && p.offers.length > 0 ? p.offers : p.products.flatMap(pr => pr.offers || []));
+      setFindings(p.findings);
+      setActionItems(p.actions);
+      setEvidence(p.evidence && p.evidence.length > 0 ? p.evidence : p.products.flatMap(pr => pr.evidenceDocuments || []));
+      setStoreProfile(p.storeProfile);
+      setSelectedProductId(p.products[0]?.id ?? null);
+      if (!isLogoutTransition) {
+        addToast('Demo Session Loaded', 'Your local demo workspace catalog has been loaded.', 'info');
       }
       return;
     }
 
-    // Authenticated Cloud Workspace mode: Load from backend API
+    // Explicitly restore default demo seed fixtures so prior cloud workspace data can never linger
+    setProducts(initialProducts);
+    setVariants(initialProducts.flatMap(pr => pr.variants || []));
+    setOffers(initialProducts.flatMap(pr => pr.offers || []));
+    setFindings(initialFindings);
+    setActionItems(initialActionItems);
+    setEvidence(initialProducts.flatMap(pr => pr.evidenceDocuments || []));
+    setStoreProfile(initialStoreProfile);
+    setSelectedProductId(initialProducts[0]?.id ?? 'prod_solstice_01');
+
+    if (result.type === 'not_found') {
+      storageAdapter.save({
+        products: initialProducts,
+        variants: initialProducts.flatMap(pr => pr.variants || []),
+        offers: initialProducts.flatMap(pr => pr.offers || []),
+        findings: initialFindings,
+        actions: initialActionItems,
+        evidence: initialProducts.flatMap(pr => pr.evidenceDocuments || []),
+        storeProfile: initialStoreProfile,
+      });
+    } else if (result.type === 'corrupt') {
+      console.warn(`[AIXSHOP Storage] Corrupted local data detected and preserved in backup: ${result.backupKey}`);
+      addToast(
+        'Workspace Restored',
+        'A problem was detected with local session data. Restored with default catalog items.',
+        'warning'
+      );
+    } else if (result.type === 'unsupported_version') {
+      console.warn(`[AIXSHOP Storage] Future schema version (${result.foundVersion}) detected. Enabling read-only mode.`);
+      setIsReadOnlyMode(true);
+      setReadOnlyReason(storageAdapter.getReadOnlyReason());
+      addToast(
+        'Read-Only Mode Active',
+        'This catalog was updated in a newer version. Editing is temporarily paused to protect your store data.',
+        'warning'
+      );
+    } else if (result.type === 'storage_failure') {
+      console.warn(`[AIXSHOP Storage] Storage error: ${result.error}`);
+      addToast('Storage Restricted', 'Local storage is currently restricted. Your catalog is available for this session.', 'warning');
+    }
+  };
+
+  // Hydrate: Cloud API if authenticated in active workspace; otherwise local storage adapter
+  useEffect(() => {
+    const reqGen = ++cloudRequestGenRef.current;
+
+    if (!isCloudWorkspace) {
+      const hadCloudSession = wasCloudSessionRef.current;
+      wasCloudSessionRef.current = false;
+
+      catalogVersionRef.current = undefined;
+      setCatalogVersion(undefined);
+      setLoadedWorkspaceId(null);
+      setLoadedCloudIdentity(null);
+      setCloudCatalogStatus('idle');
+      setCloudCatalogError(null);
+      setCloudCatalogErrorIdentity(null);
+
+      if (!isInitializedRef.current || hadCloudSession) {
+        isInitializedRef.current = true;
+        hydrateLocalDemoCatalog(hadCloudSession);
+      }
+      return;
+    }
+
+    // Authenticated Cloud Workspace mode: Immediately clear previous workspace/demo state before fetching
+    wasCloudSessionRef.current = true;
+    const targetWorkspaceId = activeWorkspaceId!;
+    const targetUserId = activeUserId;
+    const targetIdentity = currentCloudIdentity!;
+    const targetWorkspaceName = authContext?.activeWorkspace?.name || 'Workspace';
+
+    clearCloudCatalogState(authContext?.activeWorkspace);
+    setCloudCatalogError(null);
+    setCloudCatalogErrorIdentity(null);
+    setCloudCatalogStatus('loading');
+
     let isCancelled = false;
     async function loadCloudCatalog() {
-      setCloudCatalogStatus('loading');
       try {
         const res = await apiClient.getCatalog();
-        if (isCancelled) return;
-        applyCatalogSnapshot(res.catalog);
+        if (
+          isCancelled ||
+          !isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId, res.workspaceId)
+        ) {
+          return;
+        }
+        applyCatalogSnapshot(res.catalog, targetWorkspaceId, targetUserId);
         setCloudCatalogStatus('loaded');
         setIsReadOnlyMode(false);
         setReadOnlyReason(null);
         addToast(
           'Workspace Connected',
-          `Loaded catalog for workspace "${authContext.activeWorkspace.name}". Data is durably persisted to PostgreSQL.`,
+          `Loaded catalog for workspace "${targetWorkspaceName}". Data is durably persisted to PostgreSQL.`,
           'success'
         );
       } catch (err: any) {
-        if (isCancelled) return;
+        if (
+          isCancelled ||
+          !isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId)
+        ) {
+          return;
+        }
+        clearCloudCatalogState(authContext?.activeWorkspace);
+        const errMessage = err?.message || 'Failed to load catalog from server.';
+        setCloudCatalogError(errMessage);
+        setCloudCatalogErrorIdentity(targetIdentity);
         setCloudCatalogStatus('error');
         console.error('[AIXSHOP Cloud] Failed to load workspace catalog:', err);
         addToast(
           'Cloud Catalog Error',
-          err.message || 'Failed to load catalog from server. Local state preserved.',
+          errMessage,
           'error'
         );
       }
@@ -277,8 +455,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     loadCloudCatalog();
     return () => {
       isCancelled = true;
+      cloudRequestGenRef.current += 1;
     };
-  }, [isCloudWorkspace, activeWorkspaceId]);
+  }, [isCloudWorkspace, activeWorkspaceId, activeUserId]);
 
   const navigateTo = (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => {
     setMobileMenuOpen(false);
@@ -321,9 +500,17 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   }, [selectedProductId, products]);
 
   const runStoreCheck = async (url: string) => {
+    const startIdentity = activeIdentityRef.current.identity;
+    const startGen = cloudRequestGenRef.current;
     setIsCheckingStore(true);
     try {
       const result = await ingestAndAnalyzeStore(url, { existingCatalog: products });
+      if (
+        activeIdentityRef.current.identity !== startIdentity ||
+        cloudRequestGenRef.current !== startGen
+      ) {
+        return;
+      }
       setQuickCheckResult(result);
       if (result.ingestionResult) {
         setLastIngestionResult(result.ingestionResult);
@@ -355,6 +542,12 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         );
       }
     } catch (e) {
+      if (
+        activeIdentityRef.current.identity !== startIdentity ||
+        cloudRequestGenRef.current !== startGen
+      ) {
+        return;
+      }
       addToast('Scan Error', (e as Error).message || 'Failed to inspect store.', 'error');
     } finally {
       setIsCheckingStore(false);
@@ -368,17 +561,23 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
 
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.importCatalog(lastIngestionResult.candidateProducts);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
         if (res.success && res.result) {
           const catRes = await apiClient.getCatalog();
-          applyCatalogSnapshot(catRes.catalog);
+          if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes.workspaceId)) return null;
+          applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
           setCloudCatalogStatus('loaded');
           addToast('Catalog Import Complete', res.result.message, 'success');
           return res.result;
         }
         return null;
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
         addToast('Import Failed (Rolled Back)', err.message || 'Server rejected catalog import. Catalog preserved.', 'error');
         return null;
       }
@@ -443,14 +642,19 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const approveAction = async (actionId: string, customApprovedValue?: string) => {
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.approveAction(actionId, customApprovedValue);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
             setCatalogVersion(res.catalogVersion);
           } else {
             await reloadWorkspaceCatalog();
+            if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
           }
           setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
           if (res.product) {
@@ -459,6 +663,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
           addToast('Remediation Approved', 'Action successfully approved and durably persisted to PostgreSQL.', 'success');
         }
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         addToast('Action Failed (Rolled Back)', err.message || 'Failed to approve action on server.', 'error');
       }
       return;
@@ -514,19 +719,25 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const dismissAction = async (actionId: string) => {
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.dismissAction(actionId);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
             setCatalogVersion(res.catalogVersion);
           } else {
             await reloadWorkspaceCatalog();
+            if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
           }
           setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
           addToast('Action Dismissed', 'Action dismissed and durably persisted.', 'info');
         }
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         addToast('Dismiss Failed', err.message || 'Failed to dismiss action on server.', 'error');
       }
       return;
@@ -566,19 +777,25 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const recheckAction = async (actionId: string) => {
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.recheckAction(actionId);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
             setCatalogVersion(res.catalogVersion);
           } else {
             await reloadWorkspaceCatalog();
+            if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
           }
           setActionItems(prev => prev.map(a => a.id === actionId ? res.action : a));
           addToast('Action Re-checked', 'Action evaluated and durably updated.', 'info');
         }
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         addToast('Re-check Failed', err.message || 'Failed to re-check action on server.', 'error');
       }
       return;
@@ -634,6 +851,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
 
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const expectedVersion = catalogVersionRef.current;
         const saveRes = await apiClient.saveCatalog(
@@ -649,6 +869,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
           },
           expectedVersion
         );
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         if (!saveRes.success) {
           addToast('Persistence Failed', 'Could not persist product audit to cloud database.', 'error');
           return;
@@ -658,6 +879,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
           setCatalogVersion(saveRes.catalogVersion);
         }
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
         if (err.status === 409 || err.code === 'CATALOG_VERSION_CONFLICT') {
           await reloadWorkspaceCatalog();
           addToast(
@@ -690,8 +912,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const updateStoreProfile = async (updates: Partial<StoreProfile>): Promise<{ success: boolean; error?: string }> => {
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.updateStoreProfile(updates);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
+          return { success: false, error: 'Workspace session changed' };
+        }
         if (res.success && res.store) {
           setStoreProfile(res.store);
           addToast('Store Settings Saved', 'Store configuration updated and durably persisted to PostgreSQL.', 'success');
@@ -699,6 +927,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
         return { success: false, error: 'Failed to update store profile' };
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
+          return { success: false, error: 'Workspace session changed' };
+        }
         addToast('Settings Save Failed', err.message || 'Failed to update store profile on server.', 'error');
         return { success: false, error: err.message };
       }
@@ -742,8 +973,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const toggleConnectorSync = async (connectorId: string): Promise<{ success: boolean; error?: string }> => {
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.toggleConnector(connectorId);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
+          return { success: false, error: 'Workspace session changed' };
+        }
         if (res.success && res.store) {
           setStoreProfile(res.store);
           addToast('Connector Status Updated', 'Connector configuration updated and durably persisted.', 'info');
@@ -751,6 +988,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
         return { success: false, error: 'Failed to toggle connector' };
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
+          return { success: false, error: 'Workspace session changed' };
+        }
         addToast('Connector Update Failed', err.message || 'Failed to toggle connector on server.', 'error');
         return { success: false, error: err.message };
       }
@@ -797,12 +1037,19 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       return false;
     }
 
+    const reqGen = cloudRequestGenRef.current;
+    const targetWsId = activeWorkspaceId;
+    const targetUserId = activeUserId;
+    const targetWsName = authContext?.activeWorkspace?.name || 'Workspace';
+
     try {
       const expectedVersion = catalogVersionRef.current;
       const res = await apiClient.migrateDemoData(expectedVersion);
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return false;
       if (res.success) {
         const catRes = await apiClient.getCatalog();
-        applyCatalogSnapshot(catRes.catalog);
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes.workspaceId)) return false;
+        applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
         const nextVer =
           typeof res.catalogVersion === 'number'
             ? res.catalogVersion
@@ -812,13 +1059,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         setCloudCatalogStatus('loaded');
         addToast(
           'Demo Catalog Imported',
-          `Successfully migrated ${res.skuCount} demo products into your cloud workspace "${authContext.activeWorkspace.name}".`,
+          `Successfully migrated ${res.skuCount} demo products into your cloud workspace "${targetWsName}".`,
           'success'
         );
         return true;
       }
       return false;
     } catch (err: any) {
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return false;
       if (err?.status === 409 || err?.code === 'CATALOG_VERSION_CONFLICT') {
         await reloadWorkspaceCatalog();
         addToast(
@@ -835,10 +1083,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const runAudit = async (): Promise<any> => {
     if (isCloudWorkspace) {
+      const reqGen = cloudRequestGenRef.current;
+      const targetWsId = activeWorkspaceId;
+      const targetUserId = activeUserId;
       try {
         const res = await apiClient.runAudit();
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
         if (res.success && res.catalog) {
-          applyCatalogSnapshot(res.catalog);
+          applyCatalogSnapshot(res.catalog, targetWsId, targetUserId);
           setCloudCatalogStatus('loaded');
           addToast(
             'Audit Completed',
@@ -848,6 +1100,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
           return res.auditRun;
         }
       } catch (err: any) {
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
         addToast('Audit Failed', err.message || 'Failed to execute audit on server.', 'error');
         throw err;
       }
@@ -907,42 +1160,94 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   };
 
   const reloadWorkspaceCatalog = async () => {
-    if (isCloudWorkspace) {
-      setCloudCatalogStatus('loading');
-      try {
-        const res = await apiClient.getCatalog();
-        applyCatalogSnapshot(res.catalog);
-        setCloudCatalogStatus('loaded');
-      } catch (err: any) {
-        setCloudCatalogStatus('error');
-        console.error('[AIXSHOP] Failed to reload workspace catalog:', err);
+    if (!isCloudWorkspace || !activeWorkspaceId) return;
+
+    const reqGen = ++cloudRequestGenRef.current;
+    const targetWsId = activeWorkspaceId;
+    const targetUserId = activeUserId;
+    const targetIdentity = currentCloudIdentity!;
+
+    setCloudCatalogError(null);
+    setCloudCatalogErrorIdentity(null);
+    setCloudCatalogStatus('loading');
+    try {
+      const res = await apiClient.getCatalog();
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, res.workspaceId)) {
+        return;
       }
+      applyCatalogSnapshot(res.catalog, targetWsId, targetUserId);
+      setCloudCatalogStatus('loaded');
+    } catch (err: any) {
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
+        return;
+      }
+      clearCloudCatalogState(authContext?.activeWorkspace);
+      const errMessage = err?.message || 'Failed to reload workspace catalog.';
+      setCloudCatalogError(errMessage);
+      setCloudCatalogErrorIdentity(targetIdentity);
+      setCloudCatalogStatus('error');
+      console.error('[AIXSHOP] Failed to reload workspace catalog:', err);
     }
   };
+
+  // Render-time workspace isolation guard: never expose prior workspace/account state
+  // even for a single synchronous render frame before useEffect finishes transitioning.
+  const isCloudTransitionMismatch =
+    isCloudWorkspace && loadedCloudIdentity !== currentCloudIdentity;
+  const isLogoutTransitionMismatch = !isCloudWorkspace && loadedCloudIdentity !== null;
+  const isStateWorkspaceMismatch = isCloudTransitionMismatch || isLogoutTransitionMismatch;
+
+  const effectiveProducts = isStateWorkspaceMismatch ? [] : products;
+  const effectiveVariants = isStateWorkspaceMismatch ? [] : variants;
+  const effectiveOffers = isStateWorkspaceMismatch ? [] : offers;
+  const effectiveFindings = isStateWorkspaceMismatch ? [] : findings;
+  const effectiveActionItems = isStateWorkspaceMismatch ? [] : actionItems;
+  const effectiveEvidence = isStateWorkspaceMismatch ? [] : evidence;
+  const effectiveStoreProfile = isStateWorkspaceMismatch
+    ? buildEmptyCloudStoreProfile(isCloudWorkspace ? authContext?.activeWorkspace : null)
+    : storeProfile;
+  const effectiveCatalogVersion = isStateWorkspaceMismatch ? undefined : catalogVersion;
+  const effectiveLoadedWorkspaceId = isStateWorkspaceMismatch ? null : loadedWorkspaceId;
+  const effectiveCloudCatalogError =
+    isCloudWorkspace && cloudCatalogErrorIdentity === currentCloudIdentity
+      ? cloudCatalogError
+      : null;
+  const effectiveCloudCatalogStatus: CloudCatalogLoadStatus = isCloudTransitionMismatch
+    ? cloudCatalogError && cloudCatalogErrorIdentity === currentCloudIdentity
+      ? 'error'
+      : 'loading'
+    : isLogoutTransitionMismatch
+    ? 'idle'
+    : cloudCatalogStatus;
+  const effectiveSelectedProductId = isStateWorkspaceMismatch ? null : selectedProductId;
+  const effectiveSelectedActionId = isStateWorkspaceMismatch ? null : selectedActionId;
+  const effectiveSelectedProduct = isStateWorkspaceMismatch ? null : selectedProduct;
+  const effectiveQuickCheckResult = isStateWorkspaceMismatch ? null : quickCheckResult;
+  const effectiveLastIngestionResult = isStateWorkspaceMismatch ? null : lastIngestionResult;
 
   const demoOverwriteProtection = useMemo(
     () =>
       evaluateDemoOverwriteProtection({
         isCloudWorkspace,
-        cloudCatalogStatus,
-        catalogVersion,
-        productsCount: products.length,
-        variantsCount: variants.length,
-        offersCount: offers.length,
-        findingsCount: findings.length,
-        actionsCount: actionItems.length,
-        evidenceCount: evidence.length,
+        cloudCatalogStatus: effectiveCloudCatalogStatus,
+        catalogVersion: effectiveCatalogVersion,
+        productsCount: effectiveProducts.length,
+        variantsCount: effectiveVariants.length,
+        offersCount: effectiveOffers.length,
+        findingsCount: effectiveFindings.length,
+        actionsCount: effectiveActionItems.length,
+        evidenceCount: effectiveEvidence.length,
       }),
     [
       isCloudWorkspace,
-      cloudCatalogStatus,
-      catalogVersion,
-      products.length,
-      variants.length,
-      offers.length,
-      findings.length,
-      actionItems.length,
-      evidence.length,
+      effectiveCloudCatalogStatus,
+      effectiveCatalogVersion,
+      effectiveProducts.length,
+      effectiveVariants.length,
+      effectiveOffers.length,
+      effectiveFindings.length,
+      effectiveActionItems.length,
+      effectiveEvidence.length,
     ]
   );
 
@@ -951,28 +1256,30 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       value={{
         currentPage,
         previousPage,
-        selectedProductId,
-        selectedActionId,
-        storeProfile,
-        products,
-        variantsCount: variants.length,
-        offersCount: offers.length,
-        findings,
-        actionItems,
-        evidenceCount: evidence.length,
+        selectedProductId: effectiveSelectedProductId,
+        selectedActionId: effectiveSelectedActionId,
+        storeProfile: effectiveStoreProfile,
+        products: effectiveProducts,
+        variantsCount: effectiveVariants.length,
+        offersCount: effectiveOffers.length,
+        findings: effectiveFindings,
+        actionItems: effectiveActionItems,
+        evidenceCount: effectiveEvidence.length,
         toasts,
-        quickCheckResult,
-        lastIngestionResult,
+        quickCheckResult: effectiveQuickCheckResult,
+        lastIngestionResult: effectiveLastIngestionResult,
         isCheckingStore,
-        selectedProduct,
+        selectedProduct: effectiveSelectedProduct,
         mobileMenuOpen,
         isReadOnlyMode,
         readOnlyReason,
         storageLoadResult,
         isDurableStorage: isCloudWorkspace ? true : storageAdapter.isDurable(),
         isCloudWorkspace,
-        cloudCatalogStatus,
-        catalogVersion,
+        cloudCatalogStatus: effectiveCloudCatalogStatus,
+        loadedWorkspaceId: effectiveLoadedWorkspaceId,
+        cloudCatalogError: effectiveCloudCatalogError,
+        catalogVersion: effectiveCatalogVersion,
         demoOverwriteProtection,
         setMobileMenuOpen,
         setSelectedActionId,

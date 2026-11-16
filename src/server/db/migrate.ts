@@ -68,20 +68,55 @@ export async function runMigrations(
   const pool = customPool || new Pool(poolConfig!);
   const shouldClosePool = !customPool;
   let client: PoolClient | null = null;
-  let lockAcquired = false;
+  let lockAttempted = false;
+  let lockConfirmedAcquired = false;
+  let lockConfirmedReleased = false;
+  let inTransaction = false;
+  let rollbackAttempted = false;
+  let rollbackSucceeded = false;
+  let connectionPoisoned = false;
   let clientReleased = false;
   let poolClosed = false;
+  let primaryError: unknown = null;
+
+  const cleanupDiagnostics: Array<{ phase: 'rollback' | 'unlock' | 'release' | 'pool_end'; message: string; error: unknown }> = [];
+  const recordCleanupFailure = (
+    phase: 'rollback' | 'unlock' | 'release' | 'pool_end',
+    err: unknown
+  ) => {
+    const message = err instanceof Error ? err.message : String(err);
+    cleanupDiagnostics.push({ phase, message, error: err });
+    if (primaryError && typeof primaryError === 'object' && Object.isExtensible(primaryError)) {
+      const target = primaryError as Record<string, any>;
+      const existing = Array.isArray(target.cleanupErrors) ? target.cleanupErrors : [];
+      target.cleanupErrors = [...existing, { phase, message, error: err }];
+      if (phase === 'rollback' && target.rollbackError === undefined) {
+        target.rollbackError = err;
+      }
+      if (phase === 'unlock' && target.unlockError === undefined) {
+        target.unlockError = err;
+      }
+    }
+  };
 
   try {
     client = await pool.connect();
 
     // Acquire PostgreSQL advisory lock to serialize concurrent migration runs
     console.log('[AIXSHOP Migration] Acquiring migration advisory lock...');
-    await client.query('SELECT pg_advisory_lock($1, $2)', [
-      MIGRATION_ADVISORY_LOCK_KEY_1,
-      MIGRATION_ADVISORY_LOCK_KEY_2,
-    ]);
-    lockAcquired = true;
+    lockAttempted = true;
+    try {
+      await client.query('SELECT pg_advisory_lock($1, $2)', [
+        MIGRATION_ADVISORY_LOCK_KEY_1,
+        MIGRATION_ADVISORY_LOCK_KEY_2,
+      ]);
+      lockConfirmedAcquired = true;
+    } catch (lockErr) {
+      // If the lock acquisition query fails, server-side session lock outcome is uncertain
+      connectionPoisoned = true;
+      primaryError = lockErr;
+      throw lockErr;
+    }
 
     // 1. Ensure migrations tracking table & checksum columns exist
     await client.query(`
@@ -175,7 +210,15 @@ export async function runMigrations(
       console.log(`[AIXSHOP Migration] Executing pending migration: ${file}...`);
 
       // Execute within transaction: schema changes + tracking entry + SHA-256 checksum succeed or rollback together
-      await client.query('BEGIN');
+      try {
+        await client.query('BEGIN');
+        inTransaction = true;
+      } catch (beginErr: any) {
+        connectionPoisoned = true;
+        primaryError = beginErr;
+        throw beginErr;
+      }
+
       try {
         await client.query(sql);
         await client.query(
@@ -183,15 +226,23 @@ export async function runMigrations(
           [file, fileChecksum]
         );
         await client.query('COMMIT');
+        inTransaction = false;
         applied.push(file);
         verifiedChecksums.push(file);
         console.log(`[AIXSHOP Migration] ✓ Successfully applied ${file} (sha256: ${fileChecksum.slice(0, 12)}...)`);
       } catch (err: any) {
+        primaryError = err;
+        rollbackAttempted = true;
         try {
           await client.query('ROLLBACK');
+          inTransaction = false;
+          rollbackSucceeded = true;
         } catch (rollbackErr: any) {
+          rollbackSucceeded = false;
+          connectionPoisoned = true;
+          recordCleanupFailure('rollback', rollbackErr);
           console.error(
-            `[AIXSHOP Migration Rollback Warning] Rollback failed for ${file}:`,
+            `[AIXSHOP Migration Rollback Error] Rollback failed for ${file}; connection marked for destruction:`,
             rollbackErr?.message || rollbackErr
           );
         }
@@ -211,33 +262,65 @@ export async function runMigrations(
       verifiedChecksums,
       legacyUnverifiedMigrations,
     };
+  } catch (err) {
+    if (primaryError === null) {
+      primaryError = err;
+    }
+    throw err;
   } finally {
-    if (lockAcquired && client) {
+    if (lockConfirmedAcquired && client) {
       try {
-        await client.query('SELECT pg_advisory_unlock($1, $2)', [
-          MIGRATION_ADVISORY_LOCK_KEY_1,
-          MIGRATION_ADVISORY_LOCK_KEY_2,
-        ]);
-      } catch {
-        // Connection loss automatically releases session advisory lock in Postgres
+        const unlockRes = await client.query<{ pg_advisory_unlock?: boolean }>(
+          'SELECT pg_advisory_unlock($1, $2) AS pg_advisory_unlock',
+          [MIGRATION_ADVISORY_LOCK_KEY_1, MIGRATION_ADVISORY_LOCK_KEY_2]
+        );
+        if (unlockRes?.rows?.[0] && unlockRes.rows[0].pg_advisory_unlock === false) {
+          connectionPoisoned = true;
+          const falseUnlockErr = new Error('pg_advisory_unlock returned false during migration cleanup');
+          recordCleanupFailure('unlock', falseUnlockErr);
+          console.error(
+            '[AIXSHOP Migration Unlock Error] pg_advisory_unlock returned false; connection marked for destruction.'
+          );
+        } else {
+          lockConfirmedReleased = true;
+        }
+      } catch (unlockErr: any) {
+        connectionPoisoned = true;
+        recordCleanupFailure('unlock', unlockErr);
+        console.error(
+          '[AIXSHOP Migration Unlock Error] Failed to release advisory lock; connection marked for destruction:',
+          unlockErr?.message || unlockErr
+        );
       }
     }
 
     if (client && !clientReleased) {
+      clientReleased = true;
+      const isConnectionSafe =
+        !connectionPoisoned &&
+        !inTransaction &&
+        (!rollbackAttempted || rollbackSucceeded) &&
+        (!lockAttempted || (lockConfirmedAcquired && lockConfirmedReleased));
+
       try {
-        client.release();
-        clientReleased = true;
-      } catch {
-        // Guard against double release
+        if (isConnectionSafe) {
+          client.release();
+        } else {
+          (client.release as any)(true);
+        }
+      } catch (releaseErr) {
+        recordCleanupFailure('release', releaseErr);
+        // Guard against double or secondary release error hiding primary failure
       }
     }
 
     if (shouldClosePool && !poolClosed) {
+      poolClosed = true;
       try {
         await pool.end();
-        poolClosed = true;
-      } catch {
-        // Guard against double end
+      } catch (poolEndErr) {
+        recordCleanupFailure('pool_end', poolEndErr);
+        // Guard against secondary pool.end() error hiding primary failure
       }
     }
   }
@@ -262,6 +345,7 @@ export async function checkMigrationStatus(
   let client: PoolClient | null = null;
   let clientReleased = false;
   let poolClosed = false;
+  let queryFailed = false;
 
   try {
     client = await pool.connect();
@@ -339,20 +423,29 @@ export async function checkMigrationStatus(
       legacyUnverifiedMigrations,
       integrityVerified,
     };
+  } catch (err) {
+    if (client) {
+      queryFailed = true;
+    }
+    throw err;
   } finally {
     if (client && !clientReleased) {
+      clientReleased = true;
       try {
-        client.release();
-        clientReleased = true;
+        if (queryFailed) {
+          (client.release as any)(true);
+        } else {
+          client.release();
+        }
       } catch {
         // Guard against double release
       }
     }
 
     if (shouldClosePool && !poolClosed) {
+      poolClosed = true;
       try {
         await pool.end();
-        poolClosed = true;
       } catch {
         // Guard against double end
       }
