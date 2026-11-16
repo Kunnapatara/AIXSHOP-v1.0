@@ -28,8 +28,135 @@ import {
   Check
 } from 'lucide-react';
 import { apiClient, ShopifyStatusResponse } from '../api/client';
+import {
+  evaluateDemoOverwriteProtection,
+  CloudCatalogLoadStatus,
+  DemoOverwriteProtectionEvaluation,
+} from '../domain/catalog/demoMigrationProtection';
 
-export const SettingsPage: React.FC = () => {
+export interface DemoCatalogMigrationSectionProps {
+  isAuthenticated: boolean;
+  openAuthModal: (mode?: 'login' | 'register') => void;
+  overwriteProtection: DemoOverwriteProtectionEvaluation;
+  confirmingDemoOverwrite: boolean;
+  setConfirmingDemoOverwrite: (next: boolean) => void;
+  isMigratingDemo: boolean;
+  setIsMigratingDemo: (next: boolean) => void;
+  cloudCatalogStatus?: CloudCatalogLoadStatus;
+  catalogVersion?: number;
+  migrateDemoDataToCloud: () => Promise<boolean>;
+  reloadWorkspaceCatalog: () => Promise<void>;
+}
+
+export const DemoCatalogMigrationSection: React.FC<DemoCatalogMigrationSectionProps> = ({
+  isAuthenticated,
+  openAuthModal,
+  overwriteProtection,
+  confirmingDemoOverwrite,
+  setConfirmingDemoOverwrite,
+  isMigratingDemo,
+  setIsMigratingDemo,
+  cloudCatalogStatus,
+  catalogVersion,
+  migrateDemoDataToCloud,
+  reloadWorkspaceCatalog,
+}) => (
+  <div className="border border-stone-200 rounded-xl p-4 bg-white space-y-3">
+    <div className="flex items-center gap-2">
+      <UploadCloud className="w-4 h-4 text-orange-600" />
+      <h4 className="text-xs font-bold text-stone-900">Demo Catalog Migration Path</h4>
+    </div>
+    <p className="text-xs text-stone-600 leading-relaxed">
+      Import the verified Solstice Mercantile demo catalog fixtures (184 products, variants, commercial offers, audit findings, remediation actions, and evidence documents) directly into your cloud workspace database for evaluation.
+    </p>
+    {confirmingDemoOverwrite ? (
+      <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2.5">
+        {overwriteProtection.isUnknownState ? (
+          <p className="text-xs text-amber-900 font-medium leading-relaxed">
+            The active cloud workspace catalog state has not finished loading or failed to verify (status:{' '}
+            <span className="font-mono">{cloudCatalogStatus ?? 'unknown'}</span>). Proceeding will replace all 6 workspace catalog collections (products, variants, offers, findings, actions, and evidence) with demo fixtures or be rejected with a 409 conflict if the workspace was already initialized. Reload the catalog first or confirm explicit replacement below.
+          </p>
+        ) : (
+          <p className="text-xs text-amber-900 font-medium leading-relaxed">
+            {overwriteProtection.nonEmptyCategories.length > 0
+              ? `Your active cloud workspace currently contains ${overwriteProtection.nonEmptyCategories
+                  .map(c => `${c.count} ${c.label}`)
+                  .join(', ')}. `
+              : `Your active cloud workspace catalog is already initialized (version ${catalogVersion ?? 1}). `}
+            Demo catalog migration replaces all 6 collections (products, variants, offers, findings, actions, and evidence) using optimistic version verification and rejects automatically if another session updates the catalog first.
+          </p>
+        )}
+        <div className="flex flex-wrap items-center gap-2">
+          {overwriteProtection.isUnknownState && (
+            <button
+              type="button"
+              disabled={isMigratingDemo}
+              onClick={async () => {
+                await reloadWorkspaceCatalog();
+              }}
+              className="px-3.5 py-1.5 bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+            >
+              Reload Catalog State
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={isMigratingDemo}
+            onClick={async () => {
+              setIsMigratingDemo(true);
+              try {
+                await migrateDemoDataToCloud();
+              } finally {
+                setIsMigratingDemo(false);
+                setConfirmingDemoOverwrite(false);
+              }
+            }}
+            className="px-3.5 py-1.5 bg-amber-700 hover:bg-amber-800 text-white text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+          >
+            {isMigratingDemo ? 'Replacing Catalog...' : 'Confirm Replace Workspace Catalog'}
+          </button>
+          <button
+            type="button"
+            disabled={isMigratingDemo}
+            onClick={() => setConfirmingDemoOverwrite(false)}
+            className="px-3.5 py-1.5 bg-white border border-stone-300 hover:bg-stone-50 text-stone-700 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    ) : (
+      <button
+        type="button"
+        disabled={isMigratingDemo}
+        onClick={async () => {
+          if (!isAuthenticated) {
+            openAuthModal('register');
+            return;
+          }
+          if (overwriteProtection.requiresConfirmation) {
+            setConfirmingDemoOverwrite(true);
+            return;
+          }
+          setIsMigratingDemo(true);
+          try {
+            await migrateDemoDataToCloud();
+          } finally {
+            setIsMigratingDemo(false);
+          }
+        }}
+        className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 disabled:opacity-50 cursor-pointer"
+      >
+        <RefreshCw className={`w-3.5 h-3.5 ${isMigratingDemo ? 'animate-spin' : ''}`} />
+        <span>{isMigratingDemo ? 'Importing Fixtures...' : 'Import Demo Catalog into Active Workspace'}</span>
+      </button>
+    )}
+  </div>
+);
+
+export type SettingsTabId = 'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics';
+
+export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initialTab = 'profile' }) => {
   const { 
     storeProfile, 
     updateStoreProfile, 
@@ -40,8 +167,30 @@ export const SettingsPage: React.FC = () => {
     isCloudWorkspace,
     migrateDemoDataToCloud,
     products,
+    variantsCount,
+    offersCount,
+    findings,
+    actionItems,
+    evidenceCount,
+    cloudCatalogStatus,
+    catalogVersion,
+    demoOverwriteProtection,
     reloadWorkspaceCatalog
   } = useApp();
+
+  const overwriteProtection =
+    demoOverwriteProtection ??
+    evaluateDemoOverwriteProtection({
+      isCloudWorkspace,
+      cloudCatalogStatus: cloudCatalogStatus ?? 'idle',
+      catalogVersion,
+      productsCount: products?.length ?? 0,
+      variantsCount: variantsCount ?? 0,
+      offersCount: offersCount ?? 0,
+      findingsCount: findings?.length ?? 0,
+      actionsCount: actionItems?.length ?? 0,
+      evidenceCount: evidenceCount ?? 0,
+    });
 
   const {
     user,
@@ -52,7 +201,7 @@ export const SettingsPage: React.FC = () => {
     switchWorkspace
   } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics'>('profile');
+  const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [storeName, setStoreName] = useState(storeProfile.name);
   const [storeDomain, setStoreDomain] = useState(storeProfile.domain);
   const [currency, setCurrency] = useState(storeProfile.currency);
@@ -514,70 +663,19 @@ export const SettingsPage: React.FC = () => {
           )}
 
           {/* Migration Path: Import Demo Catalog into Workspace */}
-          <div className="border border-stone-200 rounded-xl p-4 bg-white space-y-3">
-            <div className="flex items-center gap-2">
-              <UploadCloud className="w-4 h-4 text-orange-600" />
-              <h4 className="text-xs font-bold text-stone-900">Demo Catalog Migration Path</h4>
-            </div>
-            <p className="text-xs text-stone-600 leading-relaxed">
-              Import the verified Solstice Mercantile demo catalog fixtures (184 products, variants, audit findings, and action items) directly into your cloud workspace database for evaluation.
-            </p>
-            {confirmingDemoOverwrite ? (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2.5">
-                <p className="text-xs text-amber-900 font-medium leading-relaxed">
-                  Your active cloud workspace currently has {products.length} product{products.length === 1 ? '' : 's'}. Replacing it with demo fixtures uses optimistic version verification and will reject automatically if another session updates the catalog first.
-                </p>
-                <div className="flex items-center gap-2">
-                  <button
-                    disabled={isMigratingDemo}
-                    onClick={async () => {
-                      setIsMigratingDemo(true);
-                      try {
-                        await migrateDemoDataToCloud();
-                      } finally {
-                        setIsMigratingDemo(false);
-                        setConfirmingDemoOverwrite(false);
-                      }
-                    }}
-                    className="px-3.5 py-1.5 bg-amber-700 hover:bg-amber-800 text-white text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
-                  >
-                    {isMigratingDemo ? 'Replacing Catalog...' : 'Confirm Replace Workspace Catalog'}
-                  </button>
-                  <button
-                    disabled={isMigratingDemo}
-                    onClick={() => setConfirmingDemoOverwrite(false)}
-                    className="px-3.5 py-1.5 bg-white border border-stone-300 hover:bg-stone-50 text-stone-700 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <button
-                disabled={isMigratingDemo}
-                onClick={async () => {
-                  if (!isAuthenticated) {
-                    openAuthModal('register');
-                    return;
-                  }
-                  if (isCloudWorkspace && products.length > 0) {
-                    setConfirmingDemoOverwrite(true);
-                    return;
-                  }
-                  setIsMigratingDemo(true);
-                  try {
-                    await migrateDemoDataToCloud();
-                  } finally {
-                    setIsMigratingDemo(false);
-                  }
-                }}
-                className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 disabled:opacity-50 cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isMigratingDemo ? 'animate-spin' : ''}`} />
-                <span>{isMigratingDemo ? 'Importing Fixtures...' : 'Import Demo Catalog into Active Workspace'}</span>
-              </button>
-            )}
-          </div>
+          <DemoCatalogMigrationSection
+            isAuthenticated={isAuthenticated}
+            openAuthModal={openAuthModal}
+            overwriteProtection={overwriteProtection}
+            confirmingDemoOverwrite={confirmingDemoOverwrite}
+            setConfirmingDemoOverwrite={setConfirmingDemoOverwrite}
+            isMigratingDemo={isMigratingDemo}
+            setIsMigratingDemo={setIsMigratingDemo}
+            cloudCatalogStatus={cloudCatalogStatus}
+            catalogVersion={catalogVersion}
+            migrateDemoDataToCloud={migrateDemoDataToCloud}
+            reloadWorkspaceCatalog={reloadWorkspaceCatalog}
+          />
 
           {/* Multi-Tenant Security & Durability Architecture */}
           <div className="bg-stone-50 rounded-xl p-4 border border-stone-200 space-y-3 text-xs">
@@ -624,7 +722,7 @@ export const SettingsPage: React.FC = () => {
                     </span>
                   </div>
                   <p className="text-xs text-stone-500 mt-0.5">
-                    Real-time bidirectional catalog synchronization, webhook listeners, and AES-256-GCM token security.
+                    Read-only Shopify catalog synchronization, webhook listeners, and AES-256-GCM token security.
                   </p>
                 </div>
               </div>
@@ -1090,7 +1188,7 @@ export const SettingsPage: React.FC = () => {
               <p className="text-xs text-stone-500">Workspace scale limits and demo plan parameters (unverified entitlement)</p>
             </div>
             <span className="text-xs font-mono font-bold text-orange-700 bg-orange-50 px-2 py-0.5 rounded border border-orange-200">
-              {storeProfile.tier} (Demo Fixture)
+              {isCloudWorkspace ? `${storeProfile.tier} (Workspace Limit)` : `${storeProfile.tier} (Demo Fixture)`}
             </span>
           </div>
 
@@ -1134,19 +1232,27 @@ export const SettingsPage: React.FC = () => {
                   Not Configured
                 </span>
               </div>
-              <p className="text-base font-bold text-stone-900 font-mono">$179 / mo</p>
-              <p className="text-stone-500">Target tier reference · No active billing provider</p>
+              <p className="text-base font-bold text-stone-900 font-mono">
+                {storeProfile.tier?.toLowerCase().includes('enterprise')
+                  ? '$499 / mo'
+                  : storeProfile.tier?.toLowerCase().includes('growth')
+                  ? '$149 / mo'
+                  : storeProfile.tier?.toLowerCase().includes('starter')
+                  ? '$49 / mo'
+                  : '$0 / mo'}
+              </p>
+              <p className="text-stone-500">Authoritative server tier price · Live Stripe checkout depends on server credentials</p>
             </div>
 
             <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
               <div className="flex items-center justify-between">
-                <span className="text-stone-500">Audit & Sync</span>
+                <span className="text-stone-500">Audit &amp; Sync</span>
                 <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-600 border border-stone-200">
-                  Manual Only
+                  On-Demand
                 </span>
               </div>
               <p className="text-base font-bold text-stone-900 font-mono">On-Demand</p>
-              <p className="text-stone-500">Live webhook synchronization not configured</p>
+              <p className="text-stone-500">Manual audit execution; Shopify webhook handling requires live store credentials</p>
             </div>
 
             <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
@@ -1163,7 +1269,7 @@ export const SettingsPage: React.FC = () => {
 
           <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200 text-xs text-stone-600">
             <strong className="block mb-0.5 text-stone-800">Integration Notice:</strong>
-            Recurring billing, payment gateways, live webhook listeners, and paid SaaS entitlements are not implemented in this workspace. Displayed metrics and capacity allowances serve as local application constraints.
+            Server billing services (authoritative tier pricing, SKU quota enforcement, Stripe checkout/webhook signature handlers, and leased webhook idempotency) are implemented in the backend, while this panel displays your workspace SKU capacity. Live Stripe payments remain unconfigured and unverified until <code className="font-mono">STRIPE_SECRET_KEY</code>, <code className="font-mono">STRIPE_WEBHOOK_SECRET</code>, and Stripe Price IDs are provisioned.
           </div>
         </div>
       )}

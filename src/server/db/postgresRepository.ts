@@ -101,8 +101,13 @@ export class PostgresRepository implements DatabaseRepository {
     const ctx = this.lockStorage.getStore();
     if (ctx) {
       if (!ctx.inTransaction) {
+        try {
+          await ctx.client.query('BEGIN');
+        } catch (beginErr) {
+          ctx.poisoned = true;
+          throw beginErr;
+        }
         ctx.inTransaction = true;
-        await ctx.client.query('BEGIN');
         try {
           const result = await fn(ctx.client);
           await ctx.client.query('COMMIT');
@@ -121,7 +126,13 @@ export class PostgresRepository implements DatabaseRepository {
       } else {
         ctx.savepointDepth += 1;
         const spName = `aixshop_sp_${ctx.savepointDepth}`;
-        await ctx.client.query(`SAVEPOINT ${spName}`);
+        try {
+          await ctx.client.query(`SAVEPOINT ${spName}`);
+        } catch (spErr) {
+          ctx.savepointDepth -= 1;
+          ctx.poisoned = true;
+          throw spErr;
+        }
         try {
           const result = await fn(ctx.client);
           await ctx.client.query(`RELEASE SAVEPOINT ${spName}`);
@@ -141,20 +152,46 @@ export class PostgresRepository implements DatabaseRepository {
     }
 
     const client = await this.pool.connect();
+    let begun = false;
+    let poisoned = false;
+    let released = false;
+    const releaseOnce = (destroy: boolean) => {
+      if (released) return;
+      released = true;
+      try {
+        if (destroy) {
+          (client.release as any)(true);
+        } else {
+          client.release();
+        }
+      } catch {
+        // ignore secondary release errors while preserving original operation error
+      }
+    };
+
     try {
-      await client.query('BEGIN');
+      try {
+        await client.query('BEGIN');
+        begun = true;
+      } catch (beginErr) {
+        poisoned = true;
+        throw beginErr;
+      }
       const result = await fn(client);
       await client.query('COMMIT');
       return result;
     } catch (err) {
-      try {
-        await client.query('ROLLBACK');
-      } catch (rollbackErr) {
-        console.error('[AIXSHOP Database] Rollback failed:', rollbackErr);
+      if (begun) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+          poisoned = true;
+          console.error('[AIXSHOP Database] Rollback failed; connection marked for destruction:', rollbackErr);
+        }
       }
       throw err;
     } finally {
-      client.release();
+      releaseOnce(poisoned);
     }
   }
 
@@ -1452,10 +1489,27 @@ export class PostgresRepository implements DatabaseRepository {
       }
 
       while (true) {
-        const res = await existingCtx.client.query<{ locked: boolean }>(
-          `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
-          [workspaceId]
-        );
+        let nestedLockAttempted = false;
+        let nestedLockOutcomeKnown = false;
+        let res: { rows: Array<{ locked: boolean }> };
+        try {
+          nestedLockAttempted = true;
+          res = await existingCtx.client.query<{ locked: boolean }>(
+            `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
+            [workspaceId]
+          );
+          nestedLockOutcomeKnown = true;
+        } catch (acqErr) {
+          if (nestedLockAttempted && !nestedLockOutcomeKnown) {
+            existingCtx.poisoned = true;
+            console.error(
+              `[AIXSHOP Workspace Lock] Nested pg_try_advisory_lock failed with uncertain server lock state for workspace "${workspaceId}"; connection marked for destruction.`,
+              acqErr
+            );
+          }
+          throw acqErr;
+        }
+
         if (res.rows[0]?.locked) {
           existingCtx.heldWorkspaceLocks.add(workspaceId);
           let operationResult: T;
@@ -1504,16 +1558,35 @@ export class PostgresRepository implements DatabaseRepository {
 
     while (true) {
       const client = await this.pool.connect();
+      let lockAttempted = false;
+      let lockOutcomeKnown = false;
       let lockAcquiredNow = false;
+      let released = false;
+      const releaseOnce = (destroy: boolean) => {
+        if (released) return;
+        released = true;
+        try {
+          if (destroy) {
+            (client.release as any)(true);
+          } else {
+            client.release();
+          }
+        } catch {
+          // ignore secondary release errors
+        }
+      };
+
       try {
+        lockAttempted = true;
         const res = await client.query<{ locked: boolean }>(
           `SELECT pg_try_advisory_lock(hashtext('aixshop_ws'), hashtext($1)) AS locked`,
           [workspaceId]
         );
+        lockOutcomeKnown = true;
         lockAcquiredNow = Boolean(res.rows[0]?.locked);
         if (!lockAcquiredNow) {
           // Release connection immediately before backing off so waiters cannot exhaust the pool
-          client.release();
+          releaseOnce(false);
         } else {
           const lockCtx: WorkspaceLockContext = {
             client,
@@ -1540,20 +1613,19 @@ export class PostgresRepository implements DatabaseRepository {
             } catch {
               destroyClient = true;
             }
-            if (destroyClient || lockCtx.poisoned) {
-              (client.release as any)(true);
-            } else {
-              client.release();
-            }
+            releaseOnce(destroyClient || lockCtx.poisoned);
           }
         }
       } catch (err) {
         if (!lockAcquiredNow) {
-          try {
-            client.release();
-          } catch {
-            // ignore already released
+          const lockStateUncertain = lockAttempted && !lockOutcomeKnown;
+          if (lockStateUncertain) {
+            console.error(
+              `[AIXSHOP Workspace Lock] Outer pg_try_advisory_lock failed with uncertain server lock state for workspace "${workspaceId}"; destroying connection.`,
+              err
+            );
           }
+          releaseOnce(lockStateUncertain);
         }
         throw err;
       }

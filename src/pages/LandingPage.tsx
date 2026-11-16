@@ -127,16 +127,16 @@ export const LandingPage: React.FC = () => {
             {/* Quick Proof Strip */}
             <div className="pt-2 grid grid-cols-3 gap-4 border-t border-stone-200/80">
               <div>
-                <p className="text-2xl font-bold font-mono text-stone-900 tabular-nums">100%</p>
-                <p className="text-xs text-stone-500 mt-0.5">Evidence-Gated Checks</p>
+                <p className="text-2xl font-bold font-mono text-stone-900 tabular-nums">Rule + Review</p>
+                <p className="text-xs text-stone-500 mt-0.5">Automated + Evidence Checks</p>
               </div>
               <div>
                 <p className="text-2xl font-bold font-mono text-stone-900 tabular-nums">Product ≠ Offer</p>
                 <p className="text-xs text-stone-500 mt-0.5">Canonical Data Model</p>
               </div>
               <div>
-                <p className="text-2xl font-bold font-mono text-stone-900 tabular-nums">Zero Claims</p>
-                <p className="text-xs text-stone-500 mt-0.5">No Fake AI Ranking Hype</p>
+                <p className="text-2xl font-bold font-mono text-stone-900 tabular-nums">No Ranking Claims</p>
+                <p className="text-xs text-stone-500 mt-0.5">Strict Discovery Boundary</p>
               </div>
             </div>
           </div>
@@ -219,8 +219,8 @@ export const LandingPage: React.FC = () => {
             )}
 
             <div className="mt-4 pt-3 border-t border-stone-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-stone-500">
-              <span>Evaluates: Schema.org JSON-LD · Variant GTIN/UPC completeness · Attribute conflicts</span>
-              <span className="font-mono text-stone-400">Demonstration analysis preview mode</span>
+              <span>Evaluates: Variant GTIN/UPC completeness · Attribute &amp; schema gaps · Claim conflicts</span>
+              <span className="font-mono text-stone-400">Solstice demo fixture or public 25-product sample scan</span>
             </div>
           </form>
 
@@ -500,7 +500,7 @@ export const LandingPage: React.FC = () => {
             Why Catalog Completeness Governs AI Discovery
           </h2>
           <p className="text-sm text-stone-600 mt-2 leading-relaxed">
-            AI shopping models do not guess. If a spec is missing, contradictory, or unevidenced, the assistant drops the product or reports uncertainty.
+            Missing or conflicting product attributes can reduce machine-readable clarity and may result in incomplete product information. AIXSHOP identifies these catalog data-quality issues and provides evidence-backed recommendations.
           </p>
         </div>
 
@@ -531,7 +531,7 @@ export const LandingPage: React.FC = () => {
                 Evidence-Backed Verification
               </h3>
               <p className="text-xs text-stone-600 mt-2 leading-relaxed">
-                Unsubstantiated claims (e.g. "organic", "fair trade", "biodegradable") without certifying registry documents trigger greenwashing flags. We attach verified proof to every claim.
+                Unsubstantiated claims (e.g. &quot;organic&quot;, &quot;fair trade&quot;, &quot;biodegradable&quot;) without certifying registry documents trigger claim-evidence findings. AIXSHOP helps merchants attach supporting documents for manual review.
               </p>
             </div>
             <div className="mt-6 pt-4 border-t border-stone-100 text-xs font-mono text-stone-500">
@@ -587,7 +587,10 @@ export const LandingPage: React.FC = () => {
             Transparent Pricing by Catalog Capacity
           </h2>
           <p className="text-sm text-stone-600 mt-2">
-            Pricing scaled by verified SKU limits with full audit capabilities included across all plans.
+            Pricing scaled by verified SKU limits with manual audit and remediation workflows across all plans.
+          </p>
+          <p className="text-xs text-stone-500 mt-1.5">
+            Live recurring checkout requires configured server Stripe credentials; unconfigured preview environments operate on Free Audit limits.
           </p>
         </div>
 
@@ -599,32 +602,32 @@ export const LandingPage: React.FC = () => {
               <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$49<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
               <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
                 <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Up to 250 SKUs</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Daily catalog schema audit</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> GTIN & barcode consistency check</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> 1 Storefront connector (Shopify / Woo)</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> On-demand catalog schema audit</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> GTIN &amp; barcode consistency check</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Read-only Shopify OAuth catalog sync</li>
               </ul>
             </div>
             <button
               onClick={() => navigateTo('home')}
               className="mt-8 w-full py-2.5 text-xs font-semibold bg-stone-100 hover:bg-stone-200 text-stone-900 rounded-xl transition-colors min-h-[44px]"
             >
-              Start Free Trial
+              Open Starter Preview
             </button>
           </div>
 
           <div className="bg-white border-2 border-orange-600 rounded-2xl p-6 flex flex-col justify-between relative shadow-md">
             <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-orange-600 text-white text-[11px] font-bold rounded-full uppercase tracking-wider">
-              Current Active Store Tier
+              Demo Reference Tier
             </div>
             <div>
               <span className="text-xs font-semibold text-orange-700">For Growing Stores</span>
               <h3 className="text-xl font-bold text-stone-900 mt-1">Growth Tier</h3>
-              <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$179<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
+              <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$149<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
               <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
                 <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Up to 2,500 SKUs</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Continuous audit & conflict detection</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Rule-based audit &amp; conflict detection</li>
                 <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Evidence document registry</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Multi-channel feeds (Shopify + Google)</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Google Merchant Center feed readiness</li>
                 <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Merchant remediation queue with re-check</li>
               </ul>
             </div>
@@ -632,7 +635,7 @@ export const LandingPage: React.FC = () => {
               onClick={() => navigateTo('home')}
               className="mt-8 w-full py-2.5 text-xs font-semibold bg-orange-600 hover:bg-orange-700 text-white rounded-xl transition-colors min-h-[44px]"
             >
-              Access Current Account
+              Open Workspace App
             </button>
           </div>
 
@@ -642,17 +645,17 @@ export const LandingPage: React.FC = () => {
               <h3 className="text-xl font-bold text-stone-900 mt-1">Enterprise Tier</h3>
               <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$499<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
               <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Unlimited SKUs & feeds</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Custom ERP & warehouse API connectors</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Dedicated evidence verification specialist</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Automated write-back hooks (authorized)</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Unlimited SKUs &amp; catalog audits</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Workspace-isolated PostgreSQL storage</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Historical audit snapshot &amp; diff reports</li>
+                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> CSV &amp; structured feed export</li>
               </ul>
             </div>
             <button
               onClick={() => navigateTo('settings')}
               className="mt-8 w-full py-2.5 text-xs font-semibold bg-stone-100 hover:bg-stone-200 text-stone-900 rounded-xl transition-colors min-h-[44px]"
             >
-              Contact Sales
+              View Plan Configuration
             </button>
           </div>
         </div>
@@ -691,7 +694,7 @@ export const LandingPage: React.FC = () => {
                 Does approving a correction write directly to my live store?
               </h3>
               <p className="text-xs text-stone-600 mt-1.5 leading-relaxed">
-                Approval in AIXSHOP verifies the remediation in your intelligence catalog. Live write-back to Shopify or your ERP requires explicit connector authorization with write permissions configured in Store / Settings.
+                Approval in AIXSHOP updates your verified workspace intelligence catalog and audit trail only. Live write-back to Shopify or external ERPs is not implemented in this version; Shopify integration operates in read-only catalog sync mode.
               </p>
             </div>
           </div>

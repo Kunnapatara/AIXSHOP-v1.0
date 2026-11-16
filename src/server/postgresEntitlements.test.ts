@@ -1,5 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { Pool } from 'pg';
 import { PostgresRepository } from './db/postgresRepository';
 import { 
@@ -1155,11 +1156,12 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
 
     test('21. Live PostgreSQL: Real transactions, quota enforcement, and multi-connection concurrency', { skip: skipReason }, async () => {
       const pool = new Pool(buildLivePoolConfig(5));
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const testWsId = `ws_live_${runId}`;
+      const testUserId = `usr_live_${runId}`;
 
       try {
         const pgRepo = new PostgresRepository(pool);
-        const testWsId = `ws_live_${Date.now()}`;
-        const testUserId = `usr_live_${Date.now()}`;
 
         // Initialize test user, workspace, and store in Starter tier (250 SKUs)
         await pool.query(
@@ -1168,7 +1170,7 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
         );
         await pool.query(
           'INSERT INTO workspaces (id, name, slug) VALUES ($1, $2, $3)',
-          [testWsId, 'Live Test Workspace', `live-${Date.now()}`]
+          [testWsId, 'Live Test Workspace', `live-${runId}`]
         );
         await pool.query(
           'INSERT INTO workspace_memberships (id, workspace_id, user_id, role) VALUES ($1, $2, $3, $4)',
@@ -1184,7 +1186,7 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
         // Two connections simultaneously try to import candidate batches (150 SKUs each).
         // Since Starter limit is 250, only one batch can succeed without oversubscribing!
         const batchA = Array.from({ length: 15 }, (_, i) => ({
-          id: `p_a_${i}`,
+          id: `${runId}_p_a_${i}`,
           title: `Product A ${i}`,
           brand: 'Test',
           category: 'Apparel',
@@ -1196,8 +1198,8 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
           externalDiscoveryStatus: 'observed_in_sample',
           attributes: {},
           variants: Array.from({ length: 10 }, (_, j) => ({
-            id: `var_a_${i}_${j}`,
-            sku: `SKU-A-${i}-${j}`,
+            id: `${runId}_var_a_${i}_${j}`,
+            sku: `SKU-A-${runId}-${i}-${j}`,
             title: `V${j}`,
             barcode: '',
             price: 10,
@@ -1211,7 +1213,7 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
         })); // 15 products * 10 variants = 150 SKUs
 
         const batchB = Array.from({ length: 15 }, (_, i) => ({
-          id: `p_b_${i}`,
+          id: `${runId}_p_b_${i}`,
           title: `Product B ${i}`,
           brand: 'Test',
           category: 'Apparel',
@@ -1223,8 +1225,8 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
           externalDiscoveryStatus: 'observed_in_sample',
           attributes: {},
           variants: Array.from({ length: 10 }, (_, j) => ({
-            id: `var_b_${i}_${j}`,
-            sku: `SKU-B-${i}-${j}`,
+            id: `${runId}_var_b_${i}_${j}`,
+            sku: `SKU-B-${runId}-${i}-${j}`,
             title: `V${j}`,
             barcode: '',
             price: 10,
@@ -1264,11 +1266,9 @@ describe('AIXSHOP v1.0 — PostgreSQL Entitlement Persistence & Plan Integrity S
           assert.match(err.message, /Intentional transaction abort/);
         }
         assert.equal(rollbackThrew, true, 'Error must propagate');
-
-        // Clean up test workspace
-        await pool.query('DELETE FROM workspaces WHERE id = $1', [testWsId]);
-        await pool.query('DELETE FROM users WHERE id = $1', [testUserId]);
       } finally {
+        await pool.query('DELETE FROM workspaces WHERE id = $1', [testWsId]).catch(() => {});
+        await pool.query('DELETE FROM users WHERE id = $1', [testUserId]).catch(() => {});
         await pool.end();
       }
     });

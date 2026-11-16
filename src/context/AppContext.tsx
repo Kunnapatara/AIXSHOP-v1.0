@@ -2,6 +2,9 @@ import React, { createContext, useContext, useState, useMemo, useEffect, ReactNo
 import { 
   NavigationPage, 
   Product, 
+  Variant,
+  Offer,
+  EvidenceDocument,
   Finding, 
   ActionItem, 
   StoreProfile, 
@@ -32,6 +35,11 @@ import {
   applyConnectorToggle 
 } from '../domain/settings/settingsService';
 import { executeCatalogAudit } from '../domain/audit/auditEngine';
+import {
+  evaluateDemoOverwriteProtection,
+  CloudCatalogLoadStatus,
+  DemoOverwriteProtectionEvaluation,
+} from '../domain/catalog/demoMigrationProtection';
 import { useAuth } from './AuthContext';
 import { apiClient } from '../api/client';
 
@@ -42,15 +50,18 @@ export interface ToastMessage {
   message: string;
 }
 
-interface AppContextType {
+export interface AppContextType {
   currentPage: NavigationPage;
   previousPage: NavigationPage;
   selectedProductId: string | null;
   selectedActionId: string | null;
   storeProfile: StoreProfile;
   products: Product[];
+  variantsCount: number;
+  offersCount: number;
   findings: Finding[];
   actionItems: ActionItem[];
+  evidenceCount: number;
   toasts: ToastMessage[];
   quickCheckResult: QuickHealthCheckResult | null;
   lastIngestionResult: StoreIngestionResult | null;
@@ -62,6 +73,9 @@ interface AppContextType {
   storageLoadResult: StorageLoadResult | null;
   isDurableStorage: boolean;
   isCloudWorkspace: boolean;
+  cloudCatalogStatus: CloudCatalogLoadStatus;
+  catalogVersion?: number;
+  demoOverwriteProtection: DemoOverwriteProtectionEvaluation;
   setMobileMenuOpen: (open: boolean) => void;
   setSelectedActionId: (id: string | null) => void;
   navigateTo: (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => void;
@@ -83,7 +97,7 @@ interface AppContextType {
   reloadWorkspaceCatalog: () => Promise<void>;
 }
 
-const AppContext = createContext<AppContextType | undefined>(undefined);
+export const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?: CatalogStorageAdapter }> = ({ 
   children, 
@@ -98,8 +112,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
   const [storeProfile, setStoreProfile] = useState<StoreProfile>(initialStoreProfile);
   const [products, setProducts] = useState<Product[]>(initialProducts);
+  const [variants, setVariants] = useState<Variant[]>(() => initialProducts.flatMap(p => p.variants || []));
+  const [offers, setOffers] = useState<Offer[]>(() => initialProducts.flatMap(p => p.offers || []));
   const [findings, setFindings] = useState<Finding[]>(initialFindings);
   const [actionItems, setActionItems] = useState<ActionItem[]>(initialActionItems);
+  const [evidence, setEvidence] = useState<EvidenceDocument[]>(() => initialProducts.flatMap(p => p.evidenceDocuments || []));
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [quickCheckResult, setQuickCheckResult] = useState<QuickHealthCheckResult | null>(null);
   const [lastIngestionResult, setLastIngestionResult] = useState<StoreIngestionResult | null>(null);
@@ -108,6 +125,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [isReadOnlyMode, setIsReadOnlyMode] = useState<boolean>(false);
   const [readOnlyReason, setReadOnlyReason] = useState<string | null>(null);
   const [storageLoadResult, setStorageLoadResult] = useState<StorageLoadResult | null>(null);
+  const [cloudCatalogStatus, setCloudCatalogStatus] = useState<CloudCatalogLoadStatus>('idle');
+  const [catalogVersion, setCatalogVersion] = useState<number | undefined>(undefined);
 
   const isInitializedRef = useRef<boolean>(false);
   const catalogVersionRef = useRef<number | undefined>(undefined);
@@ -168,10 +187,24 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     return res;
   };
 
+  const applyCatalogSnapshot = (cat: StoragePayloadV1) => {
+    catalogVersionRef.current = cat.catalogVersion;
+    setCatalogVersion(cat.catalogVersion);
+    setProducts(cat.products);
+    setVariants(cat.variants && cat.variants.length > 0 ? cat.variants : cat.products.flatMap(p => p.variants || []));
+    setOffers(cat.offers && cat.offers.length > 0 ? cat.offers : cat.products.flatMap(p => p.offers || []));
+    setFindings(cat.findings);
+    setActionItems(cat.actions);
+    setEvidence(cat.evidence && cat.evidence.length > 0 ? cat.evidence : cat.products.flatMap(p => p.evidenceDocuments || []));
+    setStoreProfile(cat.storeProfile);
+  };
+
   // Hydrate: Cloud API if authenticated in active workspace; otherwise local storage adapter
   useEffect(() => {
     if (!isCloudWorkspace) {
       catalogVersionRef.current = undefined;
+      setCatalogVersion(undefined);
+      setCloudCatalogStatus('idle');
       if (!isInitializedRef.current) {
         isInitializedRef.current = true;
         const result = storageAdapter.load();
@@ -180,8 +213,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         if (result.type === 'valid') {
           const p = result.envelope.payload;
           setProducts(p.products);
+          setVariants(p.variants && p.variants.length > 0 ? p.variants : p.products.flatMap(pr => pr.variants || []));
+          setOffers(p.offers && p.offers.length > 0 ? p.offers : p.products.flatMap(pr => pr.offers || []));
           setFindings(p.findings);
           setActionItems(p.actions);
+          setEvidence(p.evidence && p.evidence.length > 0 ? p.evidence : p.products.flatMap(pr => pr.evidenceDocuments || []));
           setStoreProfile(p.storeProfile);
           addToast('Demo Session Loaded', 'Your local demo workspace catalog has been loaded.', 'info');
         } else if (result.type === 'not_found') {
@@ -213,14 +249,12 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     // Authenticated Cloud Workspace mode: Load from backend API
     let isCancelled = false;
     async function loadCloudCatalog() {
+      setCloudCatalogStatus('loading');
       try {
         const res = await apiClient.getCatalog();
         if (isCancelled) return;
-        catalogVersionRef.current = res.catalog.catalogVersion;
-        setProducts(res.catalog.products);
-        setFindings(res.catalog.findings);
-        setActionItems(res.catalog.actions);
-        setStoreProfile(res.catalog.storeProfile);
+        applyCatalogSnapshot(res.catalog);
+        setCloudCatalogStatus('loaded');
         setIsReadOnlyMode(false);
         setReadOnlyReason(null);
         addToast(
@@ -230,6 +264,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         );
       } catch (err: any) {
         if (isCancelled) return;
+        setCloudCatalogStatus('error');
         console.error('[AIXSHOP Cloud] Failed to load workspace catalog:', err);
         addToast(
           'Cloud Catalog Error',
@@ -337,11 +372,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         const res = await apiClient.importCatalog(lastIngestionResult.candidateProducts);
         if (res.success && res.result) {
           const catRes = await apiClient.getCatalog();
-          catalogVersionRef.current = catRes.catalog.catalogVersion;
-          setProducts(catRes.catalog.products);
-          setFindings(catRes.catalog.findings);
-          setActionItems(catRes.catalog.actions);
-          setStoreProfile(catRes.catalog.storeProfile);
+          applyCatalogSnapshot(catRes.catalog);
+          setCloudCatalogStatus('loaded');
           addToast('Catalog Import Complete', res.result.message, 'success');
           return res.result;
         }
@@ -416,6 +448,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
+            setCatalogVersion(res.catalogVersion);
           } else {
             await reloadWorkspaceCatalog();
           }
@@ -486,6 +519,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
+            setCatalogVersion(res.catalogVersion);
           } else {
             await reloadWorkspaceCatalog();
           }
@@ -537,6 +571,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
+            setCatalogVersion(res.catalogVersion);
           } else {
             await reloadWorkspaceCatalog();
           }
@@ -620,6 +655,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
         if (typeof saveRes.catalogVersion === 'number') {
           catalogVersionRef.current = saveRes.catalogVersion;
+          setCatalogVersion(saveRes.catalogVersion);
         }
       } catch (err: any) {
         if (err.status === 409 || err.code === 'CATALOG_VERSION_CONFLICT') {
@@ -766,14 +802,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       const res = await apiClient.migrateDemoData(expectedVersion);
       if (res.success) {
         const catRes = await apiClient.getCatalog();
-        catalogVersionRef.current =
+        applyCatalogSnapshot(catRes.catalog);
+        const nextVer =
           typeof res.catalogVersion === 'number'
             ? res.catalogVersion
             : catRes.catalog.catalogVersion;
-        setProducts(catRes.catalog.products);
-        setFindings(catRes.catalog.findings);
-        setActionItems(catRes.catalog.actions);
-        setStoreProfile(catRes.catalog.storeProfile);
+        catalogVersionRef.current = nextVer;
+        setCatalogVersion(nextVer);
+        setCloudCatalogStatus('loaded');
         addToast(
           'Demo Catalog Imported',
           `Successfully migrated ${res.skuCount} demo products into your cloud workspace "${authContext.activeWorkspace.name}".`,
@@ -802,11 +838,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       try {
         const res = await apiClient.runAudit();
         if (res.success && res.catalog) {
-          catalogVersionRef.current = res.catalog.catalogVersion;
-          setProducts(res.catalog.products);
-          setFindings(res.catalog.findings);
-          setActionItems(res.catalog.actions);
-          setStoreProfile(res.catalog.storeProfile);
+          applyCatalogSnapshot(res.catalog);
+          setCloudCatalogStatus('loaded');
           addToast(
             'Audit Completed',
             `Audit evaluated ${res.auditRun.productsEvaluated} products across ${res.auditRun.rulesEvaluated} rule checks. Results durably persisted.`,
@@ -863,8 +896,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
     storageAdapter.clear();
     setProducts(initialProducts);
+    setVariants(initialProducts.flatMap(p => p.variants || []));
+    setOffers(initialProducts.flatMap(p => p.offers || []));
     setFindings(initialFindings);
     setActionItems(initialActionItems);
+    setEvidence(initialProducts.flatMap(p => p.evidenceDocuments || []));
     setStoreProfile(initialStoreProfile);
     persistState(initialProducts, initialFindings, initialActionItems, initialStoreProfile);
     addToast('Catalog Reset', 'Reset all catalog data to default Solstice seed fixtures.', 'info');
@@ -872,18 +908,43 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const reloadWorkspaceCatalog = async () => {
     if (isCloudWorkspace) {
+      setCloudCatalogStatus('loading');
       try {
         const res = await apiClient.getCatalog();
-        catalogVersionRef.current = res.catalog.catalogVersion;
-        setProducts(res.catalog.products);
-        setFindings(res.catalog.findings);
-        setActionItems(res.catalog.actions);
-        setStoreProfile(res.catalog.storeProfile);
+        applyCatalogSnapshot(res.catalog);
+        setCloudCatalogStatus('loaded');
       } catch (err: any) {
+        setCloudCatalogStatus('error');
         console.error('[AIXSHOP] Failed to reload workspace catalog:', err);
       }
     }
   };
+
+  const demoOverwriteProtection = useMemo(
+    () =>
+      evaluateDemoOverwriteProtection({
+        isCloudWorkspace,
+        cloudCatalogStatus,
+        catalogVersion,
+        productsCount: products.length,
+        variantsCount: variants.length,
+        offersCount: offers.length,
+        findingsCount: findings.length,
+        actionsCount: actionItems.length,
+        evidenceCount: evidence.length,
+      }),
+    [
+      isCloudWorkspace,
+      cloudCatalogStatus,
+      catalogVersion,
+      products.length,
+      variants.length,
+      offers.length,
+      findings.length,
+      actionItems.length,
+      evidence.length,
+    ]
+  );
 
   return (
     <AppContext.Provider
@@ -894,8 +955,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         selectedActionId,
         storeProfile,
         products,
+        variantsCount: variants.length,
+        offersCount: offers.length,
         findings,
         actionItems,
+        evidenceCount: evidence.length,
         toasts,
         quickCheckResult,
         lastIngestionResult,
@@ -907,6 +971,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         storageLoadResult,
         isDurableStorage: isCloudWorkspace ? true : storageAdapter.isDurable(),
         isCloudWorkspace,
+        cloudCatalogStatus,
+        catalogVersion,
+        demoOverwriteProtection,
         setMobileMenuOpen,
         setSelectedActionId,
         navigateTo,

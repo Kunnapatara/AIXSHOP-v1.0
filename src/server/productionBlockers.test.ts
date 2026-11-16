@@ -1089,452 +1089,478 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
     });
 
     test('I1. Live PG executes two-connection advisory lock, clock_timestamp() lease expiry rollback, and concurrent visibility hash race', async () => {
-      const wsId = `ws_live_${Date.now()}`;
-      const usrId = `usr_live_${Date.now()}`;
-      const shopDomain = `live-${Date.now()}.myshopify.com`;
-      const evtId = `evt_live_${Date.now()}`;
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const wsId = `ws_live_${runId}`;
+      const usrId = `usr_live_${runId}`;
+      const evtId = `evt_live_${runId}`;
 
-      await repoA.registerUser({
-        user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Live PG' },
-        workspace: { id: wsId, name: 'Live PG WS', slug: wsId },
-        session: {
-          id: `sess_${Date.now()}`,
-          sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
-          userId: usrId,
-          activeWorkspaceId: wsId,
-          expiresAt: new Date(Date.now() + 86400000).toISOString(),
-        },
-      });
-
-      // 1. Real two-connection billing lease expiry across Pool A & Pool B
-      const claimA = await repoA.claimBillingEvent(
-        {
-          id: `be_${Date.now()}`,
-          provider: 'stripe',
-          eventId: evtId,
-          eventType: 'invoice.paid',
-          idempotencyKey: evtId,
-          payload: { id: evtId },
-          status: 'processing',
-          processedAt: new Date().toISOString(),
-        },
-        { leaseOwner: 'connA', leaseDurationMs: 60 }
-      );
-      assert.equal(claimA.claimed, true);
-
-      await new Promise((r) => setTimeout(r, 90));
-
-      const claimB = await repoB.claimBillingEvent(
-        {
-          id: `be_${Date.now()}_b`,
-          provider: 'stripe',
-          eventId: evtId,
-          eventType: 'invoice.paid',
-          idempotencyKey: evtId,
-          payload: { id: evtId },
-          status: 'processing',
-          processedAt: new Date().toISOString(),
-        },
-        { leaseOwner: 'connB', leaseDurationMs: 5000 }
-      );
-      assert.equal(claimB.claimed, true);
-
-      // Stale worker on Connection A must reject and leave entitlement untouched!
-      await assert.rejects(
-        () =>
-          repoA.applyBillingTransition({
-            eventId: evtId,
-            leaseOwner: 'connA',
-            subscription: {
-              id: `sub_${Date.now()}`,
-              workspaceId: wsId,
-              provider: 'stripe',
-              customerId: 'cus_live',
-              subscriptionId: 'sub_live',
-              tier: 'Enterprise',
-              status: 'active',
-              currentPeriodStart: new Date().toISOString(),
-              currentPeriodEnd: new Date(Date.now() + 86400000).toISOString(),
-              cancelAtPeriodEnd: false,
-              lastEventCreated: 1,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            },
-            storeProfileUpdate: { tier: 'Enterprise', skuLimit: 0 },
-          }),
-        /lease ownership lost or expired/i
-      );
-
-      // 2. Concurrent visibility identical content_hash upload across Pool A & Pool B
-      const hash = crypto.createHash('sha256').update(`live_${wsId}`).digest('hex');
-      const makeImp = (id: string) => ({
-        id,
-        workspaceId: wsId,
-        filename: `${id}.csv`,
-        contentHash: hash,
-        rowCount: 1,
-        rejectedRowCount: 0,
-        status: 'completed' as const,
-        errors: [],
-        reportingPeriodStart: '2026-10-01',
-        reportingPeriodEnd: '2026-10-01',
-        sourcePlatform: 'merchant_csv',
-        createdAt: new Date().toISOString(),
-      });
-      const makeMetric = (impId: string) => ({
-        id: `vm_${impId}`,
-        workspaceId: wsId,
-        importId: impId,
-        observationDate: '2026-10-01',
-        platform: 'Perplexity',
-        brandMentions: 5,
-        productMentions: 2,
-        websiteClicks: 1,
-        discoveryTopic: null,
-        topicPresence: 'unspecified' as const,
-        evidenceSource: 'live.csv',
-        createdAt: new Date().toISOString(),
-      });
-
-      const [vResA, vResB] = await Promise.all([
-        repoA.saveVisibilityImportAtomic(makeImp('vimp_a'), [makeMetric('vimp_a')]),
-        repoB.saveVisibilityImportAtomic(makeImp('vimp_b'), [makeMetric('vimp_b')]),
-      ]);
-      const dupCount = [vResA, vResB].filter((r) => r.duplicateImport).length;
-      assert.equal(dupCount, 1, 'Exactly one concurrent duplicate content_hash insert must become duplicate_noop');
-
-      // 3. Remediation A Live PG: Concurrent differing CSV imports on a nonexistent key must serialize cleanly
-      const makeImpDiff = (id: string, hashSeed: string) => ({
-        id,
-        workspaceId: wsId,
-        filename: `${id}.csv`,
-        contentHash: crypto.createHash('sha256').update(`${hashSeed}_${wsId}`).digest('hex'),
-        rowCount: 1,
-        rejectedRowCount: 0,
-        status: 'completed' as const,
-        errors: [],
-        reportingPeriodStart: '2026-10-05',
-        reportingPeriodEnd: '2026-10-05',
-        sourcePlatform: 'merchant_csv',
-        createdAt: new Date().toISOString(),
-      });
-      const makeMetricDiff = (impId: string, mentions: number, topic: string | null) => ({
-        id: `vm_${impId}`,
-        workspaceId: wsId,
-        importId: impId,
-        observationDate: '2026-10-05',
-        platform: 'ChatGPT Search',
-        brandMentions: mentions,
-        productMentions: 4,
-        websiteClicks: 2,
-        discoveryTopic: topic,
-        topicPresence: topic === null ? ('unspecified' as const) : ('explicit_blank' as const),
-        evidenceSource: 'live-conflict.csv',
-        createdAt: new Date().toISOString(),
-      });
-
-      const settledConflict = await Promise.allSettled([
-        repoA.saveVisibilityImportAtomic(makeImpDiff('vimp_c1', 'diff1'), [makeMetricDiff('vimp_c1', 10, null)]),
-        repoB.saveVisibilityImportAtomic(makeImpDiff('vimp_c2', 'diff2'), [makeMetricDiff('vimp_c2', 20, null)]),
-      ]);
-      const fulfilledConflict = settledConflict.filter((r) => r.status === 'fulfilled');
-      const rejectedConflict = settledConflict.filter((r) => r.status === 'rejected');
-      assert.equal(fulfilledConflict.length, 1);
-      assert.equal(rejectedConflict.length, 1);
-      assert.ok(rejectedConflict[0].status === 'rejected' && rejectedConflict[0].reason instanceof VisibilityObservationConflictError);
-
-      // NULL vs explicit '' remains distinct even concurrently on live PG
-      const blankRes = await repoB.saveVisibilityImportAtomic(
-        makeImpDiff('vimp_blank', 'blank'),
-        [makeMetricDiff('vimp_blank', 33, '')]
-      );
-      assert.equal(blankRes.metricsSaved, 1);
-
-      // 4. Remediation C + B Live PG: pool.max = 1 nested withWorkspaceLock + mandatory catalogVersion guard
-      const singleConnPool = new Pool({
-        ...(process.env.DATABASE_URL
-          ? { connectionString: process.env.DATABASE_URL }
-          : {
-              host: process.env.SQL_HOST || process.env.PGHOST,
-              port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
-              user: process.env.SQL_USER || process.env.PGUSER,
-              password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
-              database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
-            }),
-        max: 1,
-        connectionTimeoutMillis: 2000,
-      });
       try {
-        const singleRepo = new PostgresRepository(singleConnPool);
-        await singleRepo.withWorkspaceLock(wsId, async () => {
-          const cat1 = (await singleRepo.loadWorkspaceCatalog(wsId))!;
-          await singleRepo.withWorkspaceLock(wsId, async () => {
-            await singleRepo.saveWorkspaceCatalog(wsId, cat1);
-          });
-          await singleRepo.mutateWorkspaceCatalog(wsId, async (cat) => ({
-            nextCatalog: cat,
-            result: true,
-          }));
+        await repoA.registerUser({
+          user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Live PG' },
+          workspace: { id: wsId, name: 'Live PG WS', slug: wsId },
+          session: {
+            id: `sess_${runId}`,
+            sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
+            userId: usrId,
+            activeWorkspaceId: wsId,
+            expiresAt: new Date(Date.now() + 86400000).toISOString(),
+          },
         });
-        const postSingleCat = (await singleRepo.loadWorkspaceCatalog(wsId))!;
-        assert.ok((postSingleCat.catalogVersion || 1) >= 2);
-        await assert.rejects(
-          () => singleRepo.saveWorkspaceCatalog(wsId, { ...postSingleCat, catalogVersion: undefined }),
-          (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409
+
+        // 1. Real two-connection billing lease expiry across Pool A & Pool B
+        const claimA = await repoA.claimBillingEvent(
+          {
+            id: `be_${runId}_a`,
+            provider: 'stripe',
+            eventId: evtId,
+            eventType: 'invoice.paid',
+            idempotencyKey: evtId,
+            payload: { id: evtId },
+            status: 'processing',
+            processedAt: new Date().toISOString(),
+          },
+          { leaseOwner: 'connA', leaseDurationMs: 60 }
         );
+        assert.equal(claimA.claimed, true);
+
+        await new Promise((r) => setTimeout(r, 90));
+
+        const claimB = await repoB.claimBillingEvent(
+          {
+            id: `be_${runId}_b`,
+            provider: 'stripe',
+            eventId: evtId,
+            eventType: 'invoice.paid',
+            idempotencyKey: evtId,
+            payload: { id: evtId },
+            status: 'processing',
+            processedAt: new Date().toISOString(),
+          },
+          { leaseOwner: 'connB', leaseDurationMs: 5000 }
+        );
+        assert.equal(claimB.claimed, true);
+
+        // Stale worker on Connection A must reject and leave entitlement untouched!
+        await assert.rejects(
+          () =>
+            repoA.applyBillingTransition({
+              eventId: evtId,
+              leaseOwner: 'connA',
+              subscription: {
+                id: `sub_${runId}`,
+                workspaceId: wsId,
+                provider: 'stripe',
+                customerId: `cus_${runId}`,
+                subscriptionId: `sub_ext_${runId}`,
+                tier: 'Enterprise',
+                status: 'active',
+                currentPeriodStart: new Date().toISOString(),
+                currentPeriodEnd: new Date(Date.now() + 86400000).toISOString(),
+                cancelAtPeriodEnd: false,
+                lastEventCreated: 1,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              },
+              storeProfileUpdate: { tier: 'Enterprise', skuLimit: 0 },
+            }),
+          /lease ownership lost or expired/i
+        );
+
+        // 2. Concurrent visibility identical content_hash upload across Pool A & Pool B
+        const hash = crypto.createHash('sha256').update(`live_${wsId}`).digest('hex');
+        const makeImp = (id: string) => ({
+          id,
+          workspaceId: wsId,
+          filename: `${id}.csv`,
+          contentHash: hash,
+          rowCount: 1,
+          rejectedRowCount: 0,
+          status: 'completed' as const,
+          errors: [],
+          reportingPeriodStart: '2026-10-01',
+          reportingPeriodEnd: '2026-10-01',
+          sourcePlatform: 'merchant_csv',
+          createdAt: new Date().toISOString(),
+        });
+        const makeMetric = (impId: string) => ({
+          id: `vm_${impId}`,
+          workspaceId: wsId,
+          importId: impId,
+          observationDate: '2026-10-01',
+          platform: 'Perplexity',
+          brandMentions: 5,
+          productMentions: 2,
+          websiteClicks: 1,
+          discoveryTopic: null,
+          topicPresence: 'unspecified' as const,
+          evidenceSource: 'live.csv',
+          createdAt: new Date().toISOString(),
+        });
+
+        const [vResA, vResB] = await Promise.all([
+          repoA.saveVisibilityImportAtomic(makeImp(`${runId}_vimp_a`), [makeMetric(`${runId}_vimp_a`)]),
+          repoB.saveVisibilityImportAtomic(makeImp(`${runId}_vimp_b`), [makeMetric(`${runId}_vimp_b`)]),
+        ]);
+        const dupCount = [vResA, vResB].filter((r) => r.duplicateImport).length;
+        assert.equal(dupCount, 1, 'Exactly one concurrent duplicate content_hash insert must become duplicate_noop');
+
+        // 3. Remediation A Live PG: Concurrent differing CSV imports on a nonexistent key must serialize cleanly
+        const makeImpDiff = (id: string, hashSeed: string) => ({
+          id,
+          workspaceId: wsId,
+          filename: `${id}.csv`,
+          contentHash: crypto.createHash('sha256').update(`${hashSeed}_${wsId}`).digest('hex'),
+          rowCount: 1,
+          rejectedRowCount: 0,
+          status: 'completed' as const,
+          errors: [],
+          reportingPeriodStart: '2026-10-05',
+          reportingPeriodEnd: '2026-10-05',
+          sourcePlatform: 'merchant_csv',
+          createdAt: new Date().toISOString(),
+        });
+        const makeMetricDiff = (impId: string, mentions: number, topic: string | null) => ({
+          id: `vm_${impId}`,
+          workspaceId: wsId,
+          importId: impId,
+          observationDate: '2026-10-05',
+          platform: 'ChatGPT Search',
+          brandMentions: mentions,
+          productMentions: 4,
+          websiteClicks: 2,
+          discoveryTopic: topic,
+          topicPresence: topic === null ? ('unspecified' as const) : ('explicit_blank' as const),
+          evidenceSource: 'live-conflict.csv',
+          createdAt: new Date().toISOString(),
+        });
+
+        const settledConflict = await Promise.allSettled([
+          repoA.saveVisibilityImportAtomic(makeImpDiff(`${runId}_vimp_c1`, 'diff1'), [makeMetricDiff(`${runId}_vimp_c1`, 10, null)]),
+          repoB.saveVisibilityImportAtomic(makeImpDiff(`${runId}_vimp_c2`, 'diff2'), [makeMetricDiff(`${runId}_vimp_c2`, 20, null)]),
+        ]);
+        const fulfilledConflict = settledConflict.filter((r) => r.status === 'fulfilled');
+        const rejectedConflict = settledConflict.filter((r) => r.status === 'rejected');
+        assert.equal(fulfilledConflict.length, 1);
+        assert.equal(rejectedConflict.length, 1);
+        assert.ok(rejectedConflict[0].status === 'rejected' && rejectedConflict[0].reason instanceof VisibilityObservationConflictError);
+
+        // NULL vs explicit '' remains distinct even concurrently on live PG
+        const blankRes = await repoB.saveVisibilityImportAtomic(
+          makeImpDiff(`${runId}_vimp_blank`, 'blank'),
+          [makeMetricDiff(`${runId}_vimp_blank`, 33, '')]
+        );
+        assert.equal(blankRes.metricsSaved, 1);
+
+        // 4. Remediation C + B Live PG: pool.max = 1 nested withWorkspaceLock + mandatory catalogVersion guard
+        const singleConnPool = new Pool({
+          ...(process.env.DATABASE_URL
+            ? { connectionString: process.env.DATABASE_URL }
+            : {
+                host: process.env.SQL_HOST || process.env.PGHOST,
+                port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
+                user: process.env.SQL_USER || process.env.PGUSER,
+                password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
+                database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
+              }),
+          max: 1,
+          connectionTimeoutMillis: 2000,
+        });
+        try {
+          const singleRepo = new PostgresRepository(singleConnPool);
+          await singleRepo.withWorkspaceLock(wsId, async () => {
+            const cat1 = (await singleRepo.loadWorkspaceCatalog(wsId))!;
+            await singleRepo.withWorkspaceLock(wsId, async () => {
+              await singleRepo.saveWorkspaceCatalog(wsId, cat1);
+            });
+            await singleRepo.mutateWorkspaceCatalog(wsId, async (cat) => ({
+              nextCatalog: cat,
+              result: true,
+            }));
+          });
+          const postSingleCat = (await singleRepo.loadWorkspaceCatalog(wsId))!;
+          assert.ok((postSingleCat.catalogVersion || 1) >= 2);
+          await assert.rejects(
+            () => singleRepo.saveWorkspaceCatalog(wsId, { ...postSingleCat, catalogVersion: undefined }),
+            (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409
+          );
+        } finally {
+          await singleConnPool.end();
+        }
       } finally {
-        await singleConnPool.end();
+        await poolA.query('DELETE FROM billing_events WHERE event_id = $1', [evtId]).catch(() => {});
+        await poolA.query('DELETE FROM workspaces WHERE id = $1', [wsId]).catch(() => {});
+        await poolA.query('DELETE FROM users WHERE id = $1', [usrId]).catch(() => {});
       }
     });
 
     test('I2. [Live PG - Workstream 2] Two-connection concurrent replace_versioned, opposite key ordering, lineage, duplicate retry, reject_on_conflict & TX rollback', async () => {
-      const wsId = `ws_vis_live_${Date.now()}`;
-      const usrId = `usr_vis_live_${Date.now()}`;
-      await repoA.registerUser({
-        user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Vis Live' },
-        workspace: { id: wsId, name: 'Vis Live WS', slug: wsId },
-        session: {
-          id: `sess_vis_${Date.now()}`,
-          sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
-          userId: usrId,
-          activeWorkspaceId: wsId,
-          expiresAt: new Date(Date.now() + 86400000).toISOString(),
-        },
-      });
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const wsId = `ws_vis_${runId}`;
+      const usrId = `usr_vis_${runId}`;
+      try {
+        await repoA.registerUser({
+          user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Vis Live' },
+          workspace: { id: wsId, name: 'Vis Live WS', slug: wsId },
+          session: {
+            id: `sess_vis_${runId}`,
+            sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
+            userId: usrId,
+            activeWorkspaceId: wsId,
+            expiresAt: new Date(Date.now() + 86400000).toISOString(),
+          },
+        });
 
-      const makeImp = (id: string, seed: string) => ({
-        id,
-        workspaceId: wsId,
-        filename: `${id}.csv`,
-        contentHash: crypto.createHash('sha256').update(`${seed}_${wsId}`).digest('hex'),
-        rowCount: 2,
-        rejectedRowCount: 0,
-        status: 'completed' as const,
-        errors: [],
-        reportingPeriodStart: '2026-10-10',
-        reportingPeriodEnd: '2026-10-12',
-        sourcePlatform: 'merchant_csv',
-        createdAt: new Date().toISOString(),
-      });
-      const makeMetric = (impId: string, date: string, topic: string | null, mentions: number) => ({
-        id: `vm_${impId}_${date}`,
-        workspaceId: wsId,
-        importId: impId,
-        observationDate: date,
-        platform: 'ChatGPT Search',
-        brandMentions: mentions,
-        productMentions: mentions + 1,
-        websiteClicks: mentions + 2,
-        discoveryTopic: topic,
-        topicPresence: (topic === null ? 'unspecified' : 'specified') as 'unspecified' | 'specified',
-        evidenceSource: `${impId}.csv`,
-        createdAt: new Date().toISOString(),
-      });
+        const makeImp = (id: string, seed: string) => ({
+          id,
+          workspaceId: wsId,
+          filename: `${id}.csv`,
+          contentHash: crypto.createHash('sha256').update(`${seed}_${wsId}`).digest('hex'),
+          rowCount: 2,
+          rejectedRowCount: 0,
+          status: 'completed' as const,
+          errors: [],
+          reportingPeriodStart: '2026-10-10',
+          reportingPeriodEnd: '2026-10-12',
+          sourcePlatform: 'merchant_csv',
+          createdAt: new Date().toISOString(),
+        });
+        const makeMetric = (impId: string, date: string, topic: string | null, mentions: number) => ({
+          id: `vm_${impId}_${date}`,
+          workspaceId: wsId,
+          importId: impId,
+          observationDate: date,
+          platform: 'ChatGPT Search',
+          brandMentions: mentions,
+          productMentions: mentions + 1,
+          websiteClicks: mentions + 2,
+          discoveryTopic: topic,
+          topicPresence: (topic === null ? 'unspecified' : 'specified') as 'unspecified' | 'specified',
+          evidenceSource: `${impId}.csv`,
+          createdAt: new Date().toISOString(),
+        });
 
-      // 1. Seed initial v1 on keys K1 ('2026-10-10', null) & K2 ('2026-10-11', 'running')
-      const imp1 = makeImp('vimp_v1', 'seed_v1');
-      await repoA.saveVisibilityImportAtomic(imp1, [
-        makeMetric('vimp_v1', '2026-10-10', null, 10),
-        makeMetric('vimp_v1', '2026-10-11', 'running', 20),
-      ]);
+        // 1. Seed initial v1 on keys K1 ('2026-10-10', null) & K2 ('2026-10-11', 'running')
+        const impV1Id = `${runId}_vimp_v1`;
+        const impV2aId = `${runId}_vimp_v2a`;
+        const impV2bId = `${runId}_vimp_v2b`;
+        const impRetryId = `${runId}_vimp_v2b_r`;
+        const impRejectId = `${runId}_vimp_rej`;
+        const impAbortId = `${runId}_vimp_abt`;
 
-      // 2. Concurrent replace_versioned across Pool A ([K1, K2]) and Pool B ([K2, K1] opposite order)
-      const [repA, repB] = await Promise.all([
-        repoA.saveVisibilityImportAtomic(
-          makeImp('vimp_v2a', 'rep_a'),
-          [
-            makeMetric('vimp_v2a', '2026-10-10', null, 100),
-            makeMetric('vimp_v2a', '2026-10-11', 'running', 200),
-          ],
-          { conflictPolicy: 'replace_versioned' }
-        ),
-        repoB.saveVisibilityImportAtomic(
-          makeImp('vimp_v2b', 'rep_b'),
-          [
-            makeMetric('vimp_v2b', '2026-10-11', 'running', 400),
-            makeMetric('vimp_v2b', '2026-10-10', null, 300),
-          ],
-          { conflictPolicy: 'replace_versioned' }
-        ),
-      ]);
-      assert.equal(repA.replacedCount, 2);
-      assert.equal(repB.replacedCount, 2);
+        const imp1 = makeImp(impV1Id, 'seed_v1');
+        await repoA.saveVisibilityImportAtomic(imp1, [
+          makeMetric(impV1Id, '2026-10-10', null, 10),
+          makeMetric(impV1Id, '2026-10-11', 'running', 20),
+        ]);
 
-      // 3. Verify lineage v1 -> v2 -> v3 intact and supersedes_history_id chain valid
-      const hist = await repoA.getVisibilityObservationHistory(wsId, 50);
-      const k1Hist = hist.filter((h) => h.observationDate === '2026-10-10').sort((a, b) => a.versionNumber - b.versionNumber);
-      const k2Hist = hist.filter((h) => h.observationDate === '2026-10-11').sort((a, b) => a.versionNumber - b.versionNumber);
-      assert.deepEqual(k1Hist.map((h) => h.versionNumber), [1, 2, 3]);
-      assert.deepEqual(k2Hist.map((h) => h.versionNumber), [1, 2, 3]);
-      assert.equal(k1Hist[0].eventType, 'recorded');
-      assert.equal(k1Hist[1].eventType, 'replaced');
-      assert.equal(k1Hist[1].supersedesHistoryId, k1Hist[0].id);
-      assert.equal(k1Hist[2].supersedesHistoryId, k1Hist[1].id);
-      assert.equal(k2Hist[2].supersedesHistoryId, k2Hist[1].id);
-
-      // Active metric matches v3 exactly
-      const summary = await repoB.getVisibilitySummary(wsId);
-      const k1Active = summary.recentObservations.find((m) => m.observationDate === '2026-10-10')!;
-      const k2Active = summary.recentObservations.find((m) => m.observationDate === '2026-10-11')!;
-      assert.equal(k1Active.brandMentions, k1Hist[2].brandMentions);
-      assert.equal(k2Active.brandMentions, k2Hist[2].brandMentions);
-
-      // 4. Retry same content_hash returns duplicate_noop without creating duplicate history rows
-      const retryDup = await repoA.saveVisibilityImportAtomic(
-        makeImp('vimp_v2b_retry', 'rep_b'),
-        [
-          makeMetric('vimp_v2b_retry', '2026-10-10', null, 300),
-          makeMetric('vimp_v2b_retry', '2026-10-11', 'running', 400),
-        ],
-        { conflictPolicy: 'replace_versioned' }
-      );
-      assert.equal(retryDup.duplicateImport, true);
-      const histAfterRetry = await repoA.getVisibilityObservationHistory(wsId, 50);
-      assert.equal(histAfterRetry.length, 6, 'Duplicate retry must not emit additional history rows');
-
-      // 5. reject_on_conflict leaves zero partial import rows
-      await assert.rejects(
-        () =>
-          repoB.saveVisibilityImportAtomic(
-            makeImp('vimp_reject', 'reject_seed'),
-            [makeMetric('vimp_reject', '2026-10-10', null, 999)],
-            { conflictPolicy: 'reject_on_conflict' }
-          ),
-        (err: any) => err instanceof VisibilityObservationConflictError && err.statusCode === 409
-      );
-      const impCheck = await poolA.query(`SELECT id FROM ai_visibility_imports WHERE id = 'vimp_reject'`);
-      assert.equal(impCheck.rows.length, 0, 'Rejected conflict import must roll back completely');
-
-      // 6. Mid-TX replacement failure (forced SQL error on 2nd metric inside replace_versioned) rolls back import, history, and v3 active metric
-      await assert.rejects(
-        () =>
+        // 2. Concurrent replace_versioned across Pool A ([K1, K2]) and Pool B ([K2, K1] opposite order)
+        const [repA, repB] = await Promise.all([
           repoA.saveVisibilityImportAtomic(
-            makeImp('vimp_tx_abort', 'abort_seed'),
+            makeImp(impV2aId, 'rep_a'),
             [
-              makeMetric('vimp_tx_abort', '2026-10-10', null, 777),
-              {
-                ...makeMetric('vimp_tx_abort', '2026-10-11', 'running', 888),
-                platform: null as any, // triggers NOT NULL violation inside same TX after 1st metric wrote
-              },
+              makeMetric(impV2aId, '2026-10-10', null, 100),
+              makeMetric(impV2aId, '2026-10-11', 'running', 200),
             ],
             { conflictPolicy: 'replace_versioned' }
           ),
-        (err: any) => Boolean(err)
-      );
-      const abortImpRes = await poolA.query(`SELECT id FROM ai_visibility_imports WHERE id = 'vimp_tx_abort'`);
-      assert.equal(abortImpRes.rows.length, 0, 'Aborted TX import header must be rolled back');
-      const histAfterAbort = await repoA.getVisibilityObservationHistory(wsId, 50);
-      assert.equal(histAfterAbort.length, 6, 'Aborted replacement must leave zero partial history rows');
-      const summaryAfterAbort = await repoA.getVisibilitySummary(wsId);
-      const k1AfterAbort = summaryAfterAbort.recentObservations.find((m) => m.observationDate === '2026-10-10')!;
-      assert.notEqual(k1AfterAbort.brandMentions, 777, 'First metric write inside aborted TX must be rolled back');
+          repoB.saveVisibilityImportAtomic(
+            makeImp(impV2bId, 'rep_b'),
+            [
+              makeMetric(impV2bId, '2026-10-11', 'running', 400),
+              makeMetric(impV2bId, '2026-10-10', null, 300),
+            ],
+            { conflictPolicy: 'replace_versioned' }
+          ),
+        ]);
+        assert.equal(repA.replacedCount, 2);
+        assert.equal(repB.replacedCount, 2);
+
+        // 3. Verify lineage v1 -> v2 -> v3 intact and supersedes_history_id chain valid
+        const hist = await repoA.getVisibilityObservationHistory(wsId, 50);
+        const k1Hist = hist.filter((h) => h.observationDate === '2026-10-10').sort((a, b) => a.versionNumber - b.versionNumber);
+        const k2Hist = hist.filter((h) => h.observationDate === '2026-10-11').sort((a, b) => a.versionNumber - b.versionNumber);
+        assert.deepEqual(k1Hist.map((h) => h.versionNumber), [1, 2, 3]);
+        assert.deepEqual(k2Hist.map((h) => h.versionNumber), [1, 2, 3]);
+        assert.equal(k1Hist[0].eventType, 'recorded');
+        assert.equal(k1Hist[1].eventType, 'replaced');
+        assert.equal(k1Hist[1].supersedesHistoryId, k1Hist[0].id);
+        assert.equal(k1Hist[2].supersedesHistoryId, k1Hist[1].id);
+        assert.equal(k2Hist[2].supersedesHistoryId, k2Hist[1].id);
+
+        // Active metric matches v3 exactly
+        const summary = await repoB.getVisibilitySummary(wsId);
+        const k1Active = summary.recentObservations.find((m) => m.observationDate === '2026-10-10')!;
+        const k2Active = summary.recentObservations.find((m) => m.observationDate === '2026-10-11')!;
+        assert.equal(k1Active.brandMentions, k1Hist[2].brandMentions);
+        assert.equal(k2Active.brandMentions, k2Hist[2].brandMentions);
+
+        // 4. Retry same content_hash returns duplicate_noop without creating duplicate history rows
+        const retryDup = await repoA.saveVisibilityImportAtomic(
+          makeImp(impRetryId, 'rep_b'),
+          [
+            makeMetric(impRetryId, '2026-10-10', null, 300),
+            makeMetric(impRetryId, '2026-10-11', 'running', 400),
+          ],
+          { conflictPolicy: 'replace_versioned' }
+        );
+        assert.equal(retryDup.duplicateImport, true);
+        const histAfterRetry = await repoA.getVisibilityObservationHistory(wsId, 50);
+        assert.equal(histAfterRetry.length, 6, 'Duplicate retry must not emit additional history rows');
+
+        // 5. reject_on_conflict leaves zero partial import rows
+        await assert.rejects(
+          () =>
+            repoB.saveVisibilityImportAtomic(
+              makeImp(impRejectId, 'reject_seed'),
+              [makeMetric(impRejectId, '2026-10-10', null, 999)],
+              { conflictPolicy: 'reject_on_conflict' }
+            ),
+          (err: any) => err instanceof VisibilityObservationConflictError && err.statusCode === 409
+        );
+        const impCheck = await poolA.query(`SELECT id FROM ai_visibility_imports WHERE workspace_id = $1 AND id = $2`, [wsId, impRejectId]);
+        assert.equal(impCheck.rows.length, 0, 'Rejected conflict import must roll back completely');
+
+        // 6. Mid-TX replacement failure (forced SQL error on 2nd metric inside replace_versioned) rolls back import, history, and v3 active metric
+        await assert.rejects(
+          () =>
+            repoA.saveVisibilityImportAtomic(
+              makeImp(impAbortId, 'abort_seed'),
+              [
+                makeMetric(impAbortId, '2026-10-10', null, 777),
+                {
+                  ...makeMetric(impAbortId, '2026-10-11', 'running', 888),
+                  platform: null as any, // triggers NOT NULL violation inside same TX after 1st metric wrote
+                },
+              ],
+              { conflictPolicy: 'replace_versioned' }
+            ),
+          (err: any) => Boolean(err)
+        );
+        const abortImpRes = await poolA.query(`SELECT id FROM ai_visibility_imports WHERE workspace_id = $1 AND id = $2`, [wsId, impAbortId]);
+        assert.equal(abortImpRes.rows.length, 0, 'Aborted TX import header must be rolled back');
+        const histAfterAbort = await repoA.getVisibilityObservationHistory(wsId, 50);
+        assert.equal(histAfterAbort.length, 6, 'Aborted replacement must leave zero partial history rows');
+        const summaryAfterAbort = await repoA.getVisibilitySummary(wsId);
+        const k1AfterAbort = summaryAfterAbort.recentObservations.find((m) => m.observationDate === '2026-10-10')!;
+        assert.notEqual(k1AfterAbort.brandMentions, 777, 'First metric write inside aborted TX must be rolled back');
+      } finally {
+        await poolA.query('DELETE FROM workspaces WHERE id = $1', [wsId]).catch(() => {});
+        await poolA.query('DELETE FROM users WHERE id = $1', [usrId]).catch(() => {});
+      }
     });
 
     test('I3. [Live PG - Workstream 3] Two-connection catalogVersion concurrency, single initialization winner, unversioned overwrite rejection, and TX non-mutation', async () => {
-      const wsId = `ws_ver_live_${Date.now()}`;
-      const usrId = `usr_ver_live_${Date.now()}`;
-      await repoA.registerUser({
-        user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Ver Live' },
-        workspace: { id: wsId, name: 'Ver Live WS', slug: wsId },
-        session: {
-          id: `sess_ver_${Date.now()}`,
-          sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
-          userId: usrId,
-          activeWorkspaceId: wsId,
-          expiresAt: new Date(Date.now() + 86400000).toISOString(),
-        },
-      });
-
-      const makeCat = (id: string, sku: string, ver?: number): StoragePayloadV1 => ({
-        products: [
-          {
-            id,
-            title: `Product ${id}`,
-            brand: 'LiveBrand',
-            category: 'Home',
-            description: 'Live PG product',
-            image: '',
-            status: 'active',
-            completenessScore: 90,
-            evidenceCoverageScore: 0,
-            externalDiscoveryStatus: 'observed_in_sample',
-            attributes: {},
-            variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 42, inventoryCount: 3, attributes: {} }],
-            offers: [],
-            evidenceDocuments: [],
-            findingsCount: 0,
-            lastAudited: new Date().toISOString(),
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const wsId = `ws_ver_${runId}`;
+      const usrId = `usr_ver_${runId}`;
+      try {
+        await repoA.registerUser({
+          user: { id: usrId, email: `${usrId}@example.com`, passwordHash: 'h', fullName: 'Ver Live' },
+          workspace: { id: wsId, name: 'Ver Live WS', slug: wsId },
+          session: {
+            id: `sess_ver_${runId}`,
+            sessionTokenHash: crypto.createHash('sha256').update(`tok_${wsId}`).digest('hex'),
+            userId: usrId,
+            activeWorkspaceId: wsId,
+            expiresAt: new Date(Date.now() + 86400000).toISOString(),
           },
-        ],
-        variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 42, inventoryCount: 3, attributes: {} }],
-        offers: [],
-        findings: [],
-        actions: [],
-        evidence: [],
-        storeProfile: {
-          name: 'Ver Store',
-          domain: `${wsId}.myshopify.com`,
-          currency: 'USD',
-          skuCount: 1,
-          catalogCompletenessAvg: 90,
-          truthBoundaryStrictness: 'standard',
-          tier: 'Free Audit',
-          connectors: [],
-        },
-        ...(ver !== undefined ? { catalogVersion: ver } : {}),
-      });
+        });
 
-      // 1. Concurrent unversioned init on empty catalog across Pool A & Pool B -> single winner
-      const initSettled = await Promise.allSettled([
-        repoA.saveWorkspaceCatalog(wsId, makeCat('p_initA', 'SKU-IA')),
-        repoB.saveWorkspaceCatalog(wsId, makeCat('p_initB', 'SKU-IB')),
-      ]);
-      assert.equal(initSettled.filter((r) => r.status === 'fulfilled').length, 1);
-      assert.equal(initSettled.filter((r) => r.status === 'rejected').length, 1);
+        const makeCat = (id: string, sku: string, ver?: number): StoragePayloadV1 => ({
+          products: [
+            {
+              id,
+              title: `Product ${id}`,
+              brand: 'LiveBrand',
+              category: 'Home',
+              description: 'Live PG product',
+              image: '',
+              status: 'active',
+              completenessScore: 90,
+              evidenceCoverageScore: 0,
+              externalDiscoveryStatus: 'observed_in_sample',
+              attributes: {},
+              variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 42, inventoryCount: 3, attributes: {} }],
+              offers: [],
+              evidenceDocuments: [],
+              findingsCount: 0,
+              lastAudited: new Date().toISOString(),
+            },
+          ],
+          variants: [{ id: `v_${id}`, sku, title: 'Default', barcode: '', price: 42, inventoryCount: 3, attributes: {} }],
+          offers: [],
+          findings: [],
+          actions: [],
+          evidence: [],
+          storeProfile: {
+            name: 'Ver Store',
+            domain: `${wsId}.myshopify.com`,
+            currency: 'USD',
+            skuCount: 1,
+            catalogCompletenessAvg: 90,
+            truthBoundaryStrictness: 'standard',
+            tier: 'Free Audit',
+            connectors: [],
+          },
+          ...(ver !== undefined ? { catalogVersion: ver } : {}),
+        });
 
-      const catA = (await repoA.loadWorkspaceCatalog(wsId))!;
-      const catB = (await repoB.loadWorkspaceCatalog(wsId))!;
-      assert.equal(catA.catalogVersion, 2);
-      assert.equal(catB.catalogVersion, 2);
+        // 1. Concurrent unversioned init on empty catalog across Pool A & Pool B -> single winner
+        const initSettled = await Promise.allSettled([
+          repoA.saveWorkspaceCatalog(wsId, makeCat(`${runId}_p_initA`, `SKU-IA-${runId}`)),
+          repoB.saveWorkspaceCatalog(wsId, makeCat(`${runId}_p_initB`, `SKU-IB-${runId}`)),
+        ]);
+        assert.equal(initSettled.filter((r) => r.status === 'fulfilled').length, 1);
+        assert.equal(initSettled.filter((r) => r.status === 'rejected').length, 1);
 
-      // 2. Client A updates with expectedVersion=2 -> succeeds (version 3); Client B updates with stale expectedVersion=2 -> 409
-      await repoA.saveWorkspaceCatalog(wsId, makeCat('p_winA', 'SKU-WINA', 2), { expectedVersion: 2 });
-      await assert.rejects(
-        () => repoB.saveWorkspaceCatalog(wsId, makeCat('p_staleB', 'SKU-STALEB', 2), { expectedVersion: 2 }),
-        (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409 && err.currentVersion === 3
-      );
+        const catA = (await repoA.loadWorkspaceCatalog(wsId))!;
+        const catB = (await repoB.loadWorkspaceCatalog(wsId))!;
+        assert.equal(catA.catalogVersion, 2);
+        assert.equal(catB.catalogVersion, 2);
 
-      // 3. Unversioned update cannot overwrite initialized catalog
-      await assert.rejects(
-        () => repoB.saveWorkspaceCatalog(wsId, makeCat('p_unver', 'SKU-UNVER')),
-        (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409 && err.currentVersion === 3
-      );
+        // 2. Client A updates with expectedVersion=2 -> succeeds (version 3); Client B updates with stale expectedVersion=2 -> 409
+        await repoA.saveWorkspaceCatalog(wsId, makeCat(`${runId}_p_winA`, `SKU-WINA-${runId}`, 2), { expectedVersion: 2 });
+        await assert.rejects(
+          () => repoB.saveWorkspaceCatalog(wsId, makeCat(`${runId}_p_staleB`, `SKU-STALEB-${runId}`, 2), { expectedVersion: 2 }),
+          (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409 && err.currentVersion === 3
+        );
 
-      // 4. Failed quota update does not mutate catalog or advance version
-      const overQuotaProducts = Array.from({ length: 120 }, (_, i) => ({
-        ...makeCat(`p_oq_${i}`, `SKU-OQ-${i}`).products[0],
-      }));
-      await assert.rejects(
-        () =>
-          repoA.saveWorkspaceCatalog(
-            wsId,
-            { ...makeCat('p_oq', 'SKU-OQ', 3), products: overQuotaProducts },
-            { expectedVersion: 3 }
-          ),
-        (err: any) => err.code === 'PLAN_QUOTA_EXCEEDED'
-      );
+        // 3. Unversioned update cannot overwrite initialized catalog
+        await assert.rejects(
+          () => repoB.saveWorkspaceCatalog(wsId, makeCat(`${runId}_p_unver`, `SKU-UNVER-${runId}`)),
+          (err: any) => err instanceof CatalogVersionConflictError && err.statusCode === 409 && err.currentVersion === 3
+        );
 
-      const verifiedCat = (await repoB.loadWorkspaceCatalog(wsId))!;
-      assert.equal(verifiedCat.catalogVersion, 3);
-      assert.equal(verifiedCat.products[0].id, 'p_winA');
+        // 4. Failed quota update does not mutate catalog or advance version
+        const overQuotaProducts = Array.from({ length: 120 }, (_, i) => ({
+          ...makeCat(`${runId}_p_oq_${i}`, `SKU-OQ-${runId}-${i}`).products[0],
+        }));
+        await assert.rejects(
+          () =>
+            repoA.saveWorkspaceCatalog(
+              wsId,
+              { ...makeCat(`${runId}_p_oq`, `SKU-OQ-${runId}`, 3), products: overQuotaProducts },
+              { expectedVersion: 3 }
+            ),
+          (err: any) => err.code === 'PLAN_QUOTA_EXCEEDED'
+        );
 
-      // 5. executeWorkspaceAudit increments catalogVersion and returns updated catalogVersion
-      const auditOut = await repoA.executeWorkspaceAudit(wsId);
-      assert.equal(auditOut.catalog.catalogVersion, 4);
+        const verifiedCat = (await repoB.loadWorkspaceCatalog(wsId))!;
+        assert.equal(verifiedCat.catalogVersion, 3);
+        assert.equal(verifiedCat.products[0].id, `${runId}_p_winA`);
+
+        // 5. executeWorkspaceAudit increments catalogVersion and returns updated catalogVersion
+        const auditOut = await repoA.executeWorkspaceAudit(wsId);
+        assert.equal(auditOut.catalog.catalogVersion, 4);
+      } finally {
+        await poolA.query('DELETE FROM workspaces WHERE id = $1', [wsId]).catch(() => {});
+        await poolA.query('DELETE FROM users WHERE id = $1', [usrId]).catch(() => {});
+      }
     });
 
     test('I4. [Live PG - Workstream 4] Nested unlock failure destroys pooled backend PID (0 pg_locks leaks) & cross-workspace lock ordering enforces deterministic order', async () => {
-      const wsBase = `ws_lock_${Date.now()}`;
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const wsBase = `ws_lock_${runId}`;
       const wsA = `${wsBase}_a`;
       const wsB = `${wsBase}_b`;
 
@@ -1640,7 +1666,11 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       process.env.APP_URL = 'https://app.aixshop.example.com';
       _resetRateLimiter();
 
-      const testIp = `203.0.113.${Math.floor(Math.random() * 200) + 10}`;
+      const randByteA = (crypto.randomBytes(1)[0] % 200) + 10;
+      const randByteB = (crypto.randomBytes(1)[0] % 200) + 10;
+      const randByteOut = (crypto.randomBytes(1)[0] % 200) + 10;
+      const testIp = `203.0.113.${randByteA}.${randByteB}`;
+      const outageIp = `198.51.100.${randByteOut}`;
       const srvA = await startTempAppServer(createApp(repoA));
       const srvB = await startTempAppServer(createApp(repoB));
       try {
@@ -1680,7 +1710,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         };
         const outageRes = await fetch(`${srvA.baseUrl}/api/auth/login`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.77' },
+          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': outageIp },
           body: JSON.stringify({ email: 'outage@example.com', password: 'wrong' }),
         });
         assert.equal(outageRes.status, 503);
@@ -1691,7 +1721,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         simulateOutage = false;
         const recoveredRes = await fetch(`${srvA.baseUrl}/api/auth/login`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.77' },
+          headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': outageIp },
           body: JSON.stringify({ email: 'recovered@example.com', password: 'wrong' }),
         });
         assert.equal(recoveredRes.status, 401);
@@ -1700,7 +1730,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         await srvA.close();
         await srvB.close();
         await poolA.query(`DELETE FROM auth_rate_limits WHERE rate_key LIKE $1`, [`%${testIp}%`]).catch(() => {});
-        await poolA.query(`DELETE FROM auth_rate_limits WHERE rate_key LIKE '%198.51.100.77%'`).catch(() => {});
+        await poolA.query(`DELETE FROM auth_rate_limits WHERE rate_key LIKE $1`, [`%${outageIp}%`]).catch(() => {});
         _resetRateLimiter();
         if (savedNodeEnv === undefined) delete process.env.NODE_ENV;
         else process.env.NODE_ENV = savedNodeEnv;
@@ -2844,11 +2874,15 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
     // -----------------------------------------------------------------------
     // REMEDIATION F — Public AI Studio Artifact Exposure Blocking
     // -----------------------------------------------------------------------
-    test('RF1. /assets/aistudio/* artifacts and normalized bypass paths return 404 while files remain preserved on disk', async () => {
-      const aistudioDir = path.join(process.cwd(), 'public/assets/aistudio');
-      const diskFiles = fs.readdirSync(aistudioDir);
-      assert.ok(diskFiles.includes('Paste_November_14__2026_-_8_30PM_b6c0943e'));
-      assert.ok(diskFiles.includes('Allbirds_Shopify_products_fdd9af86.txt'));
+    test('RF1. /assets/aistudio/* artifacts and normalized bypass paths return 404 while original files are archived outside public/', async () => {
+      const publicAistudioDir = path.join(process.cwd(), 'public/assets/aistudio');
+      assert.equal(fs.existsSync(publicAistudioDir), false, 'public/assets/aistudio must not remain inside public/');
+
+      const archiveDir = path.join(process.cwd(), 'docs/archive/aistudio');
+      const archivedFiles = fs.readdirSync(archiveDir);
+      assert.ok(archivedFiles.includes('Paste_November_14__2026_-_8_30PM_b6c0943e'));
+      assert.ok(archivedFiles.includes('Paste_November_15__2026_-_4_18PM_bccda2c6'));
+      assert.ok(archivedFiles.includes('Allbirds_Shopify_products_fdd9af86.txt'));
 
       const repo = new MemoryRepository();
       const app = createApp(repo);
@@ -2926,6 +2960,42 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       } finally {
         await close();
         fs.rmSync(staticDir, { recursive: true, force: true });
+      }
+    });
+
+    test('RF3. [Workstream D] Production Vite build output contains zero AI Studio artifacts in dist/ while preserving SPA assets', async () => {
+      const { build } = await import('vite');
+      const tmpDist = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-dist-check-'));
+      try {
+        await build({
+          logLevel: 'silent',
+          build: {
+            outDir: tmpDist,
+            emptyOutDir: true,
+          },
+        });
+
+        const builtFiles: string[] = [];
+        const walkBuilt = (dir: string) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) walkBuilt(full);
+            else builtFiles.push(path.relative(tmpDist, full));
+          }
+        };
+        walkBuilt(tmpDist);
+
+        assert.ok(builtFiles.includes('index.html'), 'Production build must output index.html');
+        assert.ok(builtFiles.some(f => f.startsWith('assets/') && f.endsWith('.js')), 'Production build must output JS bundle');
+        for (const rel of builtFiles) {
+          assert.doesNotMatch(
+            rel,
+            /aistudio|Paste_November_|Allbirds_Shopify_products_/i,
+            `Built artifact "${rel}" must never appear in Vite output`
+          );
+        }
+      } finally {
+        fs.rmSync(tmpDist, { recursive: true, force: true });
       }
     });
   });
