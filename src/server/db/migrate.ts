@@ -8,12 +8,28 @@ import { getPostgresPoolConfig } from './index';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+export interface MigrationCleanupErrorEntry {
+  phase: 'rollback' | 'unlock' | 'release' | 'pool_end';
+  message: string;
+}
+
+export interface MigrationDiagnostics {
+  migrationExecution: 'succeeded' | 'failed';
+  transactionCommit: 'committed' | 'rolled_back' | 'rollback_failed' | 'not_started';
+  advisoryLock: 'released' | 'release_failed' | 'not_acquired' | 'acquire_failed';
+  connectionCleanup: 'released' | 'destroyed' | 'release_failed' | 'not_acquired';
+  poolShutdown: 'closed' | 'close_failed' | 'caller_managed';
+  cleanupSucceeded: boolean;
+  cleanupErrors: MigrationCleanupErrorEntry[];
+}
+
 export interface MigrationResult {
   applied: string[];
   alreadyApplied: string[];
   totalMigrations: number;
   verifiedChecksums: string[];
   legacyUnverifiedMigrations: string[];
+  diagnostics?: MigrationDiagnostics;
 }
 
 export interface MigrationStatus {
@@ -27,6 +43,7 @@ export interface MigrationStatus {
   missingMigrationFiles: string[];
   legacyUnverifiedMigrations: string[];
   integrityVerified: boolean;
+  diagnostics?: MigrationDiagnostics;
 }
 
 export interface MigrationRunOptions {
@@ -39,6 +56,14 @@ export interface MigrationRunOptions {
 // Key 2: 0x4d494752 = 1296656210 ('MIGR' in ASCII)
 const MIGRATION_ADVISORY_LOCK_KEY_1 = 1095325779;
 const MIGRATION_ADVISORY_LOCK_KEY_2 = 1296656210;
+
+export function sanitizeDiagnosticMessage(msg: unknown): string {
+  const raw = msg instanceof Error ? msg.message : String(msg ?? '');
+  if (!raw) return '';
+  return raw
+    .replace(/(postgres(?:ql)?:\/\/)([^:@\s]+(?::[^@\s]*)?)@/gi, '$1***@')
+    .replace(/\b(password|passwd|secret|token)\s*[:=]\s*(['"]?)[^\s,;'"&]+(\2)/gi, '$1=$2***$3');
+}
 
 export function computeMigrationChecksum(sqlContent: string): string {
   const normalized = sqlContent.replace(/\r\n/g, '\n');
@@ -79,12 +104,29 @@ export async function runMigrations(
   let poolClosed = false;
   let primaryError: unknown = null;
 
+  let transactionCommitState: MigrationDiagnostics['transactionCommit'] = 'not_started';
+  let advisoryLockState: MigrationDiagnostics['advisoryLock'] = 'not_acquired';
+  let connectionCleanupState: MigrationDiagnostics['connectionCleanup'] = 'not_acquired';
+  let poolShutdownState: MigrationDiagnostics['poolShutdown'] = shouldClosePool
+    ? 'close_failed'
+    : 'caller_managed';
+
+  const diagnostics: MigrationDiagnostics = {
+    migrationExecution: 'failed',
+    transactionCommit: transactionCommitState,
+    advisoryLock: advisoryLockState,
+    connectionCleanup: connectionCleanupState,
+    poolShutdown: poolShutdownState,
+    cleanupSucceeded: true,
+    cleanupErrors: [],
+  };
+
   const cleanupDiagnostics: Array<{ phase: 'rollback' | 'unlock' | 'release' | 'pool_end'; message: string; error: unknown }> = [];
   const recordCleanupFailure = (
     phase: 'rollback' | 'unlock' | 'release' | 'pool_end',
     err: unknown
   ) => {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = sanitizeDiagnosticMessage(err);
     cleanupDiagnostics.push({ phase, message, error: err });
     if (primaryError && typeof primaryError === 'object' && Object.isExtensible(primaryError)) {
       const target = primaryError as Record<string, any>;
@@ -113,6 +155,7 @@ export async function runMigrations(
       lockConfirmedAcquired = true;
     } catch (lockErr) {
       // If the lock acquisition query fails, server-side session lock outcome is uncertain
+      advisoryLockState = 'acquire_failed';
       connectionPoisoned = true;
       primaryError = lockErr;
       throw lockErr;
@@ -227,6 +270,7 @@ export async function runMigrations(
         );
         await client.query('COMMIT');
         inTransaction = false;
+        transactionCommitState = 'committed';
         applied.push(file);
         verifiedChecksums.push(file);
         console.log(`[AIXSHOP Migration] ✓ Successfully applied ${file} (sha256: ${fileChecksum.slice(0, 12)}...)`);
@@ -237,16 +281,18 @@ export async function runMigrations(
           await client.query('ROLLBACK');
           inTransaction = false;
           rollbackSucceeded = true;
+          transactionCommitState = 'rolled_back';
         } catch (rollbackErr: any) {
           rollbackSucceeded = false;
+          transactionCommitState = 'rollback_failed';
           connectionPoisoned = true;
           recordCleanupFailure('rollback', rollbackErr);
           console.error(
             `[AIXSHOP Migration Rollback Error] Rollback failed for ${file}; connection marked for destruction:`,
-            rollbackErr?.message || rollbackErr
+            sanitizeDiagnosticMessage(rollbackErr)
           );
         }
-        console.error(`[AIXSHOP Migration Failed] Error executing ${file}:`, err?.message || err);
+        console.error(`[AIXSHOP Migration Failed] Error executing ${file}:`, sanitizeDiagnosticMessage(err));
         throw err;
       }
     }
@@ -255,12 +301,14 @@ export async function runMigrations(
       `[AIXSHOP Migration Complete] ${applied.length} migration(s) applied, ${alreadyApplied.length} already up to date.`
     );
 
+    diagnostics.migrationExecution = 'succeeded';
     return {
       applied,
       alreadyApplied,
       totalMigrations: files.length,
       verifiedChecksums,
       legacyUnverifiedMigrations,
+      diagnostics,
     };
   } catch (err) {
     if (primaryError === null) {
@@ -275,6 +323,7 @@ export async function runMigrations(
           [MIGRATION_ADVISORY_LOCK_KEY_1, MIGRATION_ADVISORY_LOCK_KEY_2]
         );
         if (unlockRes?.rows?.[0] && unlockRes.rows[0].pg_advisory_unlock === false) {
+          advisoryLockState = 'release_failed';
           connectionPoisoned = true;
           const falseUnlockErr = new Error('pg_advisory_unlock returned false during migration cleanup');
           recordCleanupFailure('unlock', falseUnlockErr);
@@ -283,13 +332,15 @@ export async function runMigrations(
           );
         } else {
           lockConfirmedReleased = true;
+          advisoryLockState = 'released';
         }
       } catch (unlockErr: any) {
+        advisoryLockState = 'release_failed';
         connectionPoisoned = true;
         recordCleanupFailure('unlock', unlockErr);
         console.error(
           '[AIXSHOP Migration Unlock Error] Failed to release advisory lock; connection marked for destruction:',
-          unlockErr?.message || unlockErr
+          sanitizeDiagnosticMessage(unlockErr)
         );
       }
     }
@@ -305,12 +356,18 @@ export async function runMigrations(
       try {
         if (isConnectionSafe) {
           client.release();
+          connectionCleanupState = 'released';
         } else {
           (client.release as any)(true);
+          connectionCleanupState = 'destroyed';
         }
       } catch (releaseErr) {
+        connectionCleanupState = 'release_failed';
         recordCleanupFailure('release', releaseErr);
-        // Guard against double or secondary release error hiding primary failure
+        console.error(
+          '[AIXSHOP Migration Cleanup Error] Failed while releasing PostgreSQL client:',
+          sanitizeDiagnosticMessage(releaseErr)
+        );
       }
     }
 
@@ -318,10 +375,30 @@ export async function runMigrations(
       poolClosed = true;
       try {
         await pool.end();
+        poolShutdownState = 'closed';
       } catch (poolEndErr) {
+        poolShutdownState = 'close_failed';
         recordCleanupFailure('pool_end', poolEndErr);
-        // Guard against secondary pool.end() error hiding primary failure
+        console.error(
+          '[AIXSHOP Migration Cleanup Error] Failed while closing internal PostgreSQL pool:',
+          sanitizeDiagnosticMessage(poolEndErr)
+        );
       }
+    }
+
+    diagnostics.migrationExecution = primaryError ? 'failed' : 'succeeded';
+    diagnostics.transactionCommit = transactionCommitState;
+    diagnostics.advisoryLock = advisoryLockState;
+    diagnostics.connectionCleanup = connectionCleanupState;
+    diagnostics.poolShutdown = poolShutdownState;
+    diagnostics.cleanupErrors = cleanupDiagnostics.map(e => ({
+      phase: e.phase,
+      message: e.message,
+    }));
+    diagnostics.cleanupSucceeded = cleanupDiagnostics.length === 0;
+
+    if (primaryError && typeof primaryError === 'object' && Object.isExtensible(primaryError)) {
+      (primaryError as Record<string, any>).migrationDiagnostics = diagnostics;
     }
   }
 }
@@ -346,6 +423,36 @@ export async function checkMigrationStatus(
   let clientReleased = false;
   let poolClosed = false;
   let queryFailed = false;
+  let primaryError: unknown = null;
+
+  let connectionCleanupState: MigrationDiagnostics['connectionCleanup'] = 'not_acquired';
+  let poolShutdownState: MigrationDiagnostics['poolShutdown'] = shouldClosePool
+    ? 'close_failed'
+    : 'caller_managed';
+
+  const cleanupErrors: MigrationCleanupErrorEntry[] = [];
+  const diagnostics: MigrationDiagnostics = {
+    migrationExecution: 'failed',
+    transactionCommit: 'not_started',
+    advisoryLock: 'not_acquired',
+    connectionCleanup: connectionCleanupState,
+    poolShutdown: poolShutdownState,
+    cleanupSucceeded: true,
+    cleanupErrors: [],
+  };
+
+  const recordStatusCleanupFailure = (
+    phase: 'release' | 'pool_end',
+    err: unknown
+  ) => {
+    const message = sanitizeDiagnosticMessage(err);
+    cleanupErrors.push({ phase, message });
+    if (primaryError && typeof primaryError === 'object' && Object.isExtensible(primaryError)) {
+      const target = primaryError as Record<string, any>;
+      const existing = Array.isArray(target.cleanupErrors) ? target.cleanupErrors : [];
+      target.cleanupErrors = [...existing, { phase, message, error: err }];
+    }
+  };
 
   try {
     client = await pool.connect();
@@ -410,6 +517,7 @@ export async function checkMigrationStatus(
     }
 
     const integrityVerified = checksumMismatches.length === 0 && missingMigrationFiles.length === 0;
+    diagnostics.migrationExecution = 'succeeded';
 
     return {
       isUpToDate: tableExists && pendingMigrations.length === 0 && integrityVerified,
@@ -422,8 +530,10 @@ export async function checkMigrationStatus(
       missingMigrationFiles,
       legacyUnverifiedMigrations,
       integrityVerified,
+      diagnostics,
     };
   } catch (err) {
+    primaryError = err;
     if (client) {
       queryFailed = true;
     }
@@ -434,11 +544,18 @@ export async function checkMigrationStatus(
       try {
         if (queryFailed) {
           (client.release as any)(true);
+          connectionCleanupState = 'destroyed';
         } else {
           client.release();
+          connectionCleanupState = 'released';
         }
-      } catch {
-        // Guard against double release
+      } catch (releaseErr) {
+        connectionCleanupState = 'release_failed';
+        recordStatusCleanupFailure('release', releaseErr);
+        console.error(
+          '[AIXSHOP Migration Status Cleanup Error] Failed while releasing PostgreSQL client:',
+          sanitizeDiagnosticMessage(releaseErr)
+        );
       }
     }
 
@@ -446,9 +563,25 @@ export async function checkMigrationStatus(
       poolClosed = true;
       try {
         await pool.end();
-      } catch {
-        // Guard against double end
+        poolShutdownState = 'closed';
+      } catch (poolEndErr) {
+        poolShutdownState = 'close_failed';
+        recordStatusCleanupFailure('pool_end', poolEndErr);
+        console.error(
+          '[AIXSHOP Migration Status Cleanup Error] Failed while closing internal PostgreSQL pool:',
+          sanitizeDiagnosticMessage(poolEndErr)
+        );
       }
+    }
+
+    diagnostics.migrationExecution = primaryError ? 'failed' : 'succeeded';
+    diagnostics.connectionCleanup = connectionCleanupState;
+    diagnostics.poolShutdown = poolShutdownState;
+    diagnostics.cleanupErrors = [...cleanupErrors];
+    diagnostics.cleanupSucceeded = cleanupErrors.length === 0;
+
+    if (primaryError && typeof primaryError === 'object' && Object.isExtensible(primaryError)) {
+      (primaryError as Record<string, any>).migrationDiagnostics = diagnostics;
     }
   }
 }
@@ -488,10 +621,23 @@ if (isDirectRun) {
         } else if (status.isUpToDate) {
           console.log('[AIXSHOP Migration Status] Schema and checksums are up to date.');
         }
+        if (status.diagnostics && !status.diagnostics.cleanupSucceeded) {
+          console.warn(
+            `[AIXSHOP Migration Status Cleanup Warning] Post-query cleanup reported issues: ${status.diagnostics.cleanupErrors
+              .map(e => `${e.phase}: ${e.message}`)
+              .join('; ')}`
+          );
+        }
         process.exit(status.isUpToDate ? 0 : 2);
       })
       .catch((err) => {
-        console.error('[AIXSHOP Migration Status Error]:', err.message || err);
+        console.error('[AIXSHOP Migration Status Error]:', sanitizeDiagnosticMessage(err));
+        if (Array.isArray(err?.cleanupErrors) && err.cleanupErrors.length > 0) {
+          console.error(
+            '[AIXSHOP Migration Status Cleanup Errors]:',
+            err.cleanupErrors.map((e: any) => `${e.phase}: ${sanitizeDiagnosticMessage(e.message)}`).join('; ')
+          );
+        }
         process.exit(1);
       });
   } else {
@@ -500,10 +646,23 @@ if (isDirectRun) {
         console.log(
           `[AIXSHOP Migration] Completed successfully. Total migrations tracked: ${result.totalMigrations}`
         );
+        if (result.diagnostics && !result.diagnostics.cleanupSucceeded) {
+          console.warn(
+            `[AIXSHOP Migration Cleanup Warning] Migration succeeded (commit=${result.diagnostics.transactionCommit}), but post-commit cleanup encountered errors: ${result.diagnostics.cleanupErrors
+              .map(e => `${e.phase}: ${e.message}`)
+              .join('; ')}`
+          );
+        }
         process.exit(0);
       })
       .catch((err) => {
-        console.error('[AIXSHOP Migration Fatal Error]:', err.message || err);
+        console.error('[AIXSHOP Migration Fatal Error]:', sanitizeDiagnosticMessage(err));
+        if (Array.isArray(err?.cleanupErrors) && err.cleanupErrors.length > 0) {
+          console.error(
+            '[AIXSHOP Migration Cleanup Errors]:',
+            err.cleanupErrors.map((e: any) => `${e.phase}: ${sanitizeDiagnosticMessage(e.message)}`).join('; ')
+          );
+        }
         process.exit(1);
       });
   }

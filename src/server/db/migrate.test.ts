@@ -538,5 +538,160 @@ describe('Migration Runner Connection Safety & Poisoned Client Cleanup', () => {
     assert.equal(status.pendingCount, 1);
     assert.equal(healthyRig.clientRecords[0].normalReleaseCount, 1);
     assert.equal(healthyRig.clientRecords[0].destroyCount, 0);
+    assert.equal(status.diagnostics?.cleanupSucceeded, true);
+    assert.equal(status.diagnostics?.connectionCleanup, 'released');
+  });
+
+  test('12. Task F: Successful migration + unlock failure exposes structured post-commit diagnostics without false rollback', async () => {
+    const dir = createTempMigrations({
+      '001_init.sql': 'CREATE TABLE t_unlock_diag (id INT);',
+    });
+
+    const rigThrow = createFailureInjectablePool({ rejectUnlock: true });
+    const res1 = await runMigrations(rigThrow.pool, { migrationsDir: dir });
+    assert.deepEqual(res1.applied, ['001_init.sql']);
+    assert.equal(res1.diagnostics?.migrationExecution, 'succeeded');
+    assert.equal(res1.diagnostics?.transactionCommit, 'committed');
+    assert.equal(res1.diagnostics?.advisoryLock, 'release_failed');
+    assert.equal(res1.diagnostics?.connectionCleanup, 'destroyed');
+    assert.equal(res1.diagnostics?.poolShutdown, 'caller_managed');
+    assert.equal(res1.diagnostics?.cleanupSucceeded, false);
+    assert.equal(res1.diagnostics?.cleanupErrors[0]?.phase, 'unlock');
+
+    const rigFalse = createFailureInjectablePool({ unlockFalse: true });
+    const res2 = await runMigrations(rigFalse.pool, { migrationsDir: dir });
+    assert.equal(res2.diagnostics?.migrationExecution, 'succeeded');
+    assert.equal(res2.diagnostics?.advisoryLock, 'release_failed');
+    assert.equal(res2.diagnostics?.connectionCleanup, 'destroyed');
+    assert.equal(res2.diagnostics?.cleanupSucceeded, false);
+    assert.equal(res2.diagnostics?.cleanupErrors[0]?.phase, 'unlock');
+  });
+
+  test('13. Task F: client.release() failure after commit records release diagnostic and redacts credentials', async () => {
+    const dir = createTempMigrations({
+      '001_init.sql': 'CREATE TABLE t_release_diag (id INT);',
+    });
+    const rig = createFailureInjectablePool({
+      throwOnRelease: new Error('release failed on postgresql://dbadmin:SuperSecretPass99@10.0.0.5:5432/prod password=rawsecret'),
+    });
+
+    const res = await runMigrations(rig.pool, { migrationsDir: dir });
+    assert.deepEqual(res.applied, ['001_init.sql']);
+    assert.equal(res.diagnostics?.migrationExecution, 'succeeded');
+    assert.equal(res.diagnostics?.transactionCommit, 'committed');
+    assert.equal(res.diagnostics?.connectionCleanup, 'release_failed');
+    assert.equal(res.diagnostics?.cleanupSucceeded, false);
+    assert.equal(res.diagnostics?.cleanupErrors.length, 1);
+    assert.equal(res.diagnostics?.cleanupErrors[0].phase, 'release');
+    assert.match(res.diagnostics?.cleanupErrors[0].message || '', /postgresql:\/\/\*\*\*@10\.0\.0\.5:5432\/prod/);
+    assert.doesNotMatch(res.diagnostics?.cleanupErrors[0].message || '', /SuperSecretPass99|rawsecret/);
+  });
+
+  test('14. Task F: Internal pool.end() failure records pool_end diagnostic cleanly and redacts connection URL credentials', async () => {
+    const dir = createTempMigrations({
+      '001_init.sql': 'CREATE TABLE t_pool_end_diag (id INT);',
+    });
+    const origUrl = process.env.DATABASE_URL;
+    const origConnect = Pool.prototype.connect;
+    const origEnd = Pool.prototype.end;
+    const origErr = console.error;
+    const logged: string[] = [];
+    console.error = (...args: any[]) => logged.push(args.map(String).join(' '));
+
+    process.env.DATABASE_URL = 'postgresql://miguser:SecretPw123@127.0.0.1:5432/testdb';
+    Pool.prototype.connect = async function () {
+      return {
+        query: async (sql: string) => {
+          if (sql.includes('SELECT id, checksum FROM schema_migrations')) return { rows: [] };
+          if (sql.includes('pg_advisory_unlock')) return { rows: [{ pg_advisory_unlock: true }] };
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => {},
+      } as any;
+    };
+    Pool.prototype.end = async function () {
+      throw new Error('pool.end socket hangup postgresql://miguser:SecretPw123@127.0.0.1:5432/testdb');
+    };
+
+    try {
+      const res = await runMigrations(undefined, { migrationsDir: dir });
+      assert.equal(res.diagnostics?.migrationExecution, 'succeeded');
+      assert.equal(res.diagnostics?.transactionCommit, 'committed');
+      assert.equal(res.diagnostics?.poolShutdown, 'close_failed');
+      assert.equal(res.diagnostics?.cleanupSucceeded, false);
+      assert.equal(res.diagnostics?.cleanupErrors[0]?.phase, 'pool_end');
+      assert.doesNotMatch(res.diagnostics?.cleanupErrors[0]?.message || '', /SecretPw123/);
+      assert.doesNotMatch(logged.join('\n'), /SecretPw123/);
+    } finally {
+      console.error = origErr;
+      Pool.prototype.connect = origConnect;
+      Pool.prototype.end = origEnd;
+      if (origUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = origUrl;
+    }
+  });
+
+  test('15. Task F: Multiple sequential cleanup failures (rollback + unlock + release + pool_end) and checkMigrationStatus() cleanup diagnostics', async () => {
+    const dir = createTempMigrations({
+      '001_fail.sql': 'CREATE TABLE t_all_fail (id INT);',
+    });
+    const origUrl = process.env.DATABASE_URL;
+    const origConnect = Pool.prototype.connect;
+    const origEnd = Pool.prototype.end;
+
+    process.env.DATABASE_URL = 'postgresql://u:s3cr3t@127.0.0.1:5432/testdb';
+    Pool.prototype.connect = async function () {
+      return {
+        query: async (sql: string) => {
+          if (sql.includes('SELECT id, checksum FROM schema_migrations')) return { rows: [] };
+          if (sql.includes('CREATE TABLE t_all_fail')) throw new Error('Primary failure on DDL');
+          if (sql === 'ROLLBACK') throw new Error('Rollback error password=leak_rb');
+          if (sql.includes('pg_advisory_unlock')) throw new Error('Unlock error postgres://user:leak_ul@host/db');
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => {
+          throw new Error('Release error token=leak_rel');
+        },
+      } as any;
+    };
+    Pool.prototype.end = async function () {
+      throw new Error('Pool end error postgresql://user:leak_end@host/db');
+    };
+
+    try {
+      await assert.rejects(
+        () => runMigrations(undefined, { migrationsDir: dir }),
+        (err: any) => {
+          assert.equal(err.message, 'Primary failure on DDL');
+          assert.deepEqual(
+            err.cleanupErrors.map((e: any) => e.phase),
+            ['rollback', 'unlock', 'release', 'pool_end']
+          );
+          assert.equal(err.migrationDiagnostics.migrationExecution, 'failed');
+          assert.equal(err.migrationDiagnostics.transactionCommit, 'rollback_failed');
+          assert.equal(err.migrationDiagnostics.advisoryLock, 'release_failed');
+          assert.equal(err.migrationDiagnostics.connectionCleanup, 'release_failed');
+          assert.equal(err.migrationDiagnostics.poolShutdown, 'close_failed');
+          assert.equal(err.migrationDiagnostics.cleanupSucceeded, false);
+          const joined = err.migrationDiagnostics.cleanupErrors.map((e: any) => e.message).join('\n');
+          assert.doesNotMatch(joined, /leak_rb|leak_ul|leak_rel|leak_end/);
+          return true;
+        }
+      );
+
+      // checkMigrationStatus cleanup failure diagnostics
+      const badStatusPool = createFailureInjectablePool({
+        throwOnRelease: new Error('Status release fail password=leak_st'),
+      });
+      const st = await checkMigrationStatus(badStatusPool.pool, { migrationsDir: dir });
+      assert.equal(st.diagnostics?.cleanupSucceeded, false);
+      assert.equal(st.diagnostics?.connectionCleanup, 'release_failed');
+      assert.doesNotMatch(st.diagnostics?.cleanupErrors[0]?.message || '', /leak_st/);
+    } finally {
+      Pool.prototype.connect = origConnect;
+      Pool.prototype.end = origEnd;
+      if (origUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = origUrl;
+    }
   });
 });

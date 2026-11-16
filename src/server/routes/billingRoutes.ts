@@ -3,15 +3,19 @@ import { DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { getBillingProvider } from '../billing/providerAdapter';
-import { BillingService } from '../services/billingService';
+import { BillingLeaseConfig, BillingService } from '../services/billingService';
 import { AUTHORITATIVE_PLANS, IBillingProvider } from '../billing/types';
 import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/productionConfig';
 
-export function createBillingRoutes(repo: DatabaseRepository, customProvider?: IBillingProvider): Router {
+export function createBillingRoutes(
+  repo: DatabaseRepository,
+  customProvider?: IBillingProvider,
+  billingLeaseConfig?: BillingLeaseConfig
+): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
   const getProvider = () => customProvider || getBillingProvider();
-  const getBillingService = () => new BillingService(repo, getProvider());
+  const getBillingService = () => new BillingService(repo, getProvider(), billingLeaseConfig);
 
   // GET /api/billing/plans — Returns authoritative server-defined plans and capacities
   router.get('/plans', (req, res) => {
@@ -135,6 +139,17 @@ export function createBillingRoutes(repo: DatabaseRepository, customProvider?: I
       const billingService = getBillingService();
       const result = await billingService.handleWebhook(rawBody, signature);
 
+      if (result.inProgress || result.retryable) {
+        res.setHeader('Retry-After', '30');
+        return res.status(503).json({
+          received: false,
+          inProgress: Boolean(result.inProgress),
+          retryable: true,
+          action: result.action,
+          message: result.message,
+        });
+      }
+
       return res.status(200).json({
         received: true,
         action: result.action,
@@ -142,9 +157,14 @@ export function createBillingRoutes(repo: DatabaseRepository, customProvider?: I
       });
     } catch (err: any) {
       console.error('[AIXSHOP Billing] Webhook processing error:', err.message || err);
-      const statusCode = typeof err.statusCode === 'number' ? err.statusCode : 400;
+      const statusCode = typeof err.statusCode === 'number' ? err.statusCode : 503;
+      if (statusCode === 503) {
+        res.setHeader('Retry-After', '30');
+      }
       return res.status(statusCode).json({
         error: err.message || 'Webhook processing failed',
+        ...(err?.code ? { code: err.code } : {}),
+        ...(statusCode === 503 ? { retryable: true } : {}),
       });
     }
   });

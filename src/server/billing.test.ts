@@ -1338,6 +1338,436 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       assert.equal(currentSub?.status, 'canceled');
     });
   });
+
+  // ==========================================
+  // 6. Task B: Stripe Subscription Status Must Fail Closed
+  // ==========================================
+  describe('Workstream 5 (Task B): Stripe Subscription Status Fail-Closed Enforcement', () => {
+    test('B.1 normalizeStripeSubscriptionStatus classifies known statuses and fails closed on unknown/missing/non-string', async () => {
+      const { normalizeStripeSubscriptionStatus } = await import('./services/billingService');
+
+      assert.deepEqual(normalizeStripeSubscriptionStatus('active'), {
+        status: 'active',
+        isKnownStatus: true,
+        isAuthorizedPaidTier: true,
+        rawStatus: 'active',
+      });
+      assert.deepEqual(normalizeStripeSubscriptionStatus(' TRIALING '), {
+        status: 'trialing',
+        isKnownStatus: true,
+        isAuthorizedPaidTier: true,
+        rawStatus: 'trialing',
+      });
+
+      for (const nonActive of ['past_due', 'canceled', 'cancelled', 'unpaid', 'incomplete', 'incomplete_expired', 'expired', 'pending']) {
+        const res = normalizeStripeSubscriptionStatus(nonActive);
+        assert.equal(res.isKnownStatus, true);
+        assert.equal(res.isAuthorizedPaidTier, false, `Status ${nonActive} must NOT authorize paid tier`);
+      }
+
+      for (const invalid of ['paused', 'unknown_status', '', '   ', undefined, null, 123, {}]) {
+        const res = normalizeStripeSubscriptionStatus(invalid);
+        assert.equal(res.status, 'incomplete', `Invalid status ${String(invalid)} must fail closed to incomplete`);
+        assert.equal(res.isKnownStatus, false);
+        assert.equal(res.isAuthorizedPaidTier, false);
+      }
+    });
+
+    test('B.2 customer.subscription.updated with unknown ("paused"), empty, or missing status downgrades paid tier to Free Audit', async () => {
+      const { resolveWorkspacePlanEntitlement } = await import('./services/entitlementService');
+
+      for (const rawStatus of ['paused', '', undefined, 42] as any[]) {
+        const wsB = `ws_task_b_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const owner = await repo.createUser({
+          id: `usr_${wsB}`,
+          email: `${wsB}@example.com`,
+          passwordHash: 'hash',
+          fullName: 'Task B Owner',
+        });
+        await repo.createWorkspace({ id: wsB, name: 'Task B WS', slug: `ws-${wsB}` }, owner.id);
+        await repo.saveStoreProfile(wsB, {
+          name: 'Task B Store',
+          domain: 'taskb.myshopify.com',
+          currency: 'USD',
+          skuCount: 0,
+          skuLimit: 2500,
+          tier: 'Growth',
+          connectors: [],
+          catalogCompletenessAvg: 100,
+          truthBoundaryStrictness: 'standard',
+        });
+        await repo.saveSubscription({
+          id: `subrec_${wsB}`,
+          workspaceId: wsB,
+          provider: 'stripe',
+          customerId: 'cus_task_b_1',
+          subscriptionId: 'sub_task_b_1',
+          tier: 'Growth',
+          status: 'active',
+          currentPeriodStart: new Date().toISOString(),
+          currentPeriodEnd: new Date(Date.now() + 86400000).toISOString(),
+          cancelAtPeriodEnd: false,
+          lastEventCreated: 1000,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+
+        const stripeProvider = new StripeBillingProvider('sk_test_key', 'whsec_test_key');
+        const stripeBillingSvc = new BillingService(repo, stripeProvider);
+
+        const eventObj: Record<string, any> = {
+          id: 'sub_task_b_1',
+          customer: 'cus_task_b_1',
+          metadata: { workspaceId: wsB, tier: 'Growth' },
+        };
+        if (rawStatus !== undefined) {
+          eventObj.status = rawStatus;
+        }
+
+        const res = await (stripeBillingSvc as any).processEvent({
+          id: `evt_bad_status_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          type: 'customer.subscription.updated',
+          created: 2000,
+          data: { object: eventObj },
+        });
+
+        assert.equal(res.success, true);
+        assert.equal(res.subscription.status, 'incomplete');
+
+        const updatedStore = await repo.getStoreByWorkspace(wsB);
+        assert.equal(updatedStore?.tier, 'Free Audit', `Status ${String(rawStatus)} must retract paid store tier`);
+
+        const entitlement = resolveWorkspacePlanEntitlement(updatedStore, res.subscription);
+        assert.equal(entitlement.tier, 'Free Audit');
+        assert.equal(entitlement.subscriptionStatus, 'incomplete');
+      }
+    });
+
+    test('B.3 Stripe checkout.session.completed with missing/empty/unknown payment_status fails closed and replay is idempotent', async () => {
+      const wsB = `ws_task_b_chk_${Date.now()}`;
+      const owner = await repo.createUser({
+        id: `usr_${wsB}`,
+        email: `${wsB}@example.com`,
+        passwordHash: 'hash',
+        fullName: 'Task B Checkout Owner',
+      });
+      await repo.createWorkspace({ id: wsB, name: 'Task B Checkout', slug: `ws-${wsB}` }, owner.id);
+
+      const stripeProvider = new StripeBillingProvider('sk_test_key', 'whsec_test_key');
+      const stripeBillingSvc = new BillingService(repo, stripeProvider);
+
+      const eventId = `evt_stripe_missing_payment_${Date.now()}`;
+      const payloadObj = {
+        id: eventId,
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: wsB,
+            customer: 'cus_stripe_missing_pay_1',
+            subscription: 'sub_stripe_missing_pay_1',
+            metadata: { tier: 'Growth' },
+            // payment_status intentionally omitted!
+          },
+        },
+      };
+
+      const raw = JSON.stringify(payloadObj);
+      const mockSignedProvider = new StripeBillingProvider(
+        'sk_test_key',
+        'whsec_test_key',
+        createMockStripeClient()
+      );
+      const svcWithMockVerify = new BillingService(repo, mockSignedProvider);
+
+      const r1 = await svcWithMockVerify.handleWebhook(raw, 't=123,v1=valid');
+      assert.equal(r1.success, true);
+      assert.equal(r1.action, 'processed');
+      assert.equal(r1.subscription?.status, 'incomplete');
+
+      const store = await repo.getStoreByWorkspace(wsB);
+      assert.equal(store?.tier, 'Free Audit', 'Stripe checkout without payment_status=paid/no_payment_required must NOT elevate tier');
+
+      // Idempotent replay also never elevates
+      const r2 = await svcWithMockVerify.handleWebhook(raw, 't=123,v1=valid');
+      assert.equal(r2.action, 'duplicate');
+      assert.equal((await repo.getStoreByWorkspace(wsB))?.tier, 'Free Audit');
+    });
+  });
+
+  // ==========================================
+  // 7. Task C: Webhook In-Progress HTTP 503 & Retry Recovery
+  // ==========================================
+  describe('Workstream 6 (Task C): Webhook In-Progress HTTP 503 & Lease Recovery Tests', () => {
+    function signSandboxEvent(payload: any, secret: string): string {
+      return crypto.createHmac('sha256', secret).update(JSON.stringify(payload)).digest('hex');
+    }
+
+    test('C.1 In-flight processing duplicate returns HTTP 503 + Retry-After: 30; terminal duplicate returns HTTP 200', async () => {
+      const wsC = `ws_task_c_http_${Date.now()}`;
+      const owner = await repo.createUser({ id: `usr_${wsC}`, email: `${wsC}@example.com`, passwordHash: 'hash', fullName: 'Task C Owner' });
+      await repo.createWorkspace({ id: wsC, name: 'Task C WS', slug: `ws-${wsC}` }, owner.id);
+
+      const eventId = `evt_c_inflight_${Date.now()}`;
+      const payloadObj = {
+        id: eventId,
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: wsC,
+            customer: 'cus_task_c_1',
+            subscription: 'sub_task_c_1',
+            metadata: { tier: 'Growth' },
+            payment_status: 'paid',
+          },
+        },
+      };
+      const raw = JSON.stringify(payloadObj);
+      const sig = sandboxProvider.generateSignedPayload(payloadObj).signature;
+
+      // Worker 1 claims an active lease (in-flight)
+      const activeClaim = await repo.claimBillingEvent(
+        {
+          id: `bevt_${eventId}`,
+          provider: 'sandbox',
+          eventId,
+          eventType: payloadObj.type,
+          idempotencyKey: eventId,
+          payload: payloadObj,
+          status: 'processing',
+          processedAt: new Date().toISOString(),
+        },
+        { leaseOwner: 'worker_1_active', leaseDurationMs: 60_000 }
+      );
+      assert.equal(activeClaim.claimed, true);
+
+      // Concurrent HTTP webhook delivery while active lease exists -> MUST return 503 (never 200!)
+      const inflightRes = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'stripe-signature': sig },
+        body: raw,
+      });
+      assert.equal(inflightRes.status, 503);
+      assert.equal(inflightRes.headers.get('retry-after'), '30');
+      const inflightJson = await inflightRes.json();
+      assert.equal(inflightJson.received, false);
+      assert.equal(inflightJson.inProgress, true);
+      assert.equal(inflightJson.retryable, true);
+
+      // Worker 1 completes entitlement transition
+      await repo.applyBillingTransition({
+        eventId,
+        leaseOwner: 'worker_1_active',
+        subscription: {
+          id: `subrec_${wsC}`,
+          workspaceId: wsC,
+          provider: 'sandbox',
+          customerId: 'cus_task_c_1',
+          subscriptionId: 'sub_task_c_1',
+          tier: 'Growth',
+          status: 'active',
+          currentPeriodStart: new Date().toISOString(),
+          currentPeriodEnd: new Date(Date.now() + 86400000).toISOString(),
+          cancelAtPeriodEnd: false,
+          lastEventCreated: payloadObj.created,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        storeProfileUpdate: { tier: 'Growth', skuLimit: 2500 },
+      });
+
+      // Replay AFTER processed -> returns HTTP 200 duplicate
+      const doneRes = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'stripe-signature': sig },
+        body: raw,
+      });
+      assert.equal(doneRes.status, 200);
+      const doneJson = await doneRes.json();
+      assert.equal(doneJson.received, true);
+      assert.equal(doneJson.action, 'duplicate');
+    });
+
+    test('C.2 Crashed Worker 1 leaves processing event -> HTTP 503 before expiry, reclaims & applies cleanly (HTTP 200) after expiry, stale Worker 1 blocked', async () => {
+      const wsC = `ws_task_c_crash_${Date.now()}`;
+      const owner = await repo.createUser({ id: `usr_${wsC}`, email: `${wsC}@example.com`, passwordHash: 'hash', fullName: 'Task C Crash' });
+      await repo.createWorkspace({ id: wsC, name: 'Task C Crash WS', slug: `ws-${wsC}` }, owner.id);
+
+      const eventId = `evt_c_crash_${Date.now()}`;
+      const payloadObj = {
+        id: eventId,
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: wsC,
+            customer: 'cus_c_crash_1',
+            subscription: 'sub_c_crash_1',
+            metadata: { tier: 'Starter' },
+            payment_status: 'paid',
+          },
+        },
+      };
+      const raw = JSON.stringify(payloadObj);
+      const sig = sandboxProvider.generateSignedPayload(payloadObj).signature;
+
+      // Worker 1 claims a short 80ms lease and crashes
+      const claim1 = await repo.claimBillingEvent(
+        {
+          id: `bevt_${eventId}`,
+          provider: 'sandbox',
+          eventId,
+          eventType: payloadObj.type,
+          idempotencyKey: eventId,
+          payload: payloadObj,
+          status: 'processing',
+          processedAt: new Date().toISOString(),
+        },
+        { leaseOwner: 'crashed_worker_1', leaseDurationMs: 80 }
+      );
+      assert.equal(claim1.claimed, true);
+
+      // Immediate retry before expiry -> HTTP 503
+      const earlyRetry = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'stripe-signature': sig },
+        body: raw,
+      });
+      assert.equal(earlyRetry.status, 503);
+
+      // Wait for lease to expire
+      await new Promise(r => setTimeout(r, 110));
+
+      // Retry after expiry -> HTTP 200, reclaims and grants entitlement once
+      const recoveredRes = await fetch(`${baseUrl}/api/billing/webhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'stripe-signature': sig },
+        body: raw,
+      });
+      assert.equal(recoveredRes.status, 200);
+      const recoveredJson = await recoveredRes.json();
+      assert.equal(recoveredJson.action, 'processed');
+
+      const store = await repo.getStoreByWorkspace(wsC);
+      assert.equal(store?.tier, 'Starter');
+
+      // Stale crashed_worker_1 waking up later cannot mutate entitlement or overwrite 'processed' -> 'failed'
+      await assert.rejects(
+        () =>
+          repo.applyBillingTransition({
+            eventId,
+            leaseOwner: 'crashed_worker_1',
+            subscription: {
+              id: `subrec_${wsC}`,
+              workspaceId: wsC,
+              provider: 'sandbox',
+              customerId: 'cus_stale',
+              subscriptionId: 'sub_stale',
+              tier: 'Enterprise',
+              status: 'active',
+              currentPeriodStart: new Date().toISOString(),
+              currentPeriodEnd: new Date(Date.now() + 86400000).toISOString(),
+              cancelAtPeriodEnd: false,
+              lastEventCreated: payloadObj.created + 10,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+            storeProfileUpdate: { tier: 'Enterprise', skuLimit: 99999 },
+          }),
+        /lost or expired/i
+      );
+      assert.equal((await repo.getStoreByWorkspace(wsC))?.tier, 'Starter');
+      assert.equal((await repo.getBillingEventById(eventId))?.status, 'processed');
+    });
+
+    test('C.3 DB outage on claim/transition or lost heartbeat returns HTTP 503 (never 400/200)', async () => {
+      const express = (await import('express')).default;
+      const { createBillingRoutes } = await import('./routes/billingRoutes');
+      const localSecret = 'task_c_db_outage_secret';
+      const localProvider = new SandboxBillingProvider(localSecret);
+
+      const wsC = `ws_task_c_db_${Date.now()}`;
+      const owner = await repo.createUser({ id: `usr_${wsC}`, email: `${wsC}@example.com`, passwordHash: 'hash', fullName: 'Task C DB' });
+      await repo.createWorkspace({ id: wsC, name: 'Task C DB WS', slug: `ws-${wsC}` }, owner.id);
+
+      let injectFailure: 'claim_db_error' | 'heartbeat_lost' | 'none' = 'claim_db_error';
+      const flakyRepo = new Proxy(repo, {
+        get(target, prop, receiver) {
+          if (prop === 'claimBillingEvent' && injectFailure === 'claim_db_error') {
+            return async () => {
+              throw new Error('ECONNRESET claiming billing event');
+            };
+          }
+          if (prop === 'renewBillingEventLease' && injectFailure === 'heartbeat_lost') {
+            return async () => false;
+          }
+          if (prop === 'getWorkspaceById' && injectFailure === 'heartbeat_lost') {
+            return async (id: string) => {
+              await new Promise(r => setTimeout(r, 90));
+              return target.getWorkspaceById(id);
+            };
+          }
+          const orig = Reflect.get(target, prop, receiver);
+          return typeof orig === 'function' ? orig.bind(target) : orig;
+        },
+      });
+
+      const localApp = express();
+      localApp.use(
+        '/api/billing',
+        express.json({
+          verify: (req: any, _res, buf) => {
+            req.rawBody = buf;
+          },
+        }),
+        createBillingRoutes(flakyRepo, localProvider, { leaseDurationMs: 70, heartbeatIntervalMs: 20 })
+      );
+
+      const localServer = http.createServer(localApp);
+      await new Promise<void>(resolve => localServer.listen(0, '127.0.0.1', () => resolve()));
+      const addr = localServer.address() as any;
+      const localUrl = `http://127.0.0.1:${addr.port}`;
+
+      try {
+        const evt1 = {
+          id: `evt_c_db_${Date.now()}`,
+          type: 'checkout.session.completed',
+          created: Math.floor(Date.now() / 1000),
+          data: {
+            object: {
+              client_reference_id: wsC,
+              customer: 'cus_db_1',
+              subscription: 'sub_db_1',
+              metadata: { tier: 'Growth' },
+              payment_status: 'paid',
+            },
+          },
+        };
+        const dbRes = await fetch(`${localUrl}/api/billing/webhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'stripe-signature': signSandboxEvent(evt1, localSecret) },
+          body: JSON.stringify(evt1),
+        });
+        assert.equal(dbRes.status, 503);
+        assert.equal(dbRes.headers.get('retry-after'), '30');
+
+        injectFailure = 'heartbeat_lost';
+        const evt2 = { ...evt1, id: `evt_c_hb_lost_${Date.now()}` };
+        const hbRes = await fetch(`${localUrl}/api/billing/webhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'stripe-signature': signSandboxEvent(evt2, localSecret) },
+          body: JSON.stringify(evt2),
+        });
+        assert.equal(hbRes.status, 503);
+        const hbJson = await hbRes.json();
+        assert.equal(hbJson.code, 'BILLING_LEASE_LOST');
+        assert.equal((await repo.getStoreByWorkspace(wsC))?.tier, 'Free Audit');
+      } finally {
+        await new Promise<void>((resolve, reject) => localServer.close(err => (err ? reject(err) : resolve())));
+      }
+    });
+  });
 });
 
 

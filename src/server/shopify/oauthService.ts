@@ -3,6 +3,7 @@ import { DatabaseRepository } from '../db/repository';
 import { ShopifyConnectionRecord } from './types';
 import { isValidShopDomain, normalizeShopDomain, verifyShopifyConnection } from './client';
 import { encryptCredential, decryptCredential, verifyHmacSha256 } from '../security/encryption';
+import { getTrustedShopifyUrls } from '../config/productionConfig';
 
 export const DEFAULT_SHOPIFY_SCOPES = 'read_products';
 
@@ -17,13 +18,12 @@ export interface ShopifyOAuthEnv {
 
 /**
  * Resolves Shopify OAuth configuration from environment.
+ * Uses centralized production-safe URL resolution (SHOPIFY_APP_URL > APP_URL; fails closed in production).
  */
 export function getShopifyOAuthEnv(): ShopifyOAuthEnv {
   const apiKey = process.env.SHOPIFY_API_KEY || '';
   const apiSecret = process.env.SHOPIFY_API_SECRET || '';
-  const appUrl = process.env.SHOPIFY_APP_URL || 'http://localhost:3000';
-  const redirectUri = process.env.SHOPIFY_REDIRECT_URI || `${appUrl}/api/shopify/callback`;
-  const webhookUrl = process.env.SHOPIFY_WEBHOOK_URL || `${appUrl}/api/shopify/webhooks`;
+  const { appUrl, redirectUri, webhookUrl } = getTrustedShopifyUrls();
   const scopes = process.env.SHOPIFY_SCOPES || DEFAULT_SHOPIFY_SCOPES;
 
   return { apiKey, apiSecret, appUrl, redirectUri, webhookUrl, scopes };

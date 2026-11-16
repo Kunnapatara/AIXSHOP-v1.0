@@ -83,46 +83,207 @@ const KNOWN_PLACEHOLDER_URLS = new Set(['MY_APP_URL', 'http://localhost:3000', '
  */
 export function validateProductionAppUrl(
   rawUrl: string | undefined,
-  options: { allowHttpLocal?: boolean } = {}
+  options: { allowHttpLocal?: boolean; varName?: string } = {}
 ): { valid: boolean; normalizedUrl?: string; origin?: string; error?: string } {
+  const varName = options.varName || 'APP_URL';
   if (!rawUrl || typeof rawUrl !== 'string' || !rawUrl.trim()) {
-    return { valid: false, error: 'APP_URL is not configured.' };
+    return { valid: false, error: `${varName} is not configured.` };
   }
 
   const trimmed = rawUrl.trim();
   if (KNOWN_PLACEHOLDER_URLS.has(trimmed)) {
-    return { valid: false, error: `APP_URL uses placeholder/local value "${trimmed}".` };
+    return { valid: false, error: `${varName} uses placeholder/local value "${trimmed}".` };
   }
 
   let parsed: URL;
   try {
     parsed = new URL(trimmed);
   } catch {
-    return { valid: false, error: 'APP_URL is not a valid URL.' };
+    return { valid: false, error: `${varName} is not a valid URL.` };
   }
 
   if (parsed.username || parsed.password) {
-    return { valid: false, error: 'APP_URL must not contain credentials.' };
+    return { valid: false, error: `${varName} must not contain credentials.` };
   }
 
   if (parsed.search || parsed.hash) {
-    return { valid: false, error: 'APP_URL must not contain query parameters or fragments.' };
+    return { valid: false, error: `${varName} must not contain query parameters or fragments.` };
   }
 
   const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
   if (!options.allowHttpLocal) {
     if (parsed.protocol !== 'https:') {
-      return { valid: false, error: 'APP_URL must use https:// in production.' };
+      return { valid: false, error: `${varName} must use https:// in production.` };
     }
     if (isLocalHost) {
-      return { valid: false, error: 'APP_URL must not point to localhost in production.' };
+      return { valid: false, error: `${varName} must not point to localhost in production.` };
     }
   } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    return { valid: false, error: 'APP_URL must use http:// or https://.' };
+    return { valid: false, error: `${varName} must use http:// or https://.` };
   }
 
   const normalizedUrl = `${parsed.origin}${parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/+$/, '')}`;
   return { valid: true, normalizedUrl, origin: parsed.origin };
+}
+
+export interface ShopifyUrlConfigResult {
+  valid: boolean;
+  appUrl: string;
+  redirectUri: string;
+  webhookUrl: string;
+  error?: string;
+}
+
+function validateShopifyEndpointOverride(
+  rawUrl: string,
+  varName: string,
+  trustedBaseUrl: string,
+  isProd: boolean
+): { valid: boolean; normalizedUrl?: string; error?: string } {
+  const trimmed = rawUrl.trim();
+  if (KNOWN_PLACEHOLDER_URLS.has(trimmed)) {
+    return { valid: false, error: `${varName} uses placeholder/local value "${trimmed}".` };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { valid: false, error: `${varName} is not a valid URL.` };
+  }
+
+  if (parsed.username || parsed.password) {
+    return { valid: false, error: `${varName} must not contain credentials.` };
+  }
+
+  if (parsed.hash) {
+    return { valid: false, error: `${varName} must not contain fragments.` };
+  }
+
+  const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
+  if (isProd) {
+    if (parsed.protocol !== 'https:') {
+      return { valid: false, error: `${varName} must use https:// in production.` };
+    }
+    if (isLocalHost) {
+      return { valid: false, error: `${varName} must not point to localhost in production.` };
+    }
+    const allowedOrigins = getAllowedRedirectOrigins(trustedBaseUrl);
+    if (!allowedOrigins.has(parsed.origin)) {
+      return { valid: false, error: `${varName} origin (${parsed.origin}) does not match trusted app origin (${new URL(trustedBaseUrl).origin}).` };
+    }
+  } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return { valid: false, error: `${varName} must use http:// or https://.` };
+  }
+
+  return { valid: true, normalizedUrl: parsed.toString() };
+}
+
+/**
+ * Validates and resolves Shopify OAuth & webhook URLs from environment variables.
+ * - Precedence: SHOPIFY_APP_URL > APP_URL (> http://localhost:3000 in development/test only).
+ * - In production (NODE_ENV=production): strictly requires valid HTTPS non-localhost URLs,
+ *   never falls back to localhost, and never uses request Host/X-Forwarded-* headers.
+ */
+export function validateShopifyUrlConfig(): ShopifyUrlConfigResult {
+  const isProd = process.env.NODE_ENV === 'production';
+  const rawShopifyAppUrl = process.env.SHOPIFY_APP_URL?.trim() || '';
+  const rawAppUrl = process.env.APP_URL?.trim() || '';
+  const rawRedirectUri = process.env.SHOPIFY_REDIRECT_URI?.trim() || '';
+  const rawWebhookUrl = process.env.SHOPIFY_WEBHOOK_URL?.trim() || '';
+
+  let appUrl = '';
+
+  if (isProd) {
+    const candidate = rawShopifyAppUrl || rawAppUrl;
+    const sourceVar = rawShopifyAppUrl ? 'SHOPIFY_APP_URL' : (rawAppUrl ? 'APP_URL' : 'SHOPIFY_APP_URL (or APP_URL)');
+    const baseCheck = validateProductionAppUrl(candidate, { allowHttpLocal: false, varName: sourceVar });
+    if (!baseCheck.valid || !baseCheck.normalizedUrl) {
+      return {
+        valid: false,
+        appUrl: '',
+        redirectUri: '',
+        webhookUrl: '',
+        error: baseCheck.error || 'Trusted production Shopify app URL is not configured.',
+      };
+    }
+    appUrl = baseCheck.normalizedUrl;
+  } else {
+    if (rawShopifyAppUrl && rawShopifyAppUrl !== 'MY_APP_URL') {
+      const devCheck = validateProductionAppUrl(rawShopifyAppUrl, { allowHttpLocal: true, varName: 'SHOPIFY_APP_URL' });
+      if (!devCheck.valid || !devCheck.normalizedUrl) {
+        return {
+          valid: false,
+          appUrl: '',
+          redirectUri: '',
+          webhookUrl: '',
+          error: devCheck.error || 'SHOPIFY_APP_URL is invalid.',
+        };
+      }
+      appUrl = devCheck.normalizedUrl;
+    } else if (rawAppUrl && rawAppUrl !== 'MY_APP_URL') {
+      const devAppCheck = validateProductionAppUrl(rawAppUrl, { allowHttpLocal: true, varName: 'APP_URL' });
+      if (devAppCheck.valid && devAppCheck.normalizedUrl) {
+        appUrl = devAppCheck.normalizedUrl;
+      } else {
+        appUrl = 'http://localhost:3000';
+      }
+    } else {
+      appUrl = 'http://localhost:3000';
+    }
+  }
+
+  let redirectUri = `${appUrl}/api/shopify/callback`;
+  if (rawRedirectUri) {
+    const redirectCheck = validateShopifyEndpointOverride(rawRedirectUri, 'SHOPIFY_REDIRECT_URI', appUrl, isProd);
+    if (!redirectCheck.valid || !redirectCheck.normalizedUrl) {
+      return {
+        valid: false,
+        appUrl,
+        redirectUri: '',
+        webhookUrl: '',
+        error: redirectCheck.error,
+      };
+    }
+    redirectUri = redirectCheck.normalizedUrl;
+  }
+
+  let webhookUrl = `${appUrl}/api/shopify/webhooks`;
+  if (rawWebhookUrl) {
+    const webhookCheck = validateShopifyEndpointOverride(rawWebhookUrl, 'SHOPIFY_WEBHOOK_URL', appUrl, isProd);
+    if (!webhookCheck.valid || !webhookCheck.normalizedUrl) {
+      return {
+        valid: false,
+        appUrl,
+        redirectUri,
+        webhookUrl: '',
+        error: webhookCheck.error,
+      };
+    }
+    webhookUrl = webhookCheck.normalizedUrl;
+  }
+
+  return { valid: true, appUrl, redirectUri, webhookUrl };
+}
+
+/**
+ * Returns trusted Shopify OAuth & webhook URLs or throws an explicit configuration error.
+ */
+export function getTrustedShopifyUrls(): { appUrl: string; redirectUri: string; webhookUrl: string } {
+  const result = validateShopifyUrlConfig();
+  if (!result.valid) {
+    const err: any = new Error(
+      `[AIXSHOP Shopify Config] Trusted Shopify URL configuration invalid: ${result.error}`
+    );
+    err.statusCode = 500;
+    err.code = process.env.NODE_ENV === 'production' ? 'INVALID_PRODUCTION_SHOPIFY_URL' : 'INVALID_SHOPIFY_URL';
+    throw err;
+  }
+  return {
+    appUrl: result.appUrl,
+    redirectUri: result.redirectUri,
+    webhookUrl: result.webhookUrl,
+  };
 }
 
 /**
@@ -323,12 +484,24 @@ export function validateProductionConfig(): ProductionConfigValidationResult {
     missingOrInvalid.push('STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET');
   }
 
-  // 5. Shopify (if Shopify credentials partially configured, validate pair + encryption; in strict prod validate pair if enabled)
+  // 5. Shopify (validate key/secret pair and production Shopify URL configuration when Shopify is enabled or URLs overridden)
   const hasShopifyKey = Boolean(process.env.SHOPIFY_API_KEY?.trim());
   const hasShopifySecret = Boolean(process.env.SHOPIFY_API_SECRET?.trim());
+  const hasShopifyUrlsConfigured = Boolean(
+    process.env.SHOPIFY_APP_URL?.trim() ||
+    process.env.SHOPIFY_REDIRECT_URI?.trim() ||
+    process.env.SHOPIFY_WEBHOOK_URL?.trim()
+  );
   let shopifyConfigValid = hasShopifyKey === hasShopifySecret;
   if (!shopifyConfigValid) {
     missingOrInvalid.push('SHOPIFY_API_KEY / SHOPIFY_API_SECRET (both required when Shopify is enabled)');
+  }
+  if (isProd && (hasShopifyKey || hasShopifySecret || hasShopifyUrlsConfigured)) {
+    const shopifyUrlCheck = validateShopifyUrlConfig();
+    if (!shopifyUrlCheck.valid) {
+      shopifyConfigValid = false;
+      missingOrInvalid.push(`SHOPIFY_APP_URL / SHOPIFY_REDIRECT_URI / SHOPIFY_WEBHOOK_URL (${shopifyUrlCheck.error})`);
+    }
   }
 
   // 6. Proxy trust

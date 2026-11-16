@@ -21,7 +21,8 @@ import {
   handleShopifyCallback, 
   disconnectShopify,
   refreshShopifyToken,
-  getValidShopifyAccessToken
+  getValidShopifyAccessToken,
+  getShopifyOAuthEnv
 } from './shopify/oauthService';
 import { 
   mapShopifyProductNodeToDomain, 
@@ -1294,6 +1295,187 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
       assert.equal(verifyRes.status, 200);
       const verifyData = await verifyRes.json();
       assert.equal(verifyData.success, true);
+    });
+  });
+
+  // 11. Task A: Shopify Production URL Configuration, Precedence & Spoofed-Header Immunity
+  describe('11. Task A: Shopify Production URL Configuration & Fail-Closed Validation', () => {
+    test('resolve precedence (SHOPIFY_APP_URL > APP_URL), HTTPS enforcement, and spoofed header immunity in production', async () => {
+      const { validateShopifyUrlConfig, getTrustedShopifyUrls, validateProductionConfig } = await import('./config/productionConfig');
+      const snapshot = {
+        NODE_ENV: process.env.NODE_ENV,
+        SHOPIFY_APP_URL: process.env.SHOPIFY_APP_URL,
+        APP_URL: process.env.APP_URL,
+        SHOPIFY_REDIRECT_URI: process.env.SHOPIFY_REDIRECT_URI,
+        SHOPIFY_WEBHOOK_URL: process.env.SHOPIFY_WEBHOOK_URL,
+        STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY,
+        STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET,
+        DATABASE_URL: process.env.DATABASE_URL,
+      };
+
+      const tenant = await registerTestUser(`task-a-prod-${Date.now()}@example.com`, 'Task A Prod Store');
+
+      try {
+        process.env.NODE_ENV = 'production';
+        process.env.DATABASE_URL = 'postgresql://user:pass@db.prod.example.com:5432/aixshop';
+        process.env.STRIPE_SECRET_KEY = 'sk_live_dummy_123';
+        process.env.STRIPE_WEBHOOK_SECRET = 'whsec_live_dummy_123';
+
+        // 1. Valid HTTPS SHOPIFY_APP_URL takes precedence over APP_URL
+        process.env.SHOPIFY_APP_URL = 'https://shopify.aixshop.example/';
+        process.env.APP_URL = 'https://app.aixshop.example';
+        delete process.env.SHOPIFY_REDIRECT_URI;
+        delete process.env.SHOPIFY_WEBHOOK_URL;
+
+        const cfg = validateShopifyUrlConfig();
+        assert.equal(cfg.valid, true);
+        assert.equal(cfg.appUrl, 'https://shopify.aixshop.example');
+        assert.equal(cfg.redirectUri, 'https://shopify.aixshop.example/api/shopify/callback');
+        assert.equal(cfg.webhookUrl, 'https://shopify.aixshop.example/api/shopify/webhooks');
+
+        const envCfg = getShopifyOAuthEnv();
+        assert.equal(envCfg.redirectUri, 'https://shopify.aixshop.example/api/shopify/callback');
+        assert.equal(envCfg.webhookUrl, 'https://shopify.aixshop.example/api/shopify/webhooks');
+
+        // connect uses configured redirectUri and ignores spoofed Host / X-Forwarded-Host
+        const connectRes = await fetch(`${baseUrl}/api/shopify/connect?shop=${TEST_SHOP}`, {
+          headers: {
+            Authorization: `Bearer ${tenant.token}`,
+            Host: 'evil-attacker.example',
+            'X-Forwarded-Host': 'evil-attacker.example',
+            'X-Forwarded-Proto': 'http',
+          },
+        });
+        assert.equal(connectRes.status, 200);
+        const connectJson = await connectRes.json();
+        const authParsed = new URL(connectJson.authUrl);
+        assert.equal(authParsed.searchParams.get('redirect_uri'), 'https://shopify.aixshop.example/api/shopify/callback');
+        assert.ok(!connectJson.authUrl.includes('evil-attacker.example'));
+
+        // callback HTML redirect ignores spoofed Host / X-Forwarded-Host
+        const callbackRes = await fetch(`${baseUrl}/api/shopify/callback?code=bad&shop=${TEST_SHOP}&state=missing&hmac=bad`, {
+          headers: {
+            Accept: 'text/html',
+            Host: 'evil-attacker.example',
+            'X-Forwarded-Host': 'evil-attacker.example',
+          },
+          redirect: 'manual',
+        });
+        assert.equal(callbackRes.status, 302);
+        const location = callbackRes.headers.get('location') || '';
+        assert.ok(location.startsWith('https://shopify.aixshop.example/'), `Expected trusted origin, got ${location}`);
+        assert.ok(!location.includes('evil-attacker.example'));
+
+        // 2. Fallback to APP_URL when SHOPIFY_APP_URL is omitted in production
+        delete process.env.SHOPIFY_APP_URL;
+        process.env.APP_URL = 'https://app.aixshop.example';
+        const fallbackCfg = validateShopifyUrlConfig();
+        assert.equal(fallbackCfg.valid, true);
+        assert.equal(fallbackCfg.appUrl, 'https://app.aixshop.example');
+        assert.equal(fallbackCfg.redirectUri, 'https://app.aixshop.example/api/shopify/callback');
+        assert.equal(fallbackCfg.webhookUrl, 'https://app.aixshop.example/api/shopify/webhooks');
+
+        // 3. Rejects invalid production configurations (missing both, http://, localhost, 127.0.0.1, placeholder, cross-origin overrides)
+        const invalidCases: Array<{
+          label: string;
+          setup: () => void;
+        }> = [
+          {
+            label: 'both SHOPIFY_APP_URL and APP_URL missing',
+            setup: () => {
+              delete process.env.SHOPIFY_APP_URL;
+              delete process.env.APP_URL;
+            },
+          },
+          {
+            label: 'http:// scheme in production',
+            setup: () => {
+              process.env.SHOPIFY_APP_URL = 'http://shopify.aixshop.example';
+              process.env.APP_URL = 'https://app.aixshop.example';
+            },
+          },
+          {
+            label: 'localhost in production',
+            setup: () => {
+              process.env.SHOPIFY_APP_URL = 'https://localhost:3000';
+              process.env.APP_URL = 'https://app.aixshop.example';
+            },
+          },
+          {
+            label: '127.0.0.1 in production',
+            setup: () => {
+              process.env.SHOPIFY_APP_URL = 'https://127.0.0.1:3000';
+              process.env.APP_URL = 'https://app.aixshop.example';
+            },
+          },
+          {
+            label: 'placeholder MY_APP_URL',
+            setup: () => {
+              process.env.SHOPIFY_APP_URL = 'MY_APP_URL';
+              process.env.APP_URL = 'https://app.aixshop.example';
+            },
+          },
+          {
+            label: 'cross-origin SHOPIFY_REDIRECT_URI',
+            setup: () => {
+              process.env.SHOPIFY_APP_URL = 'https://shopify.aixshop.example';
+              process.env.APP_URL = 'https://shopify.aixshop.example';
+              process.env.SHOPIFY_REDIRECT_URI = 'https://attacker.example/api/shopify/callback';
+            },
+          },
+          {
+            label: 'http SHOPIFY_WEBHOOK_URL',
+            setup: () => {
+              process.env.SHOPIFY_APP_URL = 'https://shopify.aixshop.example';
+              process.env.APP_URL = 'https://shopify.aixshop.example';
+              delete process.env.SHOPIFY_REDIRECT_URI;
+              process.env.SHOPIFY_WEBHOOK_URL = 'http://shopify.aixshop.example/api/shopify/webhooks';
+            },
+          },
+        ];
+
+        for (const c of invalidCases) {
+          delete process.env.SHOPIFY_REDIRECT_URI;
+          delete process.env.SHOPIFY_WEBHOOK_URL;
+          c.setup();
+          assert.equal(validateShopifyUrlConfig().valid, false, `Expected invalid for: ${c.label}`);
+          assert.throws(() => getTrustedShopifyUrls(), /Trusted Shopify URL configuration invalid/);
+          const prodCheck = validateProductionConfig();
+          assert.equal(prodCheck.checks.shopifyConfigValid, false, `Expected shopifyConfigValid=false for: ${c.label}`);
+        }
+
+        // HTTP /connect and /callback return 500 INVALID_PRODUCTION_SHOPIFY_URL when misconfigured in production
+        delete process.env.SHOPIFY_APP_URL;
+        delete process.env.APP_URL;
+        delete process.env.SHOPIFY_REDIRECT_URI;
+        delete process.env.SHOPIFY_WEBHOOK_URL;
+
+        const failConnect = await fetch(`${baseUrl}/api/shopify/connect?shop=${TEST_SHOP}`, {
+          headers: { Authorization: `Bearer ${tenant.token}` },
+        });
+        assert.equal(failConnect.status, 500);
+        const failConnectJson = await failConnect.json();
+        assert.equal(failConnectJson.code, 'INVALID_PRODUCTION_SHOPIFY_URL');
+
+        const failCallback = await fetch(`${baseUrl}/api/shopify/callback?code=bad&shop=${TEST_SHOP}&state=missing&hmac=bad`, {
+          headers: { Accept: 'text/html' },
+        });
+        assert.equal(failCallback.status, 500);
+
+        // 4. Non-production HTTP localhost continues working cleanly
+        process.env.NODE_ENV = 'test';
+        process.env.SHOPIFY_APP_URL = 'http://127.0.0.1:3000';
+        delete process.env.APP_URL;
+        const devCfg = validateShopifyUrlConfig();
+        assert.equal(devCfg.valid, true);
+        assert.equal(devCfg.redirectUri, 'http://127.0.0.1:3000/api/shopify/callback');
+        assert.equal(devCfg.webhookUrl, 'http://127.0.0.1:3000/api/shopify/webhooks');
+      } finally {
+        for (const [k, v] of Object.entries(snapshot)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
     });
   });
 });

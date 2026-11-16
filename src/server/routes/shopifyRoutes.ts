@@ -176,7 +176,8 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
       });
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Routes] Error initiating connect:', err);
-      return res.status(400).json({ error: err.message || 'Failed to initiate Shopify connection' });
+      const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
+      return res.status(status).json({ error: err.message || 'Failed to initiate Shopify connection', code: err?.code });
     }
   });
 
@@ -185,7 +186,7 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     const resolveRedirectBase = (): string => {
       const { appUrl } = getShopifyOAuthEnv();
       if (process.env.NODE_ENV === 'production') {
-        return getTrustedBaseUrl(req);
+        return appUrl;
       }
       return appUrl || getTrustedBaseUrl(req);
     };
@@ -224,12 +225,14 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           );
           return res.redirect(redirectTarget);
         } catch (cfgErr: any) {
-          return res.status(500).json({ error: cfgErr.message || 'Trusted application URL configuration invalid' });
+          return res.status(500).json({ error: cfgErr.message || 'Trusted application URL configuration invalid', code: cfgErr?.code });
         }
       }
 
-      return res.status(400).json({
+      const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
+      return res.status(status).json({
         error: err.message || 'Shopify OAuth callback verification failed',
+        ...(err?.code ? { code: err.code } : {}),
       });
     }
   });

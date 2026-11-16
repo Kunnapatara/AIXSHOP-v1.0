@@ -1003,4 +1003,288 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
     assert.deepEqual(rig.getApp().findings.map(f => f.id), ['find_beta_ok']);
     assert.equal(rig.getApp().catalogVersion, 6);
   });
+
+  test('9. Task D: Missing, empty, whitespace, or non-string workspaceId in getCatalog / reloadWorkspaceCatalog fails closed and sets error state', async () => {
+    const defA = createDeferred<{ workspaceId: string; catalog: StoragePayloadV1 }>();
+    const defB = createDeferred<any>();
+    let callIdx = 0;
+
+    apiClient.getCatalog = async () => {
+      callIdx += 1;
+      if (callIdx === 1) return defA.promise;
+      return defB.promise;
+    };
+
+    const rig = createTestRig();
+    await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA, wsB], isAuthenticated: true });
+    await act(async () => {
+      defA.resolve({
+        workspaceId: 'ws_a',
+        catalog: makeCatalogPayload({
+          storeName: 'Store Alpha',
+          products: [makeProduct('prod_a1', 'Alpha Product')],
+          catalogVersion: 10,
+        }),
+      });
+      await flushMicrotasks();
+    });
+    assert.equal(rig.getApp().loadedWorkspaceId, 'ws_a');
+
+    // Switch to ws_b and test missing, empty, whitespace, and non-string workspaceId
+    await rig.renderWithAuth({ user: userA, activeWorkspace: wsB, workspaces: [wsA, wsB], isAuthenticated: true });
+    await act(async () => {
+      defB.resolve({
+        catalog: makeCatalogPayload({
+          storeName: 'Corrupted Missing ID Store',
+          products: [makeProduct('prod_corrupt', 'Corrupt Product')],
+          catalogVersion: 99,
+        }),
+      } as any);
+      await flushMicrotasks();
+    });
+
+    assert.equal(rig.getApp().cloudCatalogStatus, 'error');
+    assert.match(rig.getApp().cloudCatalogError || '', /workspaceId/i);
+    assert.equal(rig.getApp().loadedWorkspaceId, null);
+    assert.deepEqual(rig.getApp().products, []);
+    assert.notEqual(rig.getApp().storeProfile.name, 'Corrupted Missing ID Store');
+
+    for (const badWorkspaceId of ['', '   ', 12345, null]) {
+      apiClient.getCatalog = async () => ({
+        workspaceId: badWorkspaceId as any,
+        catalog: makeCatalogPayload({
+          storeName: 'Invalid Retry Store',
+          products: [makeProduct('prod_bad_retry', 'Bad Retry Product')],
+          catalogVersion: 5,
+        }),
+      });
+      await act(async () => {
+        await rig.getApp().reloadWorkspaceCatalog();
+        await flushMicrotasks();
+      });
+      assert.equal(rig.getApp().cloudCatalogStatus, 'error');
+      assert.equal(rig.getApp().loadedWorkspaceId, null);
+      assert.deepEqual(rig.getApp().products, []);
+    }
+  });
+
+  test('10. Task D: Non-catalog mutation (approveAction) succeeds without response.workspaceId but rejects mismatched workspaceId', async () => {
+    apiClient.getCatalog = async () => ({
+      workspaceId: 'ws_a',
+      catalog: makeCatalogPayload({
+        storeName: 'Store Alpha',
+        products: [makeProduct('prod_a1', 'Alpha Product')],
+        findings: [makeFinding('find_a1', 'prod_a1', 'Missing GTIN')],
+        actions: [makeAction('act_a1', 'prod_a1', 'Add GTIN')],
+        catalogVersion: 1,
+      }),
+    });
+
+    let approveMode: 'omit_ws' | 'wrong_ws' = 'omit_ws';
+    apiClient.approveAction = async () => {
+      if (approveMode === 'omit_ws') {
+        return {
+          success: true,
+          action: { ...makeAction('act_a1', 'prod_a1', 'Add GTIN'), status: 'approved' },
+          catalogVersion: 2,
+        } as any;
+      }
+      return {
+        workspaceId: 'ws_b',
+        success: true,
+        action: { ...makeAction('act_a1', 'prod_a1', 'Poison GTIN'), status: 'approved' },
+        catalogVersion: 99,
+      } as any;
+    };
+
+    const rig = createTestRig();
+    await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA], isAuthenticated: true });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    assert.equal(rig.getApp().catalogVersion, 1);
+
+    // Response omitting workspaceId applies cleanly for non-getCatalog mutations
+    await act(async () => {
+      await rig.getApp().approveAction('act_a1');
+      await flushMicrotasks();
+    });
+    assert.equal(rig.getApp().catalogVersion, 2);
+    assert.equal(rig.getApp().actionItems[0].status, 'approved');
+
+    // Response with explicit mismatched workspaceId is rejected
+    approveMode = 'wrong_ws';
+    await act(async () => {
+      await rig.getApp().approveAction('act_a1');
+      await flushMicrotasks();
+    });
+    assert.equal(rig.getApp().catalogVersion, 2);
+    assert.equal(rig.getApp().actionItems[0].title, 'Add GTIN');
+    assert.deepEqual(rig.getApp().products.map(p => p.id), ['prod_a1']);
+  });
+
+  test('11. Task E: Overlapping runStoreCheck keeps isCheckingStore=true until latest check completes and ignores stale first check', async () => {
+    const origFetch = globalThis.fetch;
+    const defStore1 = createDeferred<any>();
+    const defStore2 = createDeferred<any>();
+
+    globalThis.fetch = (async (input: any) => {
+      const url = String(input);
+      if (url.includes('store-one.example.com')) return defStore1.promise;
+      if (url.includes('store-two.example.com')) return defStore2.promise;
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }) as any;
+
+    try {
+      const rig = createTestRig();
+      await rig.renderWithAuth({ user: null, activeWorkspace: null, workspaces: [], isAuthenticated: false });
+
+      let check1!: Promise<void>;
+      let check2!: Promise<void>;
+
+      // Start Check #1
+      await act(async () => {
+        check1 = rig.getApp().runStoreCheck('https://store-one.example.com');
+      });
+      assert.equal(rig.getApp().isCheckingStore, true);
+
+      // Start Check #2 while #1 is still pending
+      await act(async () => {
+        check2 = rig.getApp().runStoreCheck('https://store-two.example.com');
+      });
+      assert.equal(rig.getApp().isCheckingStore, true);
+
+      // Check #1 completes FIRST: MUST NOT clear isCheckingStore or apply Store #1 results!
+      await act(async () => {
+        defStore1.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            products: [{ id: 101, title: 'Store One Item', variants: [{ id: 11, price: '10.00', sku: 'S1' }] }],
+          }),
+        });
+        await check1;
+        await flushMicrotasks();
+      });
+
+      assert.equal(rig.getApp().isCheckingStore, true, 'Older check #1 resolving must NOT clear isCheckingStore while check #2 is pending');
+      assert.equal(rig.getApp().quickCheckResult, null);
+
+      // Check #2 completes SECOND: updates result and clears isCheckingStore
+      await act(async () => {
+        defStore2.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            products: [{ id: 202, title: 'Store Two Item', variants: [{ id: 22, price: '25.00', sku: 'S2' }] }],
+          }),
+        });
+        await check2;
+        await flushMicrotasks();
+      });
+
+      assert.equal(rig.getApp().isCheckingStore, false);
+      assert.equal(rig.getApp().quickCheckResult?.url, 'https://store-two.example.com');
+      assert.equal(rig.getApp().lastIngestionResult?.candidateProducts[0]?.title, 'Store Two Item');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test('12. Task E: Stale runStoreCheck failure after newer check or workspace switch does not emit stale error toast or mutate newer state', async () => {
+    const origFetch = globalThis.fetch;
+    const defStore1 = createDeferred<any>();
+    const defStore2 = createDeferred<any>();
+    const defWsCheck = createDeferred<any>();
+
+    globalThis.fetch = (async (input: any) => {
+      const url = String(input);
+      if (url.includes('slow-fail.example.com')) return defStore1.promise;
+      if (url.includes('fast-ok.example.com')) return defStore2.promise;
+      if (url.includes('ws-switch.example.com')) return defWsCheck.promise;
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    }) as any;
+
+    try {
+      const rig = createTestRig();
+      await rig.renderWithAuth({ user: null, activeWorkspace: null, workspaces: [], isAuthenticated: false });
+
+      let checkSlowFail!: Promise<void>;
+      let checkFastOk!: Promise<void>;
+
+      await act(async () => {
+        checkSlowFail = rig.getApp().runStoreCheck('https://slow-fail.example.com');
+      });
+      await act(async () => {
+        checkFastOk = rig.getApp().runStoreCheck('https://fast-ok.example.com');
+      });
+
+      // Check #2 finishes FIRST
+      await act(async () => {
+        defStore2.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            products: [{ id: 303, title: 'Fast OK Item', variants: [{ id: 33, price: '30.00', sku: 'F1' }] }],
+          }),
+        });
+        await checkFastOk;
+        await flushMicrotasks();
+      });
+      assert.equal(rig.getApp().isCheckingStore, false);
+      const toastCountAfterFast = rig.getApp().toasts.length;
+
+      // Stale Check #1 now resolves with network error / HTTP 500 or rejects
+      await act(async () => {
+        defStore1.reject(new Error('Stale network failure'));
+        await checkSlowFail;
+        await flushMicrotasks();
+      });
+
+      assert.equal(rig.getApp().isCheckingStore, false);
+      assert.equal(rig.getApp().quickCheckResult?.url, 'https://fast-ok.example.com');
+      assert.equal(rig.getApp().toasts.length, toastCountAfterFast, 'Stale check failure must not emit toast');
+
+      // Also verify workspace switch while store check is in-flight resets isCheckingStore cleanly
+      apiClient.getCatalog = async () => ({
+        workspaceId: 'ws_a',
+        catalog: makeCatalogPayload({ storeName: 'Store Alpha', products: [makeProduct('prod_a1', 'A')], catalogVersion: 1 }),
+      });
+      await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA, wsB], isAuthenticated: true });
+      await act(async () => {
+        await flushMicrotasks();
+      });
+
+      let wsCheck!: Promise<void>;
+      await act(async () => {
+        wsCheck = rig.getApp().runStoreCheck('https://ws-switch.example.com');
+      });
+      assert.equal(rig.getApp().isCheckingStore, true);
+
+      // Switch to wsB while check is running
+      apiClient.getCatalog = async () => ({
+        workspaceId: 'ws_b',
+        catalog: makeCatalogPayload({ storeName: 'Store Beta', products: [makeProduct('prod_b1', 'B')], catalogVersion: 1 }),
+      });
+      await rig.renderWithAuth({ user: userA, activeWorkspace: wsB, workspaces: [wsA, wsB], isAuthenticated: true });
+      assert.equal(rig.getApp().isCheckingStore, false, 'Workspace switch must immediately reset isCheckingStore');
+
+      await act(async () => {
+        defWsCheck.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            products: [{ id: 404, title: 'Wrong WS Scan Product', variants: [{ id: 44, price: '40.00', sku: 'W1' }] }],
+          }),
+        });
+        await wsCheck;
+        await flushMicrotasks();
+      });
+
+      assert.equal(rig.getApp().isCheckingStore, false);
+      assert.equal(rig.getApp().quickCheckResult, null, 'Late scan from wsA must never attach to wsB');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });

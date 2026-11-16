@@ -152,6 +152,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const wasCloudSessionRef = useRef<boolean>(false);
   const catalogVersionRef = useRef<number | undefined>(undefined);
   const cloudRequestGenRef = useRef<number>(0);
+  const storeCheckGenRef = useRef<number>(0);
   const toastTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
   // Check auth context safely (null if outside AuthProvider in test environments)
@@ -245,22 +246,37 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     return res;
   };
 
+  const hasValidMatchingWorkspaceId = (
+    responseWorkspaceId: unknown,
+    expectedWorkspaceId: string
+  ): boolean =>
+    typeof responseWorkspaceId === 'string' &&
+    responseWorkspaceId.trim().length > 0 &&
+    responseWorkspaceId === expectedWorkspaceId;
+
   const isCurrentCloudRequest = (
     reqGen: number,
     expectedWorkspaceId?: string,
     expectedUserId?: string,
-    responseWorkspaceId?: string
+    responseWorkspaceId?: unknown,
+    options?: { requireResponseWorkspaceId?: boolean }
   ): boolean => {
     if (reqGen !== cloudRequestGenRef.current) return false;
     const active = activeIdentityRef.current;
     if (!active.isCloudWorkspace || !active.workspaceId) return false;
     if (expectedWorkspaceId !== active.workspaceId) return false;
     if (expectedUserId !== active.userId) return false;
-    if (responseWorkspaceId && responseWorkspaceId !== active.workspaceId) return false;
+    if (options?.requireResponseWorkspaceId) {
+      return hasValidMatchingWorkspaceId(responseWorkspaceId, active.workspaceId);
+    }
+    if (responseWorkspaceId !== undefined && responseWorkspaceId !== null) {
+      return hasValidMatchingWorkspaceId(responseWorkspaceId, active.workspaceId);
+    }
     return true;
   };
 
   const clearCloudCatalogState = (workspace?: { name?: string; slug?: string } | null) => {
+    storeCheckGenRef.current += 1;
     catalogVersionRef.current = undefined;
     setCatalogVersion(undefined);
     setLoadedWorkspaceId(null);
@@ -308,6 +324,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   };
 
   const hydrateLocalDemoCatalog = (isLogoutTransition: boolean) => {
+    storeCheckGenRef.current += 1;
     setIsReadOnlyMode(false);
     setReadOnlyReason(null);
     setSelectedActionId(null);
@@ -418,9 +435,16 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         const res = await apiClient.getCatalog();
         if (
           isCancelled ||
-          !isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId, res.workspaceId)
+          !isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId)
         ) {
           return;
+        }
+        if (
+          !isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId, res?.workspaceId, {
+            requireResponseWorkspaceId: true,
+          })
+        ) {
+          throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
         }
         applyCatalogSnapshot(res.catalog, targetWorkspaceId, targetUserId);
         setCloudCatalogStatus('loaded');
@@ -500,15 +524,18 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   }, [selectedProductId, products]);
 
   const runStoreCheck = async (url: string) => {
+    const myCheckGen = ++storeCheckGenRef.current;
     const startIdentity = activeIdentityRef.current.identity;
-    const startGen = cloudRequestGenRef.current;
+    const startCloudGen = cloudRequestGenRef.current;
+    const isStillCurrentCheck = () =>
+      storeCheckGenRef.current === myCheckGen &&
+      activeIdentityRef.current.identity === startIdentity &&
+      cloudRequestGenRef.current === startCloudGen;
+
     setIsCheckingStore(true);
     try {
       const result = await ingestAndAnalyzeStore(url, { existingCatalog: products });
-      if (
-        activeIdentityRef.current.identity !== startIdentity ||
-        cloudRequestGenRef.current !== startGen
-      ) {
+      if (!isStillCurrentCheck()) {
         return;
       }
       setQuickCheckResult(result);
@@ -542,15 +569,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         );
       }
     } catch (e) {
-      if (
-        activeIdentityRef.current.identity !== startIdentity ||
-        cloudRequestGenRef.current !== startGen
-      ) {
+      if (!isStillCurrentCheck()) {
         return;
       }
       addToast('Scan Error', (e as Error).message || 'Failed to inspect store.', 'error');
     } finally {
-      setIsCheckingStore(false);
+      if (isStillCurrentCheck()) {
+        setIsCheckingStore(false);
+      }
     }
   };
 
@@ -569,7 +595,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
         if (res.success && res.result) {
           const catRes = await apiClient.getCatalog();
-          if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes.workspaceId)) return null;
+          if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+          if (
+            !isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes?.workspaceId, {
+              requireResponseWorkspaceId: true,
+            })
+          ) {
+            throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
+          }
           applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
           setCloudCatalogStatus('loaded');
           addToast('Catalog Import Complete', res.result.message, 'success');
@@ -647,7 +680,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       const targetUserId = activeUserId;
       try {
         const res = await apiClient.approveAction(actionId, customApprovedValue);
-        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, (res as any)?.workspaceId)) return;
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
@@ -724,7 +757,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       const targetUserId = activeUserId;
       try {
         const res = await apiClient.dismissAction(actionId);
-        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, (res as any)?.workspaceId)) return;
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
@@ -782,7 +815,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       const targetUserId = activeUserId;
       try {
         const res = await apiClient.recheckAction(actionId);
-        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, (res as any)?.workspaceId)) return;
         if (res.success && res.action) {
           if (typeof res.catalogVersion === 'number') {
             catalogVersionRef.current = res.catalogVersion;
@@ -1048,7 +1081,14 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return false;
       if (res.success) {
         const catRes = await apiClient.getCatalog();
-        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes.workspaceId)) return false;
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return false;
+        if (
+          !isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes?.workspaceId, {
+            requireResponseWorkspaceId: true,
+          })
+        ) {
+          throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
+        }
         applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
         const nextVer =
           typeof res.catalogVersion === 'number'
@@ -1088,7 +1128,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
       const targetUserId = activeUserId;
       try {
         const res = await apiClient.runAudit();
-        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, (res as any)?.workspaceId)) return null;
         if (res.success && res.catalog) {
           applyCatalogSnapshot(res.catalog, targetWsId, targetUserId);
           setCloudCatalogStatus('loaded');
@@ -1172,8 +1212,15 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     setCloudCatalogStatus('loading');
     try {
       const res = await apiClient.getCatalog();
-      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, res.workspaceId)) {
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
         return;
+      }
+      if (
+        !isCurrentCloudRequest(reqGen, targetWsId, targetUserId, res?.workspaceId, {
+          requireResponseWorkspaceId: true,
+        })
+      ) {
+        throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
       }
       applyCatalogSnapshot(res.catalog, targetWsId, targetUserId);
       setCloudCatalogStatus('loaded');

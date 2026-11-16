@@ -14,7 +14,52 @@ export interface WebhookProcessingResult {
   success: boolean;
   action: 'processed' | 'ignored' | 'duplicate';
   message: string;
+  inProgress?: boolean;
+  retryable?: boolean;
   subscription?: SubscriptionRecord;
+}
+
+export interface NormalizedStripeSubscriptionStatus {
+  status: SubscriptionRecord['status'];
+  isKnownStatus: boolean;
+  isAuthorizedPaidTier: boolean;
+  rawStatus: string;
+}
+
+/**
+ * Strictly maps Stripe subscription statuses with explicit fail-closed behavior.
+ * Only 'active' and 'trialing' authorize paid tier entitlements.
+ * Unknown, missing, empty, or non-string statuses fail closed to 'incomplete' (unauthorized).
+ */
+export function normalizeStripeSubscriptionStatus(rawStatusInput: unknown): NormalizedStripeSubscriptionStatus {
+  const normalized = typeof rawStatusInput === 'string' ? rawStatusInput.trim().toLowerCase() : '';
+  switch (normalized) {
+    case 'active':
+      return { status: 'active', isKnownStatus: true, isAuthorizedPaidTier: true, rawStatus: normalized };
+    case 'trialing':
+      return { status: 'trialing', isKnownStatus: true, isAuthorizedPaidTier: true, rawStatus: normalized };
+    case 'past_due':
+      return { status: 'past_due', isKnownStatus: true, isAuthorizedPaidTier: false, rawStatus: normalized };
+    case 'canceled':
+    case 'cancelled':
+      return { status: 'canceled', isKnownStatus: true, isAuthorizedPaidTier: false, rawStatus: normalized };
+    case 'unpaid':
+      return { status: 'unpaid', isKnownStatus: true, isAuthorizedPaidTier: false, rawStatus: normalized };
+    case 'incomplete':
+      return { status: 'incomplete', isKnownStatus: true, isAuthorizedPaidTier: false, rawStatus: normalized };
+    case 'incomplete_expired':
+    case 'expired':
+      return { status: 'expired', isKnownStatus: true, isAuthorizedPaidTier: false, rawStatus: normalized };
+    case 'pending':
+      return { status: 'pending', isKnownStatus: true, isAuthorizedPaidTier: false, rawStatus: normalized };
+    default:
+      return {
+        status: 'incomplete',
+        isKnownStatus: false,
+        isAuthorizedPaidTier: false,
+        rawStatus: normalized || '(missing_or_invalid)',
+      };
+  }
 }
 
 export interface BillingLeaseConfig {
@@ -171,7 +216,15 @@ export class BillingService {
     }
 
     // 3. Parse event payload safely
-    const event = this.provider.parseWebhookEvent(rawBody);
+    let event: WebhookEventPayload;
+    try {
+      event = this.provider.parseWebhookEvent(rawBody);
+    } catch (parseErr: any) {
+      if (parseErr && typeof parseErr === 'object' && parseErr.statusCode === undefined) {
+        parseErr.statusCode = 400;
+      }
+      throw parseErr;
+    }
 
     // 4. Atomic Event Claim with durable lease ownership (PostgreSQL concurrency & idempotency guard)
     const claimRecord: BillingEventRecord = {
@@ -206,13 +259,16 @@ export class BillingService {
           message: `Webhook event ${event.id} was previously ignored.`,
         };
       }
-      if (existingStatus === 'processing') {
-        return {
-          success: true,
-          action: 'duplicate',
-          message: `Webhook event ${event.id} is currently being processed by another worker.`,
-        };
-      }
+      return {
+        success: false,
+        action: 'duplicate',
+        inProgress: true,
+        retryable: true,
+        message:
+          existingStatus === 'processing'
+            ? `Webhook event ${event.id} is currently being processed by another worker and has not completed yet; retry safely later.`
+            : `Webhook event ${event.id} could not be claimed in state "${existingStatus || 'unknown'}"; retry safely later.`,
+      };
     }
 
     const leaseOwner = claim.leaseOwner;
@@ -293,6 +349,7 @@ export class BillingService {
           `Billing lease ownership lost for event ${event.id}: worker "${leaseOwner}" aborted (${hb.leaseLostReason}).`
         );
         lostErr.code = 'BILLING_LEASE_LOST';
+        lostErr.statusCode = 503;
         throw lostErr;
       }
     };
@@ -310,7 +367,15 @@ export class BillingService {
       if (hb.inFlightRenewal) {
         await hb.inFlightRenewal.catch(() => {});
       }
-      if (!hb.leaseLost) {
+      const isLeaseLost =
+        hb.leaseLost ||
+        err?.code === 'BILLING_LEASE_LOST' ||
+        (typeof err?.message === 'string' && /lease ownership lost or expired/i.test(err.message));
+      if (isLeaseLost && err && typeof err === 'object') {
+        err.code = err.code || 'BILLING_LEASE_LOST';
+        err.statusCode = 503;
+      }
+      if (!isLeaseLost) {
         await this.repo.updateBillingEventStatus(event.id, 'failed', err?.message, leaseOwner).catch(() => {});
       }
       throw err;
@@ -351,10 +416,14 @@ export class BillingService {
 
         if (isStripe) {
           if (!customerId || typeof customerId !== 'string' || !customerId.startsWith('cus_')) {
-            throw new Error(`[Billing] Stripe checkout session ${event.id} missing valid customer ID (must start with cus_).`);
+            const err: any = new Error(`[Billing] Stripe checkout session ${event.id} missing valid customer ID (must start with cus_).`);
+            err.statusCode = 400;
+            throw err;
           }
           if (!subscriptionId || typeof subscriptionId !== 'string' || !subscriptionId.startsWith('sub_')) {
-            throw new Error(`[Billing] Stripe checkout session ${event.id} missing valid subscription ID (must start with sub_).`);
+            const err: any = new Error(`[Billing] Stripe checkout session ${event.id} missing valid subscription ID (must start with sub_).`);
+            err.statusCode = 400;
+            throw err;
           }
         } else {
           if (!customerId) {
@@ -366,7 +435,9 @@ export class BillingService {
         const priceId = dataObj.line_items?.data?.[0]?.price?.id || dataObj.priceId || dataObj.metadata?.priceId;
         let planFromPrice = priceId ? findPlanByPriceId(priceId) : null;
         if (priceId && !planFromPrice && isStripe) {
-          throw new Error(`[Billing] Configured price ID "${priceId}" is not associated with an authoritative plan.`);
+          const err: any = new Error(`[Billing] Configured price ID "${priceId}" is not associated with an authoritative plan.`);
+          err.statusCode = 400;
+          throw err;
         }
 
         const tierName = planFromPrice?.tier || dataObj.metadata?.tier || dataObj.tier || 'Starter';
@@ -375,10 +446,18 @@ export class BillingService {
         );
         const plan = planKey ? AUTHORITATIVE_PLANS[planKey] : AUTHORITATIVE_PLANS['starter'];
 
-        // Evaluate payment status: only 'paid' or zero-payment trials grant active store entitlements
-        const paymentStatus = (dataObj.payment_status || 'paid').toLowerCase();
-        let subStatus: SubscriptionRecord['status'] = 'active';
-        let grantTier = true;
+        // Evaluate payment status: in Stripe mode, missing/invalid payment_status fails closed;
+        // only 'paid' or 'no_payment_required' grant paid store entitlements.
+        const paymentStatus =
+          typeof dataObj.payment_status === 'string'
+            ? dataObj.payment_status.trim().toLowerCase()
+            : isStripe
+            ? ''
+            : dataObj.payment_status === undefined
+            ? 'paid'
+            : '';
+        let subStatus: SubscriptionRecord['status'] = 'incomplete';
+        let grantTier = false;
 
         if (paymentStatus === 'paid') {
           subStatus = 'active';
@@ -387,7 +466,7 @@ export class BillingService {
           subStatus = 'trialing';
           grantTier = true;
         } else {
-          // Delayed or unpaid checkout payment
+          // Delayed, unpaid, missing (in Stripe mode), or unknown payment status fails closed
           subStatus = 'incomplete';
           grantTier = false;
         }
@@ -474,23 +553,16 @@ export class BillingService {
         }
 
         const tier: PlanTier = dataObj.metadata?.tier || dataObj.tier || existingSub?.tier || 'Starter';
-        const rawStatus = (dataObj.status || 'active').toLowerCase();
+        const statusEval = normalizeStripeSubscriptionStatus(dataObj.status);
+        const status: SubscriptionRecord['status'] = statusEval.status;
         const cancelAtPeriodEnd = Boolean(dataObj.cancel_at_period_end);
 
-        let status: SubscriptionRecord['status'] = 'active';
-        if (rawStatus === 'trialing') status = 'trialing';
-        else if (rawStatus === 'past_due') status = 'past_due';
-        else if (rawStatus === 'canceled' || rawStatus === 'cancelled') status = 'canceled';
-        else if (rawStatus === 'unpaid') status = 'unpaid';
-        else if (rawStatus === 'incomplete') status = 'incomplete';
-        else if (rawStatus === 'incomplete_expired') status = 'expired';
-
-        // Do not resurrect already canceled subscriptions with older updates
+        // Do not resurrect already canceled subscriptions unless explicitly reactivated as 'active'
         if (existingSub?.status === 'canceled' && status !== 'active') {
           return {
             success: true,
             action: 'ignored',
-            message: `Subscription for workspace ${workspaceId} is already canceled. Stale status "${status}" ignored.`,
+            message: `Subscription for workspace ${workspaceId} is already canceled. Status "${statusEval.rawStatus}" ignored.`,
           };
         }
 
@@ -515,17 +587,18 @@ export class BillingService {
           updatedAt: new Date().toISOString(),
         };
 
-        // Entitlement synchronization:
-        // - Active or trialing (even with cancelAtPeriodEnd = true) preserves full paid tier entitlements until period ends!
-        // - Canceled or expired immediately downgrades to Free Audit without deleting catalog items.
+        // Fail-closed entitlement synchronization:
+        // - Only 'active' or 'trialing' authorize paid tier entitlements.
+        // - 'past_due' restricts new SKU imports via entitlementService while preserving tier metadata for payment recovery.
+        // - Any other status ('canceled', 'expired', 'unpaid', 'incomplete', 'pending', or unknown/missing) immediately downgrades store tier to 'Free Audit'.
         let storeProfileUpdate: { tier: PlanTier; skuLimit?: number } | undefined = undefined;
 
-        if (status === 'active' || status === 'trialing') {
+        if (statusEval.isAuthorizedPaidTier) {
           storeProfileUpdate = {
             tier: plan.tier,
             skuLimit: plan.skuLimit === Infinity ? undefined : plan.skuLimit,
           };
-        } else if (status === 'canceled' || status === 'expired') {
+        } else if (status !== 'past_due') {
           storeProfileUpdate = {
             tier: 'Free Audit',
             skuLimit: AUTHORITATIVE_PLANS['free_audit'].skuLimit,

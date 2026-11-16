@@ -90,12 +90,16 @@ export function resolveWorkspacePlanEntitlement(
   let isPastDue = false;
 
   if (subscription) {
-    if (subscription.status === 'active') {
+    const normalizedSubStatus = typeof subscription.status === 'string'
+      ? subscription.status.trim().toLowerCase()
+      : '';
+    if (normalizedSubStatus === 'active' || normalizedSubStatus === 'trialing') {
       rawTier = subscription.tier;
-    } else if (subscription.status === 'past_due') {
+    } else if (normalizedSubStatus === 'past_due') {
       rawTier = subscription.tier;
       isPastDue = true;
-    } else if (subscription.status === 'canceled' || subscription.status === 'expired') {
+    } else {
+      // Canceled, expired, unpaid, incomplete, pending, missing, or unknown status must fail closed
       rawTier = 'Free Audit';
     }
   }
