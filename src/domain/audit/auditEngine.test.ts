@@ -525,9 +525,11 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
         ],
       };
 
-      // Run 1 with a legacy fallback action id `act_02`
+      // Run 1 with a legacy fallback action id `act_02` owned by prodA
       const legacyApproved = {
         ...initialActionItems.find(a => a.id === 'act_02')!,
+        productId: prodA.id,
+        productTitle: prodA.title,
         status: 'approved' as const,
         approvedAt: '2026-11-01T00:00:00Z',
         verificationStatus: 'verified_in_catalog' as const,
@@ -535,9 +537,17 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
       const run1 = executeCatalogAudit([prodA, prodB], baseStore, [legacyApproved]);
       assertAllAuditIdsValid(run1, 'legacy-multi-product');
 
-      // Legacy action id `act_02` may only be claimed ONCE (for prodA), prodB must get a distinct bounded ID
+      // Legacy action id `act_02` may only be claimed by its owner prodA; prodB must get a distinct clean Action
       const act02Matches = run1.actionItems.filter(a => a.id === 'act_02');
       assert.equal(act02Matches.length, 1, 'Legacy action ID must never collide across multiple products');
+      assert.equal(act02Matches[0].productId, prodA.id);
+      assert.equal(act02Matches[0].status, 'approved');
+      const prodBAct02 = run1.actionItems.find(a => a.productId === prodB.id && a.title.includes('Microwave Safety'))!;
+      assert.ok(prodBAct02);
+      assert.notEqual(prodBAct02.id, 'act_02');
+      assert.equal(prodBAct02.status, 'pending_review');
+      const prodBFinding02 = run1.findings.find(f => f.id === prodBAct02.findingId)!;
+      assert.equal(prodBFinding02.merchantVerified, false);
 
       // Mark one hashed Shopify GTIN action approved, then re-run audit -> status & relationship preserved
       const hashedGtinAction = run1.actionItems.find(a => a.productId === 'p_shopify_9000000000000001' && a.title.includes('GTIN'))!;
@@ -555,5 +565,210 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
       assert.equal(pairedFinding?.merchantVerified, true);
     });
   });
+
+  // =========================================================================
+  // Workstream A — Legacy Action Cross-Product Contamination Isolation
+  // =========================================================================
+  describe('Workstream A: Legacy Action Ownership & Cross-Product Isolation (act_02, act_03, act_05, act_07)', () => {
+    const isolationStore: StoreProfile = {
+      name: 'Isolation Store',
+      domain: 'isolation.myshopify.com',
+      currency: 'USD',
+      skuCount: 2,
+      catalogCompletenessAvg: 70,
+      truthBoundaryStrictness: 'standard',
+      tier: 'Growth',
+      connectors: [],
+    };
+
+    const makeAllRulesProduct = (id: string, title: string): Product => ({
+      id,
+      title,
+      brand: 'Solstice Artisan',
+      category: 'Drinkware Coffee Candle',
+      description: `Handcrafted ${title} made with OEKO-TEX Standard 100 cotton and 60-hour burn soy wax blend.`,
+      image: `https://example.com/${id}.jpg`,
+      status: 'active',
+      completenessScore: 80,
+      evidenceCoverageScore: 50,
+      externalDiscoveryStatus: 'observed_in_sample',
+      attributes: {
+        microwaveSafe: 'Unspecified',
+        oekoTexCertified: 'Standard 100 (Unverified)',
+        recommendedBrewMethods: '(none)',
+        burnTime: '45-50 Hours',
+      },
+      variants: [
+        { id: `${id}_v1`, sku: `${id}_SKU`, title: 'Default', barcode: '0850029381044', price: 32, inventoryCount: 5, attributes: {} },
+      ],
+      offers: [],
+      evidenceDocuments: [],
+      findingsCount: 0,
+      lastAudited: '',
+    });
+
+    const legacySpecs: Array<{
+      legacyId: 'act_02' | 'act_03' | 'act_05' | 'act_07';
+      ruleCode: string;
+      expectedField: string;
+    }> = [
+      { legacyId: 'act_02', ruleCode: 'RULE_DISHWASHER_MICROWAVE_SAFETY', expectedField: 'attributes.microwaveSafe' },
+      { legacyId: 'act_03', ruleCode: 'RULE_UNVERIFIED_EVIDENCE_CLAIMS', expectedField: 'attributes.oekoTexCertified' },
+      { legacyId: 'act_05', ruleCode: 'RULE_STRUCTURED_BREW_METHODS', expectedField: 'attributes.recommendedBrewMethods' },
+      { legacyId: 'act_07', ruleCode: 'RULE_MARKETING_BURN_TIME_CONFLICT', expectedField: 'title / marketing claims' },
+    ];
+
+    it('Scenario 1 — Same Product: preserves approved legacy actions for all 4 fallback IDs when productId matches', () => {
+      for (const spec of legacySpecs) {
+        const prodA = makeAllRulesProduct(`prod_owner_${spec.legacyId}`, `Owner Mug Coffee Candle ${spec.legacyId}`);
+        const baseLegacy = initialActionItems.find(a => a.id === spec.legacyId)!;
+        const legacyForA = {
+          ...baseLegacy,
+          productId: prodA.id,
+          productTitle: prodA.title,
+          status: 'approved' as const,
+          approvedAt: '2026-11-10T12:00:00Z',
+          verificationStatus: 'verified_in_catalog' as const,
+          proposedChange: {
+            field: spec.expectedField,
+            from: 'custom_from_A',
+            to: 'custom_approved_to_A',
+          },
+          auditLog: [
+            { timestamp: '2026-11-10T12:00:00Z', actor: 'owner@store.com', action: 'approved', details: 'Verified A' },
+          ],
+        };
+
+        const result = executeCatalogAudit([prodA], isolationStore, [legacyForA]);
+        const finding = result.findings.find(f => f.ruleCode === spec.ruleCode && f.productId === prodA.id)!;
+        const action = result.actionItems.find(a => a.id === finding.actionItemId)!;
+
+        assert.ok(finding, `${spec.legacyId}: expected finding`);
+        assert.ok(action, `${spec.legacyId}: expected action`);
+        assert.equal(action.id, spec.legacyId);
+        assert.equal(action.productId, prodA.id);
+        assert.equal(action.productTitle, prodA.title);
+        assert.equal(action.status, 'approved');
+        assert.equal(action.approvedAt, '2026-11-10T12:00:00Z');
+        assert.equal(action.proposedChange.to, 'custom_approved_to_A');
+        assert.equal(action.auditLog?.length, 1);
+        assert.equal(finding.merchantVerified, true);
+      }
+    });
+
+    it('Scenario 2 & 3 — Different Products & Approved Action Isolation: Product B never inherits Product A state or unowned legacy fallbacks', () => {
+      for (const spec of legacySpecs) {
+        const prodB = makeAllRulesProduct(`prod_b_${spec.legacyId}`, `Product B Clean Mug Coffee Candle ${spec.legacyId}`);
+        const baseLegacy = initialActionItems.find(a => a.id === spec.legacyId)!;
+
+        // Subcase 2a: Approved legacy action explicitly belongs to Product A (Product A absent from catalog batch)
+        const approvedForA = {
+          ...baseLegacy,
+          productId: 'prod_other_A',
+          productTitle: 'Product A Contaminated Source',
+          status: 'approved' as const,
+          approvedAt: '2026-11-11T09:00:00Z',
+          verificationStatus: 'verified_in_catalog' as const,
+          proposedChange: {
+            field: spec.expectedField,
+            from: 'A_from',
+            to: 'A_SECRET_APPROVED_VALUE',
+          },
+          auditLog: [
+            { timestamp: '2026-11-11T09:00:00Z', actor: 'merchantA@example.com', action: 'approved', details: 'Only for A' },
+          ],
+        };
+
+        const runWithOtherOwner = executeCatalogAudit([prodB], isolationStore, [approvedForA]);
+        const bFinding = runWithOtherOwner.findings.find(f => f.ruleCode === spec.ruleCode && f.productId === prodB.id)!;
+        const bAction = runWithOtherOwner.actionItems.find(a => a.id === bFinding.actionItemId)!;
+
+        assert.ok(bFinding, `${spec.legacyId}: expected Product B finding`);
+        assert.ok(bAction, `${spec.legacyId}: expected Product B action`);
+        assert.notEqual(bAction.id, spec.legacyId, `${spec.legacyId}: Product B must not reuse Product A legacy ID`);
+        assert.equal(bAction.findingId, bFinding.id);
+        assert.equal(bAction.productId, prodB.id);
+        assert.equal(bAction.productTitle, prodB.title);
+        assert.equal(bAction.status, 'pending_review');
+        assert.equal(bAction.approvedAt, undefined);
+        assert.notEqual(bAction.proposedChange.to, 'A_SECRET_APPROVED_VALUE');
+        assert.deepEqual(bAction.auditLog, []);
+        assert.equal(bFinding.merchantVerified, false);
+
+        // Subcase 2b: Unowned legacy action (productId missing) must NOT be guessed onto Product B
+        const unownedLegacy = {
+          ...approvedForA,
+          productId: undefined,
+          productTitle: undefined,
+        };
+        const runWithUnowned = executeCatalogAudit([prodB], isolationStore, [unownedLegacy]);
+        const bUnownedFinding = runWithUnowned.findings.find(f => f.ruleCode === spec.ruleCode && f.productId === prodB.id)!;
+        const bUnownedAction = runWithUnowned.actionItems.find(a => a.id === bUnownedFinding.actionItemId)!;
+
+        assert.equal(bUnownedFinding.merchantVerified, false);
+        assert.equal(bUnownedAction.status, 'pending_review');
+        assert.equal(bUnownedAction.productId, prodB.id);
+        assert.equal(bUnownedAction.productTitle, prodB.title);
+        assert.deepEqual(bUnownedAction.auditLog, []);
+      }
+    });
+
+    it('Scenario 4 — Multiple Findings & Actions in single audit run with overlapping legacy fallback IDs (act_02, act_03, act_05, act_07)', () => {
+      const prodA = makeAllRulesProduct('prod_alpha', 'Alpha Coffee Mug Candle');
+      const prodB = makeAllRulesProduct('prod_beta', 'Beta Coffee Mug Candle');
+
+      const existingForAlpha = legacySpecs.map((spec) => {
+        const baseLegacy = initialActionItems.find(a => a.id === spec.legacyId)!;
+        return {
+          ...baseLegacy,
+          productId: prodA.id,
+          productTitle: prodA.title,
+          status: 'approved' as const,
+          approvedAt: '2026-11-12T08:00:00Z',
+          verificationStatus: 'verified_in_catalog' as const,
+          proposedChange: {
+            field: spec.expectedField,
+            from: 'alpha_from',
+            to: `alpha_approved_${spec.legacyId}`,
+          },
+          auditLog: [
+            { timestamp: '2026-11-12T08:00:00Z', actor: 'alpha@example.com', action: 'approved', details: `Alpha ${spec.legacyId}` },
+          ],
+        };
+      });
+
+      const result = executeCatalogAudit([prodA, prodB], isolationStore, existingForAlpha);
+
+      // Zero duplicate Action IDs or Finding IDs
+      const seenActionIds = new Set(result.actionItems.map(a => a.id));
+      const seenFindingIds = new Set(result.findings.map(f => f.id));
+      assert.equal(seenActionIds.size, result.actionItems.length);
+      assert.equal(seenFindingIds.size, result.findings.length);
+
+      for (const spec of legacySpecs) {
+        const alphaFinding = result.findings.find(f => f.ruleCode === spec.ruleCode && f.productId === prodA.id)!;
+        const alphaAction = result.actionItems.find(a => a.id === alphaFinding.actionItemId)!;
+        assert.equal(alphaAction.id, spec.legacyId);
+        assert.equal(alphaAction.productId, prodA.id);
+        assert.equal(alphaAction.productTitle, prodA.title);
+        assert.equal(alphaAction.status, 'approved');
+        assert.equal(alphaAction.proposedChange.to, `alpha_approved_${spec.legacyId}`);
+        assert.equal(alphaFinding.merchantVerified, true);
+
+        const betaFinding = result.findings.find(f => f.ruleCode === spec.ruleCode && f.productId === prodB.id)!;
+        const betaAction = result.actionItems.find(a => a.id === betaFinding.actionItemId)!;
+        assert.notEqual(betaAction.id, spec.legacyId);
+        assert.equal(betaAction.findingId, betaFinding.id);
+        assert.equal(betaAction.productId, prodB.id);
+        assert.equal(betaAction.productTitle, prodB.title);
+        assert.equal(betaAction.status, 'pending_review');
+        assert.equal(betaAction.approvedAt, undefined);
+        assert.notEqual(betaAction.proposedChange.to, `alpha_approved_${spec.legacyId}`);
+        assert.deepEqual(betaAction.auditLog, []);
+        assert.equal(betaFinding.merchantVerified, false);
+      }
+    });
+  });
 });
+
 

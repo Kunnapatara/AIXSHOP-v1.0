@@ -1914,7 +1914,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       }
     });
 
-    test('I8. [Live PG - Workstream C] Two-connection concurrency tests for finalizeExpiredExhaustedBillingEvents() using FOR UPDATE SKIP LOCKED', async () => {
+    test('I8. [Live PG - Workstreams B & C] Two-connection concurrency and deterministic FOR UPDATE SKIP LOCKED tests for finalizeExpiredExhaustedBillingEvents()', async () => {
       const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
       const testProvider = `pg_conc_${runId}`;
       const originalCreatedAt = '2026-11-10T01:02:03.000Z';
@@ -1923,7 +1923,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         suffix: string;
         status: 'processing' | 'processed' | 'ignored' | 'failed';
         attemptCount: number;
-        leaseOffsetSql: string | null;
+        leaseOffsetSeconds: number | null;
         lastError?: string | null;
       }) => {
         const eventId = `evt_conc_${runId}_${opts.suffix}`;
@@ -1936,7 +1936,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
              processed_at, created_at, updated_at
            ) VALUES (
              $1, $2, $3, $4, $3, $5::jsonb, $6,
-             $7, ${opts.leaseOffsetSql ? `clock_timestamp() + (${opts.leaseOffsetSql})::interval` : 'NULL'},
+             $7, clock_timestamp() + ($11::double precision * INTERVAL '1 second'),
              $8, $9, clock_timestamp(), NULL,
              clock_timestamp(), $10::timestamptz, clock_timestamp()
            )`,
@@ -1951,6 +1951,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
             opts.attemptCount,
             opts.lastError ?? null,
             originalCreatedAt,
+            opts.leaseOffsetSeconds,
           ]
         );
         return { eventId, payload };
@@ -1962,7 +1963,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
           suffix: 'single',
           status: 'processing',
           attemptCount: 3,
-          leaseOffsetSql: '-30 seconds',
+          leaseOffsetSeconds: -30,
           lastError: 'Prior transient PG timeout',
         });
 
@@ -1971,25 +1972,25 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
           suffix: 'unexp',
           status: 'processing',
           attemptCount: 3,
-          leaseOffsetSql: '+60 seconds',
+          leaseOffsetSeconds: 60,
         });
         const nonExhausted = await seedPgEvent({
           suffix: 'nonex',
           status: 'processing',
           attemptCount: 2,
-          leaseOffsetSql: '-30 seconds',
+          leaseOffsetSeconds: -30,
         });
         const doneProcessed = await seedPgEvent({
           suffix: 'done_p',
           status: 'processed',
           attemptCount: 5,
-          leaseOffsetSql: null,
+          leaseOffsetSeconds: null,
         });
         const doneIgnored = await seedPgEvent({
           suffix: 'done_i',
           status: 'ignored',
           attemptCount: 5,
-          leaseOffsetSql: null,
+          leaseOffsetSeconds: null,
         });
 
         const [finA, finB] = await Promise.all([
@@ -2045,11 +2046,12 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
           allowReplayFailed: true,
           maxAttempts: 5,
           leaseOwner: 'manual_replay_pg',
-          leaseDurationMs: 5000,
+          leaseDurationMs: 60000,
         });
         assert.equal(recoveryExplicitReplay.claimed, true);
         assert.equal(recoveryExplicitReplay.event?.status, 'processing');
         assert.equal(recoveryExplicitReplay.event?.attemptCount, 4);
+        await repoA.updateBillingEventStatus(single.eventId, 'processed', undefined, 'manual_replay_pg');
 
         // 2. Concurrent finalization of 6 eligible expired exhausted events across Pool A & Pool B -> disjoint union === 6
         const batchEvents: string[] = [];
@@ -2058,7 +2060,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
             suffix: `batch_${i}`,
             status: 'processing',
             attemptCount: 3 + (i % 2),
-            leaseOffsetSql: `-${20 + i} seconds`,
+            leaseOffsetSeconds: -(20 + i),
           });
           batchEvents.push(seeded.eventId);
         }
@@ -2075,6 +2077,92 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         assert.equal(idsA.length + idsB.length, 6, 'All 6 eligible events must be finalized exactly once total');
         assert.deepEqual([...idsA, ...idsB].sort(), [...batchEvents].sort());
         assert.equal((await repoB.getBillingEventById(nonExhausted.eventId))?.status, 'processing');
+
+        // 3. Deterministic FOR UPDATE SKIP LOCKED proof:
+        // Connection A holds an explicit transaction + FOR UPDATE row lock on one eligible expired exhausted event
+        // while Connection B executes finalizeExpiredExhaustedBillingEvents() concurrently.
+        const lockHeld = await seedPgEvent({
+          suffix: 'lock_held',
+          status: 'processing',
+          attemptCount: 3,
+          leaseOffsetSeconds: -45,
+          lastError: 'Prior lock-test error',
+        });
+        const unlocked1 = await seedPgEvent({
+          suffix: 'unlocked_1',
+          status: 'processing',
+          attemptCount: 3,
+          leaseOffsetSeconds: -40,
+        });
+        const unlocked2 = await seedPgEvent({
+          suffix: 'unlocked_2',
+          status: 'processing',
+          attemptCount: 4,
+          leaseOffsetSeconds: -35,
+        });
+
+        const lockClient = await poolA.connect();
+        let lockTxOpen = false;
+        try {
+          await lockClient.query('BEGIN');
+          lockTxOpen = true;
+          const lockedRowRes = await lockClient.query(
+            `SELECT id, event_id, status FROM billing_events WHERE event_id = $1 FOR UPDATE`,
+            [lockHeld.eventId]
+          );
+          assert.equal(lockedRowRes.rows.length, 1);
+          assert.equal(lockedRowRes.rows[0].status, 'processing');
+
+          // Connection B must NOT block on lockHeld; SKIP LOCKED skips lockHeld and finalizes unlocked1 + unlocked2
+          const startMs = Date.now();
+          const skippedPass = await repoB.finalizeExpiredExhaustedBillingEvents({
+            provider: testProvider,
+            maxAttempts: 3,
+            limit: 10,
+          });
+          const elapsedMs = Date.now() - startMs;
+          assert.ok(elapsedMs < 4000, `SKIP LOCKED must not wait on Connection A lock (elapsed=${elapsedMs}ms)`);
+          assert.deepEqual(
+            skippedPass.map((e) => e.eventId).sort(),
+            [unlocked1.eventId, unlocked2.eventId].sort(),
+            'Connection B must skip locked row and finalize only remaining unlocked eligible rows'
+          );
+
+          // Confirm from Connection B while Transaction A still holds lock that lockHeld remained untouched
+          assert.equal((await repoB.getBillingEventById(lockHeld.eventId))?.status, 'processing');
+          assert.equal((await repoB.getBillingEventById(unlocked1.eventId))?.status, 'permanently_failed');
+          assert.equal((await repoB.getBillingEventById(unlocked2.eventId))?.status, 'permanently_failed');
+          assert.equal((await repoB.getBillingEventById(unexpired.eventId))?.status, 'processing');
+          assert.equal((await repoB.getBillingEventById(nonExhausted.eventId))?.status, 'processing');
+
+          await lockClient.query('COMMIT');
+          lockTxOpen = false;
+        } finally {
+          if (lockTxOpen) {
+            await lockClient.query('ROLLBACK').catch(() => {});
+          }
+          lockClient.release();
+        }
+
+        // After Connection A releases lock, Connection B finalizes the previously locked event cleanly
+        const postUnlockPass = await repoB.finalizeExpiredExhaustedBillingEvents({
+          provider: testProvider,
+          maxAttempts: 3,
+          limit: 10,
+        });
+        assert.equal(postUnlockPass.length, 1);
+        assert.equal(postUnlockPass[0].eventId, lockHeld.eventId);
+
+        for (const repo of [repoA, repoB]) {
+          const finalHeld = await repo.getBillingEventById(lockHeld.eventId);
+          assert.equal(finalHeld?.status, 'permanently_failed');
+          assert.equal(finalHeld?.leaseExpiresAt, null);
+          assert.equal(finalHeld?.nextRetryAt, null);
+          assert.equal(finalHeld?.attemptCount, 3);
+          assert.deepEqual(finalHeld?.payload, lockHeld.payload);
+          assert.equal(new Date(finalHeld!.createdAt!).toISOString(), originalCreatedAt);
+          assert.match(finalHeld?.lastError || '', /^Prior lock-test error \| Worker lease expired/);
+        }
       } finally {
         await poolA.query(`DELETE FROM billing_events WHERE provider = $1`, [testProvider]).catch(() => {});
       }

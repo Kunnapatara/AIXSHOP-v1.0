@@ -228,24 +228,69 @@ export function executeCatalogAudit(
   };
 
   // Build lookup of existing action items to preserve previously approved or dismissed states
-  const existingActionMap = new Map<string, ActionItem>();
+  // for verified matching entities only (zero cross-product leakage).
+  const existingById = new Map<string, ActionItem>();
+  const existingByFindingId = new Map<string, ActionItem>();
   for (const act of existingActions) {
-    if (act.id) existingActionMap.set(act.id, act);
-    if (act.findingId) existingActionMap.set(act.findingId, act);
+    if (act.id && !existingById.has(act.id)) {
+      existingById.set(act.id, act);
+    }
+    if (act.findingId && !existingByFindingId.has(act.findingId)) {
+      existingByFindingId.set(act.findingId, act);
+    }
   }
 
   const usedActionIds = new Set<string>();
+  const consumedExistingActionIds = new Set<string>();
+
+  const isOwnedExistingCandidate = (
+    candidate: ActionItem | undefined,
+    expectedProductId: string | undefined,
+    isLegacyFallback: boolean
+  ): candidate is ActionItem => {
+    if (!candidate) return false;
+    if (consumedExistingActionIds.has(candidate.id)) return false;
+
+    if (expectedProductId !== undefined) {
+      if (isLegacyFallback) {
+        // Legacy fallback IDs (act_02, act_03, act_05, act_07) must explicitly prove product ownership.
+        return Boolean(candidate.productId && candidate.productId === expectedProductId);
+      }
+      if (candidate.productId && candidate.productId !== expectedProductId) {
+        return false;
+      }
+      return true;
+    }
+
+    // Store/catalog-scoped actions must never absorb a product-scoped action.
+    return !candidate.productId;
+  };
+
   const resolveExistingAction = (
     findingId: string,
     defaultActionId: string,
-    fallbackKeys: string[] = []
+    options: { productId?: string; fallbackKeys?: string[] } = {}
   ): { prevAction?: ActionItem; actionId: string } => {
-    const candidates: Array<ActionItem | undefined> = [
-      existingActionMap.get(findingId),
-      existingActionMap.get(defaultActionId),
-      ...fallbackKeys.map((k) => existingActionMap.get(k)),
+    const { productId, fallbackKeys = [] } = options;
+
+    const primaryCandidates: Array<ActionItem | undefined> = [
+      existingByFindingId.get(findingId),
+      existingById.get(defaultActionId),
     ];
-    const prevAction = candidates.find((c): c is ActionItem => Boolean(c));
+    let prevAction = primaryCandidates.find((c): c is ActionItem =>
+      isOwnedExistingCandidate(c, productId, false)
+    );
+
+    if (!prevAction && fallbackKeys.length > 0) {
+      prevAction = fallbackKeys
+        .map((k) => existingById.get(k))
+        .find((c): c is ActionItem => isOwnedExistingCandidate(c, productId, true));
+    }
+
+    if (prevAction?.id) {
+      consumedExistingActionIds.add(prevAction.id);
+    }
+
     let actionId = defaultActionId;
     if (
       prevAction?.id &&
@@ -256,6 +301,22 @@ export function executeCatalogAudit(
     }
     usedActionIds.add(actionId);
     return { prevAction, actionId };
+  };
+
+  const buildScopedActionItem = (
+    prevAction: ActionItem | undefined,
+    freshAction: ActionItem
+  ): ActionItem => {
+    if (!prevAction) {
+      return freshAction;
+    }
+    return {
+      ...prevAction,
+      id: freshAction.id,
+      findingId: freshAction.findingId,
+      productId: freshAction.productId,
+      productTitle: freshAction.productTitle,
+    };
   };
 
   let totalVariants = 0;
@@ -279,7 +340,7 @@ export function executeCatalogAudit(
           variantId: v.id,
           variantIndex: vIdx,
         });
-        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
         findings.push({
           id: findingId,
@@ -303,7 +364,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+        actionItems.push(buildScopedActionItem(prevAction, {
           id: actionId,
           findingId,
           productId: p.id,
@@ -321,7 +382,7 @@ export function executeCatalogAudit(
           },
           verificationStatus: 'unverified',
           auditLog: [],
-        });
+        }));
         productFindingsCount++;
       } else if (!isValidGtin13(barcode)) {
         const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
@@ -330,7 +391,7 @@ export function executeCatalogAudit(
           variantId: v.id,
           variantIndex: vIdx,
         });
-        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
         findings.push({
           id: findingId,
@@ -354,7 +415,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+        actionItems.push(buildScopedActionItem(prevAction, {
           id: actionId,
           findingId,
           productId: p.id,
@@ -371,7 +432,7 @@ export function executeCatalogAudit(
           },
           verificationStatus: 'unverified',
           auditLog: [],
-        });
+        }));
         productFindingsCount++;
       }
     });
@@ -386,7 +447,7 @@ export function executeCatalogAudit(
           variantId: v.id,
           variantIndex: vIdx,
         });
-        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
         findings.push({
           id: findingId,
@@ -410,7 +471,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+        actionItems.push(buildScopedActionItem(prevAction, {
           id: actionId,
           findingId,
           productId: p.id,
@@ -427,7 +488,7 @@ export function executeCatalogAudit(
           },
           verificationStatus: 'unverified',
           auditLog: [],
-        });
+        }));
         productFindingsCount++;
       }
     });
@@ -439,7 +500,7 @@ export function executeCatalogAudit(
         ruleSlug: 'desc_short',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
       findings.push({
         id: findingId,
@@ -462,7 +523,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -479,7 +540,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -490,7 +551,7 @@ export function executeCatalogAudit(
         ruleSlug: 'brand_missing',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
       findings.push({
         id: findingId,
@@ -513,7 +574,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -530,7 +591,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -541,7 +602,7 @@ export function executeCatalogAudit(
         ruleSlug: 'cat_missing',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
       findings.push({
         id: findingId,
@@ -564,7 +625,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -581,7 +642,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -592,7 +653,7 @@ export function executeCatalogAudit(
         ruleSlug: 'img_missing',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
 
       findings.push({
         id: findingId,
@@ -615,7 +676,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -632,7 +693,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -648,7 +709,10 @@ export function executeCatalogAudit(
           ruleSlug: '02',
           productId: p.id,
         });
-        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_02']);
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, {
+          productId: p.id,
+          fallbackKeys: ['act_02'],
+        });
 
         findings.push({
           id: findingId,
@@ -672,7 +736,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+        actionItems.push(buildScopedActionItem(prevAction, {
           id: actionId,
           findingId,
           productId: p.id,
@@ -689,7 +753,7 @@ export function executeCatalogAudit(
           },
           verificationStatus: 'unverified',
           auditLog: [],
-        });
+        }));
         productFindingsCount++;
       }
     }
@@ -703,7 +767,10 @@ export function executeCatalogAudit(
         ruleSlug: '03',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_03']);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, {
+        productId: p.id,
+        fallbackKeys: ['act_03'],
+      });
 
       findings.push({
         id: findingId,
@@ -726,7 +793,7 @@ export function executeCatalogAudit(
         ruleCode: 'RULE_UNVERIFIED_EVIDENCE_CLAIMS',
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -743,7 +810,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -755,7 +822,10 @@ export function executeCatalogAudit(
         ruleSlug: '05',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_05']);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, {
+        productId: p.id,
+        fallbackKeys: ['act_05'],
+      });
 
       findings.push({
         id: findingId,
@@ -778,7 +848,7 @@ export function executeCatalogAudit(
         ruleCode: 'RULE_STRUCTURED_BREW_METHODS',
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -794,7 +864,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -808,7 +878,10 @@ export function executeCatalogAudit(
         ruleSlug: '07',
         productId: p.id,
       });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_07']);
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, {
+        productId: p.id,
+        fallbackKeys: ['act_07'],
+      });
 
       findings.push({
         id: findingId,
@@ -831,7 +904,7 @@ export function executeCatalogAudit(
         ruleCode: 'RULE_MARKETING_BURN_TIME_CONFLICT',
       });
 
-      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+      actionItems.push(buildScopedActionItem(prevAction, {
         id: actionId,
         findingId,
         productId: p.id,
@@ -847,7 +920,7 @@ export function executeCatalogAudit(
         },
         verificationStatus: 'unverified',
         auditLog: [],
-      });
+      }));
       productFindingsCount++;
     }
 
@@ -888,7 +961,7 @@ export function executeCatalogAudit(
       ruleCode: 'RULE_DUAL_UNIT_MEASUREMENT_POLICY',
     });
 
-    actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+    actionItems.push(buildScopedActionItem(prevAction, {
       id: actionId,
       findingId,
       title: 'Standardize Dual-Unit Volume & Weight Formatting',
@@ -902,7 +975,7 @@ export function executeCatalogAudit(
       },
       verificationStatus: 'unverified',
       auditLog: [],
-    });
+    }));
   }
 
   // Rule: Shipping SLA conflict between storefront and feed
@@ -931,7 +1004,7 @@ export function executeCatalogAudit(
       ruleCode: 'RULE_SHIPPING_SLA_RECONCILIATION',
     });
 
-    actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
+    actionItems.push(buildScopedActionItem(prevAction, {
       id: actionId,
       findingId,
       title: 'Reconcile Storefront 2-Day Shipping SLA with GMC Feed',
@@ -945,7 +1018,7 @@ export function executeCatalogAudit(
       },
       verificationStatus: 'unverified',
       auditLog: [],
-    });
+    }));
   }
 
   // Calculate actual completeness
