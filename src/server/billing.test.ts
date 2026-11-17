@@ -2810,7 +2810,144 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
         console.error = origConsoleError;
       }
     });
+
+    test('C.17 Billing recovery CLI resolves non-zero exit codes on recovery failures, selects Postgres when configured, and fails closed in production without DB', async () => {
+      const { resolveBillingRecoveryCliExitCode, runBillingWebhookRecoveryCli } = await import('./billing/recoverWebhooks');
+      const { getDatabaseRepository, setDatabaseRepository } = await import('./db/index');
+      const { spawnSync } = await import('node:child_process');
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+
+      // 1. Exit code resolution for sweeps and manual replays
+      assert.equal(
+        resolveBillingRecoveryCliExitCode({
+          scanned: 2,
+          recovered: 2,
+          ignored: 0,
+          retriedFailed: 0,
+          permanentlyFailed: 0,
+          skippedContended: 0,
+          leaseLost: 0,
+          details: [],
+        }),
+        0
+      );
+      assert.equal(
+        resolveBillingRecoveryCliExitCode({
+          scanned: 1,
+          recovered: 0,
+          ignored: 0,
+          retriedFailed: 1,
+          permanentlyFailed: 0,
+          skippedContended: 0,
+          leaseLost: 0,
+          details: [],
+        }),
+        1
+      );
+      assert.equal(
+        resolveBillingRecoveryCliExitCode({
+          scanned: 1,
+          recovered: 0,
+          ignored: 0,
+          retriedFailed: 0,
+          permanentlyFailed: 1,
+          skippedContended: 0,
+          leaseLost: 0,
+          details: [],
+        }),
+        1
+      );
+      assert.equal(
+        resolveBillingRecoveryCliExitCode({
+          scanned: 1,
+          recovered: 0,
+          ignored: 0,
+          retriedFailed: 0,
+          permanentlyFailed: 0,
+          skippedContended: 0,
+          leaseLost: 1,
+          details: [],
+        }),
+        1
+      );
+      assert.equal(resolveBillingRecoveryCliExitCode({ success: true, action: 'processed', message: 'ok' }), 0);
+      assert.equal(resolveBillingRecoveryCliExitCode({ success: false, action: 'duplicate', message: 'failed' }), 1);
+
+      // 2. When DATABASE_URL is configured, getDatabaseRepository() selects PostgresRepository (not MemoryRepository)
+      const prevDbUrl = process.env.DATABASE_URL;
+      const prevNodeEnv = process.env.NODE_ENV;
+      setDatabaseRepository(null);
+      try {
+        process.env.DATABASE_URL = 'postgresql://aixshop:pass@127.0.0.1:5432/aixshop_test';
+        const selectedRepo = getDatabaseRepository();
+        assert.equal(selectedRepo.getBackendType(), 'postgres');
+      } finally {
+        setDatabaseRepository(null);
+        if (prevDbUrl === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = prevDbUrl;
+      }
+
+      // 3. Production CLI fails closed when DB is missing (throws in-process and exits non-zero in subprocess)
+      const prevSqlHost = process.env.SQL_HOST;
+      const prevPgHost = process.env.PGHOST;
+      setDatabaseRepository(null);
+      try {
+        process.env.NODE_ENV = 'production';
+        delete process.env.DATABASE_URL;
+        delete process.env.SQL_HOST;
+        delete process.env.PGHOST;
+        await assert.rejects(
+          () => runBillingWebhookRecoveryCli(['--limit=5']),
+          /Production environment \(NODE_ENV=production\) requires durable PostgreSQL database configuration/i
+        );
+      } finally {
+        setDatabaseRepository(null);
+        if (prevDbUrl === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = prevDbUrl;
+        if (prevSqlHost === undefined) delete process.env.SQL_HOST;
+        else process.env.SQL_HOST = prevSqlHost;
+        if (prevPgHost === undefined) delete process.env.PGHOST;
+        else process.env.PGHOST = prevPgHost;
+        if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = prevNodeEnv;
+      }
+
+      const cliScriptPath = path.join(process.cwd(), 'src/server/billing/recoverWebhooks.ts');
+      const tsxBin = path.join(process.cwd(), 'node_modules/.bin/tsx');
+      const baseCleanEnv = {
+        ...process.env,
+        DATABASE_URL: '',
+        SQL_HOST: '',
+        PGHOST: '',
+      };
+
+      const prodProc = spawnSync(tsxBin, [cliScriptPath, '--limit=5'], {
+        env: { ...baseCleanEnv, NODE_ENV: 'production' },
+        encoding: 'utf8',
+        timeout: 15000,
+      });
+      assert.equal(prodProc.status, 1, `Production CLI without DB must exit 1 (stderr: ${prodProc.stderr})`);
+      assert.match(prodProc.stderr, /requires durable PostgreSQL database configuration/i);
+
+      // 4. Non-production development/test fallback runs and exits 0 cleanly
+      const devProc = spawnSync(tsxBin, [cliScriptPath, '--limit=5', '--max-attempts=3'], {
+        env: { ...baseCleanEnv, NODE_ENV: 'development' },
+        encoding: 'utf8',
+        timeout: 15000,
+      });
+      assert.equal(devProc.status, 0, `Development CLI fallback must exit 0 (stderr: ${devProc.stderr})`);
+      assert.match(devProc.stdout, /Using MemoryRepository/);
+      assert.match(devProc.stdout, /Recovery sweep completed/);
+
+      // 5. Scheduler stays disabled by default in server.ts and documented cleanly in .env.example & README.md
+      const serverTxt = fs.readFileSync(path.join(process.cwd(), 'server.ts'), 'utf8');
+      assert.match(serverTxt, /process\.env\.BILLING_RECOVERY_ENABLED === 'true' && process\.env\.NODE_ENV !== 'test'/);
+      const envExampleTxt = fs.readFileSync(path.join(process.cwd(), '.env.example'), 'utf8');
+      assert.match(envExampleTxt, /BILLING_RECOVERY_ENABLED="false"/);
+    });
   });
 });
+
 
 

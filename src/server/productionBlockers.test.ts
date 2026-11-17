@@ -38,6 +38,10 @@ import {
 } from './middleware/auth';
 import { VisibilityObservationConflictError } from '../domain/monitoring/aiVisibilityTypes';
 import { StoragePayloadV1 } from '../domain/storage/storageTypes';
+import { BillingService } from './services/billingService';
+import { SandboxBillingProvider, setBillingProvider } from './billing/providerAdapter';
+import { runBillingWebhookRecoveryCli } from './billing/recoverWebhooks';
+import { setDatabaseRepository } from './db/index';
 
 function computeShopifyHmac(rawBody: Buffer | string, secret: string): string {
   return crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
@@ -1586,9 +1590,139 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         assert.equal(pgQuotaVerification.rows[0].catalog_version, 3, 'PostgreSQL catalog_version must remain 3');
         assert.equal(pgQuotaVerification.rows[0].audit_count, 0, 'No unexpected audit history mutation may occur');
 
-        // 5. executeWorkspaceAudit increments catalogVersion and returns updated catalogVersion
+        // 5. executeWorkspaceAudit increments catalogVersion, persists bounded Findings/Actions + FK relationships, and supports realistic 16-digit Shopify IDs
         const auditOut = await repoA.executeWorkspaceAudit(wsId);
         assert.equal(auditOut.catalog.catalogVersion, 4);
+        assert.equal(auditOut.auditRun.status, 'COMPLETED');
+        assert.ok(auditOut.catalog.findings.length > 0, 'executeWorkspaceAudit must persist real audit findings');
+        assert.equal(auditOut.catalog.findings.length, auditOut.catalog.actions.length, 'Each finding must have a paired action item');
+
+        for (const f of auditOut.catalog.findings) {
+          assert.ok(f.id.length <= 64, `Finding ID "${f.id}" (${f.id.length}) exceeds VARCHAR(64)`);
+          assert.ok(f.actionItemId && f.actionItemId.length <= 64, `Action ID "${f.actionItemId}" exceeds VARCHAR(64)`);
+          const pairedAction = auditOut.catalog.actions.find((a) => a.id === f.actionItemId);
+          assert.ok(pairedAction, `Action "${f.actionItemId}" missing for finding "${f.id}"`);
+          assert.equal(pairedAction?.findingId, f.id);
+        }
+
+        // Verify PostgreSQL persisted rows, lengths, FK consistency, and audit_run_findings snapshot via independent Pool B
+        const pgAuditRows = await poolB.query<{
+          findings_count: number;
+          actions_count: number;
+          snapshot_findings_count: number;
+          max_finding_id_len: number;
+          max_action_id_len: number;
+          max_snap_id_len: number;
+          unpaired_count: number;
+          run_status: string;
+        }>(
+          `SELECT
+             (SELECT count(*)::int FROM findings WHERE workspace_id = $1) AS findings_count,
+             (SELECT count(*)::int FROM action_items WHERE workspace_id = $1) AS actions_count,
+             (SELECT count(*)::int FROM audit_run_findings WHERE workspace_id = $1 AND audit_run_id = $2) AS snapshot_findings_count,
+             (SELECT COALESCE(MAX(char_length(id)), 0)::int FROM findings WHERE workspace_id = $1) AS max_finding_id_len,
+             (SELECT COALESCE(MAX(char_length(id)), 0)::int FROM action_items WHERE workspace_id = $1) AS max_action_id_len,
+             (SELECT COALESCE(MAX(char_length(id)), 0)::int FROM audit_run_findings WHERE workspace_id = $1 AND audit_run_id = $2) AS max_snap_id_len,
+             (
+               SELECT count(*)::int
+               FROM findings f
+               FULL OUTER JOIN action_items a
+                 ON a.workspace_id = f.workspace_id AND a.id = f.action_item_id AND a.finding_id = f.id
+               WHERE COALESCE(f.workspace_id, a.workspace_id) = $1
+                 AND (f.id IS NULL OR a.id IS NULL)
+             ) AS unpaired_count,
+             (SELECT status FROM audit_runs WHERE workspace_id = $1 AND id = $2) AS run_status`,
+          [wsId, auditOut.auditRun.id]
+        );
+        const auditStats = pgAuditRows.rows[0];
+        assert.equal(auditStats.run_status, 'COMPLETED');
+        assert.equal(auditStats.findings_count, auditOut.catalog.findings.length);
+        assert.equal(auditStats.actions_count, auditOut.catalog.actions.length);
+        assert.equal(auditStats.snapshot_findings_count, auditOut.catalog.findings.length);
+        assert.ok(auditStats.max_finding_id_len <= 64);
+        assert.ok(auditStats.max_action_id_len <= 64);
+        assert.ok(auditStats.max_snap_id_len <= 128);
+        assert.equal(auditStats.unpaired_count, 0, 'Every persisted finding & action must maintain 1:1 FK pairing');
+
+        // Verify retrieval via repository read paths on Pool B
+        const loadedAfterAudit = await repoB.loadWorkspaceCatalog(wsId);
+        assert.equal(loadedAfterAudit?.catalogVersion, 4);
+        assert.equal(loadedAfterAudit?.findings.length, auditOut.catalog.findings.length);
+        const latestRun = await repoB.getLatestAuditRunByWorkspace(wsId);
+        assert.equal(latestRun?.id, auditOut.auditRun.id);
+        const histSnapshot = await repoB.getHistoricalAuditSnapshot(wsId, auditOut.auditRun.id);
+        assert.equal(histSnapshot?.snapshotAvailable, true);
+        assert.equal(histSnapshot?.findings.length, auditOut.catalog.findings.length);
+
+        // 6. Persist realistic 16-digit Shopify product & variant IDs (within skuLimit=50) and execute workspace audit on Pool B
+        const shopify16Cat: StoragePayloadV1 = {
+          products: [
+            {
+              id: 'p_shopify_8901234567890123',
+              title: 'Shopify 16-Digit Merino Sneaker',
+              brand: 'Shopify Brand',
+              category: 'Footwear',
+              description: 'Sustainable eucalyptus and merino sneaker imported from Shopify.',
+              image: 'https://cdn.shopify.com/sneaker-16.jpg',
+              status: 'active',
+              completenessScore: 80,
+              evidenceCoverageScore: 0,
+              externalDiscoveryStatus: 'observed_in_sample',
+              attributes: {},
+              variants: [
+                {
+                  id: 'v_shopify_4567890123456789',
+                  sku: `SKU-SH16-${runId}`,
+                  title: 'Size 10',
+                  barcode: '',
+                  price: 29.99,
+                  inventoryCount: 8,
+                  attributes: {},
+                },
+              ],
+              offers: [],
+              evidenceDocuments: [],
+              findingsCount: 0,
+              lastAudited: new Date().toISOString(),
+            },
+          ],
+          variants: [
+            {
+              id: 'v_shopify_4567890123456789',
+              sku: `SKU-SH16-${runId}`,
+              title: 'Size 10',
+              barcode: '',
+              price: 29.99,
+              inventoryCount: 8,
+              attributes: {},
+            },
+          ],
+          offers: [],
+          findings: [],
+          actions: [],
+          evidence: [],
+          storeProfile: {
+            ...auditOut.catalog.storeProfile,
+            skuLimit: 50,
+          },
+        };
+        await repoA.saveWorkspaceCatalog(wsId, shopify16Cat, { expectedVersion: 4 });
+        const shopifyAuditOut = await repoB.executeWorkspaceAudit(wsId);
+        assert.equal(shopifyAuditOut.catalog.catalogVersion, 6);
+        const gtinFinding = shopifyAuditOut.catalog.findings.find(
+          (f) => f.productId === 'p_shopify_8901234567890123' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'
+        );
+        assert.ok(gtinFinding, '16-digit Shopify product missing barcode must generate bounded GTIN finding');
+        assert.ok(gtinFinding!.id.length <= 64);
+        assert.ok(gtinFinding!.actionItemId && gtinFinding!.actionItemId.length <= 64);
+        const gtinAction = shopifyAuditOut.catalog.actions.find((a) => a.id === gtinFinding!.actionItemId);
+        assert.equal(gtinAction?.findingId, gtinFinding!.id);
+
+        const shopifyPgCheck = await poolA.query<{ id: string; action_item_id: string }>(
+          `SELECT id, action_item_id FROM findings WHERE workspace_id = $1 AND product_id = $2`,
+          [wsId, 'p_shopify_8901234567890123']
+        );
+        assert.ok(shopifyPgCheck.rows.some((r) => r.id === gtinFinding!.id && r.action_item_id === gtinAction!.id));
       } finally {
         await poolA.query('DELETE FROM workspaces WHERE id = $1', [wsId]).catch(() => {});
         await poolA.query('DELETE FROM users WHERE id = $1', [usrId]).catch(() => {});
@@ -1777,6 +1911,397 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         else process.env.SESSION_SECRET = savedSessionSecret;
         if (savedAppUrl === undefined) delete process.env.APP_URL;
         else process.env.APP_URL = savedAppUrl;
+      }
+    });
+
+    test('I8. [Live PG - Workstream C] Two-connection concurrency tests for finalizeExpiredExhaustedBillingEvents() using FOR UPDATE SKIP LOCKED', async () => {
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const testProvider = `pg_conc_${runId}`;
+      const originalCreatedAt = '2026-11-10T01:02:03.000Z';
+
+      const seedPgEvent = async (opts: {
+        suffix: string;
+        status: 'processing' | 'processed' | 'ignored' | 'failed';
+        attemptCount: number;
+        leaseOffsetSql: string | null;
+        lastError?: string | null;
+      }) => {
+        const eventId = `evt_conc_${runId}_${opts.suffix}`;
+        const rowId = `be_conc_${runId}_${opts.suffix}`;
+        const payload = { id: eventId, type: 'checkout.session.completed', marker: opts.suffix };
+        await poolA.query(
+          `INSERT INTO billing_events (
+             id, provider, event_id, event_type, idempotency_key, payload_json, status,
+             lease_owner, lease_expires_at, attempt_count, last_error, last_attempt_at, next_retry_at,
+             processed_at, created_at, updated_at
+           ) VALUES (
+             $1, $2, $3, $4, $3, $5::jsonb, $6,
+             $7, ${opts.leaseOffsetSql ? `clock_timestamp() + (${opts.leaseOffsetSql})::interval` : 'NULL'},
+             $8, $9, clock_timestamp(), NULL,
+             clock_timestamp(), $10::timestamptz, clock_timestamp()
+           )`,
+          [
+            rowId,
+            testProvider,
+            eventId,
+            'checkout.session.completed',
+            JSON.stringify(payload),
+            opts.status,
+            opts.status === 'processing' ? `worker_${opts.suffix}` : null,
+            opts.attemptCount,
+            opts.lastError ?? null,
+            originalCreatedAt,
+          ]
+        );
+        return { eventId, payload };
+      };
+
+      try {
+        // 1. Concurrent finalization of 1 expired exhausted event across Pool A & Pool B -> exactly 1 winner
+        const single = await seedPgEvent({
+          suffix: 'single',
+          status: 'processing',
+          attemptCount: 3,
+          leaseOffsetSql: '-30 seconds',
+          lastError: 'Prior transient PG timeout',
+        });
+
+        // Unexpired exhausted, non-exhausted expired, and completed exhausted must ALL be ignored
+        const unexpired = await seedPgEvent({
+          suffix: 'unexp',
+          status: 'processing',
+          attemptCount: 3,
+          leaseOffsetSql: '+60 seconds',
+        });
+        const nonExhausted = await seedPgEvent({
+          suffix: 'nonex',
+          status: 'processing',
+          attemptCount: 2,
+          leaseOffsetSql: '-30 seconds',
+        });
+        const doneProcessed = await seedPgEvent({
+          suffix: 'done_p',
+          status: 'processed',
+          attemptCount: 5,
+          leaseOffsetSql: null,
+        });
+        const doneIgnored = await seedPgEvent({
+          suffix: 'done_i',
+          status: 'ignored',
+          attemptCount: 5,
+          leaseOffsetSql: null,
+        });
+
+        const [finA, finB] = await Promise.all([
+          repoA.finalizeExpiredExhaustedBillingEvents({ provider: testProvider, maxAttempts: 3, limit: 10 }),
+          repoB.finalizeExpiredExhaustedBillingEvents({ provider: testProvider, maxAttempts: 3, limit: 10 }),
+        ]);
+        const combinedSingle = [...finA, ...finB];
+        assert.equal(combinedSingle.length, 1, 'Exactly one PG worker connection must finalize the single eligible event');
+        assert.equal(combinedSingle[0].eventId, single.eventId);
+
+        // Verify persisted PostgreSQL state via Pool B
+        const dbSingle = await repoB.getBillingEventById(single.eventId);
+        assert.equal(dbSingle?.status, 'permanently_failed');
+        assert.equal(dbSingle?.leaseExpiresAt, null);
+        assert.equal(dbSingle?.nextRetryAt, null);
+        assert.equal(dbSingle?.attemptCount, 3);
+        assert.deepEqual(dbSingle?.payload, single.payload);
+        assert.equal(new Date(dbSingle!.createdAt!).toISOString(), originalCreatedAt);
+        assert.match(dbSingle?.lastError || '', /^Prior transient PG timeout \| Worker lease expired/);
+
+        // Untouched rows remain in their original states
+        assert.equal((await repoB.getBillingEventById(unexpired.eventId))?.status, 'processing');
+        assert.equal((await repoA.getBillingEventById(nonExhausted.eventId))?.status, 'processing');
+        assert.equal((await repoB.getBillingEventById(doneProcessed.eventId))?.status, 'processed');
+        assert.equal((await repoA.getBillingEventById(doneIgnored.eventId))?.status, 'ignored');
+
+        // Replay & idempotency protections on permanently_failed event in PostgreSQL
+        const reClaimWebhook = await repoA.claimBillingEvent(
+          {
+            id: `re_${runId}`,
+            provider: testProvider,
+            eventId: single.eventId,
+            eventType: 'checkout.session.completed',
+            idempotencyKey: single.eventId,
+            payload: single.payload,
+            status: 'processing',
+            processedAt: new Date().toISOString(),
+          },
+          { leaseOwner: 'dup_worker', leaseDurationMs: 5000 }
+        );
+        assert.equal(reClaimWebhook.claimed, false);
+        assert.equal(reClaimWebhook.event?.status, 'permanently_failed');
+
+        const recoveryNoReplay = await repoB.claimBillingEventForRecovery(single.eventId, {
+          provider: testProvider,
+          allowReplayFailed: false,
+          maxAttempts: 5,
+        });
+        assert.equal(recoveryNoReplay.claimed, false);
+
+        const recoveryExplicitReplay = await repoA.claimBillingEventForRecovery(single.eventId, {
+          provider: testProvider,
+          allowReplayFailed: true,
+          maxAttempts: 5,
+          leaseOwner: 'manual_replay_pg',
+          leaseDurationMs: 5000,
+        });
+        assert.equal(recoveryExplicitReplay.claimed, true);
+        assert.equal(recoveryExplicitReplay.event?.status, 'processing');
+        assert.equal(recoveryExplicitReplay.event?.attemptCount, 4);
+
+        // 2. Concurrent finalization of 6 eligible expired exhausted events across Pool A & Pool B -> disjoint union === 6
+        const batchEvents: string[] = [];
+        for (let i = 0; i < 6; i++) {
+          const seeded = await seedPgEvent({
+            suffix: `batch_${i}`,
+            status: 'processing',
+            attemptCount: 3 + (i % 2),
+            leaseOffsetSql: `-${20 + i} seconds`,
+          });
+          batchEvents.push(seeded.eventId);
+        }
+
+        const [batchA, batchB] = await Promise.all([
+          repoA.finalizeExpiredExhaustedBillingEvents({ provider: testProvider, maxAttempts: 3, limit: 10 }),
+          repoB.finalizeExpiredExhaustedBillingEvents({ provider: testProvider, maxAttempts: 3, limit: 10 }),
+        ]);
+
+        const idsA = batchA.map((e) => e.eventId);
+        const idsB = batchB.map((e) => e.eventId);
+        const overlap = idsA.filter((id) => idsB.includes(id));
+        assert.equal(overlap.length, 0, 'SKIP LOCKED must guarantee zero overlapping rows across connections');
+        assert.equal(idsA.length + idsB.length, 6, 'All 6 eligible events must be finalized exactly once total');
+        assert.deepEqual([...idsA, ...idsB].sort(), [...batchEvents].sort());
+        assert.equal((await repoB.getBillingEventById(nonExhausted.eventId))?.status, 'processing');
+      } finally {
+        await poolA.query(`DELETE FROM billing_events WHERE provider = $1`, [testProvider]).catch(() => {});
+      }
+    });
+
+    test('I9. [Live PG - Workstream D] Real SQL trigger fault injection blocks failure persistence without secret leakage or false permanently_failed, then recovers via second connection', async () => {
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const safeRun = runId.replace(/[^a-zA-Z0-9_]/g, '_');
+      const wsId = `ws_pg_fault_${runId}`;
+      const usrId = `usr_pg_fault_${runId}`;
+      const wsId2 = `ws_pg_fault2_${runId}`;
+      const usrId2 = `usr_pg_fault2_${runId}`;
+      const evtId = `evt_pg_fault_${runId}`;
+      const evtExhaustedId = `evt_pg_fault_ex_${runId}`;
+
+      const subFn = `fn_test_sub_fail_${safeRun}`;
+      const subTrg = `trg_test_sub_fail_${safeRun}`;
+      const beFn = `fn_test_be_fail_${safeRun}`;
+      const beTrg = `trg_test_be_fail_${safeRun}`;
+
+      const sandboxProvider = new SandboxBillingProvider('pg_fault_webhook_secret_123');
+      const capturedErrors: any[][] = [];
+      const origConsoleError = console.error;
+
+      try {
+        for (const [u, w] of [[usrId, wsId], [usrId2, wsId2]]) {
+          await repoA.registerUser({
+            user: { id: u, email: `${u}@example.com`, passwordHash: 'h', fullName: 'PG Fault User' },
+            workspace: { id: w, name: `PG Fault ${w}`, slug: w },
+            session: {
+              id: `sess_${w}`,
+              sessionTokenHash: crypto.createHash('sha256').update(`tok_${w}`).digest('hex'),
+              userId: u,
+              activeWorkspaceId: w,
+              expiresAt: new Date(Date.now() + 86400000).toISOString(),
+            },
+          });
+        }
+
+        // Install scoped PG triggers causing BOTH subscriptions INSERT failure and billing_events failure-status UPDATE failure
+        await poolA.query(`
+          CREATE OR REPLACE FUNCTION ${subFn}() RETURNS TRIGGER AS $$
+          BEGIN
+            IF NEW.workspace_id IN ('${wsId}', '${wsId2}') THEN
+              RAISE EXCEPTION 'Simulated PG subscriptions write outage postgresql://dbadmin:UltraSecretPgPass123@pg.internal:5432/prod';
+            END IF;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          CREATE TRIGGER ${subTrg}
+          BEFORE INSERT ON subscriptions
+          FOR EACH ROW EXECUTE FUNCTION ${subFn}();
+
+          CREATE OR REPLACE FUNCTION ${beFn}() RETURNS TRIGGER AS $$
+          BEGIN
+            IF NEW.event_id IN ('${evtId}', '${evtExhaustedId}') AND NEW.status IN ('failed', 'permanently_failed') THEN
+              RAISE EXCEPTION 'Simulated PG billing_events error persistence outage password=TopSecretTriggerPass';
+            END IF;
+            RETURN NEW;
+          END;
+          $$ LANGUAGE plpgsql;
+
+          CREATE TRIGGER ${beTrg}
+          BEFORE UPDATE ON billing_events
+          FOR EACH ROW EXECUTE FUNCTION ${beFn}();
+        `);
+
+        console.error = (...args: any[]) => {
+          capturedErrors.push(args);
+        };
+
+        const makePayload = (id: string, targetWs: string) => ({
+          id,
+          type: 'checkout.session.completed',
+          created: Math.floor(Date.now() / 1000),
+          data: {
+            object: {
+              client_reference_id: targetWs,
+              customer: `cus_fault_${runId}`,
+              subscription: `sub_fault_${runId}`,
+              metadata: { tier: 'Growth' },
+              payment_status: 'paid',
+            },
+          },
+        });
+
+        // 1. Trigger outage on retryable path (maxAttempts: 3): failure persistence blocked cleanly
+        const svcFault = new BillingService(
+          repoA,
+          sandboxProvider,
+          { leaseDurationMs: 120, heartbeatIntervalMs: 30 },
+          { maxAttempts: 3, baseBackoffMs: 0, maxBackoffMs: 0 }
+        );
+        const signed1 = sandboxProvider.generateSignedPayload(makePayload(evtId, wsId));
+        await assert.rejects(
+          () => svcFault.handleWebhook(signed1.payload, signed1.signature),
+          (err: any) => {
+            assert.match(err.message, /Simulated PG subscriptions write outage/i);
+            assert.equal(err.failureStatePersisted, false);
+            assert.equal(err.permanentlyFailed, false);
+            assert.match(err.persistenceError || '', /Simulated PG billing_events error persistence outage/i);
+            assert.doesNotMatch(err.persistenceError || '', /TopSecretTriggerPass|UltraSecretPgPass123/);
+            return true;
+          }
+        );
+
+        // 2. Even on final-attempt budget (maxAttempts: 1), blocked failure persistence NEVER falsely reports permanentlyFailed
+        const svcExhausted = new BillingService(
+          repoA,
+          sandboxProvider,
+          { leaseDurationMs: 120, heartbeatIntervalMs: 30 },
+          { maxAttempts: 1, baseBackoffMs: 0, maxBackoffMs: 0 }
+        );
+        const signed2 = sandboxProvider.generateSignedPayload(makePayload(evtExhaustedId, wsId2));
+        await assert.rejects(
+          () => svcExhausted.handleWebhook(signed2.payload, signed2.signature),
+          (err: any) => {
+            assert.equal(err.failureStatePersisted, false);
+            assert.equal(err.permanentlyFailed, false, 'Must NEVER falsely report permanentlyFailed when DB did not persist it');
+            return true;
+          }
+        );
+
+        // Verify structured sanitized error log was emitted with zero leaked DB passwords
+        const persistLog = capturedErrors.find(
+          (args) => args[0] === '[AIXSHOP Billing Error Persistence]' && args[1]?.eventId === evtId
+        );
+        assert.ok(persistLog, 'Must emit structured [AIXSHOP Billing Error Persistence] log');
+        const logJson = JSON.stringify(persistLog);
+        assert.doesNotMatch(logJson, /UltraSecretPgPass123|TopSecretTriggerPass/);
+
+        // Verify via independent Pool B that both events remain 'processing' (not 'permanently_failed') and zero subscriptions/tier changes leaked
+        const pgState1 = await repoB.getBillingEventById(evtId);
+        const pgState2 = await repoB.getBillingEventById(evtExhaustedId);
+        assert.equal(pgState1?.status, 'processing');
+        assert.equal(pgState1?.attemptCount, 1);
+        assert.equal(pgState2?.status, 'processing');
+        assert.equal(await repoB.getSubscriptionByWorkspace(wsId), null);
+        assert.equal((await repoB.getStoreByWorkspace(wsId))?.tier, 'Free Audit');
+
+        // 3. Remove DB fault triggers, wait for short 120ms lease to expire, and recover via independent Connection B
+        await poolA.query(`
+          DROP TRIGGER IF EXISTS ${subTrg} ON subscriptions;
+          DROP FUNCTION IF EXISTS ${subFn}();
+          DROP TRIGGER IF EXISTS ${beTrg} ON billing_events;
+          DROP FUNCTION IF EXISTS ${beFn}();
+        `);
+
+        await new Promise((r) => setTimeout(r, 180));
+
+        // Clean evtExhaustedId out of sandbox sweep before recovering evtId on Pool B
+        await poolA.query(`DELETE FROM billing_events WHERE event_id = $1`, [evtExhaustedId]);
+
+        const svcRecoverB = new BillingService(
+          repoB,
+          sandboxProvider,
+          { leaseDurationMs: 5000, heartbeatIntervalMs: 1000 },
+          { maxAttempts: 3, baseBackoffMs: 0, maxBackoffMs: 0 }
+        );
+        const summary = await svcRecoverB.recoverPendingWebhookEvents({
+          limit: 50,
+          maxAttempts: 3,
+          leaseOwnerPrefix: 'pg_recovery_connB',
+        });
+        const recDetail = summary.details.find((d) => d.eventId === evtId);
+        assert.equal(recDetail?.outcome, 'recovered', `Expected recovered detail, got: ${JSON.stringify(summary.details)}`);
+
+        // Verify recovered terminal state via Pool A
+        const recoveredEvent = await repoA.getBillingEventById(evtId);
+        assert.equal(recoveredEvent?.status, 'processed');
+        assert.equal(recoveredEvent?.attemptCount, 2);
+        assert.equal(recoveredEvent?.lastError, null);
+        const sub = await repoA.getSubscriptionByWorkspace(wsId);
+        assert.equal(sub?.tier, 'Growth');
+        assert.equal(sub?.status, 'active');
+        assert.equal((await repoA.getStoreByWorkspace(wsId))?.tier, 'Growth');
+      } finally {
+        console.error = origConsoleError;
+        await poolA.query(`DROP TRIGGER IF EXISTS ${subTrg} ON subscriptions`).catch(() => {});
+        await poolA.query(`DROP FUNCTION IF EXISTS ${subFn}()`).catch(() => {});
+        await poolA.query(`DROP TRIGGER IF EXISTS ${beTrg} ON billing_events`).catch(() => {});
+        await poolA.query(`DROP FUNCTION IF EXISTS ${beFn}()`).catch(() => {});
+        await poolA.query(`DELETE FROM billing_events WHERE event_id IN ($1, $2)`, [evtId, evtExhaustedId]).catch(() => {});
+        await poolA.query(`DELETE FROM workspaces WHERE id IN ($1, $2)`, [wsId, wsId2]).catch(() => {});
+        await poolA.query(`DELETE FROM users WHERE id IN ($1, $2)`, [usrId, usrId2]).catch(() => {});
+      }
+    });
+
+    test('I10. [Live PG - Workstream F] runBillingWebhookRecoveryCli connects via PostgresRepository and finalizes expired exhausted Stripe event in live PostgreSQL', async () => {
+      const runId = `${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
+      const evtId = `evt_cli_livepg_${runId}`;
+      const prevBillingProvider = process.env.BILLING_PROVIDER;
+      const prevStripeKey = process.env.STRIPE_SECRET_KEY;
+
+      setDatabaseRepository(null);
+      setBillingProvider(null);
+      try {
+        await poolA.query(
+          `INSERT INTO billing_events (
+             id, provider, event_id, event_type, idempotency_key, payload_json, status,
+             lease_owner, lease_expires_at, attempt_count, last_error, last_attempt_at, next_retry_at,
+             processed_at, created_at, updated_at
+           ) VALUES (
+             $1, 'stripe', $2, 'checkout.session.completed', $2, '{}'::jsonb, 'processing',
+             'crashed_cli_worker', clock_timestamp() - INTERVAL '30 seconds', 5, 'CLI pre-crash error',
+             clock_timestamp() - INTERVAL '1 minute', NULL, clock_timestamp(), clock_timestamp(), clock_timestamp()
+           )`,
+          [`be_cli_${runId}`, evtId]
+        );
+
+        process.env.BILLING_PROVIDER = 'stripe';
+        process.env.STRIPE_SECRET_KEY = 'sk_test_livepg_cli_placeholder';
+        const result = await runBillingWebhookRecoveryCli(['--limit=50', '--max-attempts=5']);
+        assert.ok('scanned' in result);
+
+        const persisted = await repoB.getBillingEventById(evtId);
+        assert.equal(persisted?.status, 'permanently_failed');
+        assert.match(persisted?.lastError || '', /Worker lease expired on final attempt/);
+      } finally {
+        setDatabaseRepository(null);
+        setBillingProvider(null);
+        await poolA.query(`DELETE FROM billing_events WHERE event_id = $1`, [evtId]).catch(() => {});
+        if (prevBillingProvider === undefined) delete process.env.BILLING_PROVIDER;
+        else process.env.BILLING_PROVIDER = prevBillingProvider;
+        if (prevStripeKey === undefined) delete process.env.STRIPE_SECRET_KEY;
+        else process.env.STRIPE_SECRET_KEY = prevStripeKey;
       }
     });
   });
@@ -2772,7 +3297,7 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
     // -----------------------------------------------------------------------
     // REMEDIATION D — CI Dependency Installation Consistency
     // -----------------------------------------------------------------------
-    test('RD1. CI postgres-integration workflow installs with bun --frozen-lockfile matching committed bun.lock', () => {
+    test('RD1. CI postgres-integration workflow installs with bun --frozen-lockfile and passes explicit pg_isready user/db flags', () => {
       const ciPath = path.join(process.cwd(), '.github/workflows/ci.yml');
       const bunLockPath = path.join(process.cwd(), 'bun.lock');
       assert.ok(fs.existsSync(ciPath), '.github/workflows/ci.yml must exist');
@@ -2781,6 +3306,8 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       assert.doesNotMatch(ciContent, /\bnpm ci\b/, 'CI must not invoke npm ci when package-lock.json is absent');
       assert.match(ciContent, /oven-sh\/setup-bun/);
       assert.match(ciContent, /bun install --frozen-lockfile/);
+      assert.match(ciContent, /--health-cmd "pg_isready -U aixshop -d aixshop_test"/);
+      assert.doesNotMatch(ciContent, /--health-cmd pg_isready\s*$/m);
     });
 
     // -----------------------------------------------------------------------

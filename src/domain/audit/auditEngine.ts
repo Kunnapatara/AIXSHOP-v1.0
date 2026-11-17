@@ -44,6 +44,170 @@ export const AUDIT_RULES = [
 
 export type AuditRuleCode = typeof AUDIT_RULES[number];
 
+export const MAX_AUDIT_IDENTIFIER_LENGTH = 64;
+
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function encodeUtf8Bytes(str: string): Uint8Array {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(str);
+  }
+  const bytes: number[] = [];
+  for (let i = 0; i < str.length; i++) {
+    let code = str.charCodeAt(i);
+    if (code < 0x80) {
+      bytes.push(code);
+    } else if (code < 0x800) {
+      bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+      const next = str.charCodeAt(++i);
+      code = 0x10000 + (((code & 0x3ff) << 10) | (next & 0x3ff));
+      bytes.push(
+        0xf0 | (code >> 18),
+        0x80 | ((code >> 12) & 0x3f),
+        0x80 | ((code >> 6) & 0x3f),
+        0x80 | (code & 0x3f)
+      );
+    } else {
+      bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+/**
+ * Pure TypeScript synchronous FIPS 180-4 SHA-256 implementation (browser & Node compatible).
+ */
+export function sha256Hex(input: string): string {
+  const bytes = encodeUtf8Bytes(input);
+  const bitLen = bytes.length * 8;
+  const paddedLen = Math.ceil((bytes.length + 9) / 64) * 64;
+  const padded = new Uint8Array(paddedLen);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+
+  const view = new DataView(padded.buffer);
+  const highBits = Math.floor(bitLen / 0x100000000);
+  const lowBits = bitLen >>> 0;
+  view.setUint32(paddedLen - 8, highBits, false);
+  view.setUint32(paddedLen - 4, lowBits, false);
+
+  const hash = new Uint32Array([
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ]);
+  const w = new Uint32Array(64);
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n));
+
+  for (let offset = 0; offset < paddedLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(offset + i * 4, false);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+
+    let [a, b, c, d, e, f, g, h] = hash;
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) >>> 0;
+
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+
+    hash[0] = (hash[0] + a) >>> 0;
+    hash[1] = (hash[1] + b) >>> 0;
+    hash[2] = (hash[2] + c) >>> 0;
+    hash[3] = (hash[3] + d) >>> 0;
+    hash[4] = (hash[4] + e) >>> 0;
+    hash[5] = (hash[5] + f) >>> 0;
+    hash[6] = (hash[6] + g) >>> 0;
+    hash[7] = (hash[7] + h) >>> 0;
+  }
+
+  return Array.from(hash)
+    .map((n) => n.toString(16).padStart(8, '0'))
+    .join('');
+}
+
+export interface AuditEntityIdParams {
+  ruleSlug: string;
+  productId?: string;
+  variantId?: string;
+  variantIndex?: number;
+}
+
+/**
+ * Generates deterministic, namespace-separated Finding & Action identifiers
+ * guaranteed to fit within PostgreSQL VARCHAR(64) constraints (<= 64 chars).
+ * Preserves legacy human-readable format when both IDs fit within 64 chars,
+ * and falls back to collision-resistant SHA-256 digests when concatenated
+ * product/variant IDs exceed 64 chars (e.g. Shopify 13–16+ digit numeric IDs).
+ */
+export function buildAuditEntityIds(params: AuditEntityIdParams): { findingId: string; actionId: string } {
+  const safeSlug = params.ruleSlug.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 20) || 'rule';
+  const variantKey =
+    params.variantId !== undefined
+      ? params.variantId || `idx_${params.variantIndex ?? 0}`
+      : undefined;
+
+  let rawFindingId: string;
+  let rawActionId: string;
+
+  if (params.productId === undefined) {
+    rawFindingId = `find_${safeSlug}`;
+    rawActionId = `act_${safeSlug}`;
+  } else if (variantKey !== undefined) {
+    rawFindingId = `find_${safeSlug}_${params.productId}_${variantKey}`;
+    rawActionId = `act_${safeSlug}_${params.productId}_${variantKey}`;
+  } else {
+    rawFindingId = `find_${safeSlug}_${params.productId}`;
+    rawActionId = `act_${safeSlug}_${params.productId}`;
+  }
+
+  if (
+    rawFindingId.length <= MAX_AUDIT_IDENTIFIER_LENGTH &&
+    rawActionId.length <= MAX_AUDIT_IDENTIFIER_LENGTH
+  ) {
+    return { findingId: rawFindingId, actionId: rawActionId };
+  }
+
+  const canonicalInput = JSON.stringify([
+    'aixshop_audit_id_v1',
+    params.ruleSlug,
+    params.productId ?? null,
+    variantKey ?? null,
+  ]);
+  const digest = sha256Hex(canonicalInput).slice(0, 32);
+
+  return {
+    findingId: `find_${safeSlug}_h_${digest}`,
+    actionId: `act_${safeSlug}_h_${digest}`,
+  };
+}
+
 /**
  * Genuine, deterministic catalog audit engine.
  * Evaluates real catalog products, variants, attributes, evidence, and store policies
@@ -70,6 +234,30 @@ export function executeCatalogAudit(
     if (act.findingId) existingActionMap.set(act.findingId, act);
   }
 
+  const usedActionIds = new Set<string>();
+  const resolveExistingAction = (
+    findingId: string,
+    defaultActionId: string,
+    fallbackKeys: string[] = []
+  ): { prevAction?: ActionItem; actionId: string } => {
+    const candidates: Array<ActionItem | undefined> = [
+      existingActionMap.get(findingId),
+      existingActionMap.get(defaultActionId),
+      ...fallbackKeys.map((k) => existingActionMap.get(k)),
+    ];
+    const prevAction = candidates.find((c): c is ActionItem => Boolean(c));
+    let actionId = defaultActionId;
+    if (
+      prevAction?.id &&
+      prevAction.id.length <= MAX_AUDIT_IDENTIFIER_LENGTH &&
+      !usedActionIds.has(prevAction.id)
+    ) {
+      actionId = prevAction.id;
+    }
+    usedActionIds.add(actionId);
+    return { prevAction, actionId };
+  };
+
   let totalVariants = 0;
   const updatedProducts: Product[] = [];
 
@@ -85,9 +273,13 @@ export function executeCatalogAudit(
       const barcode = (v.barcode || '').trim();
       const variantKey = v.sku || v.id || `idx_${vIdx}`;
       if (!barcode) {
-        const findingId = `find_gtin_missing_${p.id}_${v.id}`;
-        const actionId = `act_gtin_missing_${p.id}_${v.id}`;
-        const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+        const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+          ruleSlug: 'gtin_missing',
+          productId: p.id,
+          variantId: v.id,
+          variantIndex: vIdx,
+        });
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
         findings.push({
           id: findingId,
@@ -111,7 +303,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, findingId } : {
+        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
           id: actionId,
           findingId,
           productId: p.id,
@@ -132,9 +324,13 @@ export function executeCatalogAudit(
         });
         productFindingsCount++;
       } else if (!isValidGtin13(barcode)) {
-        const findingId = `find_gtin_invalid_${p.id}_${v.id}`;
-        const actionId = `act_gtin_invalid_${p.id}_${v.id}`;
-        const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+        const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+          ruleSlug: 'gtin_invalid',
+          productId: p.id,
+          variantId: v.id,
+          variantIndex: vIdx,
+        });
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
         findings.push({
           id: findingId,
@@ -158,7 +354,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, findingId } : {
+        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
           id: actionId,
           findingId,
           productId: p.id,
@@ -184,9 +380,13 @@ export function executeCatalogAudit(
     recordRule('RULE_VARIANT_PRICE_PRESENCE');
     variants.forEach((v, vIdx) => {
       if (v.price === null || v.price === undefined || isNaN(v.price) || v.price < 0) {
-        const findingId = `find_price_invalid_${p.id}_${v.id}`;
-        const actionId = `act_price_invalid_${p.id}_${v.id}`;
-        const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+        const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+          ruleSlug: 'price_invalid',
+          productId: p.id,
+          variantId: v.id,
+          variantIndex: vIdx,
+        });
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
         findings.push({
           id: findingId,
@@ -210,7 +410,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, findingId } : {
+        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
           id: actionId,
           findingId,
           productId: p.id,
@@ -235,9 +435,11 @@ export function executeCatalogAudit(
     // Rule: Product description
     recordRule('RULE_PRODUCT_DESCRIPTION_LENGTH');
     if (!p.description || p.description.trim().length < 15) {
-      const findingId = `find_desc_short_${p.id}`;
-      const actionId = `act_desc_short_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: 'desc_short',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
       findings.push({
         id: findingId,
@@ -260,7 +462,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -284,9 +486,11 @@ export function executeCatalogAudit(
     // Rule: Brand specification
     recordRule('RULE_PRODUCT_BRAND_SPECIFICATION');
     if (!p.brand || p.brand.trim() === '' || p.brand.trim() === 'Unknown Brand' || p.brand.trim() === 'Unspecified') {
-      const findingId = `find_brand_missing_${p.id}`;
-      const actionId = `act_brand_missing_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: 'brand_missing',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
       findings.push({
         id: findingId,
@@ -309,7 +513,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -333,9 +537,11 @@ export function executeCatalogAudit(
     // Rule: Category taxonomy
     recordRule('RULE_PRODUCT_CATEGORY_TAXONOMY');
     if (!p.category || p.category.trim() === '' || p.category.trim() === 'General Merchandise') {
-      const findingId = `find_cat_missing_${p.id}`;
-      const actionId = `act_cat_missing_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: 'cat_missing',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
       findings.push({
         id: findingId,
@@ -358,7 +564,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -382,9 +588,11 @@ export function executeCatalogAudit(
     // Rule: Primary Image
     recordRule('RULE_PRODUCT_IMAGE_ASSET');
     if (!p.image || p.image.trim() === '') {
-      const findingId = `find_img_missing_${p.id}`;
-      const actionId = `act_img_missing_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: 'img_missing',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
       findings.push({
         id: findingId,
@@ -407,7 +615,7 @@ export function executeCatalogAudit(
         needsMerchantInput: true,
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -436,9 +644,11 @@ export function executeCatalogAudit(
     if (isDrinkwareOrCeramic) {
       const microwave = p.attributes?.microwaveSafe;
       if (!microwave || microwave.toLowerCase() === 'unspecified' || microwave.trim() === '') {
-        const findingId = `find_02_${p.id}`;
-        const actionId = `act_02_${p.id}`;
-        const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId) || existingActionMap.get('act_02');
+        const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+          ruleSlug: '02',
+          productId: p.id,
+        });
+        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_02']);
 
         findings.push({
           id: findingId,
@@ -462,7 +672,7 @@ export function executeCatalogAudit(
           needsMerchantInput: true,
         });
 
-        actionItems.push(prevAction ? { ...prevAction, findingId } : {
+        actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
           id: actionId,
           findingId,
           productId: p.id,
@@ -489,9 +699,11 @@ export function executeCatalogAudit(
     const hasUnverifiedOekoTex = (p.description || '').toLowerCase().includes('oeko-tex') &&
       (!p.attributes?.oekoTexCertified || p.attributes.oekoTexCertified.includes('Unverified'));
     if (hasUnverifiedOekoTex) {
-      const findingId = `find_03_${p.id}`;
-      const actionId = `act_03_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId) || existingActionMap.get('act_03');
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: '03',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_03']);
 
       findings.push({
         id: findingId,
@@ -514,7 +726,7 @@ export function executeCatalogAudit(
         ruleCode: 'RULE_UNVERIFIED_EVIDENCE_CLAIMS',
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -539,9 +751,11 @@ export function executeCatalogAudit(
     recordRule('RULE_STRUCTURED_BREW_METHODS');
     const isCoffee = (p.category || '').toLowerCase().includes('coffee') || (p.title || '').toLowerCase().includes('coffee');
     if (isCoffee && (!p.attributes?.recommendedBrewMethods || p.attributes.recommendedBrewMethods === '(none)')) {
-      const findingId = `find_05_${p.id}`;
-      const actionId = `act_05_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId) || existingActionMap.get('act_05');
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: '05',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_05']);
 
       findings.push({
         id: findingId,
@@ -564,7 +778,7 @@ export function executeCatalogAudit(
         ruleCode: 'RULE_STRUCTURED_BREW_METHODS',
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -590,9 +804,11 @@ export function executeCatalogAudit(
     const titleBurnClaim = (p.title || '').toLowerCase().includes('60-hour') || (p.description || '').toLowerCase().includes('60-hour burn');
     const techBurnSpec = (p.attributes?.burnTime || p.attributes?.verifiedBurnTime || '').toLowerCase();
     if (isCandle && titleBurnClaim && (techBurnSpec.includes('45') || techBurnSpec.includes('50'))) {
-      const findingId = `find_07_${p.id}`;
-      const actionId = `act_07_${p.id}`;
-      const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId) || existingActionMap.get('act_07');
+      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+        ruleSlug: '07',
+        productId: p.id,
+      });
+      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, ['act_07']);
 
       findings.push({
         id: findingId,
@@ -615,7 +831,7 @@ export function executeCatalogAudit(
         ruleCode: 'RULE_MARKETING_BURN_TIME_CONFLICT',
       });
 
-      actionItems.push(prevAction ? { ...prevAction, findingId } : {
+      actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
         id: actionId,
         findingId,
         productId: p.id,
@@ -650,9 +866,8 @@ export function executeCatalogAudit(
   recordRule('RULE_DUAL_UNIT_MEASUREMENT_POLICY');
   const unitPolicy = storeProfile.catalogPolicy?.units || '';
   if (products.length > 0 && unitPolicy.toLowerCase().includes('mixed')) {
-    const findingId = 'find_04';
-    const actionId = 'act_04';
-    const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+    const { findingId, actionId: defaultActionId } = buildAuditEntityIds({ ruleSlug: '04' });
+    const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
     findings.push({
       id: findingId,
@@ -673,7 +888,7 @@ export function executeCatalogAudit(
       ruleCode: 'RULE_DUAL_UNIT_MEASUREMENT_POLICY',
     });
 
-    actionItems.push(prevAction ? { ...prevAction, findingId } : {
+    actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
       id: actionId,
       findingId,
       title: 'Standardize Dual-Unit Volume & Weight Formatting',
@@ -694,9 +909,8 @@ export function executeCatalogAudit(
   recordRule('RULE_SHIPPING_SLA_RECONCILIATION');
   const gmcSla = (storeProfile.shippingSla?.gmc || '').toLowerCase();
   if (products.length > 0 && gmcSla.includes('3-5')) {
-    const findingId = 'find_06';
-    const actionId = 'act_06';
-    const prevAction = existingActionMap.get(findingId) || existingActionMap.get(actionId);
+    const { findingId, actionId: defaultActionId } = buildAuditEntityIds({ ruleSlug: '06' });
+    const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
 
     findings.push({
       id: findingId,
@@ -717,7 +931,7 @@ export function executeCatalogAudit(
       ruleCode: 'RULE_SHIPPING_SLA_RECONCILIATION',
     });
 
-    actionItems.push(prevAction ? { ...prevAction, findingId } : {
+    actionItems.push(prevAction ? { ...prevAction, id: actionId, findingId } : {
       id: actionId,
       findingId,
       title: 'Reconcile Storefront 2-Day Shipping SLA with GMC Feed',

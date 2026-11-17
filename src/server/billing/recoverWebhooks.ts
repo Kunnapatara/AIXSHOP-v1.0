@@ -91,6 +91,18 @@ export async function runBillingWebhookRecoveryCli(
   }
 }
 
+export function resolveBillingRecoveryCliExitCode(
+  result: WebhookRecoverySummary | WebhookProcessingResult
+): 0 | 1 {
+  if ('success' in result) {
+    return result.success ? 0 : 1;
+  }
+  if (result.retriedFailed > 0 || result.permanentlyFailed > 0 || result.leaseLost > 0) {
+    return 1;
+  }
+  return 0;
+}
+
 const isDirectExecution = (() => {
   if (typeof process === 'undefined' || !Array.isArray(process.argv) || !process.argv[1]) {
     return false;
@@ -101,8 +113,8 @@ const isDirectExecution = (() => {
 
 if (isDirectExecution) {
   runBillingWebhookRecoveryCli(process.argv.slice(2))
-    .then(() => {
-      process.exit(0);
+    .then((result) => {
+      process.exit(resolveBillingRecoveryCliExitCode(result));
     })
     .catch((err) => {
       console.error('[AIXSHOP Billing Recovery CLI] Failed:', sanitizeBillingErrorMessage(err));

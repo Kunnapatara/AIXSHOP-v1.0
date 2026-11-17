@@ -927,6 +927,106 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
       assert.equal(ev.issuer, 'USDA National Organic Program');
       assert.equal(ev.status, 'verified');
     });
+
+    test('executeWorkspaceAudit handles 16-digit Shopify product & variant IDs without identifier overflow or relationship loss', async () => {
+      const shopifyTenant = await registerTenant('shopify_16digit_audit@example.com', 'Shopify 16Digit Store');
+      const storeRes = await fetch(`${baseUrl}/api/store/profile`, {
+        headers: { 'Authorization': `Bearer ${shopifyTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      const store = await storeRes.json();
+
+      const shopifyProd: Product = {
+        id: 'p_shopify_8901234567890123',
+        title: 'Shopify Tree Runner 16-Digit',
+        brand: 'Shopify Brand',
+        category: 'Footwear',
+        description: 'Lightweight eucalyptus knit sneaker with cushioned sugarcane midsole.',
+        image: 'https://cdn.shopify.com/tree-runner.jpg',
+        status: 'active',
+        completenessScore: 80,
+        evidenceCoverageScore: 0,
+        externalDiscoveryStatus: 'observed_in_sample',
+        attributes: {},
+        variants: [
+          {
+            id: 'v_shopify_4567890123456789',
+            sku: 'TR-16-99',
+            title: 'Size 9 / Navy',
+            barcode: '',
+            price: 98.0,
+            inventoryCount: 15,
+            attributes: {},
+          },
+        ],
+        offers: [],
+        evidenceDocuments: [],
+        findingsCount: 0,
+        lastAudited: '',
+      };
+
+      const saveRes = await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${shopifyTenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            products: [shopifyProd],
+            variants: shopifyProd.variants,
+            offers: [],
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: store,
+          },
+        }),
+      });
+      assert.equal(saveRes.status, 200);
+
+      const runRes = await fetch(`${baseUrl}/api/audit/run`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${shopifyTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(runRes.status, 200);
+      const runData = await runRes.json();
+
+      const findings = runData.catalog.findings as Array<any>;
+      const actions = runData.catalog.actions as Array<any>;
+      assert.ok(findings.length > 0);
+      assert.equal(findings.length, actions.length);
+
+      for (const f of findings) {
+        assert.ok(f.id.length <= 64, `Finding ID ${f.id} exceeded 64 chars`);
+        assert.ok(f.actionItemId.length <= 64, `Action ID ${f.actionItemId} exceeded 64 chars`);
+        const a = actions.find((act) => act.id === f.actionItemId);
+        assert.ok(a, `Missing paired action for ${f.id}`);
+        assert.equal(a.findingId, f.id);
+      }
+
+      // Approve the GTIN action via API and re-run audit -> status preserved cleanly
+      const gtinAction = actions.find((a) => a.title.includes('GTIN'));
+      assert.ok(gtinAction);
+      const approveRes = await fetch(`${baseUrl}/api/catalog/actions/${encodeURIComponent(gtinAction.id)}/approve`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${shopifyTenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ customApprovedValue: '0850029381044' }),
+      });
+      assert.equal(approveRes.status, 200);
+
+      const detailRes = await fetch(`${baseUrl}/api/audit/${runData.auditRun.id}`, {
+        headers: { 'Authorization': `Bearer ${shopifyTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      assert.equal(detailRes.status, 200);
+      const detailData = await detailRes.json();
+      assert.equal(detailData.snapshotAvailable, true);
+      assert.ok(detailData.findings.every((f: any) => f.originalFindingId.length <= 64 && f.id.length <= 128));
+    });
   });
 });
 
