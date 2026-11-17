@@ -3,7 +3,7 @@ import { DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { getBillingProvider } from '../billing/providerAdapter';
-import { BillingLeaseConfig, BillingService } from '../services/billingService';
+import { BillingLeaseConfig, BillingService, sanitizeBillingErrorMessage } from '../services/billingService';
 import { AUTHORITATIVE_PLANS, IBillingProvider } from '../billing/types';
 import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/productionConfig';
 
@@ -85,7 +85,7 @@ export function createBillingRoutes(
         provider: session.provider,
       });
     } catch (err: any) {
-      console.error('[AIXSHOP Billing] Error creating checkout session:', err?.message || err);
+      console.error('[AIXSHOP Billing] Error creating checkout session:', sanitizeBillingErrorMessage(err));
       const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
       return res.status(status).json({ error: err.message || 'Failed to create checkout session', code: err?.code });
     }
@@ -113,7 +113,7 @@ export function createBillingRoutes(
         provider: portal.provider,
       });
     } catch (err: any) {
-      console.error('[AIXSHOP Billing] Error creating portal session:', err?.message || err);
+      console.error('[AIXSHOP Billing] Error creating portal session:', sanitizeBillingErrorMessage(err));
       const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
       return res.status(status).json({ error: err.message || 'Failed to create customer portal session', code: err?.code });
     }
@@ -139,6 +139,16 @@ export function createBillingRoutes(
       const billingService = getBillingService();
       const result = await billingService.handleWebhook(rawBody, signature);
 
+      if (result.permanentlyFailed) {
+        return res.status(200).json({
+          received: true,
+          deadLettered: true,
+          retryable: false,
+          action: result.action,
+          message: result.message,
+        });
+      }
+
       if (result.inProgress || result.retryable) {
         res.setHeader('Retry-After', '30');
         return res.status(503).json({
@@ -156,7 +166,7 @@ export function createBillingRoutes(
         message: result.message,
       });
     } catch (err: any) {
-      console.error('[AIXSHOP Billing] Webhook processing error:', err.message || err);
+      console.error('[AIXSHOP Billing] Webhook processing error:', sanitizeBillingErrorMessage(err));
       const statusCode = typeof err.statusCode === 'number' ? err.statusCode : 503;
       if (statusCode === 503) {
         res.setHeader('Retry-After', '30');

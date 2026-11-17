@@ -80,6 +80,8 @@ export interface SubscriptionRecord {
   updatedAt: string;
 }
 
+export type BillingEventStatus = 'processing' | 'processed' | 'failed' | 'ignored' | 'permanently_failed';
+
 export interface BillingEventRecord {
   id: string;
   provider: string;
@@ -87,10 +89,13 @@ export interface BillingEventRecord {
   eventType: string;
   idempotencyKey: string;
   payload: any;
-  status: 'processing' | 'processed' | 'failed' | 'ignored';
+  status: BillingEventStatus;
   leaseOwner?: string | null;
   leaseExpiresAt?: string | null;
   attemptCount?: number;
+  lastError?: string | null;
+  lastAttemptAt?: string | null;
+  nextRetryAt?: string | null;
   processedAt: string;
   createdAt?: string;
   updatedAt?: string;

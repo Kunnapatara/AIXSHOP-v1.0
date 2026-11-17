@@ -5,6 +5,12 @@ import { createServer as createViteServer } from 'vite';
 import { createApp } from './src/server/app';
 import { getDatabaseRepository } from './src/server/db/index';
 import { validateProductionConfig } from './src/server/config/productionConfig';
+import { getBillingProvider } from './src/server/billing/providerAdapter';
+import {
+  BillingService,
+  DEFAULT_BILLING_RECOVERY_POLICY,
+  sanitizeBillingErrorMessage,
+} from './src/server/services/billingService';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -72,12 +78,70 @@ async function start() {
     console.log(`[AIXSHOP] Server listening on http://0.0.0.0:${PORT}`);
   });
 
+  // Optional, explicitly env-guarded billing webhook recovery scheduler
+  let billingRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+  let recoveryInFlight = false;
+  if (process.env.BILLING_RECOVERY_ENABLED === 'true' && process.env.NODE_ENV !== 'test') {
+    const rawInterval = Number.parseInt(process.env.BILLING_RECOVERY_INTERVAL_MS || '60000', 10);
+    const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 60000;
+    const rawMaxAttempts = Number.parseInt(
+      process.env.BILLING_RECOVERY_MAX_ATTEMPTS || String(DEFAULT_BILLING_RECOVERY_POLICY.maxAttempts),
+      10
+    );
+    const maxAttempts =
+      Number.isFinite(rawMaxAttempts) && rawMaxAttempts > 0
+        ? rawMaxAttempts
+        : DEFAULT_BILLING_RECOVERY_POLICY.maxAttempts;
+
+    const runRecoverySweep = async () => {
+      if (recoveryInFlight || isShuttingDown) return;
+      recoveryInFlight = true;
+      try {
+        const provider = getBillingProvider();
+        const billingService = new BillingService(repo, provider, undefined, { maxAttempts });
+        const summary = await billingService.recoverPendingWebhookEvents({
+          limit: 25,
+          maxAttempts,
+          leaseOwnerPrefix: 'scheduler_recovery',
+        });
+        if (summary.scanned > 0) {
+          console.log('[AIXSHOP Billing Recovery]', {
+            scanned: summary.scanned,
+            recovered: summary.recovered,
+            ignored: summary.ignored,
+            retriedFailed: summary.retriedFailed,
+            permanentlyFailed: summary.permanentlyFailed,
+            skippedContended: summary.skippedContended,
+            leaseLost: summary.leaseLost,
+          });
+        }
+      } catch (recoveryErr) {
+        console.error('[AIXSHOP Billing Recovery] Sweep error:', sanitizeBillingErrorMessage(recoveryErr));
+      } finally {
+        recoveryInFlight = false;
+      }
+    };
+
+    billingRecoveryTimer = setInterval(() => {
+      void runRecoverySweep();
+    }, intervalMs);
+    if (typeof billingRecoveryTimer.unref === 'function') {
+      billingRecoveryTimer.unref();
+    }
+    console.log(`[AIXSHOP] Billing webhook recovery scheduler enabled (interval=${intervalMs}ms, maxAttempts=${maxAttempts}).`);
+  }
+
   // Graceful shutdown handling
   let isShuttingDown = false;
   const gracefulShutdown = async (signal: string) => {
     if (isShuttingDown) return;
     isShuttingDown = true;
     console.log(`[AIXSHOP] Received ${signal}. Initiating graceful shutdown...`);
+
+    if (billingRecoveryTimer) {
+      clearInterval(billingRecoveryTimer);
+      billingRecoveryTimer = null;
+    }
 
     server.close(async (err) => {
       if (err) {

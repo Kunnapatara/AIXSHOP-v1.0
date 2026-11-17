@@ -46,7 +46,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord, PlanTier } from '../billing/types';
+import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
 import { 
   calculateImportUsage, 
@@ -469,6 +469,7 @@ export class PostgresRepository implements DatabaseRepository {
           '010_remediation_integrity_and_leases.sql',
           '011_corrective_integrity_and_visibility_provenance.sql',
           '012_production_blockers_integrity.sql',
+          '013_billing_webhook_recovery.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -2154,36 +2155,48 @@ export class PostgresRepository implements DatabaseRepository {
     return res.rows[0];
   }
 
+  private mapBillingEventRow(r: any): BillingEventRecord {
+    return {
+      ...r,
+      leaseExpiresAt: r.leaseExpiresAt ? new Date(r.leaseExpiresAt).toISOString() : null,
+      lastAttemptAt: r.lastAttemptAt ? new Date(r.lastAttemptAt).toISOString() : null,
+      nextRetryAt: r.nextRetryAt ? new Date(r.nextRetryAt).toISOString() : null,
+      processedAt: new Date(r.processedAt).toISOString(),
+      createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : undefined,
+      updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : undefined,
+    };
+  }
+
   async getBillingEventById(eventId: string): Promise<BillingEventRecord | null> {
     const res = await this.query<any>(
       `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
               payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
-              attempt_count AS "attemptCount", processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+              attempt_count AS "attemptCount", last_error AS "lastError", last_attempt_at AS "lastAttemptAt",
+              next_retry_at AS "nextRetryAt", processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
        FROM billing_events
        WHERE event_id = $1`,
       [eventId]
     );
     if (res.rows.length === 0) return null;
-    const r = res.rows[0];
-    return {
-      ...r,
-      leaseExpiresAt: r.leaseExpiresAt ? new Date(r.leaseExpiresAt).toISOString() : null,
-      processedAt: new Date(r.processedAt).toISOString(),
-    };
+    return this.mapBillingEventRow(res.rows[0]);
   }
 
   async saveBillingEvent(event: BillingEventRecord): Promise<void> {
     await this.query(
       `INSERT INTO billing_events (
          id, provider, event_id, event_type, idempotency_key, payload_json, status,
-         lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, NOW(), NOW())
+         lease_owner, lease_expires_at, attempt_count, last_error, last_attempt_at, next_retry_at,
+         processed_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
        ON CONFLICT (provider, event_id) DO UPDATE SET
          status = EXCLUDED.status,
          payload_json = EXCLUDED.payload_json,
          lease_owner = EXCLUDED.lease_owner,
          lease_expires_at = EXCLUDED.lease_expires_at,
          attempt_count = EXCLUDED.attempt_count,
+         last_error = EXCLUDED.last_error,
+         last_attempt_at = EXCLUDED.last_attempt_at,
+         next_retry_at = EXCLUDED.next_retry_at,
          processed_at = EXCLUDED.processed_at,
          updated_at = NOW()`,
       [
@@ -2197,6 +2210,9 @@ export class PostgresRepository implements DatabaseRepository {
         event.leaseOwner || null,
         event.leaseExpiresAt || null,
         event.attemptCount ?? 0,
+        event.lastError ?? null,
+        event.lastAttemptAt ?? null,
+        event.nextRetryAt ?? null,
         event.processedAt || new Date().toISOString(),
       ]
     );
@@ -2212,14 +2228,17 @@ export class PostgresRepository implements DatabaseRepository {
     const res = await this.query<any>(
       `INSERT INTO billing_events (
          id, provider, event_id, event_type, idempotency_key, payload_json, status,
-         lease_owner, lease_expires_at, attempt_count, processed_at, created_at, updated_at
+         lease_owner, lease_expires_at, attempt_count, last_attempt_at, next_retry_at,
+         processed_at, created_at, updated_at
        )
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', $7, clock_timestamp() + ($8 * INTERVAL '1 millisecond'), 1, clock_timestamp(), clock_timestamp(), clock_timestamp())
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'processing', $7, clock_timestamp() + ($8 * INTERVAL '1 millisecond'), 1, clock_timestamp(), NULL, clock_timestamp(), clock_timestamp(), clock_timestamp())
        ON CONFLICT (provider, event_id) DO UPDATE SET
          status = 'processing',
          lease_owner = EXCLUDED.lease_owner,
          lease_expires_at = clock_timestamp() + ($8 * INTERVAL '1 millisecond'),
          attempt_count = COALESCE(billing_events.attempt_count, 0) + 1,
+         last_attempt_at = clock_timestamp(),
+         next_retry_at = NULL,
          payload_json = CASE WHEN EXCLUDED.payload_json <> '{}'::jsonb THEN EXCLUDED.payload_json ELSE billing_events.payload_json END,
          processed_at = clock_timestamp(),
          updated_at = clock_timestamp()
@@ -2232,7 +2251,8 @@ export class PostgresRepository implements DatabaseRepository {
           )
        RETURNING id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
                  payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
-                 attempt_count AS "attemptCount", processed_at AS "processedAt"`,
+                 attempt_count AS "attemptCount", last_error AS "lastError", last_attempt_at AS "lastAttemptAt",
+                 next_retry_at AS "nextRetryAt", processed_at AS "processedAt"`,
       [
         event.id,
         event.provider,
@@ -2246,19 +2266,115 @@ export class PostgresRepository implements DatabaseRepository {
     );
 
     if (res.rows.length > 0) {
-      const row = res.rows[0];
       return {
         claimed: true,
         leaseOwner,
-        event: {
-          ...row,
-          leaseExpiresAt: row.leaseExpiresAt ? new Date(row.leaseExpiresAt).toISOString() : null,
-          processedAt: new Date(row.processedAt).toISOString(),
-        },
+        event: this.mapBillingEventRow(res.rows[0]),
       };
     }
 
     const existing = await this.getBillingEventById(event.eventId);
+    return { claimed: false, event: existing };
+  }
+
+  async listRecoverableBillingEvents(options?: {
+    maxAttempts?: number;
+    limit?: number;
+    provider?: string;
+  }): Promise<BillingEventRecord[]> {
+    const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
+    const providerFilter = options?.provider ? options.provider : null;
+
+    const res = await this.query<any>(
+      `SELECT id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
+              payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
+              attempt_count AS "attemptCount", last_error AS "lastError", last_attempt_at AS "lastAttemptAt",
+              next_retry_at AS "nextRetryAt", processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM billing_events
+       WHERE ($1::text IS NULL OR provider = $1)
+         AND COALESCE(attempt_count, 0) < $2
+         AND (
+           (
+             status = 'processing' AND (
+               (lease_expires_at IS NOT NULL AND lease_expires_at < clock_timestamp())
+               OR (lease_expires_at IS NULL AND processed_at < clock_timestamp() - INTERVAL '5 minutes')
+             )
+           )
+           OR (
+             status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
+           )
+         )
+       ORDER BY COALESCE(next_retry_at, lease_expires_at, processed_at, created_at) ASC, created_at ASC
+       LIMIT $3`,
+      [providerFilter, maxAttempts, limit]
+    );
+
+    return res.rows.map(r => this.mapBillingEventRow(r));
+  }
+
+  async claimBillingEventForRecovery(
+    eventId: string,
+    options?: {
+      leaseOwner?: string;
+      leaseDurationMs?: number;
+      maxAttempts?: number;
+      allowReplayFailed?: boolean;
+      provider?: string;
+    }
+  ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }> {
+    const leaseDurationMs = Math.max(50, options?.leaseDurationMs ?? 5 * 60 * 1000);
+    const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
+    const allowReplayFailed = Boolean(options?.allowReplayFailed);
+    const providerFilter = options?.provider ? options.provider : null;
+    const leaseOwner = options?.leaseOwner || `recovery_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+    const res = await this.query<any>(
+      `UPDATE billing_events
+       SET status = 'processing',
+           lease_owner = $2,
+           lease_expires_at = clock_timestamp() + ($3 * INTERVAL '1 millisecond'),
+           attempt_count = COALESCE(attempt_count, 0) + 1,
+           last_attempt_at = clock_timestamp(),
+           next_retry_at = NULL,
+           processed_at = clock_timestamp(),
+           updated_at = clock_timestamp()
+       WHERE event_id = $1
+         AND ($4::text IS NULL OR provider = $4)
+         AND status NOT IN ('processed', 'ignored')
+         AND (
+           $5::boolean = TRUE
+           OR (
+             status <> 'permanently_failed'
+             AND COALESCE(attempt_count, 0) < $6
+           )
+         )
+         AND (
+           (status = 'failed' AND ($5::boolean = TRUE OR next_retry_at IS NULL OR next_retry_at <= clock_timestamp()))
+           OR ($5::boolean = TRUE AND status = 'permanently_failed')
+           OR (
+             status = 'processing' AND (
+               (lease_expires_at IS NOT NULL AND lease_expires_at < clock_timestamp())
+               OR (lease_expires_at IS NULL AND processed_at < clock_timestamp() - INTERVAL '5 minutes')
+             )
+           )
+         )
+       RETURNING id, provider, event_id AS "eventId", event_type AS "eventType", idempotency_key AS "idempotencyKey",
+                 payload_json AS "payload", status, lease_owner AS "leaseOwner", lease_expires_at AS "leaseExpiresAt",
+                 attempt_count AS "attemptCount", last_error AS "lastError", last_attempt_at AS "lastAttemptAt",
+                 next_retry_at AS "nextRetryAt", processed_at AS "processedAt", created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [eventId, leaseOwner, leaseDurationMs, providerFilter, allowReplayFailed, maxAttempts]
+    );
+
+    if (res.rows.length > 0) {
+      return {
+        claimed: true,
+        leaseOwner,
+        event: this.mapBillingEventRow(res.rows[0]),
+      };
+    }
+
+    const existing = await this.getBillingEventById(eventId);
     return { claimed: false, event: existing };
   }
 
@@ -2287,7 +2403,7 @@ export class PostgresRepository implements DatabaseRepository {
 
   async updateBillingEventStatus(
     eventId: string,
-    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    status: BillingEventStatus,
     payload?: any,
     leaseOwner?: string
   ): Promise<void> {
@@ -2295,6 +2411,9 @@ export class PostgresRepository implements DatabaseRepository {
     const setClauses = ['status = $2', 'updated_at = clock_timestamp()'];
     if (status !== 'processing') {
       setClauses.push('lease_expires_at = NULL');
+    }
+    if (status === 'processed' || status === 'ignored') {
+      setClauses.push('next_retry_at = NULL', 'last_error = NULL');
     }
     if (payload !== undefined) {
       params.push(JSON.stringify(payload));
@@ -2322,6 +2441,48 @@ export class PostgresRepository implements DatabaseRepository {
 
     if (leaseOwner && res.rowCount === 0) {
       throw new Error(`Billing lease ownership lost or expired for event ${eventId}: stale worker "${leaseOwner}" rejected.`);
+    }
+  }
+
+  async markBillingEventFailure(params: {
+    eventId: string;
+    leaseOwner?: string;
+    status: 'failed' | 'permanently_failed';
+    errorMessage: string;
+    nextRetryAt?: string | null;
+  }): Promise<void> {
+    const queryParams: any[] = [
+      params.eventId,
+      params.status,
+      params.errorMessage,
+      params.status === 'failed' ? (params.nextRetryAt ?? null) : null,
+    ];
+    let whereClause = 'WHERE event_id = $1';
+    if (params.leaseOwner) {
+      queryParams.push(params.leaseOwner);
+      whereClause += `
+        AND lease_owner = $${queryParams.length}
+        AND status = 'processing'
+        AND (
+          (lease_expires_at IS NOT NULL AND lease_expires_at >= clock_timestamp())
+          OR (lease_expires_at IS NULL AND processed_at >= clock_timestamp() - INTERVAL '5 minutes')
+        )`;
+    }
+
+    const res = await this.query(
+      `UPDATE billing_events
+       SET status = $2,
+           lease_expires_at = NULL,
+           last_error = $3,
+           last_attempt_at = COALESCE(last_attempt_at, clock_timestamp()),
+           next_retry_at = $4,
+           updated_at = clock_timestamp()
+       ${whereClause}`,
+      queryParams
+    );
+
+    if (params.leaseOwner && res.rowCount === 0) {
+      throw new Error(`Billing lease ownership lost or expired for event ${params.eventId}: stale worker "${params.leaseOwner}" rejected.`);
     }
   }
 
@@ -2409,6 +2570,8 @@ export class PostgresRepository implements DatabaseRepository {
           ? `UPDATE billing_events
              SET status = 'processed',
                  lease_expires_at = NULL,
+                 last_error = NULL,
+                 next_retry_at = NULL,
                  processed_at = clock_timestamp(),
                  updated_at = clock_timestamp()
              WHERE event_id = $1
@@ -2421,6 +2584,8 @@ export class PostgresRepository implements DatabaseRepository {
           : `UPDATE billing_events
              SET status = 'processed',
                  lease_expires_at = NULL,
+                 last_error = NULL,
+                 next_retry_at = NULL,
                  processed_at = clock_timestamp(),
                  updated_at = clock_timestamp()
              WHERE event_id = $1`;

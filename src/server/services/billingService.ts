@@ -16,7 +16,97 @@ export interface WebhookProcessingResult {
   message: string;
   inProgress?: boolean;
   retryable?: boolean;
+  permanentlyFailed?: boolean;
   subscription?: SubscriptionRecord;
+}
+
+export interface BillingRecoveryPolicy {
+  maxAttempts?: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
+}
+
+export const DEFAULT_BILLING_RECOVERY_POLICY: Required<BillingRecoveryPolicy> = {
+  maxAttempts: 5,
+  baseBackoffMs: 30_000,
+  maxBackoffMs: 3_600_000,
+};
+
+export interface RecoverWebhookOptions extends BillingLeaseConfig, BillingRecoveryPolicy {
+  limit?: number;
+  leaseOwnerPrefix?: string;
+}
+
+export interface WebhookRecoveryDetail {
+  eventId: string;
+  eventType: string;
+  attemptCount: number;
+  outcome: 'recovered' | 'ignored' | 'retried_failed' | 'permanently_failed' | 'skipped_contended' | 'lease_lost';
+  message?: string;
+}
+
+export interface WebhookRecoverySummary {
+  scanned: number;
+  recovered: number;
+  ignored: number;
+  retriedFailed: number;
+  permanentlyFailed: number;
+  skippedContended: number;
+  leaseLost: number;
+  details: WebhookRecoveryDetail[];
+}
+
+export function sanitizeBillingErrorMessage(err: unknown): string {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+      ? err
+      : String(err ?? 'Unknown billing processing error');
+  let sanitized = raw
+    .replace(/\b(sk|rk)_(live|test)_[A-Za-z0-9_]+\b/g, '[REDACTED_STRIPE_KEY]')
+    .replace(/\bwhsec_[A-Za-z0-9_]+\b/g, '[REDACTED_WEBHOOK_SECRET]')
+    .replace(/(postgres(?:ql)?:\/\/)([^:\s/@]+):([^@\s]+)@/gi, '$1***@')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[REDACTED_TOKEN]')
+    .replace(/\b(password|passwd|secret|token|api[_-]?key|signature)\s*([:=])\s*([^\s,;]+)/gi, '$1$2[REDACTED]')
+    .replace(/[\r\n\t]+/g, ' ')
+    .trim();
+  if (!sanitized) {
+    sanitized = 'Billing processing failed.';
+  }
+  if (sanitized.length > 500) {
+    sanitized = `${sanitized.slice(0, 497)}...`;
+  }
+  return sanitized;
+}
+
+export function classifyWebhookProcessingError(err: any): { retryable: boolean; reason: string } {
+  const msg = typeof err?.message === 'string' ? err.message : '';
+  if (err?.code === 'BILLING_LEASE_LOST' || /lease ownership lost or expired/i.test(msg)) {
+    return { retryable: true, reason: 'lease_lost' };
+  }
+  if (err?.nonRetryable === true) {
+    return { retryable: false, reason: 'explicit_non_retryable' };
+  }
+  const statusCode = typeof err?.statusCode === 'number' ? err.statusCode : undefined;
+  if (statusCode !== undefined && statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 429) {
+    return { retryable: false, reason: 'deterministic_client_or_payload_error' };
+  }
+  return { retryable: true, reason: 'transient_processing_error' };
+}
+
+export function computeNextRetryAt(
+  attemptCount: number,
+  baseBackoffMs: number = DEFAULT_BILLING_RECOVERY_POLICY.baseBackoffMs,
+  maxBackoffMs: number = DEFAULT_BILLING_RECOVERY_POLICY.maxBackoffMs,
+  nowMs: number = Date.now()
+): string {
+  const safeBase = Number.isFinite(baseBackoffMs) && baseBackoffMs >= 0 ? baseBackoffMs : DEFAULT_BILLING_RECOVERY_POLICY.baseBackoffMs;
+  const safeMax = Number.isFinite(maxBackoffMs) && maxBackoffMs >= 0 ? maxBackoffMs : DEFAULT_BILLING_RECOVERY_POLICY.maxBackoffMs;
+  const exponent = Math.max(0, Math.floor(attemptCount) - 1);
+  const rawDelay = safeBase * Math.pow(2, exponent);
+  const boundedDelay = Math.min(safeMax, Math.max(0, rawDelay));
+  return new Date(nowMs + boundedDelay).toISOString();
 }
 
 export interface NormalizedStripeSubscriptionStatus {
@@ -114,11 +204,28 @@ export class BillingService {
   private repo: DatabaseRepository;
   private provider: IBillingProvider;
   private leaseConfig: { leaseDurationMs: number; heartbeatIntervalMs: number };
+  private recoveryPolicy: Required<BillingRecoveryPolicy>;
 
-  constructor(repo: DatabaseRepository, provider: IBillingProvider, leaseConfig?: BillingLeaseConfig) {
+  constructor(
+    repo: DatabaseRepository,
+    provider: IBillingProvider,
+    leaseConfig?: BillingLeaseConfig,
+    recoveryPolicy?: BillingRecoveryPolicy
+  ) {
     this.repo = repo;
     this.provider = provider;
     this.leaseConfig = validateBillingLeaseConfig(leaseConfig);
+    this.recoveryPolicy = {
+      maxAttempts: Math.max(1, recoveryPolicy?.maxAttempts ?? DEFAULT_BILLING_RECOVERY_POLICY.maxAttempts),
+      baseBackoffMs:
+        recoveryPolicy?.baseBackoffMs !== undefined && recoveryPolicy.baseBackoffMs >= 0
+          ? recoveryPolicy.baseBackoffMs
+          : DEFAULT_BILLING_RECOVERY_POLICY.baseBackoffMs,
+      maxBackoffMs:
+        recoveryPolicy?.maxBackoffMs !== undefined && recoveryPolicy.maxBackoffMs >= 0
+          ? recoveryPolicy.maxBackoffMs
+          : DEFAULT_BILLING_RECOVERY_POLICY.maxBackoffMs,
+    };
   }
 
   async createCheckoutSession(
@@ -259,6 +366,16 @@ export class BillingService {
           message: `Webhook event ${event.id} was previously ignored.`,
         };
       }
+      if (existingStatus === 'permanently_failed') {
+        return {
+          success: false,
+          action: 'duplicate',
+          inProgress: false,
+          retryable: false,
+          permanentlyFailed: true,
+          message: `Webhook event ${event.id} exceeded maximum recovery retries or failed permanently and requires manual replay.`,
+        };
+      }
       return {
         success: false,
         action: 'duplicate',
@@ -276,7 +393,307 @@ export class BillingService {
       throw new Error(`[AIXSHOP Billing] Claimed billing event ${event.id} without lease owner.`);
     }
 
-    // 5. Automatic lease heartbeat lifecycle + guarded dispatch
+    const attemptCount = claim.event?.attemptCount ?? 1;
+    return this.executeClaimedWebhookEvent(
+      event,
+      leaseOwner,
+      effectiveLease,
+      attemptCount,
+      this.recoveryPolicy
+    );
+  }
+
+  /**
+   * Scans durable billing_events storage for abandoned 'processing' (expired lease) or retry-ready
+   * 'failed' webhook events, atomically claims each via compare-and-set lease acquisition,
+   * and executes the authoritative billing state transition cleanly with exponential backoff or dead-lettering.
+   */
+  async recoverPendingWebhookEvents(options?: RecoverWebhookOptions): Promise<WebhookRecoverySummary> {
+    const effectiveLease = validateBillingLeaseConfig(
+      {
+        leaseDurationMs: options?.leaseDurationMs,
+        heartbeatIntervalMs: options?.heartbeatIntervalMs,
+      },
+      this.leaseConfig
+    );
+    const effectiveRecovery: Required<BillingRecoveryPolicy> = {
+      maxAttempts: Math.max(1, options?.maxAttempts ?? this.recoveryPolicy.maxAttempts),
+      baseBackoffMs:
+        options?.baseBackoffMs !== undefined && options.baseBackoffMs >= 0
+          ? options.baseBackoffMs
+          : this.recoveryPolicy.baseBackoffMs,
+      maxBackoffMs:
+        options?.maxBackoffMs !== undefined && options.maxBackoffMs >= 0
+          ? options.maxBackoffMs
+          : this.recoveryPolicy.maxBackoffMs,
+    };
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
+    const leasePrefix = options?.leaseOwnerPrefix || 'recovery_worker';
+
+    const candidates = await this.repo.listRecoverableBillingEvents({
+      maxAttempts: effectiveRecovery.maxAttempts,
+      limit,
+      provider: this.provider.providerName,
+    });
+
+    const summary: WebhookRecoverySummary = {
+      scanned: candidates.length,
+      recovered: 0,
+      ignored: 0,
+      retriedFailed: 0,
+      permanentlyFailed: 0,
+      skippedContended: 0,
+      leaseLost: 0,
+      details: [],
+    };
+
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      const leaseOwner = `${leasePrefix}_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 8)}`;
+
+      const claim = await this.repo.claimBillingEventForRecovery(candidate.eventId, {
+        leaseOwner,
+        leaseDurationMs: effectiveLease.leaseDurationMs,
+        maxAttempts: effectiveRecovery.maxAttempts,
+        provider: this.provider.providerName,
+      });
+
+      if (!claim.claimed || !claim.event || !claim.leaseOwner) {
+        summary.skippedContended += 1;
+        summary.details.push({
+          eventId: candidate.eventId,
+          eventType: candidate.eventType,
+          attemptCount: candidate.attemptCount ?? 0,
+          outcome: 'skipped_contended',
+          message: 'Claimed concurrently or no longer eligible for recovery.',
+        });
+        continue;
+      }
+
+      const claimedRecord = claim.event;
+      const attemptCount = claimedRecord.attemptCount ?? 1;
+      const payload = claimedRecord.payload as WebhookEventPayload | undefined;
+
+      if (!payload || typeof payload !== 'object' || typeof payload.id !== 'string' || typeof payload.type !== 'string') {
+        const sanitizedMsg = sanitizeBillingErrorMessage('Stored webhook payload is invalid or missing event metadata.');
+        await this.repo.markBillingEventFailure({
+          eventId: claimedRecord.eventId,
+          leaseOwner: claim.leaseOwner,
+          status: 'permanently_failed',
+          errorMessage: sanitizedMsg,
+          nextRetryAt: null,
+        }).catch(() => {});
+        summary.permanentlyFailed += 1;
+        summary.details.push({
+          eventId: claimedRecord.eventId,
+          eventType: claimedRecord.eventType,
+          attemptCount,
+          outcome: 'permanently_failed',
+          message: sanitizedMsg,
+        });
+        continue;
+      }
+
+      try {
+        const result = await this.executeClaimedWebhookEvent(
+          payload,
+          claim.leaseOwner,
+          effectiveLease,
+          attemptCount,
+          effectiveRecovery
+        );
+        if (result.action === 'ignored') {
+          summary.ignored += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'ignored',
+            message: result.message,
+          });
+        } else {
+          summary.recovered += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'recovered',
+            message: result.message,
+          });
+        }
+      } catch (err: any) {
+        if (err?.code === 'BILLING_LEASE_LOST') {
+          summary.leaseLost += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'lease_lost',
+            message: sanitizeBillingErrorMessage(err),
+          });
+        } else if (err?.permanentlyFailed) {
+          summary.permanentlyFailed += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'permanently_failed',
+            message: sanitizeBillingErrorMessage(err),
+          });
+        } else {
+          summary.retriedFailed += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'retried_failed',
+            message: sanitizeBillingErrorMessage(err),
+          });
+        }
+      }
+    }
+
+    return summary;
+  }
+
+  /**
+   * Controlled manual replay for a specific stored billing event (e.g., an operator replaying
+   * a 'permanently_failed' dead-lettered event after fixing an upstream workspace or catalog issue).
+   * Strictly refuses already-'processed' or 'ignored' events and preserves active processing leases.
+   */
+  async reprocessBillingEvent(
+    eventId: string,
+    options?: BillingLeaseConfig & BillingRecoveryPolicy & { leaseOwner?: string; allowPermanentlyFailed?: boolean }
+  ): Promise<WebhookProcessingResult> {
+    const existing = await this.repo.getBillingEventById(eventId);
+    if (!existing) {
+      const err: any = new Error(`Billing event "${eventId}" not found.`);
+      err.statusCode = 404;
+      err.code = 'BILLING_EVENT_NOT_FOUND';
+      throw err;
+    }
+
+    if (existing.provider !== this.provider.providerName) {
+      const err: any = new Error(
+        `Billing event "${eventId}" belongs to provider "${existing.provider}", expected "${this.provider.providerName}".`
+      );
+      err.statusCode = 409;
+      err.code = 'BILLING_PROVIDER_MISMATCH';
+      throw err;
+    }
+
+    if (existing.status === 'processed') {
+      return {
+        success: true,
+        action: 'duplicate',
+        message: `Webhook event ${eventId} was already processed (idempotent no-op).`,
+      };
+    }
+
+    if (existing.status === 'ignored') {
+      return {
+        success: true,
+        action: 'ignored',
+        message: `Webhook event ${eventId} was previously ignored.`,
+      };
+    }
+
+    const effectiveLease = validateBillingLeaseConfig(
+      {
+        leaseDurationMs: options?.leaseDurationMs,
+        heartbeatIntervalMs: options?.heartbeatIntervalMs,
+      },
+      this.leaseConfig
+    );
+    const effectiveRecovery: Required<BillingRecoveryPolicy> = {
+      maxAttempts: Math.max(1, options?.maxAttempts ?? this.recoveryPolicy.maxAttempts),
+      baseBackoffMs:
+        options?.baseBackoffMs !== undefined && options.baseBackoffMs >= 0
+          ? options.baseBackoffMs
+          : this.recoveryPolicy.baseBackoffMs,
+      maxBackoffMs:
+        options?.maxBackoffMs !== undefined && options.maxBackoffMs >= 0
+          ? options.maxBackoffMs
+          : this.recoveryPolicy.maxBackoffMs,
+    };
+
+    const allowReplay = options?.allowPermanentlyFailed ?? true;
+    const claim = await this.repo.claimBillingEventForRecovery(eventId, {
+      leaseOwner: options?.leaseOwner,
+      leaseDurationMs: effectiveLease.leaseDurationMs,
+      maxAttempts: effectiveRecovery.maxAttempts,
+      allowReplayFailed: allowReplay,
+      provider: this.provider.providerName,
+    });
+
+    if (!claim.claimed || !claim.event || !claim.leaseOwner) {
+      const latestStatus = claim.event?.status;
+      if (latestStatus === 'processed') {
+        return {
+          success: true,
+          action: 'duplicate',
+          message: `Webhook event ${eventId} was already processed (idempotent no-op).`,
+        };
+      }
+      if (latestStatus === 'ignored') {
+        return {
+          success: true,
+          action: 'ignored',
+          message: `Webhook event ${eventId} was previously ignored.`,
+        };
+      }
+      if (latestStatus === 'permanently_failed') {
+        return {
+          success: false,
+          action: 'duplicate',
+          inProgress: false,
+          retryable: false,
+          permanentlyFailed: true,
+          message: `Webhook event ${eventId} is in permanently_failed state and replay was not enabled.`,
+        };
+      }
+      return {
+        success: false,
+        action: 'duplicate',
+        inProgress: true,
+        retryable: true,
+        message: `Webhook event ${eventId} is currently held under an active processing lease; retry safely later.`,
+      };
+    }
+
+    const payload = claim.event.payload as WebhookEventPayload | undefined;
+    if (!payload || typeof payload !== 'object' || typeof payload.id !== 'string' || typeof payload.type !== 'string') {
+      const sanitizedMsg = sanitizeBillingErrorMessage('Stored webhook payload is invalid or missing event metadata.');
+      await this.repo.markBillingEventFailure({
+        eventId: claim.event.eventId,
+        leaseOwner: claim.leaseOwner,
+        status: 'permanently_failed',
+        errorMessage: sanitizedMsg,
+        nextRetryAt: null,
+      }).catch(() => {});
+      const err: any = new Error(sanitizedMsg);
+      err.statusCode = 400;
+      err.permanentlyFailed = true;
+      throw err;
+    }
+
+    return this.executeClaimedWebhookEvent(
+      payload,
+      claim.leaseOwner,
+      effectiveLease,
+      claim.event.attemptCount ?? 1,
+      effectiveRecovery
+    );
+  }
+
+  private async executeClaimedWebhookEvent(
+    event: WebhookEventPayload,
+    leaseOwner: string,
+    effectiveLease: { leaseDurationMs: number; heartbeatIntervalMs: number },
+    attemptCount: number,
+    recoveryPolicy: Required<BillingRecoveryPolicy>
+  ): Promise<WebhookProcessingResult> {
+    // Automatic lease heartbeat lifecycle + guarded dispatch
     const hb = {
       leaseLost: false,
       leaseLostReason: '',
@@ -376,7 +793,29 @@ export class BillingService {
         err.statusCode = 503;
       }
       if (!isLeaseLost) {
-        await this.repo.updateBillingEventStatus(event.id, 'failed', err?.message, leaseOwner).catch(() => {});
+        const classification = classifyWebhookProcessingError(err);
+        const shouldMarkPermanent = !classification.retryable || attemptCount >= recoveryPolicy.maxAttempts;
+        const failureStatus: 'failed' | 'permanently_failed' = shouldMarkPermanent
+          ? 'permanently_failed'
+          : 'failed';
+        const nextRetryAt = shouldMarkPermanent
+          ? null
+          : computeNextRetryAt(attemptCount, recoveryPolicy.baseBackoffMs, recoveryPolicy.maxBackoffMs);
+        const errorMessage = sanitizeBillingErrorMessage(err);
+
+        if (err && typeof err === 'object') {
+          err.permanentlyFailed = shouldMarkPermanent;
+        }
+
+        await this.repo
+          .markBillingEventFailure({
+            eventId: event.id,
+            leaseOwner,
+            status: failureStatus,
+            errorMessage,
+            nextRetryAt,
+          })
+          .catch(() => {});
       }
       throw err;
     } finally {

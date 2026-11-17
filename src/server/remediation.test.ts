@@ -856,6 +856,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql',
         '011_corrective_integrity_and_visibility_provenance.sql',
         '012_production_blockers_integrity.sql',
+        '013_billing_webhook_recovery.sql',
       ];
       const baseConstraints = [
         { source_schema: 'tenant_prod', source_table: 'stores', target_schema: '', target_table: '', constraint_name: 'uq_stores_ws_id', constraint_type: 'u', source_columns: 'workspace_id,id', target_columns: '', is_partial_index: false },

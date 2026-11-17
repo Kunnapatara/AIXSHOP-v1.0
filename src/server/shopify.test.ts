@@ -1477,5 +1477,124 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
         }
       }
     });
+
+    test('rejects IPv6 loopback ([::1], [0:0:0:0:0:0:0:1], [::ffff:127.0.0.1]), unspecified ([::], 0.0.0.0), 127.0.0.0/8, and DNS loopback variants in production', async () => {
+      const {
+        isLoopbackOrLocalHostname,
+        validateProductionAppUrl,
+        validateShopifyUrlConfig,
+        getAllowedRedirectOrigins,
+        resolveTrustedRedirectUrl,
+      } = await import('./config/productionConfig');
+
+      const snapshot = {
+        NODE_ENV: process.env.NODE_ENV,
+        SHOPIFY_APP_URL: process.env.SHOPIFY_APP_URL,
+        APP_URL: process.env.APP_URL,
+        SHOPIFY_REDIRECT_URI: process.env.SHOPIFY_REDIRECT_URI,
+        SHOPIFY_WEBHOOK_URL: process.env.SHOPIFY_WEBHOOK_URL,
+        ALLOWED_APP_ORIGINS: process.env.ALLOWED_APP_ORIGINS,
+      };
+
+      try {
+        // Direct hostname helper checks (IPv6, IPv4, IPv4-mapped IPv6, zones, trailing dot, DNS)
+        const loopbackHosts = [
+          'localhost',
+          'LOCALHOST.',
+          'sub.localhost',
+          'localhost.localdomain',
+          '127.0.0.1',
+          '127.0.0.2',
+          '127.255.254.1',
+          '0.0.0.0',
+          '0.10.20.30',
+          '[::1]',
+          '::1',
+          '[0:0:0:0:0:0:0:1]',
+          '[0000:0000:0000:0000:0000:0000:0000:0001]',
+          '[::0:1]',
+          '[::]',
+          '[0:0:0:0:0:0:0:0]',
+          '[::ffff:127.0.0.1]',
+          '[::FFFF:127.0.0.1]',
+          '[::ffff:7f00:1]',
+          '[::127.0.0.1]',
+          '[::1%25lo0]',
+        ];
+        for (const host of loopbackHosts) {
+          assert.equal(isLoopbackOrLocalHostname(host), true, `Expected loopback/local detection for "${host}"`);
+        }
+
+        const publicHosts = ['aixshop.example.com', 'store.myshopify.com', '203.0.113.10', '[2001:db8::1]'];
+        for (const host of publicHosts) {
+          assert.equal(isLoopbackOrLocalHostname(host), false, `Expected public host for "${host}"`);
+        }
+
+        // Production URL & Shopify endpoint rejections
+        process.env.NODE_ENV = 'production';
+        const rejectedProdUrls = [
+          'https://[::1]',
+          'https://[::1]:3000',
+          'https://[0:0:0:0:0:0:0:1]/path',
+          'https://[::0:1]:8443',
+          'https://[::ffff:127.0.0.1]',
+          'https://[::ffff:7f00:1]:3000',
+          'https://[::]',
+          'https://0.0.0.0:3000',
+          'https://127.0.0.2:3000',
+          'https://app.localhost',
+          'https://localhost.localdomain',
+          'https://user:pass@aixshop.example.com',
+        ];
+        for (const candidateUrl of rejectedProdUrls) {
+          assert.equal(
+            validateProductionAppUrl(candidateUrl).valid,
+            false,
+            `validateProductionAppUrl must reject ${candidateUrl} in production`
+          );
+
+          process.env.APP_URL = candidateUrl;
+          delete process.env.SHOPIFY_APP_URL;
+          delete process.env.SHOPIFY_REDIRECT_URI;
+          delete process.env.SHOPIFY_WEBHOOK_URL;
+          assert.equal(
+            validateShopifyUrlConfig().valid,
+            false,
+            `validateShopifyUrlConfig must reject APP_URL=${candidateUrl} in production`
+          );
+        }
+
+        // Valid IPv6 public URL allowed if HTTPS and non-loopback
+        process.env.APP_URL = 'https://app.aixshop.example.com';
+        process.env.SHOPIFY_APP_URL = 'https://app.aixshop.example.com';
+        process.env.ALLOWED_APP_ORIGINS =
+          'https://[::1]:3000,http://insecure.example.com,https://admin.aixshop.example.com,https://127.0.0.2:3000,https://user:secret@cred.example.com';
+
+        const allowedOrigins = getAllowedRedirectOrigins('https://app.aixshop.example.com');
+        assert.deepEqual(Array.from(allowedOrigins).sort(), [
+          'https://admin.aixshop.example.com',
+          'https://app.aixshop.example.com',
+        ]);
+
+        const resolvedLoopback = resolveTrustedRedirectUrl(
+          'https://app.aixshop.example.com',
+          'https://[::1]:3000/settings',
+          '/settings'
+        );
+        assert.equal(resolvedLoopback, 'https://app.aixshop.example.com/settings');
+
+        const resolvedTrusted = resolveTrustedRedirectUrl(
+          'https://app.aixshop.example.com',
+          'https://admin.aixshop.example.com/settings?ok=1',
+          '/settings'
+        );
+        assert.equal(resolvedTrusted, 'https://admin.aixshop.example.com/settings?ok=1');
+      } finally {
+        for (const [k, v] of Object.entries(snapshot)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
   });
 });

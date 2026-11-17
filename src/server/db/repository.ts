@@ -18,7 +18,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord, PlanTier } from '../billing/types';
+import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
 
 export interface CreateUserData {
   id: string;
@@ -210,13 +210,35 @@ export interface DatabaseRepository {
     event: BillingEventRecord,
     leaseOptions?: { leaseOwner?: string; leaseDurationMs?: number }
   ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }>;
+  listRecoverableBillingEvents(options?: {
+    maxAttempts?: number;
+    limit?: number;
+    provider?: string;
+  }): Promise<BillingEventRecord[]>;
+  claimBillingEventForRecovery(
+    eventId: string,
+    options?: {
+      leaseOwner?: string;
+      leaseDurationMs?: number;
+      maxAttempts?: number;
+      allowReplayFailed?: boolean;
+      provider?: string;
+    }
+  ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }>;
   renewBillingEventLease(eventId: string, leaseOwner: string, extendMs?: number): Promise<boolean>;
   updateBillingEventStatus(
     eventId: string,
-    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    status: BillingEventStatus,
     payload?: any,
     leaseOwner?: string
   ): Promise<void>;
+  markBillingEventFailure(params: {
+    eventId: string;
+    leaseOwner?: string;
+    status: 'failed' | 'permanently_failed';
+    errorMessage: string;
+    nextRetryAt?: string | null;
+  }): Promise<void>;
   applyBillingTransition(params: {
     eventId: string;
     subscription: SubscriptionRecord;

@@ -1287,4 +1287,53 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
       globalThis.fetch = origFetch;
     }
   });
+
+  test('13. Task E: Logout during pending runStoreCheck immediately resets isCheckingStore and ignores late resolution/error', async () => {
+    const origFetch = globalThis.fetch;
+    const defStoreLogout = createDeferred<any>();
+
+    globalThis.fetch = (async () => defStoreLogout.promise) as any;
+
+    try {
+      apiClient.getCatalog = async () => ({
+        workspaceId: 'ws_a',
+        catalog: makeCatalogPayload({ storeName: 'Store Alpha', products: [makeProduct('prod_a1', 'A')], catalogVersion: 1 }),
+      });
+      const rig = createTestRig();
+      await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA], isAuthenticated: true });
+      await act(async () => {
+        await flushMicrotasks();
+      });
+
+      let logoutScan!: Promise<void>;
+      await act(async () => {
+        logoutScan = rig.getApp().runStoreCheck('https://logout-race.example.com');
+      });
+      assert.equal(rig.getApp().isCheckingStore, true);
+
+      // Logout immediately while runStoreCheck is still in flight
+      await rig.renderWithAuth({ user: null, activeWorkspace: null, workspaces: [], isAuthenticated: false });
+      assert.equal(rig.getApp().isCheckingStore, false, 'Logout must immediately reset isCheckingStore');
+      const toastsAtLogout = rig.getApp().toasts.length;
+
+      // In-flight scan resolves AFTER logout
+      await act(async () => {
+        defStoreLogout.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            products: [{ id: 505, title: 'Late Logout Product', variants: [{ id: 55, price: '50.00', sku: 'L1' }] }],
+          }),
+        });
+        await logoutScan;
+        await flushMicrotasks();
+      });
+
+      assert.equal(rig.getApp().isCheckingStore, false);
+      assert.equal(rig.getApp().quickCheckResult, null, 'Late scan resolution after logout must be discarded');
+      assert.equal(rig.getApp().toasts.length, toastsAtLogout, 'Late scan resolution after logout must not emit toast');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });

@@ -41,7 +41,7 @@ import {
   ProductCandidate
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord, PlanTier } from '../billing/types';
+import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
 import { 
   initialProducts, 
   initialFindings, 
@@ -863,6 +863,9 @@ export class MemoryRepository implements DatabaseRepository {
         leaseOwner,
         leaseExpiresAt,
         attemptCount: 1,
+        lastError: null,
+        lastAttemptAt: nowIso,
+        nextRetryAt: null,
         processedAt: nowIso,
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -883,6 +886,8 @@ export class MemoryRepository implements DatabaseRepository {
       existing.leaseOwner = leaseOwner;
       existing.leaseExpiresAt = leaseExpiresAt;
       existing.attemptCount = (existing.attemptCount || 0) + 1;
+      existing.lastAttemptAt = nowIso;
+      existing.nextRetryAt = null;
       existing.processedAt = nowIso;
       existing.updatedAt = nowIso;
       if (event.payload) {
@@ -892,6 +897,113 @@ export class MemoryRepository implements DatabaseRepository {
     }
 
     return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+  }
+
+  async listRecoverableBillingEvents(options?: {
+    maxAttempts?: number;
+    limit?: number;
+    provider?: string;
+  }): Promise<BillingEventRecord[]> {
+    const now = Date.now();
+    const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
+    const results: BillingEventRecord[] = [];
+
+    for (const existing of this.billingEvents.values()) {
+      if (options?.provider && existing.provider !== options.provider) {
+        continue;
+      }
+      if ((existing.attemptCount ?? 0) >= maxAttempts) {
+        continue;
+      }
+      if (existing.status === 'processing') {
+        const processedTime = new Date(existing.processedAt).getTime();
+        const leaseExpiryTime = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() : NaN;
+        const isExpired = !isNaN(leaseExpiryTime)
+          ? leaseExpiryTime < now
+          : now - processedTime > 5 * 60 * 1000;
+        if (isExpired) {
+          results.push(JSON.parse(JSON.stringify(existing)));
+        }
+      } else if (existing.status === 'failed') {
+        const nextRetryTime = existing.nextRetryAt ? new Date(existing.nextRetryAt).getTime() : NaN;
+        if (isNaN(nextRetryTime) || nextRetryTime <= now) {
+          results.push(JSON.parse(JSON.stringify(existing)));
+        }
+      }
+    }
+
+    results.sort((a, b) => {
+      const ta = new Date(a.nextRetryAt || a.leaseExpiresAt || a.processedAt || a.createdAt || 0).getTime();
+      const tb = new Date(b.nextRetryAt || b.leaseExpiresAt || b.processedAt || b.createdAt || 0).getTime();
+      return ta - tb;
+    });
+
+    return results.slice(0, limit);
+  }
+
+  async claimBillingEventForRecovery(
+    eventId: string,
+    options?: {
+      leaseOwner?: string;
+      leaseDurationMs?: number;
+      maxAttempts?: number;
+      allowReplayFailed?: boolean;
+      provider?: string;
+    }
+  ): Promise<{ claimed: boolean; event: BillingEventRecord | null; leaseOwner?: string }> {
+    const existing = this.billingEvents.get(eventId);
+    if (!existing) {
+      return { claimed: false, event: null };
+    }
+    if (options?.provider && existing.provider !== options.provider) {
+      return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+    }
+    if (existing.status === 'processed' || existing.status === 'ignored') {
+      return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+    }
+
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
+    const allowReplayFailed = Boolean(options?.allowReplayFailed);
+    const leaseDurationMs = Math.max(50, options?.leaseDurationMs ?? 5 * 60 * 1000);
+    const leaseOwner = options?.leaseOwner || `recovery_${now}_${Math.random().toString(36).slice(2, 10)}`;
+
+    let canClaim = false;
+    if (existing.status === 'processing') {
+      const processedTime = new Date(existing.processedAt).getTime();
+      const leaseExpiryTime = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() : NaN;
+      const isExpired = !isNaN(leaseExpiryTime)
+        ? leaseExpiryTime < now
+        : now - processedTime > 5 * 60 * 1000;
+      canClaim = isExpired && (allowReplayFailed || (existing.attemptCount ?? 0) < maxAttempts);
+    } else if (existing.status === 'failed') {
+      const nextRetryTime = existing.nextRetryAt ? new Date(existing.nextRetryAt).getTime() : NaN;
+      const retryReady = allowReplayFailed || isNaN(nextRetryTime) || nextRetryTime <= now;
+      canClaim = retryReady && (allowReplayFailed || (existing.attemptCount ?? 0) < maxAttempts);
+    } else if (existing.status === 'permanently_failed') {
+      canClaim = allowReplayFailed;
+    }
+
+    if (!canClaim) {
+      return { claimed: false, event: JSON.parse(JSON.stringify(existing)) };
+    }
+
+    existing.status = 'processing';
+    existing.leaseOwner = leaseOwner;
+    existing.leaseExpiresAt = new Date(now + leaseDurationMs).toISOString();
+    existing.attemptCount = (existing.attemptCount || 0) + 1;
+    existing.lastAttemptAt = nowIso;
+    existing.nextRetryAt = null;
+    existing.processedAt = nowIso;
+    existing.updatedAt = nowIso;
+
+    return {
+      claimed: true,
+      leaseOwner,
+      event: JSON.parse(JSON.stringify(existing)),
+    };
   }
 
   async renewBillingEventLease(
@@ -917,7 +1029,7 @@ export class MemoryRepository implements DatabaseRepository {
 
   async updateBillingEventStatus(
     eventId: string,
-    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    status: BillingEventStatus,
     payload?: any,
     leaseOwner?: string
   ): Promise<void> {
@@ -939,10 +1051,45 @@ export class MemoryRepository implements DatabaseRepository {
       if (status !== 'processing') {
         existing.leaseExpiresAt = null;
       }
+      if (status === 'processed' || status === 'ignored') {
+        existing.nextRetryAt = null;
+        existing.lastError = null;
+      }
       if (payload !== undefined) {
         existing.payload = JSON.parse(JSON.stringify(payload));
       }
     }
+  }
+
+  async markBillingEventFailure(params: {
+    eventId: string;
+    leaseOwner?: string;
+    status: 'failed' | 'permanently_failed';
+    errorMessage: string;
+    nextRetryAt?: string | null;
+  }): Promise<void> {
+    const existing = this.billingEvents.get(params.eventId);
+    if (!existing) {
+      return;
+    }
+    if (params.leaseOwner) {
+      const now = Date.now();
+      const leaseExpiryTime = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() : NaN;
+      const processedTime = existing.processedAt ? new Date(existing.processedAt).getTime() : NaN;
+      const isExpired = !isNaN(leaseExpiryTime)
+        ? leaseExpiryTime < now
+        : (!isNaN(processedTime) && now - processedTime > 5 * 60 * 1000);
+      if (existing.status !== 'processing' || existing.leaseOwner !== params.leaseOwner || isExpired) {
+        throw new Error(`Billing lease ownership lost or expired for event ${params.eventId}: stale worker "${params.leaseOwner}" rejected.`);
+      }
+    }
+    const nowIso = new Date().toISOString();
+    existing.status = params.status;
+    existing.leaseExpiresAt = null;
+    existing.lastError = params.errorMessage;
+    existing.lastAttemptAt = existing.lastAttemptAt || nowIso;
+    existing.nextRetryAt = params.status === 'failed' ? (params.nextRetryAt ?? null) : null;
+    existing.updatedAt = nowIso;
   }
 
   async applyBillingTransition(params: {
@@ -996,6 +1143,8 @@ export class MemoryRepository implements DatabaseRepository {
       if (params.markProcessed !== false && prevEvent) {
         prevEvent.status = 'processed';
         prevEvent.leaseExpiresAt = null;
+        prevEvent.lastError = null;
+        prevEvent.nextRetryAt = null;
         prevEvent.processedAt = new Date().toISOString();
         prevEvent.updatedAt = new Date().toISOString();
       }
