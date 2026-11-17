@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { Request } from 'express';
 import { getPostgresPoolConfig } from '../db/index';
 import { getEncryptionKey } from '../security/encryption';
@@ -77,9 +78,128 @@ export function resolveAuthRateLimitFailurePolicy(
 
 const KNOWN_PLACEHOLDER_URLS = new Set(['MY_APP_URL', 'http://localhost:3000', 'https://example.com']);
 
+function expandIpv6Hextets(rawAddr: string): number[] | null {
+  const zoneIdx = rawAddr.indexOf('%');
+  let addr = (zoneIdx >= 0 ? rawAddr.slice(0, zoneIdx) : rawAddr).toLowerCase();
+  if (!addr) return null;
+
+  // Handle dotted IPv4-embedded suffix (e.g. ::ffff:127.0.0.1 or ::127.0.0.1)
+  const lastColon = addr.lastIndexOf(':');
+  let ipv4TailHextets: number[] | null = null;
+  if (lastColon !== -1 && addr.slice(lastColon + 1).includes('.')) {
+    const ipv4Part = addr.slice(lastColon + 1);
+    if (isIP(ipv4Part) !== 4) return null;
+    const octets = ipv4Part.split('.').map(Number);
+    ipv4TailHextets = [(octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]];
+    const prefix = addr.slice(0, lastColon);
+    addr = prefix.endsWith(':') ? `${prefix}:` : prefix;
+  }
+
+  const dblParts = addr.split('::');
+  if (dblParts.length > 2) return null;
+
+  const parseGroups = (part: string): number[] | null => {
+    if (!part) return [];
+    const tokens = part.split(':');
+    const out: number[] = [];
+    for (const tok of tokens) {
+      if (!/^[0-9a-f]{1,4}$/.test(tok)) return null;
+      out.push(parseInt(tok, 16));
+    }
+    return out;
+  };
+
+  let hextets: number[];
+  if (dblParts.length === 2) {
+    const left = parseGroups(dblParts[0]);
+    const right = parseGroups(dblParts[1]);
+    if (!left || !right) return null;
+    const tailLen = ipv4TailHextets ? ipv4TailHextets.length : 0;
+    const missing = 8 - (left.length + right.length + tailLen);
+    if (missing < 1) return null;
+    hextets = [
+      ...left,
+      ...new Array<number>(missing).fill(0),
+      ...right,
+      ...(ipv4TailHextets || []),
+    ];
+  } else {
+    const groups = parseGroups(addr);
+    if (!groups) return null;
+    hextets = [...groups, ...(ipv4TailHextets || [])];
+  }
+
+  return hextets.length === 8 ? hextets : null;
+}
+
+/**
+ * Returns true if the parsed URL hostname resolves to a loopback or local-only address:
+ * - localhost, localhost., *.localhost, localhost.localdomain
+ * - IPv4 loopback (127.0.0.0/8) or unspecified 0.0.0.0/8
+ * - IPv6 loopback ([::1], [0:0:0:0:0:0:0:1], [::0:1], uppercase) or unspecified ([::])
+ * - IPv4-mapped / IPv4-compatible IPv6 loopback ([::ffff:127.0.0.1], [::ffff:7f00:1], [::127.0.0.1])
+ */
+export function isLoopbackOrLocalHostname(rawHostname: string): boolean {
+  if (!rawHostname || typeof rawHostname !== 'string') {
+    return false;
+  }
+
+  const trimmed = rawHostname.trim().toLowerCase().replace(/\.+$/, '');
+  if (!trimmed) return false;
+
+  const unbracketed =
+    trimmed.startsWith('[') && trimmed.endsWith(']')
+      ? trimmed.slice(1, -1)
+      : trimmed;
+
+  const zoneIdx = unbracketed.indexOf('%');
+  const host = zoneIdx >= 0 ? unbracketed.slice(0, zoneIdx) : unbracketed;
+  if (!host) return false;
+
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === 'localhost.localdomain'
+  ) {
+    return true;
+  }
+
+  const ipVer = isIP(host);
+  if (ipVer === 4) {
+    const firstOctet = Number(host.split('.')[0]);
+    return firstOctet === 127 || firstOctet === 0;
+  }
+
+  if (ipVer === 6) {
+    const h = expandIpv6Hextets(host);
+    if (!h) return true; // Fail closed on unparseable IPv6 literal
+
+    const first6Zero =
+      h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0;
+
+    // :: (0:0:0:0:0:0:0:0) or ::1 (0:0:0:0:0:0:0:1)
+    if (first6Zero && h[6] === 0 && (h[7] === 0 || h[7] === 1)) {
+      return true;
+    }
+
+    // IPv4-mapped (::ffff:w.x.y.z) or IPv4-compatible (::w.x.y.z)
+    const isMappedPrefix =
+      h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 &&
+      (h[5] === 0xffff || h[5] === 0);
+    if (isMappedPrefix) {
+      const topOctet = h[6] >> 8;
+      if (topOctet === 127 || (h[6] === 0 && h[7] === 0)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 /**
  * Validates and normalizes an application base URL.
- * In production, enforces HTTPS, no embedded credentials, no query/hash, and rejects dev placeholders.
+ * In production, enforces HTTPS, no embedded credentials, no query/hash, and rejects dev/loopback hosts.
  */
 export function validateProductionAppUrl(
   rawUrl: string | undefined,
@@ -110,13 +230,13 @@ export function validateProductionAppUrl(
     return { valid: false, error: `${varName} must not contain query parameters or fragments.` };
   }
 
-  const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
+  const isLocalHost = isLoopbackOrLocalHostname(parsed.hostname);
   if (!options.allowHttpLocal) {
     if (parsed.protocol !== 'https:') {
       return { valid: false, error: `${varName} must use https:// in production.` };
     }
     if (isLocalHost) {
-      return { valid: false, error: `${varName} must not point to localhost in production.` };
+      return { valid: false, error: `${varName} must not point to localhost or loopback addresses in production.` };
     }
   } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     return { valid: false, error: `${varName} must use http:// or https://.` };
@@ -160,13 +280,13 @@ function validateShopifyEndpointOverride(
     return { valid: false, error: `${varName} must not contain fragments.` };
   }
 
-  const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
+  const isLocalHost = isLoopbackOrLocalHostname(parsed.hostname);
   if (isProd) {
     if (parsed.protocol !== 'https:') {
       return { valid: false, error: `${varName} must use https:// in production.` };
     }
     if (isLocalHost) {
-      return { valid: false, error: `${varName} must not point to localhost in production.` };
+      return { valid: false, error: `${varName} must not point to localhost or loopback addresses in production.` };
     }
     const allowedOrigins = getAllowedRedirectOrigins(trustedBaseUrl);
     if (!allowedOrigins.has(parsed.origin)) {
@@ -291,8 +411,18 @@ export function getTrustedShopifyUrls(): { appUrl: string; redirectUri: string; 
  */
 export function getAllowedRedirectOrigins(baseUrl: string): Set<string> {
   const allowed = new Set<string>();
+  const isProd = process.env.NODE_ENV === 'production';
   try {
-    allowed.add(new URL(baseUrl).origin);
+    const parsedBase = new URL(baseUrl);
+    if (
+      !isProd ||
+      (parsedBase.protocol === 'https:' &&
+        !parsedBase.username &&
+        !parsedBase.password &&
+        !isLoopbackOrLocalHostname(parsedBase.hostname))
+    ) {
+      allowed.add(parsedBase.origin);
+    }
   } catch {
     // ignore
   }
@@ -304,7 +434,13 @@ export function getAllowedRedirectOrigins(baseUrl: string): Set<string> {
       if (!candidate) continue;
       try {
         const parsed = new URL(candidate);
-        if (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:') {
+        if (parsed.username || parsed.password) {
+          continue;
+        }
+        if (
+          isProd &&
+          (parsed.protocol !== 'https:' || isLoopbackOrLocalHostname(parsed.hostname))
+        ) {
           continue;
         }
         allowed.add(parsed.origin);
@@ -343,7 +479,9 @@ export function getTrustedBaseUrl(req?: Pick<Request, 'headers' | 'protocol'>): 
   }
 
   const rawHost = String(req?.headers?.host || 'localhost:3000').trim();
-  const safeHost = /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(rawHost) ? rawHost : 'localhost:3000';
+  const safeHost = /^([a-zA-Z0-9.-]+|\[[0-9a-fA-F:]+\])(:\d{1,5})?$/.test(rawHost)
+    ? rawHost
+    : 'localhost:3000';
   const rawProto = String(req?.headers?.['x-forwarded-proto'] || req?.protocol || 'http').split(',')[0].trim().toLowerCase();
   const protocol = rawProto === 'https' ? 'https' : 'http';
   return `${protocol}://${safeHost}`;
@@ -368,6 +506,8 @@ export function resolveTrustedRedirectUrl(
     return fallback;
   }
 
+  const isProd = process.env.NODE_ENV === 'production';
+
   // Reject protocol-relative paths like //evil.com
   if (trimmed.startsWith('/')) {
     if (trimmed.startsWith('//')) {
@@ -376,6 +516,9 @@ export function resolveTrustedRedirectUrl(
     try {
       const resolved = new URL(trimmed, baseUrl);
       if (resolved.origin === new URL(baseUrl).origin) {
+        if (isProd && (resolved.protocol !== 'https:' || isLoopbackOrLocalHostname(resolved.hostname))) {
+          return fallback;
+        }
         return resolved.toString();
       }
     } catch {
@@ -387,7 +530,10 @@ export function resolveTrustedRedirectUrl(
   try {
     const parsedClient = new URL(trimmed);
     const allowedOrigins = getAllowedRedirectOrigins(baseUrl);
-    if (process.env.NODE_ENV === 'production' && parsedClient.protocol !== 'https:') {
+    if (
+      isProd &&
+      (parsedClient.protocol !== 'https:' || isLoopbackOrLocalHostname(parsedClient.hostname))
+    ) {
       return fallback;
     }
     if (allowedOrigins.has(parsedClient.origin)) {
