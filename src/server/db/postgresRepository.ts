@@ -17,7 +17,7 @@ import {
   CatalogVersionValidationError,
   WorkspaceLockOrderError
 } from './repository';
-import { computeMigrationChecksum, getDefaultMigrationsDir } from './migrate';
+import { computeMigrationChecksum, getDefaultMigrationsDir, sanitizeDiagnosticMessage } from './migrate';
 import {
   TopicPresenceState,
   VisibilityConflictPolicy,
@@ -199,7 +199,8 @@ export class PostgresRepository implements DatabaseRepository {
     try {
       const res = await this.query('SELECT 1');
       return res.rowCount !== null && res.rowCount > 0;
-    } catch {
+    } catch (err) {
+      console.warn('[AIXSHOP Database] PostgreSQL connectivity ping failed:', sanitizeDiagnosticMessage(err));
       return false;
     }
   }
@@ -2308,6 +2309,60 @@ export class PostgresRepository implements DatabaseRepository {
        ORDER BY COALESCE(next_retry_at, lease_expires_at, processed_at, created_at) ASC, created_at ASC
        LIMIT $3`,
       [providerFilter, maxAttempts, limit]
+    );
+
+    return res.rows.map(r => this.mapBillingEventRow(r));
+  }
+
+  async finalizeExpiredExhaustedBillingEvents(options?: {
+    maxAttempts?: number;
+    limit?: number;
+    provider?: string;
+    reason?: string;
+  }): Promise<BillingEventRecord[]> {
+    const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
+    const providerFilter = options?.provider ? options.provider : null;
+    const reason = (
+      options?.reason ||
+      `Worker lease expired on final attempt (maxAttempts=${maxAttempts}) without completion; event finalized to permanently_failed for manual replay.`
+    ).slice(0, 500);
+
+    const res = await this.query<any>(
+      `WITH candidates AS (
+         SELECT id
+         FROM billing_events
+         WHERE ($1::text IS NULL OR provider = $1)
+           AND status = 'processing'
+           AND COALESCE(attempt_count, 0) >= $2
+           AND (
+             (lease_expires_at IS NOT NULL AND lease_expires_at < clock_timestamp())
+             OR (lease_expires_at IS NULL AND processed_at < clock_timestamp() - INTERVAL '5 minutes')
+           )
+         ORDER BY COALESCE(lease_expires_at, processed_at, created_at) ASC, created_at ASC
+         LIMIT $3
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE billing_events AS b
+       SET status = 'permanently_failed',
+           lease_expires_at = NULL,
+           next_retry_at = NULL,
+           last_error = CASE
+             WHEN b.last_error IS NOT NULL AND btrim(b.last_error) <> ''
+               THEN LEFT(b.last_error || ' | ' || $4, 500)
+             ELSE $4
+           END,
+           updated_at = clock_timestamp()
+       FROM candidates AS c
+       WHERE b.id = c.id
+         AND b.status = 'processing'
+       RETURNING b.id, b.provider, b.event_id AS "eventId", b.event_type AS "eventType",
+                 b.idempotency_key AS "idempotencyKey", b.payload_json AS "payload",
+                 b.status, b.lease_owner AS "leaseOwner", b.lease_expires_at AS "leaseExpiresAt",
+                 b.attempt_count AS "attemptCount", b.last_error AS "lastError",
+                 b.last_attempt_at AS "lastAttemptAt", b.next_retry_at AS "nextRetryAt",
+                 b.processed_at AS "processedAt", b.created_at AS "createdAt", b.updated_at AS "updatedAt"`,
+      [providerFilter, maxAttempts, limit, reason]
     );
 
     return res.rows.map(r => this.mapBillingEventRow(r));

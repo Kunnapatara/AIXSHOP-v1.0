@@ -65,6 +65,28 @@ export function getPostgresPoolConfig(): PoolConfig | null {
 
   // 1. Primary: DATABASE_URL takes highest precedence
   if (databaseUrl) {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(databaseUrl);
+    } catch {
+      throw new Error(
+        '[AIXSHOP Configuration Error] Invalid DATABASE_URL format. Must be a valid postgresql:// connection URI.'
+      );
+    }
+    if (parsedUrl.protocol !== 'postgresql:' && parsedUrl.protocol !== 'postgres:') {
+      throw new Error(
+        '[AIXSHOP Configuration Error] Invalid DATABASE_URL scheme. Expected postgresql:// or postgres://.'
+      );
+    }
+    const hasExplicitUrlUser =
+      Boolean(parsedUrl.username) ||
+      Boolean(parsedUrl.searchParams.get('user')?.trim()) ||
+      Boolean(process.env.PGUSER?.trim());
+    if (!hasExplicitUrlUser) {
+      throw new Error(
+        '[AIXSHOP Configuration Error] DATABASE_URL is missing a database user. Specify user credentials in DATABASE_URL to prevent host OS role fallback.'
+      );
+    }
     return {
       connectionString: databaseUrl,
       ...(sslConfig !== undefined ? { ssl: sslConfig } : {}),

@@ -1532,6 +1532,22 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
         );
 
         // 4. Failed quota update does not mutate catalog or advance version
+        // Explicitly configure a tight workspace quota (50 SKUs) so 120 SKUs deterministically exceeds entitlement.
+        const preQuotaStore = await repoB.getStoreByWorkspace(wsId);
+        assert.ok(preQuotaStore, 'Workspace store profile must exist before quota update');
+        await repoA.saveStoreProfile(wsId, {
+          ...preQuotaStore!,
+          skuLimit: 50,
+        });
+        const configuredStore = await repoB.getStoreByWorkspace(wsId);
+        assert.equal(configuredStore?.skuLimit, 50, 'Workspace must have explicit SKU quota of 50');
+
+        const preQuotaAuditCount = await poolA.query<{ cnt: number }>(
+          `SELECT count(*)::int AS cnt FROM audit_runs WHERE workspace_id = $1`,
+          [wsId]
+        );
+        assert.equal(preQuotaAuditCount.rows[0].cnt, 0);
+
         const overQuotaProducts = Array.from({ length: 120 }, (_, i) => ({
           ...makeCat(`${runId}_p_oq_${i}`, `SKU-OQ-${runId}-${i}`).products[0],
         }));
@@ -1542,12 +1558,33 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
               { ...makeCat(`${runId}_p_oq`, `SKU-OQ-${runId}`, 3), products: overQuotaProducts },
               { expectedVersion: 3 }
             ),
-          (err: any) => err.code === 'PLAN_QUOTA_EXCEEDED'
+          (err: any) => {
+            assert.equal(err.code, 'PLAN_QUOTA_EXCEEDED');
+            assert.equal(err.limit, 50);
+            assert.equal(err.projectedUsage, 120);
+            return true;
+          }
         );
 
         const verifiedCat = (await repoB.loadWorkspaceCatalog(wsId))!;
-        assert.equal(verifiedCat.catalogVersion, 3);
-        assert.equal(verifiedCat.products[0].id, `${runId}_p_winA`);
+        assert.equal(verifiedCat.catalogVersion, 3, 'Failed quota update must not advance catalogVersion');
+        assert.equal(verifiedCat.products.length, 1, 'Failed quota update must not write partial products');
+        assert.equal(verifiedCat.products[0].id, `${runId}_p_winA`, 'Existing catalog product must remain intact');
+
+        const pgQuotaVerification = await poolB.query<{
+          product_count: number;
+          catalog_version: number;
+          audit_count: number;
+        }>(
+          `SELECT
+             (SELECT count(*)::int FROM products WHERE workspace_id = $1) AS product_count,
+             (SELECT catalog_version::int FROM stores WHERE workspace_id = $1) AS catalog_version,
+             (SELECT count(*)::int FROM audit_runs WHERE workspace_id = $1) AS audit_count`,
+          [wsId]
+        );
+        assert.equal(pgQuotaVerification.rows[0].product_count, 1, 'No partial product rows may be persisted');
+        assert.equal(pgQuotaVerification.rows[0].catalog_version, 3, 'PostgreSQL catalog_version must remain 3');
+        assert.equal(pgQuotaVerification.rows[0].audit_count, 0, 'No unexpected audit history mutation may occur');
 
         // 5. executeWorkspaceAudit increments catalogVersion and returns updated catalogVersion
         const auditOut = await repoA.executeWorkspaceAudit(wsId);

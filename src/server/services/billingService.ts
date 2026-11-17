@@ -399,7 +399,8 @@ export class BillingService {
       leaseOwner,
       effectiveLease,
       attemptCount,
-      this.recoveryPolicy
+      this.recoveryPolicy,
+      'webhook'
     );
   }
 
@@ -430,22 +431,56 @@ export class BillingService {
     const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
     const leasePrefix = options?.leaseOwnerPrefix || 'recovery_worker';
 
-    const candidates = await this.repo.listRecoverableBillingEvents({
+    const finalizedExhausted = await this.repo.finalizeExpiredExhaustedBillingEvents({
       maxAttempts: effectiveRecovery.maxAttempts,
       limit,
       provider: this.provider.providerName,
     });
 
     const summary: WebhookRecoverySummary = {
-      scanned: candidates.length,
+      scanned: finalizedExhausted.length,
       recovered: 0,
       ignored: 0,
       retriedFailed: 0,
-      permanentlyFailed: 0,
+      permanentlyFailed: finalizedExhausted.length,
       skippedContended: 0,
       leaseLost: 0,
       details: [],
     };
+
+    for (const finalized of finalizedExhausted) {
+      console.warn('[AIXSHOP Billing Recovery]', {
+        eventId: finalized.eventId,
+        eventType: finalized.eventType,
+        currentStatus: 'processing',
+        targetStatus: 'permanently_failed',
+        attemptCount: finalized.attemptCount ?? effectiveRecovery.maxAttempts,
+        maxAttempts: effectiveRecovery.maxAttempts,
+        previousLeaseOwner: finalized.leaseOwner || null,
+        classification: 'final_attempt_lease_expired',
+        failureStatePersisted: true,
+      });
+      summary.details.push({
+        eventId: finalized.eventId,
+        eventType: finalized.eventType,
+        attemptCount: finalized.attemptCount ?? effectiveRecovery.maxAttempts,
+        outcome: 'permanently_failed',
+        message:
+          finalized.lastError ||
+          `Worker lease expired on final attempt (maxAttempts=${effectiveRecovery.maxAttempts}); finalized to permanently_failed.`,
+      });
+    }
+
+    const remainingLimit = Math.max(0, limit - finalizedExhausted.length);
+    const candidates =
+      remainingLimit > 0
+        ? await this.repo.listRecoverableBillingEvents({
+            maxAttempts: effectiveRecovery.maxAttempts,
+            limit: remainingLimit,
+            provider: this.provider.providerName,
+          })
+        : [];
+    summary.scanned += candidates.length;
 
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
@@ -476,21 +511,45 @@ export class BillingService {
 
       if (!payload || typeof payload !== 'object' || typeof payload.id !== 'string' || typeof payload.type !== 'string') {
         const sanitizedMsg = sanitizeBillingErrorMessage('Stored webhook payload is invalid or missing event metadata.');
-        await this.repo.markBillingEventFailure({
+        const persistOutcome = await this.recordBillingFailureState({
           eventId: claimedRecord.eventId,
           leaseOwner: claim.leaseOwner,
-          status: 'permanently_failed',
+          targetStatus: 'permanently_failed',
           errorMessage: sanitizedMsg,
           nextRetryAt: null,
-        }).catch(() => {});
-        summary.permanentlyFailed += 1;
-        summary.details.push({
-          eventId: claimedRecord.eventId,
-          eventType: claimedRecord.eventType,
           attemptCount,
-          outcome: 'permanently_failed',
-          message: sanitizedMsg,
+          classification: 'invalid_stored_payload',
+          operation: 'recovery_sweep',
         });
+
+        if (persistOutcome.persisted) {
+          summary.permanentlyFailed += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'permanently_failed',
+            message: sanitizedMsg,
+          });
+        } else if (persistOutcome.leaseLost) {
+          summary.leaseLost += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'lease_lost',
+            message: `Lease lost before invalid-payload failure could be persisted (${persistOutcome.persistenceError}); original error: ${sanitizedMsg}`,
+          });
+        } else {
+          summary.retriedFailed += 1;
+          summary.details.push({
+            eventId: claimedRecord.eventId,
+            eventType: claimedRecord.eventType,
+            attemptCount,
+            outcome: 'retried_failed',
+            message: `Failure-state persistence failed (${persistOutcome.persistenceError}); event remains in processing for lease-expiry recovery. Original error: ${sanitizedMsg}`,
+          });
+        }
         continue;
       }
 
@@ -500,7 +559,8 @@ export class BillingService {
           claim.leaseOwner,
           effectiveLease,
           attemptCount,
-          effectiveRecovery
+          effectiveRecovery,
+          'recovery_sweep'
         );
         if (result.action === 'ignored') {
           summary.ignored += 1;
@@ -531,7 +591,7 @@ export class BillingService {
             outcome: 'lease_lost',
             message: sanitizeBillingErrorMessage(err),
           });
-        } else if (err?.permanentlyFailed) {
+        } else if (err?.permanentlyFailed && err?.failureStatePersisted !== false) {
           summary.permanentlyFailed += 1;
           summary.details.push({
             eventId: claimedRecord.eventId,
@@ -542,12 +602,16 @@ export class BillingService {
           });
         } else {
           summary.retriedFailed += 1;
+          const baseMessage = sanitizeBillingErrorMessage(err);
           summary.details.push({
             eventId: claimedRecord.eventId,
             eventType: claimedRecord.eventType,
             attemptCount,
             outcome: 'retried_failed',
-            message: sanitizeBillingErrorMessage(err),
+            message:
+              err?.failureStatePersisted === false
+                ? `${baseMessage} (failure-state persistence error: ${err.persistenceError || 'unknown'})`
+                : baseMessage,
           });
         }
       }
@@ -662,18 +726,26 @@ export class BillingService {
     }
 
     const payload = claim.event.payload as WebhookEventPayload | undefined;
+    const replayAttemptCount = claim.event.attemptCount ?? 1;
     if (!payload || typeof payload !== 'object' || typeof payload.id !== 'string' || typeof payload.type !== 'string') {
       const sanitizedMsg = sanitizeBillingErrorMessage('Stored webhook payload is invalid or missing event metadata.');
-      await this.repo.markBillingEventFailure({
+      const persistOutcome = await this.recordBillingFailureState({
         eventId: claim.event.eventId,
         leaseOwner: claim.leaseOwner,
-        status: 'permanently_failed',
+        targetStatus: 'permanently_failed',
         errorMessage: sanitizedMsg,
         nextRetryAt: null,
-      }).catch(() => {});
+        attemptCount: replayAttemptCount,
+        classification: 'invalid_stored_payload',
+        operation: 'manual_replay',
+      });
       const err: any = new Error(sanitizedMsg);
-      err.statusCode = 400;
-      err.permanentlyFailed = true;
+      err.statusCode = persistOutcome.persisted ? 400 : 503;
+      err.permanentlyFailed = persistOutcome.persisted;
+      err.failureStatePersisted = persistOutcome.persisted;
+      if (!persistOutcome.persisted) {
+        err.persistenceError = persistOutcome.persistenceError;
+      }
       throw err;
     }
 
@@ -681,9 +753,55 @@ export class BillingService {
       payload,
       claim.leaseOwner,
       effectiveLease,
-      claim.event.attemptCount ?? 1,
-      effectiveRecovery
+      replayAttemptCount,
+      effectiveRecovery,
+      'manual_replay'
     );
+  }
+
+  private async recordBillingFailureState(params: {
+    eventId: string;
+    leaseOwner?: string;
+    targetStatus: 'failed' | 'permanently_failed';
+    errorMessage: string;
+    nextRetryAt: string | null;
+    attemptCount: number;
+    classification: string;
+    operation: 'webhook' | 'recovery_sweep' | 'manual_replay';
+  }): Promise<{ persisted: boolean; leaseLost: boolean; persistenceError?: string }> {
+    try {
+      await this.repo.markBillingEventFailure({
+        eventId: params.eventId,
+        leaseOwner: params.leaseOwner,
+        status: params.targetStatus,
+        errorMessage: params.errorMessage,
+        nextRetryAt: params.nextRetryAt,
+      });
+      return { persisted: true, leaseLost: false };
+    } catch (persistErr: any) {
+      const persistenceError = sanitizeBillingErrorMessage(persistErr);
+      const leaseLost =
+        persistErr?.code === 'BILLING_LEASE_LOST' ||
+        /lease ownership lost or expired/i.test(typeof persistErr?.message === 'string' ? persistErr.message : '');
+      console.error('[AIXSHOP Billing Error Persistence]', {
+        eventId: params.eventId,
+        currentStatus: 'processing',
+        targetStatus: params.targetStatus,
+        attemptCount: params.attemptCount,
+        classification: params.classification,
+        operation: params.operation,
+        leaseOwner: params.leaseOwner || null,
+        failureStatePersisted: false,
+        leaseLost,
+        persistenceError,
+        originalError: params.errorMessage,
+      });
+      return {
+        persisted: false,
+        leaseLost,
+        persistenceError,
+      };
+    }
   }
 
   private async executeClaimedWebhookEvent(
@@ -691,7 +809,8 @@ export class BillingService {
     leaseOwner: string,
     effectiveLease: { leaseDurationMs: number; heartbeatIntervalMs: number },
     attemptCount: number,
-    recoveryPolicy: Required<BillingRecoveryPolicy>
+    recoveryPolicy: Required<BillingRecoveryPolicy>,
+    operation: 'webhook' | 'recovery_sweep' | 'manual_replay' = 'webhook'
   ): Promise<WebhookProcessingResult> {
     // Automatic lease heartbeat lifecycle + guarded dispatch
     const hb = {
@@ -803,19 +922,27 @@ export class BillingService {
           : computeNextRetryAt(attemptCount, recoveryPolicy.baseBackoffMs, recoveryPolicy.maxBackoffMs);
         const errorMessage = sanitizeBillingErrorMessage(err);
 
-        if (err && typeof err === 'object') {
-          err.permanentlyFailed = shouldMarkPermanent;
-        }
+        const persistOutcome = await this.recordBillingFailureState({
+          eventId: event.id,
+          leaseOwner,
+          targetStatus: failureStatus,
+          errorMessage,
+          nextRetryAt,
+          attemptCount,
+          classification: classification.reason,
+          operation,
+        });
 
-        await this.repo
-          .markBillingEventFailure({
-            eventId: event.id,
-            leaseOwner,
-            status: failureStatus,
-            errorMessage,
-            nextRetryAt,
-          })
-          .catch(() => {});
+        if (err && typeof err === 'object') {
+          err.failureStatePersisted = persistOutcome.persisted;
+          if (persistOutcome.persisted) {
+            err.permanentlyFailed = shouldMarkPermanent;
+          } else {
+            // Never claim an event is permanently failed unless DB confirmed the state transition.
+            err.permanentlyFailed = false;
+            err.persistenceError = persistOutcome.persistenceError;
+          }
+        }
       }
       throw err;
     } finally {

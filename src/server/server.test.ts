@@ -930,9 +930,12 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           }
         );
       } finally {
-        if (originalUrl) process.env.DATABASE_URL = originalUrl;
-        if (originalHost) process.env.SQL_HOST = originalHost;
-        if (originalPgHost) process.env.PGHOST = originalPgHost;
+        if (originalUrl !== undefined) process.env.DATABASE_URL = originalUrl;
+        else delete process.env.DATABASE_URL;
+        if (originalHost !== undefined) process.env.SQL_HOST = originalHost;
+        else delete process.env.SQL_HOST;
+        if (originalPgHost !== undefined) process.env.PGHOST = originalPgHost;
+        else delete process.env.PGHOST;
       }
     });
 
@@ -957,9 +960,12 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           }
         );
       } finally {
-        if (originalUrl) process.env.DATABASE_URL = originalUrl;
-        if (originalHost) process.env.SQL_HOST = originalHost;
-        if (originalPgHost) process.env.PGHOST = originalPgHost;
+        if (originalUrl !== undefined) process.env.DATABASE_URL = originalUrl;
+        else delete process.env.DATABASE_URL;
+        if (originalHost !== undefined) process.env.SQL_HOST = originalHost;
+        else delete process.env.SQL_HOST;
+        if (originalPgHost !== undefined) process.env.PGHOST = originalPgHost;
+        else delete process.env.PGHOST;
       }
     });
 
@@ -1090,6 +1096,8 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
     });
 
     test('1b. internally created pool: pool.connect() rejects: calls pool.end() and preserves original error', async () => {
+      const hadDatabaseUrl = Object.prototype.hasOwnProperty.call(process.env, 'DATABASE_URL');
+      const savedDatabaseUrl = process.env.DATABASE_URL;
       process.env.DATABASE_URL = 'postgresql://mock_user:mock_pass@127.0.0.1:5432/mock_db';
       let internalPoolEndCalled = false;
       const originalConnect = Pool.prototype.connect;
@@ -1116,7 +1124,11 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       } finally {
         Pool.prototype.connect = originalConnect;
         Pool.prototype.end = originalEnd;
-        delete process.env.DATABASE_URL;
+        if (hadDatabaseUrl && savedDatabaseUrl !== undefined) {
+          process.env.DATABASE_URL = savedDatabaseUrl;
+        } else {
+          delete process.env.DATABASE_URL;
+        }
       }
     });
 
@@ -2445,25 +2457,34 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
   // 9. Live PostgreSQL Infrastructure Check (Criterion 8 Compliance & Workstream 1)
   describe('Live PostgreSQL Infrastructure Verification', () => {
-    const hasLivePg = Boolean(process.env.DATABASE_URL || process.env.SQL_HOST || process.env.PGHOST);
+    const initialHasLivePg = Boolean(
+      process.env.DATABASE_URL?.trim() || process.env.SQL_HOST?.trim() || process.env.PGHOST?.trim()
+    );
+    const initialDatabaseUrl = process.env.DATABASE_URL;
 
     function buildConditionalPgPoolConfig(): Record<string, any> {
       const cfg = getPostgresPoolConfig();
-      if (cfg) return cfg;
-      if (process.env.DATABASE_URL) {
-        return { connectionString: process.env.DATABASE_URL };
+      if (!cfg) {
+        throw new Error(
+          '[AIXSHOP Test Configuration Error] Live PostgreSQL config became unavailable before infrastructure verification (must not fall back to host OS root role).'
+        );
       }
-      return {
-        host: process.env.SQL_HOST || process.env.PGHOST,
-        port: Number(process.env.SQL_PORT || process.env.PGPORT || 5432),
-        user: process.env.SQL_USER || process.env.PGUSER,
-        password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
-        database: process.env.SQL_DB_NAME || process.env.PGDATABASE,
-      };
+      return cfg;
     }
 
-    test('PostgreSQL live infrastructure status check', { skip: !hasLivePg ? 'SKIPPED: Live PostgreSQL infrastructure credentials (DATABASE_URL / SQL_HOST / PGHOST) not provisioned in current environment' : undefined }, async () => {
-      const pool = new Pool(buildConditionalPgPoolConfig());
+    test('PostgreSQL live infrastructure status check', { skip: !initialHasLivePg ? 'SKIPPED: Live PostgreSQL infrastructure credentials (DATABASE_URL / SQL_HOST / PGHOST) not provisioned in current environment' : undefined }, async () => {
+      if (initialDatabaseUrl) {
+        assert.equal(
+          process.env.DATABASE_URL,
+          initialDatabaseUrl,
+          'Configured CI DATABASE_URL must remain intact across preceding tests prior to pool initialization'
+        );
+      }
+      const poolConfig = buildConditionalPgPoolConfig();
+      if (initialDatabaseUrl) {
+        assert.equal(poolConfig.connectionString, initialDatabaseUrl);
+      }
+      const pool = new Pool(poolConfig);
       try {
         const pgRepo = new PostgresRepository(pool);
         const isConnected = await pgRepo.ping();
@@ -2566,7 +2587,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
 
     test('Invalid database credentials report connectivity false and clean up pool', async () => {
       // Simulate invalid credentials when running with live PG endpoint, or reject deterministically against mock pool failure
-      if (hasLivePg && process.env.DATABASE_URL) {
+      if (initialHasLivePg && process.env.DATABASE_URL) {
         const parsed = new URL(process.env.DATABASE_URL);
         parsed.username = 'nonexistent_invalid_role';
         parsed.password = 'definitely_wrong_password';
@@ -2602,6 +2623,65 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
           await mockBadCredPool.end();
         }
         assert.equal(ended, true);
+      }
+    });
+
+    test('Invalid DATABASE_URL (missing user or malformed URI) fails cleanly without leaking credentials and prevents host OS role fallback', () => {
+      const savedUrl = process.env.DATABASE_URL;
+      const savedPgUser = process.env.PGUSER;
+      try {
+        delete process.env.PGUSER;
+        process.env.DATABASE_URL = 'postgresql://localhost:5432/aixshop_test';
+        assert.throws(
+          () => getPostgresPoolConfig(),
+          (err: any) => {
+            assert.match(err.message, /\[AIXSHOP Configuration Error\]/i);
+            assert.match(err.message, /missing a database user/i);
+            return true;
+          }
+        );
+
+        process.env.DATABASE_URL = 'not_a_valid_url_with_secret=SuperSecret123';
+        assert.throws(
+          () => getPostgresPoolConfig(),
+          (err: any) => {
+            assert.match(err.message, /\[AIXSHOP Configuration Error\]/i);
+            assert.doesNotMatch(err.message, /SuperSecret123/);
+            return true;
+          }
+        );
+      } finally {
+        if (savedUrl !== undefined) process.env.DATABASE_URL = savedUrl;
+        else delete process.env.DATABASE_URL;
+        if (savedPgUser !== undefined) process.env.PGUSER = savedPgUser;
+        else delete process.env.PGUSER;
+      }
+    });
+
+    test('PostgreSQL connection ping failure logs credential-redacted diagnostic message', async () => {
+      const warnings: string[] = [];
+      const origWarn = console.warn;
+      console.warn = (...args: any[]) => {
+        warnings.push(args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+      };
+      const leakingMockPool: any = {
+        query: async () => {
+          throw new Error(
+            'connect ECONNREFUSED postgresql://ci_user:TopSecretPgPass99@db.internal:5432/prod password=TopSecretPgPass99'
+          );
+        },
+        end: async () => {},
+      };
+      try {
+        const pgRepo = new PostgresRepository(leakingMockPool);
+        const ok = await pgRepo.ping();
+        assert.equal(ok, false);
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /PostgreSQL connectivity ping failed/);
+        assert.match(warnings[0], /postgresql:\/\/\*\*\*@db\.internal:5432\/prod/);
+        assert.doesNotMatch(warnings[0], /TopSecretPgPass99/);
+      } finally {
+        console.warn = origWarn;
       }
     });
   });

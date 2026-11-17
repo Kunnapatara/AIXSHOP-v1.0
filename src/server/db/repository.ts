@@ -215,6 +215,12 @@ export interface DatabaseRepository {
     limit?: number;
     provider?: string;
   }): Promise<BillingEventRecord[]>;
+  finalizeExpiredExhaustedBillingEvents(options?: {
+    maxAttempts?: number;
+    limit?: number;
+    provider?: string;
+    reason?: string;
+  }): Promise<BillingEventRecord[]>;
   claimBillingEventForRecovery(
     eventId: string,
     options?: {

@@ -2428,6 +2428,388 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       const cliSummary = await runBillingWebhookRecoveryCli(['--limit=10', '--max-attempts=3']);
       assert.ok(cliSummary);
     });
+
+    test('C.12 Final-attempt worker crash: unexpired lease stays processing; expired lease at maxAttempts transitions to permanently_failed preserving payload & error history', async () => {
+      const crashRepo = new MemoryRepository(false);
+      const wsC = `ws_task_c_final_${Date.now()}`;
+      const owner = await crashRepo.createUser({ id: `usr_${wsC}`, email: `${wsC}@example.com`, passwordHash: 'hash', fullName: 'Final Crash' });
+      await crashRepo.createWorkspace({ id: wsC, name: 'Final Crash WS', slug: `ws-${wsC}` }, owner.id);
+
+      const eventId = `evt_c_final_crash_${Date.now()}`;
+      const originalCreatedAt = '2026-11-10T01:02:03.000Z';
+      const originalPayload = {
+        id: eventId,
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: wsC,
+            customer: 'cus_final_1',
+            subscription: 'sub_final_1',
+            metadata: { tier: 'Growth' },
+            payment_status: 'paid',
+          },
+        },
+      };
+
+      // Seed failed attempt 1 with prior error history, then claim final attempt (maxAttempts = 2) with short lease
+      await crashRepo.saveBillingEvent({
+        id: `bevt_${eventId}`,
+        provider: 'sandbox',
+        eventId,
+        eventType: originalPayload.type,
+        idempotencyKey: eventId,
+        payload: originalPayload,
+        status: 'failed',
+        attemptCount: 1,
+        lastError: 'Attempt 1 transient timeout',
+        processedAt: new Date(Date.now() - 10_000).toISOString(),
+        createdAt: originalCreatedAt,
+      });
+
+      const finalClaim = await crashRepo.claimBillingEventForRecovery(eventId, {
+        leaseOwner: 'worker_final_attempt',
+        leaseDurationMs: 80,
+        maxAttempts: 2,
+        provider: 'sandbox',
+      });
+      assert.equal(finalClaim.claimed, true);
+      assert.equal(finalClaim.event?.attemptCount, 2);
+      assert.equal(finalClaim.event?.status, 'processing');
+
+      const svc = new BillingService(crashRepo, sandboxProvider, undefined, { maxAttempts: 2 });
+
+      // B: While lease is still valid/unexpired, recovery MUST NOT finalize it prematurely
+      const beforeExpirySummary = await svc.recoverPendingWebhookEvents({ limit: 50, maxAttempts: 2 });
+      assert.equal(beforeExpirySummary.permanentlyFailed, 0);
+      assert.equal(beforeExpirySummary.details.some(d => d.eventId === eventId), false);
+      assert.equal((await crashRepo.getBillingEventById(eventId))?.status, 'processing');
+
+      // Worker crashes; wait for lease to expire
+      await new Promise(r => setTimeout(r, 110));
+
+      // A: Recovery runs after lease expiry -> transitions processing + exhausted -> permanently_failed
+      const afterExpirySummary = await svc.recoverPendingWebhookEvents({ limit: 50, maxAttempts: 2 });
+      assert.equal(afterExpirySummary.permanentlyFailed, 1);
+      const detail = afterExpirySummary.details.find(d => d.eventId === eventId);
+      assert.equal(detail?.outcome, 'permanently_failed');
+      assert.equal(detail?.attemptCount, 2);
+
+      const finalized = await crashRepo.getBillingEventById(eventId);
+      assert.ok(finalized);
+      assert.equal(finalized?.status, 'permanently_failed');
+      assert.equal(finalized?.leaseExpiresAt, null);
+      assert.equal(finalized?.nextRetryAt, null);
+      assert.equal(finalized?.eventId, eventId);
+      assert.equal(finalized?.attemptCount, 2);
+      assert.equal(finalized?.createdAt, originalCreatedAt);
+      assert.ok(finalized?.lastAttemptAt);
+      assert.match(finalized?.lastError || '', /Attempt 1 transient timeout/);
+      assert.match(finalized?.lastError || '', /Worker lease expired on final attempt/);
+      // Original payload strictly preserved
+      assert.deepEqual(finalized?.payload, originalPayload);
+    });
+
+    test('C.13 Completed event protection: processed & ignored events at >= maxAttempts are never changed to permanently_failed', async () => {
+      const protRepo = new MemoryRepository(false);
+      const processedId = `evt_c_done_proc_${Date.now()}`;
+      const ignoredId = `evt_c_done_ign_${Date.now()}`;
+      const pastTs = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+
+      await protRepo.saveBillingEvent({
+        id: `bevt_${processedId}`,
+        provider: 'sandbox',
+        eventId: processedId,
+        eventType: 'checkout.session.completed',
+        idempotencyKey: processedId,
+        payload: { id: processedId, type: 'checkout.session.completed' },
+        status: 'processed',
+        attemptCount: 5,
+        leaseExpiresAt: pastTs,
+        processedAt: pastTs,
+      });
+      await protRepo.saveBillingEvent({
+        id: `bevt_${ignoredId}`,
+        provider: 'sandbox',
+        eventId: ignoredId,
+        eventType: 'invoice.paid',
+        idempotencyKey: ignoredId,
+        payload: { id: ignoredId, type: 'invoice.paid' },
+        status: 'ignored',
+        attemptCount: 5,
+        leaseExpiresAt: pastTs,
+        processedAt: pastTs,
+      });
+
+      const finalized = await protRepo.finalizeExpiredExhaustedBillingEvents({
+        maxAttempts: 5,
+        limit: 50,
+        provider: 'sandbox',
+      });
+      assert.equal(finalized.length, 0);
+      assert.equal((await protRepo.getBillingEventById(processedId))?.status, 'processed');
+      assert.equal((await protRepo.getBillingEventById(ignoredId))?.status, 'ignored');
+    });
+
+    test('C.14 Concurrent exhausted-lease finalization & controlled manual reprocessing preserve historical data and prevent duplicate billing transitions', async () => {
+      const concRepo = new MemoryRepository(false);
+      const wsC = `ws_task_c_conc_dlq_${Date.now()}`;
+      const owner = await concRepo.createUser({ id: `usr_${wsC}`, email: `${wsC}@example.com`, passwordHash: 'hash', fullName: 'Conc DLQ' });
+      await concRepo.createWorkspace({ id: wsC, name: 'Conc DLQ WS', slug: `ws-${wsC}` }, owner.id);
+
+      const eventId = `evt_c_conc_dlq_${Date.now()}`;
+      const seededCreatedAt = '2026-11-09T12:00:00.000Z';
+      const payloadObj = {
+        id: eventId,
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: wsC,
+            customer: 'cus_conc_1',
+            subscription: 'sub_conc_1',
+            metadata: { tier: 'Enterprise' },
+            payment_status: 'paid',
+          },
+        },
+      };
+
+      await concRepo.saveBillingEvent({
+        id: `bevt_${eventId}`,
+        provider: 'sandbox',
+        eventId,
+        eventType: payloadObj.type,
+        idempotencyKey: eventId,
+        payload: payloadObj,
+        status: 'processing',
+        attemptCount: 3,
+        leaseOwner: 'crashed_final_worker',
+        leaseExpiresAt: new Date(Date.now() - 2000).toISOString(),
+        lastError: 'Prior attempt DB glitch',
+        processedAt: new Date(Date.now() - 10_000).toISOString(),
+        createdAt: seededCreatedAt,
+      });
+
+      const workerA = new BillingService(concRepo, sandboxProvider, undefined, { maxAttempts: 3 });
+      const workerB = new BillingService(concRepo, sandboxProvider, undefined, { maxAttempts: 3 });
+
+      const [sumA, sumB] = await Promise.all([
+        workerA.recoverPendingWebhookEvents({ leaseOwnerPrefix: 'recA', maxAttempts: 3 }),
+        workerB.recoverPendingWebhookEvents({ leaseOwnerPrefix: 'recB', maxAttempts: 3 }),
+      ]);
+
+      assert.equal(sumA.permanentlyFailed + sumB.permanentlyFailed, 1, 'Exhausted expired event must be finalized strictly once');
+      assert.equal((await concRepo.getBillingEventById(eventId))?.status, 'permanently_failed');
+      assert.equal(await concRepo.getSubscriptionByWorkspace(wsC), null, 'Finalization must not apply duplicate billing side effects');
+
+      // Disallowed replay respects allowPermanentlyFailed: false
+      const refused = await workerA.reprocessBillingEvent(eventId, { allowPermanentlyFailed: false, maxAttempts: 3 });
+      assert.equal(refused.success, false);
+      assert.equal(refused.permanentlyFailed, true);
+
+      // Authorized manual replay processes event cleanly and preserves historical event metadata
+      const replayed = await workerA.reprocessBillingEvent(eventId, { allowPermanentlyFailed: true, maxAttempts: 3 });
+      assert.equal(replayed.success, true);
+      assert.equal(replayed.action, 'processed');
+      assert.equal((await concRepo.getStoreByWorkspace(wsC))?.tier, 'Enterprise');
+
+      const afterReplay = await concRepo.getBillingEventById(eventId);
+      assert.equal(afterReplay?.status, 'processed');
+      assert.equal(afterReplay?.eventId, eventId);
+      assert.equal(afterReplay?.createdAt, seededCreatedAt);
+      assert.equal(afterReplay?.attemptCount, 4);
+      assert.deepEqual(afterReplay?.payload, payloadObj);
+    });
+
+    test('C.15 PostgresRepository.finalizeExpiredExhaustedBillingEvents SQL uses atomic SKIP LOCKED, clock_timestamp(), attempt_count >= maxAttempts, and preserves payload_json', async () => {
+      const { PostgresRepository } = await import('./db/postgresRepository');
+      const executed: Array<{ sql: string; params?: any[] }> = [];
+
+      const mockPool: any = {
+        query: async (sql: string, params?: any[]) => {
+          executed.push({ sql, params });
+          return {
+            rows: [
+              {
+                id: 'bevt_pg_final_1',
+                provider: 'stripe',
+                eventId: 'evt_pg_final_1',
+                eventType: 'checkout.session.completed',
+                idempotencyKey: 'evt_pg_final_1',
+                payload: { id: 'evt_pg_final_1', type: 'checkout.session.completed' },
+                status: 'permanently_failed',
+                leaseOwner: 'crashed_final',
+                leaseExpiresAt: null,
+                attemptCount: 5,
+                lastError: 'Prior error | Worker lease expired on final attempt (maxAttempts=5)',
+                lastAttemptAt: new Date(),
+                nextRetryAt: null,
+                processedAt: new Date(),
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            ],
+            rowCount: 1,
+          };
+        },
+        connect: async () => {
+          throw new Error('connect unused');
+        },
+        end: async () => {},
+      };
+
+      const pgRepo = new PostgresRepository(mockPool);
+      const finalized = await pgRepo.finalizeExpiredExhaustedBillingEvents({
+        maxAttempts: 5,
+        limit: 25,
+        provider: 'stripe',
+      });
+
+      assert.equal(finalized.length, 1);
+      assert.equal(finalized[0].status, 'permanently_failed');
+      assert.equal(finalized[0].attemptCount, 5);
+
+      assert.equal(executed.length, 1);
+      const sql = executed[0].sql;
+      assert.ok(sql.includes('FOR UPDATE SKIP LOCKED'), 'Must atomically lock candidates with SKIP LOCKED');
+      assert.ok(sql.includes("status = 'processing'"), 'Must only target processing rows');
+      assert.ok(sql.includes('COALESCE(attempt_count, 0) >= $2'), 'Must target exhausted attempts');
+      assert.ok(sql.includes('clock_timestamp()'), 'Must use wall-clock clock_timestamp()');
+      assert.doesNotMatch(sql, /\bNOW\(\)/i, 'Must not use transaction-frozen NOW()');
+      assert.ok(sql.includes("SET status = 'permanently_failed'"), 'Must transition to permanently_failed');
+      assert.ok(!sql.includes('payload_json ='), 'Must never overwrite payload_json');
+      assert.deepEqual(executed[0].params?.slice(0, 3), ['stripe', 5, 25]);
+    });
+
+    test('C.16 Error persistence observability: failure persistence errors are logged without secrets, original error preserved, never falsely marked permanently_failed, and recoverable on lease expiry', async () => {
+      const errRepo = new MemoryRepository(false);
+      const wsC = `ws_task_c_err_persist_${Date.now()}`;
+      const owner = await errRepo.createUser({ id: `usr_${wsC}`, email: `${wsC}@example.com`, passwordHash: 'hash', fullName: 'Err Persist' });
+      await errRepo.createWorkspace({ id: wsC, name: 'Err Persist WS', slug: `ws-${wsC}` }, owner.id);
+
+      const eventId = `evt_c_err_persist_${Date.now()}`;
+      const payloadObj = {
+        id: eventId,
+        type: 'checkout.session.completed',
+        created: Math.floor(Date.now() / 1000),
+        data: {
+          object: {
+            client_reference_id: wsC,
+            customer: 'cus_errp_1',
+            subscription: 'sub_errp_1',
+            metadata: { tier: 'Growth' },
+            payment_status: 'paid',
+          },
+        },
+      };
+
+      // 1. Failure-state persistence succeeds -> failureStatePersisted === true
+      let failTransitionMode: 'none' | 'deterministic_400' = 'deterministic_400';
+      let failMarkFailure = false;
+      const instrumentedRepo = new Proxy(errRepo, {
+        get(target, prop, receiver) {
+          if (prop === 'applyBillingTransition' && failTransitionMode === 'deterministic_400') {
+            return async () => {
+              const err: any = new Error('Deterministic catalog validation failed sk_live_secretValue999');
+              err.statusCode = 400;
+              throw err;
+            };
+          }
+          if (prop === 'markBillingEventFailure' && failMarkFailure) {
+            return async () => {
+              throw new Error(
+                'DB write failed on postgresql://dbadmin:UltraSecretPgPass123@db.internal:5432/prod password=RawDbSecret'
+              );
+            };
+          }
+          const orig = Reflect.get(target, prop, receiver);
+          return typeof orig === 'function' ? orig.bind(target) : orig;
+        },
+      });
+
+      // Test success persistence first on a separate event
+      const okPersistEvt = { ...payloadObj, id: `${eventId}_ok_persist` };
+      const svcOk = new BillingService(instrumentedRepo, sandboxProvider, { leaseDurationMs: 60, heartbeatIntervalMs: 20 });
+      await assert.rejects(
+        () => svcOk.handleWebhook(JSON.stringify(okPersistEvt), sandboxProvider.generateSignedPayload(okPersistEvt).signature),
+        (err: any) => {
+          assert.match(err.message, /Deterministic catalog validation failed/);
+          assert.equal(err.failureStatePersisted, true);
+          assert.equal(err.permanentlyFailed, true);
+          return true;
+        }
+      );
+      assert.equal((await errRepo.getBillingEventById(okPersistEvt.id))?.status, 'permanently_failed');
+
+      // 2. Failure-state persistence FAILS -> must log structured sanitized diagnostics, preserve original error,
+      //    NOT falsely claim permanentlyFailed, and leave event in 'processing' recoverable after lease expiry!
+      failMarkFailure = true;
+      const capturedErrors: any[][] = [];
+      const origConsoleError = console.error;
+      console.error = (...args: any[]) => {
+        capturedErrors.push(args);
+      };
+
+      try {
+        const svcFail = new BillingService(
+          instrumentedRepo,
+          sandboxProvider,
+          { leaseDurationMs: 70, heartbeatIntervalMs: 20 },
+          { maxAttempts: 3, baseBackoffMs: 0, maxBackoffMs: 0 }
+        );
+
+        await assert.rejects(
+          () => svcFail.handleWebhook(JSON.stringify(payloadObj), sandboxProvider.generateSignedPayload(payloadObj).signature),
+          (err: any) => {
+            // Original processing error preserved
+            assert.match(err.message, /Deterministic catalog validation failed/);
+            // Persistence failure recorded separately
+            assert.equal(err.failureStatePersisted, false);
+            assert.match(err.persistenceError || '', /DB write failed/);
+            assert.doesNotMatch(err.persistenceError || '', /UltraSecretPgPass123|RawDbSecret/);
+            // Must NEVER falsely claim permanentlyFailed when DB did not persist it
+            assert.equal(err.permanentlyFailed, false);
+            return true;
+          }
+        );
+
+        // Structured sanitized log verified
+        const persistLog = capturedErrors.find((args) => args[0] === '[AIXSHOP Billing Error Persistence]');
+        assert.ok(persistLog, 'Must emit structured error persistence log instead of swallowing error');
+        const logCtx = persistLog[1];
+        assert.equal(logCtx.eventId, eventId);
+        assert.equal(logCtx.currentStatus, 'processing');
+        assert.equal(logCtx.targetStatus, 'permanently_failed');
+        assert.equal(logCtx.attemptCount, 1);
+        assert.equal(logCtx.classification, 'deterministic_client_or_payload_error');
+        assert.equal(logCtx.operation, 'webhook');
+        assert.equal(logCtx.failureStatePersisted, false);
+        assert.ok(logCtx.leaseOwner);
+        const serializedLog = JSON.stringify(persistLog);
+        assert.doesNotMatch(serializedLog, /UltraSecretPgPass123|RawDbSecret|sk_live_secretValue999|cus_errp_1|sub_errp_1/);
+
+        // Event remains in 'processing' (NOT permanently_failed) so it stays recoverable after lease expiry
+        assert.equal((await errRepo.getBillingEventById(eventId))?.status, 'processing');
+
+        // Wait for short 70ms lease to expire, then verify recovery sweep also does not falsely mark permanently_failed while DB fail persists
+        await new Promise(r => setTimeout(r, 95));
+        const failSweep = await svcFail.recoverPendingWebhookEvents({ limit: 50, leaseDurationMs: 70, heartbeatIntervalMs: 20 });
+        assert.equal(failSweep.permanentlyFailed, 0, 'Sweep must not report permanently_failed when persistence fails');
+        assert.equal(failSweep.retriedFailed, 1);
+
+        // Wait for lease expiry again, fix DB outage, and confirm recovery reaches valid terminal state ('processed')
+        await new Promise(r => setTimeout(r, 95));
+        failTransitionMode = 'none';
+        failMarkFailure = false;
+        const okSweep = await svcFail.recoverPendingWebhookEvents({ limit: 50, leaseDurationMs: 5000, heartbeatIntervalMs: 1000 });
+        const recoveredDetail = okSweep.details.find(d => d.eventId === eventId);
+        assert.equal(recoveredDetail?.outcome, 'recovered');
+        assert.equal((await errRepo.getBillingEventById(eventId))?.status, 'processed');
+        assert.equal((await errRepo.getStoreByWorkspace(wsC))?.tier, 'Growth');
+      } finally {
+        console.error = origConsoleError;
+      }
+    });
   });
 });
 

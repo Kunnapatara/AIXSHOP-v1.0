@@ -942,6 +942,64 @@ export class MemoryRepository implements DatabaseRepository {
     return results.slice(0, limit);
   }
 
+  async finalizeExpiredExhaustedBillingEvents(options?: {
+    maxAttempts?: number;
+    limit?: number;
+    provider?: string;
+    reason?: string;
+  }): Promise<BillingEventRecord[]> {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
+    const limit = Math.max(1, Math.min(500, options?.limit ?? 50));
+    const reason = (
+      options?.reason ||
+      `Worker lease expired on final attempt (maxAttempts=${maxAttempts}) without completion; event finalized to permanently_failed for manual replay.`
+    ).slice(0, 500);
+
+    const eligible: BillingEventRecord[] = [];
+    for (const existing of this.billingEvents.values()) {
+      if (options?.provider && existing.provider !== options.provider) {
+        continue;
+      }
+      if (existing.status !== 'processing') {
+        continue;
+      }
+      if ((existing.attemptCount ?? 0) < maxAttempts) {
+        continue;
+      }
+      const processedTime = new Date(existing.processedAt).getTime();
+      const leaseExpiryTime = existing.leaseExpiresAt ? new Date(existing.leaseExpiresAt).getTime() : NaN;
+      const isExpired = !isNaN(leaseExpiryTime)
+        ? leaseExpiryTime < now
+        : now - processedTime > 5 * 60 * 1000;
+      if (isExpired) {
+        eligible.push(existing);
+      }
+    }
+
+    eligible.sort((a, b) => {
+      const ta = new Date(a.leaseExpiresAt || a.processedAt || a.createdAt || 0).getTime();
+      const tb = new Date(b.leaseExpiresAt || b.processedAt || b.createdAt || 0).getTime();
+      return ta - tb;
+    });
+
+    const finalized: BillingEventRecord[] = [];
+    for (const existing of eligible.slice(0, limit)) {
+      existing.status = 'permanently_failed';
+      existing.leaseExpiresAt = null;
+      existing.nextRetryAt = null;
+      existing.lastError =
+        existing.lastError && existing.lastError.trim() !== ''
+          ? `${existing.lastError} | ${reason}`.slice(0, 500)
+          : reason;
+      existing.updatedAt = nowIso;
+      finalized.push(JSON.parse(JSON.stringify(existing)));
+    }
+
+    return finalized;
+  }
+
   async claimBillingEventForRecovery(
     eventId: string,
     options?: {

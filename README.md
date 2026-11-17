@@ -91,3 +91,63 @@ Designed for Kubernetes, Cloud Run, and container orchestrators:
   Run `npm run db:migrate` to apply the required schema (`001_initial_schema.sql`).
 - **Readiness probe returns `503 Unavailable` with `reason: Database connection unreachable`**:
   Verify network firewalls, PostgreSQL port, and credentials.
+
+---
+
+## 6. Billing Webhook Recovery & Operations (Migration 013)
+
+AIXSHOP persists verified Stripe/billing webhook events in `billing_events` with durable lease ownership (`lease_owner`, `lease_expires_at`), retry tracking (`attempt_count`, `next_retry_at`), and sanitized `last_error` diagnostics without overwriting `payload_json`.
+
+### Scheduler Status (`BILLING_RECOVERY_ENABLED`)
+- **Disabled by default**: `BILLING_RECOVERY_ENABLED` is **not enabled automatically**. Unless explicitly set to `"true"` in a running non-test `server.ts` process, no background recovery interval runs inside the web server.
+- **External Scheduler Recommended in Production**: In multi-instance, auto-scaling, or scale-to-zero environments (such as Cloud Run), configure an **external scheduler** (e.g., Cloud Scheduler + job runner or Kubernetes CronJob) to execute the one-shot CLI sweep periodically instead of relying on an in-process timer.
+
+### Running Recovery & Manual Replay (`npm run billing:recover`)
+- **Run a bounded automated recovery sweep** (finalizes expired `processing` leases at `maxAttempts` to `permanently_failed`, and retries eligible `failed` or expired `processing` events below `maxAttempts`):
+  ```bash
+  npm run billing:recover -- --limit=50 --max-attempts=5
+  ```
+- **Safely reprocess a specific dead-lettered event** (only after fixing the underlying workspace/catalog issue; refuses already-`processed` or `ignored` events and preserves active processing leases):
+  ```bash
+  npm run billing:recover -- --event-id=evt_1234567890
+  ```
+
+### Inspecting Failed Events & Expired Processing Leases
+- **Inspect dead-lettered (`permanently_failed`) events**:
+  ```sql
+  SELECT event_id, provider, event_type, attempt_count, last_error, last_attempt_at, updated_at
+  FROM billing_events
+  WHERE status = 'permanently_failed'
+  ORDER BY updated_at DESC
+  LIMIT 50;
+  ```
+- **Identify expired `processing` leases** (candidates for recovery or final-attempt finalization):
+  ```sql
+  SELECT event_id, provider, event_type, attempt_count, lease_owner, lease_expires_at, processed_at
+  FROM billing_events
+  WHERE status = 'processing'
+    AND (
+      (lease_expires_at IS NOT NULL AND lease_expires_at < clock_timestamp())
+      OR (lease_expires_at IS NULL AND processed_at < clock_timestamp() - INTERVAL '5 minutes')
+    )
+  ORDER BY COALESCE(lease_expires_at, processed_at) ASC;
+  ```
+
+### Detecting Failure-State Persistence Errors
+- Monitor structured error logs for **`[AIXSHOP Billing Error Persistence]`**.
+- Logged fields include `eventId`, `currentStatus`, `targetStatus`, `attemptCount`, `classification`, `operation`, `leaseOwner`, `failureStatePersisted: false`, `leaseLost`, redacted `persistenceError`, and redacted `originalError` (raw payloads, secrets, and payment data are never logged).
+- If persistence fails, the event is **never** falsely reported as `permanently_failed` and remains recoverable once its processing lease expires.
+
+---
+
+## 7. PostgreSQL CI Configuration & External Integration Status
+
+### Safe PostgreSQL CI Credentials
+- Configure `DATABASE_URL` explicitly with user credentials (e.g. `postgresql://aixshop:<ci_password>@localhost:5432/aixshop_test`) in CI workflow `env` so `getPostgresPoolConfig()` connects via `connectionString` and never falls back to a host OS role such as `root`.
+- Ensure test suites that temporarily override `process.env.DATABASE_URL` snapshot and restore the original value in `finally` blocks before live PostgreSQL pool creation.
+
+### External Integration Verification Truth Boundary
+- **Stripe Test Mode (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`)**: `BLOCKED — TEST CREDENTIALS / CONFIGURATION UNAVAILABLE` (not executed against live Stripe APIs in this environment).
+- **Shopify Development Store (`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`)**: `BLOCKED — SHOPIFY DEVELOPMENT STORE ACCESS UNAVAILABLE`. Current connector scope is read-only (`read_products`, `writeBackAuthorized: false`).
+- **Complete End-to-End Customer Journey**: `BLOCKED` pending live Stripe Test Mode and Shopify Development Store credentials.
+

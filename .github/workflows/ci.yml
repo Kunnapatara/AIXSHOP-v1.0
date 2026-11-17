@@ -69,7 +69,7 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Apply PostgreSQL migrations 001-012
+      - name: Apply PostgreSQL migrations 001-013
         run: bun run db:migrate
 
       - name: Verify migration checksums and readiness
