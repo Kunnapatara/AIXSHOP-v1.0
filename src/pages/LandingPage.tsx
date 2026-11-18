@@ -1,5 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useContext, useRef, useCallback } from 'react';
 import { useApp } from '../context/AppContext';
+import { AuthContext } from '../context/AuthContext';
+import { apiClient, BillingPlan, PlanTier } from '../api/client';
+import { isValidExternalHttpUrl, redirectBrowser } from '../domain/validation/shopify';
 import { 
   ArrowRight, 
   Search, 
@@ -22,6 +25,84 @@ import {
   Check
 } from 'lucide-react';
 
+const SSR_DEFAULT_PAID_PLANS: BillingPlan[] = [
+  {
+    id: 'plan_starter',
+    tier: 'Starter',
+    name: 'Starter Plan',
+    priceCents: 4900,
+    currency: 'USD',
+    billingInterval: 'month',
+    skuLimit: 250,
+    features: [
+      'Up to 250 SKUs',
+      'On-demand catalog schema audit',
+      'GTIN & barcode consistency check',
+      'Read-only Shopify OAuth catalog sync',
+    ],
+  },
+  {
+    id: 'plan_growth',
+    tier: 'Growth',
+    name: 'Growth Plan',
+    priceCents: 14900,
+    currency: 'USD',
+    billingInterval: 'month',
+    skuLimit: 2500,
+    features: [
+      'Up to 2,500 SKUs',
+      'Rule-based audit & conflict detection',
+      'Evidence document registry',
+      'Google Merchant Center feed readiness',
+      'Merchant remediation queue with re-check',
+    ],
+  },
+  {
+    id: 'plan_enterprise',
+    tier: 'Enterprise',
+    name: 'Enterprise Plan',
+    priceCents: 49900,
+    currency: 'USD',
+    billingInterval: 'month',
+    skuLimit: null,
+    features: [
+      'Unlimited SKUs & catalog audits',
+      'Workspace-isolated PostgreSQL storage',
+      'Historical audit snapshot & diff reports',
+      'CSV & structured feed export',
+    ],
+  },
+];
+
+const PLAN_PRESENTATION_META: Record<string, { subtitle: string; badge?: string; ctaLabel: string }> = {
+  Starter: {
+    subtitle: 'For Boutique Brands',
+    ctaLabel: 'Select Starter Plan',
+  },
+  Growth: {
+    subtitle: 'For Growing Stores',
+    badge: 'Demo Reference Tier',
+    ctaLabel: 'Select Growth Plan',
+  },
+  Enterprise: {
+    subtitle: 'For High-Volume Brands',
+    ctaLabel: 'Select Enterprise Plan',
+  },
+};
+
+function formatPlanPrice(priceCents: number, currency: string): string {
+  const symbol = currency?.toUpperCase() === 'EUR' ? '€' : currency?.toUpperCase() === 'GBP' ? '£' : '$';
+  const amount = priceCents / 100;
+  return `${symbol}${Number.isInteger(amount) ? amount : amount.toFixed(2)}`;
+}
+
+function formatSkuCapacityLine(skuLimit: number | null): string {
+  if (skuLimit === null || typeof skuLimit !== 'number' || !Number.isFinite(skuLimit)) {
+    return 'Unlimited SKUs & catalog audits';
+  }
+  return `Up to ${skuLimit.toLocaleString()} verified SKUs`;
+}
+
 export const LandingPage: React.FC = () => {
   const { 
     navigateTo, 
@@ -34,11 +115,127 @@ export const LandingPage: React.FC = () => {
     storeProfile 
   } = useApp();
 
+  const authContext = useContext(AuthContext);
+  const isAuthenticated = Boolean(authContext?.isAuthenticated);
+  const authModalOpen = Boolean(authContext?.authModalOpen);
+  const openAuthModal = authContext?.openAuthModal;
+
   const [isReviewOpen, setIsReviewOpen] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
 
   const [urlInput, setUrlInput] = useState('https://solsticecraftgoods.store');
   const [urlError, setUrlError] = useState<string | null>(null);
+
+  // Authoritative Billing Plans & Checkout State
+  const [paidPlans, setPaidPlans] = useState<BillingPlan[]>(SSR_DEFAULT_PAID_PLANS);
+  const [freePlan, setFreePlan] = useState<BillingPlan | null>(null);
+  const [plansLoading, setPlansLoading] = useState<boolean>(false);
+  const [plansError, setPlansError] = useState<string | null>(null);
+  const [plansLoadedFromBackend, setPlansLoadedFromBackend] = useState<boolean>(false);
+  const [checkoutLoadingTier, setCheckoutLoadingTier] = useState<PlanTier | null>(null);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
+  const [pendingPlanTier, setPendingPlanTier] = useState<PlanTier | null>(null);
+
+  const checkoutInFlightRef = useRef<boolean>(false);
+  const prevAuthModalOpenRef = useRef<boolean>(authModalOpen);
+
+  const loadPlans = useCallback(async () => {
+    setPlansLoading(true);
+    setPlansError(null);
+    try {
+      const res = await apiClient.getBillingPlans();
+      const paid = res.plans.filter(p => p.priceCents > 0);
+      const free = res.plans.find(p => p.priceCents === 0) || null;
+      if (paid.length > 0) {
+        setPaidPlans(paid);
+      }
+      setFreePlan(free);
+      setPlansLoadedFromBackend(true);
+    } catch (err: any) {
+      setPlansError(err?.message || 'Unable to load authoritative plans from server.');
+    } finally {
+      setPlansLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPlans();
+  }, [loadPlans]);
+
+  const initiateCheckout = useCallback(async (tier: PlanTier) => {
+    if (checkoutInFlightRef.current) return;
+    checkoutInFlightRef.current = true;
+    setCheckoutLoadingTier(tier);
+    setCheckoutError(null);
+
+    try {
+      let successUrl: string | undefined;
+      let cancelUrl: string | undefined;
+      if (
+        typeof window !== 'undefined' &&
+        window.location &&
+        typeof window.location.origin === 'string' &&
+        isValidExternalHttpUrl(window.location.origin)
+      ) {
+        successUrl = `${window.location.origin}/?page=settings&tab=subscription&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+        cancelUrl = `${window.location.origin}/?page=settings&tab=subscription&checkout=canceled`;
+      }
+
+      const session = await apiClient.createCheckoutSession({
+        tier,
+        ...(successUrl ? { successUrl } : {}),
+        ...(cancelUrl ? { cancelUrl } : {}),
+      });
+
+      if (!session || session.success !== true || !isValidExternalHttpUrl(session.checkoutUrl)) {
+        throw new Error('Checkout session response missing a valid checkout URL.');
+      }
+
+      redirectBrowser(session.checkoutUrl);
+    } catch (err: any) {
+      setCheckoutError(err?.message || 'Failed to initiate Stripe checkout session.');
+    } finally {
+      checkoutInFlightRef.current = false;
+      setCheckoutLoadingTier(null);
+    }
+  }, []);
+
+  // Resume pending plan checkout immediately once authentication completes
+  useEffect(() => {
+    if (isAuthenticated && pendingPlanTier) {
+      const targetTier = pendingPlanTier;
+      setPendingPlanTier(null);
+      void initiateCheckout(targetTier);
+    }
+  }, [isAuthenticated, pendingPlanTier, initiateCheckout]);
+
+  // Clear pending plan if user closes AuthModal without signing in
+  useEffect(() => {
+    const wasOpen = prevAuthModalOpenRef.current;
+    prevAuthModalOpenRef.current = authModalOpen;
+    if (wasOpen && !authModalOpen && !isAuthenticated && pendingPlanTier) {
+      setPendingPlanTier(null);
+    }
+  }, [authModalOpen, isAuthenticated, pendingPlanTier]);
+
+  const handleSelectPlan = (tier: PlanTier) => {
+    if (checkoutInFlightRef.current || checkoutLoadingTier !== null) {
+      return;
+    }
+    setCheckoutError(null);
+
+    if (!isAuthenticated) {
+      setPendingPlanTier(tier);
+      if (openAuthModal) {
+        openAuthModal('register');
+      } else {
+        setCheckoutError('Please sign in to subscribe to a paid plan.');
+      }
+      return;
+    }
+
+    void initiateCheckout(tier);
+  };
 
   const handleStoreCheckSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -580,7 +777,7 @@ export const LandingPage: React.FC = () => {
         </div>
       </section>
 
-      {/* Pricing Section with Real SKU Limits */}
+      {/* Pricing Section with Authoritative Server Plans */}
       <section id="pricing" className="px-4 sm:px-8 py-16 max-w-7xl mx-auto w-full">
         <div className="max-w-2xl mx-auto text-center mb-12">
           <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-stone-950">
@@ -590,74 +787,130 @@ export const LandingPage: React.FC = () => {
             Pricing scaled by verified SKU limits with manual audit and remediation workflows across all plans.
           </p>
           <p className="text-xs text-stone-500 mt-1.5">
+            {freePlan
+              ? `Free Audit available (${freePlan.skuLimit?.toLocaleString() ?? '2,500'} SKU capacity). `
+              : ''}
             Live recurring checkout requires configured server Stripe credentials; unconfigured preview environments operate on Free Audit limits.
           </p>
         </div>
 
+        {plansLoading && !plansLoadedFromBackend && (
+          <div className="mb-6 text-center text-xs text-stone-500 flex items-center justify-center gap-2">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            <span>Loading authoritative server pricing...</span>
+          </div>
+        )}
+
+        {plansError && (
+          <div
+            role="alert"
+            className="mb-6 max-w-2xl mx-auto p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+          >
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{plansError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadPlans()}
+              className="px-3 py-1.5 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg font-semibold text-amber-900 shrink-0"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {checkoutError && (
+          <div
+            role="alert"
+            className="mb-6 max-w-2xl mx-auto p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-center gap-2"
+          >
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{checkoutError}</span>
+          </div>
+        )}
+
+        {pendingPlanTier && !isAuthenticated && (
+          <div className="mb-6 max-w-2xl mx-auto p-3 bg-orange-50 border border-orange-200 rounded-xl text-xs text-orange-900 text-center">
+            Sign in or create a workspace account to continue checkout for <strong>{pendingPlanTier}</strong>.
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="bg-white border border-stone-200 rounded-2xl p-6 flex flex-col justify-between">
-            <div>
-              <span className="text-xs font-semibold text-stone-500">For Boutique Brands</span>
-              <h3 className="text-xl font-bold text-stone-900 mt-1">Starter Tier</h3>
-              <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$49<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
-              <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Up to 250 SKUs</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> On-demand catalog schema audit</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> GTIN &amp; barcode consistency check</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Read-only Shopify OAuth catalog sync</li>
-              </ul>
-            </div>
-            <button
-              onClick={() => navigateTo('home')}
-              className="mt-8 w-full py-2.5 text-xs font-semibold bg-stone-100 hover:bg-stone-200 text-stone-900 rounded-xl transition-colors min-h-[44px]"
-            >
-              Open Starter Preview
-            </button>
-          </div>
+          {paidPlans.map(plan => {
+            const meta = PLAN_PRESENTATION_META[plan.tier] || {
+              subtitle: 'Catalog Intelligence Plan',
+              ctaLabel: `Select ${plan.tier}`,
+            };
+            const isHighlighted = plan.tier === 'Growth';
+            const isSelectingThis = checkoutLoadingTier === plan.tier;
+            const isAnyCheckoutLoading = checkoutLoadingTier !== null;
+            const intervalLabel = plan.billingInterval === 'year' ? 'year' : 'month';
 
-          <div className="bg-white border-2 border-orange-600 rounded-2xl p-6 flex flex-col justify-between relative shadow-md">
-            <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-orange-600 text-white text-[11px] font-bold rounded-full uppercase tracking-wider">
-              Demo Reference Tier
-            </div>
-            <div>
-              <span className="text-xs font-semibold text-orange-700">For Growing Stores</span>
-              <h3 className="text-xl font-bold text-stone-900 mt-1">Growth Tier</h3>
-              <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$149<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
-              <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Up to 2,500 SKUs</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Rule-based audit &amp; conflict detection</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Evidence document registry</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Google Merchant Center feed readiness</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Merchant remediation queue with re-check</li>
-              </ul>
-            </div>
-            <button
-              onClick={() => navigateTo('home')}
-              className="mt-8 w-full py-2.5 text-xs font-semibold bg-orange-600 hover:bg-orange-700 text-white rounded-xl transition-colors min-h-[44px]"
-            >
-              Open Workspace App
-            </button>
-          </div>
+            return (
+              <div
+                key={plan.id}
+                data-plan-tier={plan.tier}
+                className={
+                  isHighlighted
+                    ? 'bg-white border-2 border-orange-600 rounded-2xl p-6 flex flex-col justify-between relative shadow-md'
+                    : 'bg-white border border-stone-200 rounded-2xl p-6 flex flex-col justify-between'
+                }
+              >
+                {meta.badge && (
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-orange-600 text-white text-[11px] font-bold rounded-full uppercase tracking-wider">
+                    {meta.badge}
+                  </div>
+                )}
 
-          <div className="bg-white border border-stone-200 rounded-2xl p-6 flex flex-col justify-between">
-            <div>
-              <span className="text-xs font-semibold text-stone-500">For High-Volume Brands</span>
-              <h3 className="text-xl font-bold text-stone-900 mt-1">Enterprise Tier</h3>
-              <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">$499<span className="text-xs font-sans text-stone-500 font-normal"> / month</span></p>
-              <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Unlimited SKUs &amp; catalog audits</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Workspace-isolated PostgreSQL storage</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> Historical audit snapshot &amp; diff reports</li>
-                <li className="flex items-center gap-2"><CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" /> CSV &amp; structured feed export</li>
-              </ul>
-            </div>
-            <button
-              onClick={() => navigateTo('settings')}
-              className="mt-8 w-full py-2.5 text-xs font-semibold bg-stone-100 hover:bg-stone-200 text-stone-900 rounded-xl transition-colors min-h-[44px]"
-            >
-              View Plan Configuration
-            </button>
-          </div>
+                <div>
+                  <span
+                    className={`text-xs font-semibold ${
+                      isHighlighted ? 'text-orange-700' : 'text-stone-500'
+                    }`}
+                  >
+                    {meta.subtitle}
+                  </span>
+                  <h3 className="text-xl font-bold text-stone-900 mt-1">{plan.name}</h3>
+                  <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">
+                    {formatPlanPrice(plan.priceCents, plan.currency)}
+                    <span className="text-xs font-sans text-stone-500 font-normal"> / {intervalLabel}</span>
+                  </p>
+                  <p className="text-xs text-stone-500 mt-1 font-medium">
+                    {formatSkuCapacityLine(plan.skuLimit)}
+                  </p>
+                  <ul className="mt-6 space-y-2.5 text-xs text-stone-600">
+                    {plan.features.map((feature, idx) => (
+                      <li key={idx} className="flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span>{feature}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={isAnyCheckoutLoading}
+                  onClick={() => handleSelectPlan(plan.tier)}
+                  className={`mt-8 w-full py-2.5 text-xs font-semibold rounded-xl transition-colors min-h-[44px] flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed ${
+                    isHighlighted
+                      ? 'bg-orange-600 hover:bg-orange-700 text-white'
+                      : 'bg-stone-100 hover:bg-stone-200 text-stone-900'
+                  }`}
+                >
+                  {isSelectingThis ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Starting Checkout...</span>
+                    </>
+                  ) : (
+                    <span>{meta.ctaLabel}</span>
+                  )}
+                </button>
+              </div>
+            );
+          })}
         </div>
       </section>
 

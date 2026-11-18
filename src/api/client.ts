@@ -1,5 +1,10 @@
 import { StoragePayloadV1 } from '../domain/storage/storageTypes';
 import { StoreProfile, ActionItem, Product, CatalogImportResult, ProductCandidate } from '../types';
+import {
+  isValidExternalHttpUrl,
+  isValidShopifyAuthUrl,
+  validateAndNormalizeShopDomain,
+} from '../domain/validation/shopify';
 
 export interface AuthUser {
   id: string;
@@ -64,7 +69,11 @@ class ApiClient {
       throw error;
     }
 
-    return res.json();
+    try {
+      return await res.json();
+    } catch {
+      throw new Error('Invalid JSON response received from server');
+    }
   }
 
   // Auth Endpoints
@@ -208,7 +217,117 @@ class ApiClient {
     return this.request<{ success: boolean; comparison: import('../domain/audit/historicalTypes').AuditComparisonResult }>(`/api/audit/compare?${params.toString()}`);
   }
 
+  // Billing Endpoints
+  async getBillingPlans(): Promise<BillingPlansResponse> {
+    const data = await this.request<BillingPlansResponse>('/api/billing/plans');
+    if (!data || typeof data !== 'object' || !Array.isArray(data.plans)) {
+      throw new Error('Malformed billing plans response from server');
+    }
+    const validPlans = data.plans.filter(
+      (p): p is BillingPlan =>
+        Boolean(p) &&
+        typeof p === 'object' &&
+        typeof p.id === 'string' &&
+        typeof p.tier === 'string' &&
+        typeof p.name === 'string' &&
+        typeof p.priceCents === 'number' &&
+        Number.isFinite(p.priceCents) &&
+        Array.isArray(p.features)
+    );
+    if (validPlans.length === 0) {
+      throw new Error('Server returned no valid billing plans');
+    }
+    return {
+      plans: validPlans,
+      currency: typeof data.currency === 'string' && data.currency ? data.currency : 'USD',
+    };
+  }
+
+  async getBillingSubscription(): Promise<BillingSubscriptionResponse> {
+    const data = await this.request<BillingSubscriptionResponse>('/api/billing/subscription');
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      typeof data.workspaceId !== 'string' ||
+      !data.workspaceId.trim() ||
+      !data.subscription ||
+      typeof data.subscription !== 'object' ||
+      typeof data.subscription.tier !== 'string' ||
+      typeof data.subscription.status !== 'string'
+    ) {
+      throw new Error('Malformed subscription response from server');
+    }
+    return data;
+  }
+
+  async createCheckoutSession(params: CreateCheckoutSessionRequest): Promise<CheckoutSessionResponse> {
+    if (!params?.tier || typeof params.tier !== 'string') {
+      throw new Error('A valid plan tier is required to initiate checkout');
+    }
+    const payload: CreateCheckoutSessionRequest = { tier: params.tier };
+    if (params.successUrl) payload.successUrl = params.successUrl;
+    if (params.cancelUrl) payload.cancelUrl = params.cancelUrl;
+
+    const data = await this.request<CheckoutSessionResponse>('/api/billing/checkout-session', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      data.success !== true ||
+      typeof data.sessionId !== 'string' ||
+      !data.sessionId.trim() ||
+      !isValidExternalHttpUrl(data.checkoutUrl)
+    ) {
+      throw new Error('Checkout session response missing a valid checkout URL');
+    }
+
+    return data;
+  }
+
+  async createPortalSession(params?: CreatePortalSessionRequest): Promise<PortalSessionResponse> {
+    const payload: CreatePortalSessionRequest = {};
+    if (params?.returnUrl) payload.returnUrl = params.returnUrl;
+
+    const data = await this.request<PortalSessionResponse>('/api/billing/portal-session', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+
+    if (!data || typeof data !== 'object' || data.success !== true || !isValidExternalHttpUrl(data.portalUrl)) {
+      throw new Error('Customer portal session response missing a valid portal URL');
+    }
+
+    return data;
+  }
+
   // Shopify Endpoints
+  async connectShopify(shop: string): Promise<ShopifyConnectResponse> {
+    const validation = validateAndNormalizeShopDomain(shop);
+    if (!validation.valid) {
+      throw new Error(validation.error);
+    }
+
+    const data = await this.request<ShopifyConnectResponse>(
+      `/api/shopify/connect?shop=${encodeURIComponent(validation.shopDomain)}`
+    );
+
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      data.success !== true ||
+      !isValidShopifyAuthUrl(data.authUrl) ||
+      typeof data.shopDomain !== 'string' ||
+      !data.shopDomain.trim()
+    ) {
+      throw new Error('Shopify connect response missing a valid Shopify authorization URL');
+    }
+
+    return data;
+  }
+
   async getShopifyStatus(options?: { verify?: 'live' }): Promise<ShopifyStatusResponse> {
     const query = options?.verify === 'live' ? '?verify=live' : '';
     return this.request<ShopifyStatusResponse>(`/api/shopify/status${query}`);
@@ -381,6 +500,83 @@ export interface ShopifyStatusResponse {
     subscribedTopics: string[];
     processedCount: number;
   };
+}
+
+export type PlanTier = 'Free Audit' | 'Starter' | 'Growth' | 'Enterprise';
+
+export type SubscriptionStatus =
+  | 'pending'
+  | 'incomplete'
+  | 'trialing'
+  | 'active'
+  | 'past_due'
+  | 'unpaid'
+  | 'canceled'
+  | 'expired';
+
+export interface BillingPlan {
+  id: string;
+  tier: PlanTier;
+  name: string;
+  priceCents: number;
+  currency: string;
+  billingInterval: 'month' | 'year';
+  skuLimit: number | null;
+  features: string[];
+}
+
+export interface BillingPlansResponse {
+  plans: BillingPlan[];
+  currency: string;
+}
+
+export interface BillingSubscriptionInfo {
+  id?: string;
+  workspaceId?: string;
+  provider: string;
+  tier: PlanTier | string;
+  status: SubscriptionStatus | string;
+  currentPeriodStart?: string;
+  currentPeriodEnd?: string;
+  cancelAtPeriodEnd: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface BillingSubscriptionResponse {
+  workspaceId: string;
+  subscription: BillingSubscriptionInfo;
+  storeProfile: StoreProfile | null;
+}
+
+export interface CreateCheckoutSessionRequest {
+  tier: PlanTier;
+  successUrl?: string;
+  cancelUrl?: string;
+}
+
+export interface CheckoutSessionResponse {
+  success: boolean;
+  sessionId: string;
+  checkoutUrl: string;
+  provider: string;
+}
+
+export interface CreatePortalSessionRequest {
+  returnUrl?: string;
+}
+
+export interface PortalSessionResponse {
+  success: boolean;
+  portalUrl: string;
+  provider: string;
+}
+
+export interface ShopifyConnectResponse {
+  success: boolean;
+  authUrl: string;
+  state: string;
+  shopDomain: string;
 }
 
 export const apiClient = new ApiClient();

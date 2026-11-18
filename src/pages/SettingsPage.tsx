@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { 
@@ -27,7 +27,19 @@ import {
   Zap,
   Check
 } from 'lucide-react';
-import { apiClient, ShopifyStatusResponse } from '../api/client';
+import {
+  apiClient,
+  BillingPlan,
+  BillingSubscriptionResponse,
+  PlanTier,
+  ShopifyStatusResponse,
+} from '../api/client';
+import {
+  isValidExternalHttpUrl,
+  isValidShopifyAuthUrl,
+  redirectBrowser,
+  validateAndNormalizeShopDomain,
+} from '../domain/validation/shopify';
 import {
   evaluateDemoOverwriteProtection,
   CloudCatalogLoadStatus,
@@ -156,7 +168,59 @@ export const DemoCatalogMigrationSection: React.FC<DemoCatalogMigrationSectionPr
 
 export type SettingsTabId = 'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics';
 
-export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initialTab = 'profile' }) => {
+function resolveInitialSettingsTab(propInitialTab?: SettingsTabId): SettingsTabId {
+  if (propInitialTab) {
+    return propInitialTab;
+  }
+  if (typeof window !== 'undefined' && window.location && typeof window.location.search === 'string') {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const tabParam = params.get('tab');
+      if (
+        tabParam === 'profile' ||
+        tabParam === 'workspace' ||
+        tabParam === 'connectors' ||
+        tabParam === 'subscription' ||
+        tabParam === 'policies' ||
+        tabParam === 'diagnostics'
+      ) {
+        return tabParam;
+      }
+      if (params.has('shopify') || params.has('shopify_error')) {
+        return 'connectors';
+      }
+      if (params.has('checkout') || params.has('session_id')) {
+        return 'subscription';
+      }
+    } catch {
+      // Ignore query parsing errors in restricted hosts
+    }
+  }
+  return 'profile';
+}
+
+function getTierMonthlyPriceLabel(tier?: string, authoritativePlan?: BillingPlan | null): string {
+  if (authoritativePlan && typeof authoritativePlan.priceCents === 'number') {
+    const amount = authoritativePlan.priceCents / 100;
+    const symbol = authoritativePlan.currency?.toUpperCase() === 'EUR' ? '€' : authoritativePlan.currency?.toUpperCase() === 'GBP' ? '£' : '$';
+    const interval = authoritativePlan.billingInterval === 'year' ? 'yr' : 'mo';
+    return `${symbol}${Number.isInteger(amount) ? amount : amount.toFixed(2)} / ${interval}`;
+  }
+  const normalized = (tier || '').toLowerCase();
+  if (normalized.includes('enterprise')) return '$499 / mo';
+  if (normalized.includes('growth')) return '$149 / mo';
+  if (normalized.includes('starter')) return '$49 / mo';
+  return '$0 / mo';
+}
+
+function formatSubscriptionDate(iso?: string): string | null {
+  if (!iso || typeof iso !== 'string') return null;
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toLocaleDateString();
+}
+
+export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initialTab }) => {
   const { 
     storeProfile, 
     updateStoreProfile, 
@@ -201,7 +265,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
     switchWorkspace
   } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const [activeTab, setActiveTab] = useState<SettingsTabId>(() => resolveInitialSettingsTab(initialTab));
   const [storeName, setStoreName] = useState(storeProfile.name);
   const [storeDomain, setStoreDomain] = useState(storeProfile.domain);
   const [currency, setCurrency] = useState(storeProfile.currency);
@@ -214,6 +278,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatusResponse | null>(null);
   const [shopifySyncRuns, setShopifySyncRuns] = useState<any[]>([]);
   const [isLoadingShopify, setIsLoadingShopify] = useState(false);
+  const [isConnectingShopify, setIsConnectingShopify] = useState(false);
   const [isSyncingShopify, setIsSyncingShopify] = useState(false);
   const [isResumingShopify, setIsResumingShopify] = useState(false);
   const [isVerifyingWebhooks, setIsVerifyingWebhooks] = useState(false);
@@ -221,30 +286,125 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   const [isDisconnectingShopify, setIsDisconnectingShopify] = useState(false);
   const [shopifyShopInput, setShopifyShopInput] = useState('');
   const [connectError, setConnectError] = useState<string | null>(null);
+  const connectingShopifyRef = useRef<boolean>(false);
 
-  // Check URL query parameters for OAuth redirect feedback
-  React.useEffect(() => {
+  // Billing & Subscription State
+  const [billingSubscription, setBillingSubscription] = useState<BillingSubscriptionResponse | null>(null);
+  const [billingPlans, setBillingPlans] = useState<BillingPlan[]>([]);
+  const [isLoadingBilling, setIsLoadingBilling] = useState(false);
+  const [billingLoadError, setBillingLoadError] = useState<string | null>(null);
+  const [isOpeningPortal, setIsOpeningPortal] = useState(false);
+  const [portalError, setPortalError] = useState<string | null>(null);
+  const [checkoutTierLoading, setCheckoutTierLoading] = useState<PlanTier | null>(null);
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
+  const portalInFlightRef = useRef<boolean>(false);
+  const checkoutInFlightRef = useRef<boolean>(false);
+  const activeWorkspaceIdRef = useRef<string | undefined>(activeWorkspace?.id);
+  activeWorkspaceIdRef.current = activeWorkspace?.id;
+
+  const fetchBillingState = useCallback(async () => {
+    const targetWorkspaceId = activeWorkspace?.id;
+    setIsLoadingBilling(true);
+    setBillingLoadError(null);
+
+    try {
+      const plansPromise = apiClient.getBillingPlans().catch(() => null);
+      const subPromise = isAuthenticated ? apiClient.getBillingSubscription() : Promise.resolve(null);
+
+      const [plansRes, subRes] = await Promise.all([plansPromise, subPromise]);
+
+      if (plansRes?.plans) {
+        setBillingPlans(plansRes.plans);
+      }
+
+      if (isAuthenticated && subRes) {
+        if (!targetWorkspaceId || subRes.workspaceId === activeWorkspaceIdRef.current) {
+          setBillingSubscription(subRes);
+        }
+      } else if (!isAuthenticated) {
+        setBillingSubscription(null);
+      }
+    } catch (err: any) {
+      setBillingLoadError(err?.message || 'Failed to load subscription details from server.');
+    } finally {
+      setIsLoadingBilling(false);
+    }
+  }, [isAuthenticated, activeWorkspace?.id]);
+
+  // Reset subscription state whenever workspace/auth changes to prevent stale tenant display
+  useEffect(() => {
+    setBillingSubscription(null);
+    setBillingLoadError(null);
+    setPortalError(null);
+    setCheckoutError(null);
+  }, [isAuthenticated, activeWorkspace?.id]);
+
+  useEffect(() => {
+    if (activeTab === 'subscription') {
+      void fetchBillingState();
+    }
+  }, [activeTab, fetchBillingState]);
+
+  // Check URL query parameters for Shopify OAuth and Stripe Checkout return feedback
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.location || typeof window.location.search !== 'string') {
+      return;
+    }
     const params = new URLSearchParams(window.location.search);
     const shopifyParam = params.get('shopify');
     const shopParam = params.get('shop');
     const errorParam = params.get('shopify_error');
+    const checkoutParam = params.get('checkout');
+    const sessionIdParam = params.get('session_id');
+    const tabParam = params.get('tab');
+
+    let handled = false;
 
     if (shopifyParam === 'connected') {
       addToast('Shopify Connected', `Successfully connected store ${shopParam || ''} via OAuth 2.0.`, 'success');
       setActiveTab('connectors');
-      window.history.replaceState({}, document.title, window.location.pathname);
+      handled = true;
     } else if (shopifyParam === 'disconnected') {
       addToast('Shopify Disconnected', 'Shopify connection and stored credentials have been revoked.', 'info');
       setActiveTab('connectors');
-      window.history.replaceState({}, document.title, window.location.pathname);
+      handled = true;
     } else if (errorParam) {
-      addToast('Shopify Connection Failed', decodeURIComponent(errorParam), 'error');
+      let decodedError = errorParam;
+      try {
+        decodedError = decodeURIComponent(errorParam);
+      } catch {
+        // Keep raw string if already decoded
+      }
+      addToast('Shopify Connection Failed', decodedError, 'error');
       setActiveTab('connectors');
-      window.history.replaceState({}, document.title, window.location.pathname);
+      handled = true;
+    } else if (checkoutParam === 'success' || sessionIdParam) {
+      addToast(
+        'Stripe Checkout Returned',
+        'Verifying your subscription status with the billing server...',
+        'info'
+      );
+      setActiveTab('subscription');
+      handled = true;
+    } else if (checkoutParam === 'canceled') {
+      addToast(
+        'Checkout Canceled',
+        'Stripe Checkout was canceled. Your current subscription remains unchanged.',
+        'info'
+      );
+      setActiveTab('subscription');
+      handled = true;
+    } else if (!initialTab && (tabParam === 'subscription' || tabParam === 'connectors')) {
+      setActiveTab(tabParam);
     }
-  }, [addToast]);
 
-  const fetchShopifyStatus = React.useCallback(async () => {
+    if (handled && typeof window.history?.replaceState === 'function') {
+      const cleanPath = typeof window.location.pathname === 'string' ? window.location.pathname : '/';
+      window.history.replaceState({}, typeof document !== 'undefined' ? document.title : '', cleanPath);
+    }
+  }, [addToast, initialTab]);
+
+  const fetchShopifyStatus = useCallback(async () => {
     if (!isAuthenticated) {
       setShopifyStatus(null);
       return;
@@ -257,35 +417,137 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
       ]);
       setShopifyStatus(status);
       setShopifySyncRuns((runsRes as any).syncRuns || (runsRes as any).runs || []);
-      if (status.shopDomain && !shopifyShopInput) {
-        setShopifyShopInput(status.shopDomain);
+      if (status.shopDomain) {
+        setShopifyShopInput(prev => prev || status.shopDomain || '');
       }
     } catch (err: any) {
       console.error('[AIXSHOP] Failed to fetch Shopify status:', err);
     } finally {
       setIsLoadingShopify(false);
     }
-  }, [isAuthenticated, shopifyShopInput]);
+  }, [isAuthenticated]);
 
-  React.useEffect(() => {
+  useEffect(() => {
     if (activeTab === 'connectors' && isAuthenticated) {
-      fetchShopifyStatus();
+      void fetchShopifyStatus();
     }
   }, [activeTab, isAuthenticated, fetchShopifyStatus]);
 
-  const handleConnectShopify = (e: React.FormEvent) => {
+  const handleConnectShopify = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (connectingShopifyRef.current || isConnectingShopify) {
+      return;
+    }
+
     setConnectError(null);
     if (!isAuthenticated) {
       openAuthModal('register');
       return;
     }
-    const trimmed = shopifyShopInput.trim();
-    if (!trimmed) {
-      setConnectError('Please enter your Shopify store domain (e.g. my-store.myshopify.com).');
+
+    const validation = validateAndNormalizeShopDomain(shopifyShopInput);
+    if (!validation.valid) {
+      setConnectError(validation.error);
       return;
     }
-    window.location.href = `/api/shopify/connect?shop=${encodeURIComponent(trimmed)}`;
+
+    connectingShopifyRef.current = true;
+    setIsConnectingShopify(true);
+
+    try {
+      const res = await apiClient.connectShopify(validation.shopDomain);
+      if (!res || res.success !== true || !isValidShopifyAuthUrl(res.authUrl)) {
+        throw new Error('Server returned an invalid Shopify authorization URL.');
+      }
+      redirectBrowser(res.authUrl);
+    } catch (err: any) {
+      setConnectError(err?.message || 'Failed to initiate Shopify OAuth connection.');
+    } finally {
+      connectingShopifyRef.current = false;
+      setIsConnectingShopify(false);
+    }
+  };
+
+  const handleOpenBillingPortal = async () => {
+    if (portalInFlightRef.current || isOpeningPortal) {
+      return;
+    }
+    setPortalError(null);
+
+    if (!isAuthenticated) {
+      openAuthModal('login');
+      return;
+    }
+
+    portalInFlightRef.current = true;
+    setIsOpeningPortal(true);
+
+    try {
+      let returnUrl: string | undefined;
+      if (
+        typeof window !== 'undefined' &&
+        window.location &&
+        typeof window.location.origin === 'string' &&
+        isValidExternalHttpUrl(window.location.origin)
+      ) {
+        returnUrl = `${window.location.origin}/?page=settings&tab=subscription`;
+      }
+
+      const res = await apiClient.createPortalSession(returnUrl ? { returnUrl } : undefined);
+      if (!res || res.success !== true || !isValidExternalHttpUrl(res.portalUrl)) {
+        throw new Error('Customer portal response missing a valid portal URL.');
+      }
+      redirectBrowser(res.portalUrl);
+    } catch (err: any) {
+      setPortalError(err?.message || 'Failed to open Stripe Customer Portal.');
+    } finally {
+      portalInFlightRef.current = false;
+      setIsOpeningPortal(false);
+    }
+  };
+
+  const handleStartUpgradeCheckout = async (tier: PlanTier) => {
+    if (checkoutInFlightRef.current || checkoutTierLoading !== null) {
+      return;
+    }
+    setCheckoutError(null);
+
+    if (!isAuthenticated) {
+      openAuthModal('register');
+      return;
+    }
+
+    checkoutInFlightRef.current = true;
+    setCheckoutTierLoading(tier);
+
+    try {
+      let successUrl: string | undefined;
+      let cancelUrl: string | undefined;
+      if (
+        typeof window !== 'undefined' &&
+        window.location &&
+        typeof window.location.origin === 'string' &&
+        isValidExternalHttpUrl(window.location.origin)
+      ) {
+        successUrl = `${window.location.origin}/?page=settings&tab=subscription&checkout=success&session_id={CHECKOUT_SESSION_ID}`;
+        cancelUrl = `${window.location.origin}/?page=settings&tab=subscription&checkout=canceled`;
+      }
+
+      const res = await apiClient.createCheckoutSession({
+        tier,
+        ...(successUrl ? { successUrl } : {}),
+        ...(cancelUrl ? { cancelUrl } : {}),
+      });
+      if (!res || res.success !== true || !isValidExternalHttpUrl(res.checkoutUrl)) {
+        throw new Error('Checkout session response missing a valid checkout URL.');
+      }
+      redirectBrowser(res.checkoutUrl);
+    } catch (err: any) {
+      setCheckoutError(err?.message || 'Failed to initiate Stripe checkout session.');
+    } finally {
+      checkoutInFlightRef.current = false;
+      setCheckoutTierLoading(null);
+    }
   };
 
   const handleSyncShopify = async () => {
@@ -1066,14 +1328,24 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                       </div>
                       <button
                         type="submit"
-                        className="px-4 py-2.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-xl shadow-xs transition-colors flex items-center gap-2 shrink-0 cursor-pointer"
+                        disabled={isConnectingShopify}
+                        className="px-4 py-2.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-xl shadow-xs transition-colors flex items-center gap-2 shrink-0 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
                       >
-                        <Link2 className="w-3.5 h-3.5" />
-                        <span>Connect Store</span>
+                        {isConnectingShopify ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>Connecting...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Link2 className="w-3.5 h-3.5" />
+                            <span>Connect Store</span>
+                          </>
+                        )}
                       </button>
                     </div>
                     {connectError && (
-                      <p className="text-xs text-red-600 mt-1.5 flex items-center gap-1">
+                      <p role="alert" className="text-xs text-red-600 mt-1.5 flex items-center gap-1">
                         <AlertTriangle className="w-3 h-3 shrink-0" />
                         <span>{connectError}</span>
                       </p>
@@ -1180,99 +1452,354 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
         </div>
       )}
 
-      {activeTab === 'subscription' && (
-        <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-xs space-y-6">
-          <div className="flex items-center justify-between pb-3 border-b border-stone-100">
-            <div>
-              <h3 className="text-sm font-bold text-stone-900">Subscription & SKU Capacity</h3>
-              <p className="text-xs text-stone-500">Workspace scale limits and demo plan parameters (unverified entitlement)</p>
-            </div>
-            <span className="text-xs font-mono font-bold text-orange-700 bg-orange-50 px-2 py-0.5 rounded border border-orange-200">
-              {isCloudWorkspace ? `${storeProfile.tier} (Workspace Limit)` : `${storeProfile.tier} (Demo Fixture)`}
-            </span>
-          </div>
+      {activeTab === 'subscription' && (() => {
+        const sub = billingSubscription?.subscription;
+        const authoritativeProfile = billingSubscription?.storeProfile;
+        const effectiveTier = String(sub?.tier || authoritativeProfile?.tier || storeProfile.tier || 'Free Audit');
+        const effectiveStatus = String(sub?.status || (isAuthenticated ? 'active' : 'demo'));
+        const effectiveProvider = String(sub?.provider || 'none');
+        const isFreeOrUnpaidProvider = effectiveProvider === 'none' || effectiveTier === 'Free Audit';
+        const hasBillingPortalAccess = Boolean(
+          isAuthenticated &&
+          sub &&
+          effectiveProvider !== 'none'
+        );
 
-          <div className="p-5 bg-stone-50 rounded-xl border border-stone-200 space-y-3">
-            {(() => {
-              const currentSkuCount = typeof storeProfile.skuCount === 'number'
-                ? storeProfile.skuCount
-                : products.reduce((acc, p) => acc + (p.variants?.length ? p.variants.length : 1), 0);
-              const effectiveLimit = storeProfile.skuLimit || 2500;
-              const utilizationPct = ((currentSkuCount / effectiveLimit) * 100).toFixed(1);
-              return (
-                <>
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-semibold text-stone-900">Catalog SKU Utilization</span>
-                    <span className="font-mono text-stone-600">
-                      {currentSkuCount} / {effectiveLimit} SKUs ({utilizationPct}%)
+        const matchedPlan = billingPlans.find(
+          p => p.tier.toLowerCase() === effectiveTier.toLowerCase()
+        ) || null;
+        const paidUpgradePlans = billingPlans.filter(p => p.priceCents > 0);
+
+        const currentSkuCount = typeof authoritativeProfile?.skuCount === 'number'
+          ? authoritativeProfile.skuCount
+          : typeof storeProfile.skuCount === 'number'
+          ? storeProfile.skuCount
+          : products.reduce((acc, p) => acc + (p.variants?.length ? p.variants.length : 1), 0);
+
+        const rawLimit =
+          authoritativeProfile?.skuLimit !== undefined
+            ? authoritativeProfile.skuLimit
+            : matchedPlan?.skuLimit !== undefined
+            ? matchedPlan.skuLimit
+            : storeProfile.skuLimit;
+
+        const isUnlimitedLimit =
+          rawLimit === null ||
+          typeof rawLimit !== 'number' ||
+          !Number.isFinite(rawLimit) ||
+          effectiveTier.toLowerCase().includes('enterprise');
+
+        const effectiveLimit = !isUnlimitedLimit && typeof rawLimit === 'number' && rawLimit > 0 ? rawLimit : 2500;
+        const utilizationPct = isUnlimitedLimit
+          ? '0.0'
+          : ((currentSkuCount / effectiveLimit) * 100).toFixed(1);
+
+        const periodStartFormatted = formatSubscriptionDate(sub?.currentPeriodStart);
+        const periodEndFormatted = formatSubscriptionDate(sub?.currentPeriodEnd);
+
+        const statusBadgeClass =
+          effectiveStatus === 'active' || effectiveStatus === 'trialing'
+            ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+            : effectiveStatus === 'past_due' || effectiveStatus === 'unpaid'
+            ? 'bg-amber-50 text-amber-800 border-amber-200'
+            : effectiveStatus === 'canceled' || effectiveStatus === 'expired'
+            ? 'bg-rose-50 text-rose-800 border-rose-200'
+            : 'bg-stone-100 text-stone-700 border-stone-200';
+
+        return (
+          <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-xs space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-stone-100">
+              <div>
+                <h3 className="text-sm font-bold text-stone-900">Subscription & SKU Capacity</h3>
+                <p className="text-xs text-stone-500">
+                  {isAuthenticated
+                    ? 'Authoritative workspace subscription status, billing interval, and SKU capacity limits'
+                    : 'Workspace scale limits and demo plan parameters (sign in for server billing)'}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-mono font-bold text-orange-700 bg-orange-50 px-2.5 py-1 rounded border border-orange-200">
+                  {effectiveTier}
+                </span>
+                <span className={`text-xs font-mono font-semibold px-2.5 py-1 rounded border capitalize ${statusBadgeClass}`}>
+                  {isFreeOrUnpaidProvider && isAuthenticated ? `${effectiveStatus} (Free / No Paid Plan)` : effectiveStatus}
+                </span>
+              </div>
+            </div>
+
+            {!isAuthenticated && (
+              <div className="bg-amber-50/70 border border-amber-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="text-xs text-amber-900">
+                    <span className="font-bold block">Sign In Required for Workspace Billing</span>
+                    <span className="text-amber-800">
+                      Sign in or register a workspace account to view live subscription status, upgrade plans, or open the Stripe Customer Portal.
                     </span>
                   </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => openAuthModal('login')}
+                  className="px-3.5 py-1.5 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg shrink-0 cursor-pointer"
+                >
+                  Sign In
+                </button>
+              </div>
+            )}
 
-                  {/* Progress bar */}
-                  <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden">
-                    <div 
-                      className="bg-orange-600 h-2.5 rounded-full" 
-                      style={{ width: `${Math.min(100, (currentSkuCount / effectiveLimit) * 100)}%` }}
-                    ></div>
-                  </div>
+            {isLoadingBilling && (
+              <div className="flex items-center gap-2 text-xs text-stone-500 font-mono">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                <span>Loading subscription details...</span>
+              </div>
+            )}
 
-                  <p className="text-xs text-stone-500">
-                    Capacity baseline: {effectiveLimit} SKUs (1 variant = 1 SKU). Plan tier and limits reflect local workspace configuration without verified third-party billing enforcement.
-                  </p>
-                </>
-              );
-            })()}
-          </div>
+            {billingLoadError && (
+              <div
+                role="alert"
+                className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span>{billingLoadError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void fetchBillingState()}
+                  className="px-3 py-1 bg-white border border-rose-300 hover:bg-rose-100 rounded-lg font-semibold text-rose-800 shrink-0 cursor-pointer"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
-            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-stone-500">Billing Cadence</span>
-                <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
-                  Not Configured
+            {/* Catalog SKU Utilization */}
+            <div className="p-5 bg-stone-50 rounded-xl border border-stone-200 space-y-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-stone-900">Catalog SKU Utilization</span>
+                <span className="font-mono text-stone-600">
+                  {isUnlimitedLimit
+                    ? `${currentSkuCount} / Unlimited SKUs`
+                    : `${currentSkuCount} / ${effectiveLimit} SKUs (${utilizationPct}%)`}
                 </span>
               </div>
-              <p className="text-base font-bold text-stone-900 font-mono">
-                {storeProfile.tier?.toLowerCase().includes('enterprise')
-                  ? '$499 / mo'
-                  : storeProfile.tier?.toLowerCase().includes('growth')
-                  ? '$149 / mo'
-                  : storeProfile.tier?.toLowerCase().includes('starter')
-                  ? '$49 / mo'
-                  : '$0 / mo'}
+
+              {!isUnlimitedLimit && (
+                <div className="w-full bg-stone-200 rounded-full h-2.5 overflow-hidden">
+                  <div
+                    className="bg-orange-600 h-2.5 rounded-full"
+                    style={{ width: `${Math.min(100, (currentSkuCount / effectiveLimit) * 100)}%` }}
+                  ></div>
+                </div>
+              )}
+
+              <p className="text-xs text-stone-500">
+                Capacity baseline: {isUnlimitedLimit ? 'Unlimited' : `${effectiveLimit} SKUs`} (1 variant = 1 SKU).
+                {sub && effectiveProvider !== 'none'
+                  ? ' Plan limits are enforced by your workspace subscription record.'
+                  : ' Unsubscribed workspaces operate under Free Audit capacity.'}
               </p>
-              <p className="text-stone-500">Authoritative server tier price · Live Stripe checkout depends on server credentials</p>
             </div>
 
-            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-stone-500">Audit &amp; Sync</span>
-                <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-600 border border-stone-200">
-                  On-Demand
-                </span>
+            {/* Subscription Summary Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2">
+              <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-stone-500">Billing Cadence</span>
+                  <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-700 border border-stone-200 capitalize">
+                    {matchedPlan?.billingInterval ? `${matchedPlan.billingInterval}ly` : isFreeOrUnpaidProvider ? 'Free Audit' : 'Monthly'}
+                  </span>
+                </div>
+                <p className="text-base font-bold text-stone-900 font-mono">
+                  {getTierMonthlyPriceLabel(effectiveTier, matchedPlan)}
+                </p>
+                <p className="text-stone-500">
+                  {periodEndFormatted
+                    ? sub?.cancelAtPeriodEnd
+                      ? `Cancels on ${periodEndFormatted}`
+                      : `Current period ends ${periodEndFormatted}`
+                    : periodStartFormatted
+                    ? `Period started ${periodStartFormatted}`
+                    : 'Authoritative server tier price · Live Stripe checkout depends on server credentials'}
+                </p>
               </div>
-              <p className="text-base font-bold text-stone-900 font-mono">On-Demand</p>
-              <p className="text-stone-500">Manual audit execution; Shopify webhook handling requires live store credentials</p>
+
+              <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-stone-500">Audit &amp; Sync</span>
+                  <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-600 border border-stone-200">
+                    On-Demand
+                  </span>
+                </div>
+                <p className="text-base font-bold text-stone-900 font-mono">On-Demand</p>
+                <p className="text-stone-500">Manual audit execution; Shopify webhook handling requires live store credentials</p>
+              </div>
+
+              <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-stone-500">Billing Management</span>
+                  <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 capitalize">
+                    {effectiveProvider === 'none' ? 'Unpaid / Free' : effectiveProvider}
+                  </span>
+                </div>
+                <p className="text-base font-bold text-stone-900 font-mono">
+                  {hasBillingPortalAccess ? 'Active Billing Profile' : 'Standard Workspace'}
+                </p>
+                {sub?.cancelAtPeriodEnd && (
+                  <p className="text-amber-700 font-medium">Scheduled to cancel at period end.</p>
+                )}
+                <p className="text-stone-500">
+                  {hasBillingPortalAccess
+                    ? 'Manage payment methods, invoices, or cancellation via Stripe Customer Portal.'
+                    : 'Select a paid plan below to activate recurring billing.'}
+                </p>
+              </div>
             </div>
 
-            <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-stone-500">Support Entitlement</span>
-                <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
-                  Self-Serve
-                </span>
+            {/* Period Details & Entitlements */}
+            {(periodStartFormatted || periodEndFormatted || (matchedPlan && matchedPlan.features.length > 0)) && (
+              <div className="p-4 bg-stone-50 rounded-xl border border-stone-200 space-y-3 text-xs">
+                {(periodStartFormatted || periodEndFormatted) && (
+                  <div className="flex flex-wrap gap-6 pb-2 border-b border-stone-200/80">
+                    {periodStartFormatted && (
+                      <div>
+                        <span className="text-stone-500 block">Period Start</span>
+                        <span className="font-mono font-semibold text-stone-900">{periodStartFormatted}</span>
+                      </div>
+                    )}
+                    {periodEndFormatted && (
+                      <div>
+                        <span className="text-stone-500 block">
+                          {sub?.cancelAtPeriodEnd ? 'Access Ends' : 'Current Period End'}
+                        </span>
+                        <span className="font-mono font-semibold text-stone-900">{periodEndFormatted}</span>
+                      </div>
+                    )}
+                    <div>
+                      <span className="text-stone-500 block">Subscription Status</span>
+                      <span className="font-mono font-semibold text-stone-900 capitalize">{effectiveStatus}</span>
+                    </div>
+                  </div>
+                )}
+
+                {matchedPlan && matchedPlan.features.length > 0 && (
+                  <div>
+                    <span className="font-semibold text-stone-800 block mb-1.5">Plan Entitlements</span>
+                    <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-stone-600">
+                      {matchedPlan.features.map((feat, idx) => (
+                        <li key={idx} className="flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span>{feat}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
               </div>
-              <p className="text-base font-bold text-stone-900 font-mono">Standard Workspace</p>
-              <p className="text-stone-500">Priority SaaS requires verified enterprise contract</p>
+            )}
+
+            {/* Manage Billing Action (for workspaces with an active/existing billing provider record) */}
+            {hasBillingPortalAccess && (
+              <div className="p-4 bg-stone-50 rounded-xl border border-stone-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="text-xs">
+                  <span className="font-bold text-stone-900 block">Stripe Customer Portal</span>
+                  <span className="text-stone-600">
+                    Update payment details, view invoices, or modify your {effectiveTier} subscription.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  disabled={isOpeningPortal}
+                  onClick={() => void handleOpenBillingPortal()}
+                  className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 shrink-0 disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+                >
+                  {isOpeningPortal ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Opening Portal...</span>
+                    </>
+                  ) : (
+                    <>
+                      <CreditCard className="w-3.5 h-3.5" />
+                      <span>Manage Billing</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+
+            {portalError && (
+              <div role="alert" className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{portalError}</span>
+              </div>
+            )}
+
+            {checkoutError && (
+              <div role="alert" className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800 flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{checkoutError}</span>
+              </div>
+            )}
+
+            {/* Upgrade / Subscribe Plans for Free or Canceled/Expired Workspaces */}
+            {isAuthenticated && (isFreeOrUnpaidProvider || effectiveStatus === 'canceled' || effectiveStatus === 'expired') && paidUpgradePlans.length > 0 && (
+              <div className="space-y-3 pt-2 border-t border-stone-100">
+                <div>
+                  <h4 className="text-xs font-bold text-stone-900">Available Paid Plans</h4>
+                  <p className="text-xs text-stone-500">
+                    Upgrade your workspace capacity through Stripe Checkout. Subscriptions activate only after verified server payment confirmation.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {paidUpgradePlans.map(plan => {
+                    const isLoadingThis = checkoutTierLoading === plan.tier;
+                    const isAnyLoading = checkoutTierLoading !== null;
+                    return (
+                      <div key={plan.id} className="p-4 rounded-xl border border-stone-200 bg-stone-50 flex flex-col justify-between gap-3">
+                        <div>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-stone-900">{plan.name}</span>
+                            <span className="text-xs font-mono font-bold text-stone-900">
+                              {getTierMonthlyPriceLabel(plan.tier, plan)}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-stone-500 mt-1">
+                            {plan.skuLimit === null || !Number.isFinite(plan.skuLimit)
+                              ? 'Unlimited SKUs'
+                              : `Up to ${plan.skuLimit.toLocaleString()} SKUs`}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={isAnyLoading}
+                          onClick={() => void handleStartUpgradeCheckout(plan.tier)}
+                          className="w-full py-2 px-3 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
+                        >
+                          {isLoadingThis ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>Redirecting...</span>
+                            </>
+                          ) : (
+                            <span>Upgrade to {plan.tier}</span>
+                          )}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200 text-xs text-stone-600">
+              <strong className="block mb-0.5 text-stone-800">Integration Notice:</strong>
+              Server billing services (authoritative tier pricing, SKU quota enforcement, Stripe checkout/webhook signature handlers, and leased webhook idempotency) are implemented in the backend, while this panel displays your workspace SKU capacity. Live Stripe payments remain unconfigured and unverified until <code className="font-mono">STRIPE_SECRET_KEY</code>, <code className="font-mono">STRIPE_WEBHOOK_SECRET</code>, and Stripe Price IDs are provisioned.
             </div>
           </div>
-
-          <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200 text-xs text-stone-600">
-            <strong className="block mb-0.5 text-stone-800">Integration Notice:</strong>
-            Server billing services (authoritative tier pricing, SKU quota enforcement, Stripe checkout/webhook signature handlers, and leased webhook idempotency) are implemented in the backend, while this panel displays your workspace SKU capacity. Live Stripe payments remain unconfigured and unverified until <code className="font-mono">STRIPE_SECRET_KEY</code>, <code className="font-mono">STRIPE_WEBHOOK_SECRET</code>, and Stripe Price IDs are provisioned.
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {activeTab === 'policies' && (
         <div className="bg-white border border-stone-200 rounded-2xl p-6 shadow-xs space-y-5">

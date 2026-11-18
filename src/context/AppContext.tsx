@@ -115,6 +115,43 @@ function buildEmptyCloudStoreProfile(workspace?: { name?: string; slug?: string 
   };
 }
 
+function resolveInitialPageFromLocation(): NavigationPage {
+  if (typeof window === 'undefined' || !window.location) {
+    return 'home';
+  }
+  try {
+    const pathname = typeof window.location.pathname === 'string' ? window.location.pathname : '';
+    if (pathname === '/settings') {
+      return 'settings';
+    }
+    const search = typeof window.location.search === 'string' ? window.location.search : '';
+    if (search) {
+      const params = new URLSearchParams(search);
+      const pageParam = params.get('page');
+      if (
+        pageParam === 'landing' ||
+        pageParam === 'home' ||
+        pageParam === 'audit' ||
+        pageParam === 'products' ||
+        pageParam === 'actions' ||
+        pageParam === 'ai-discovery' ||
+        pageParam === 'feed-readiness' ||
+        pageParam === 'business-profile' ||
+        pageParam === 'ai-visibility' ||
+        pageParam === 'settings'
+      ) {
+        return pageParam;
+      }
+      if (params.has('shopify') || params.has('shopify_error')) {
+        return 'settings';
+      }
+    }
+  } catch {
+    // Fallback safely in restricted DOM environments
+  }
+  return 'home';
+}
+
 export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?: CatalogStorageAdapter }> = ({ 
   children, 
   customStorageAdapter 
@@ -122,7 +159,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const storageAdapterRef = useRef<CatalogStorageAdapter>(customStorageAdapter || new CatalogStorageAdapter());
   const storageAdapter = storageAdapterRef.current;
 
-  const [currentPage, setCurrentPage] = useState<NavigationPage>('home');
+  const [currentPage, setCurrentPage] = useState<NavigationPage>(() => resolveInitialPageFromLocation());
   const [previousPage, setPreviousPage] = useState<NavigationPage>('home');
   const [selectedProductId, setSelectedProductId] = useState<string | null>('prod_solstice_01');
   const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
