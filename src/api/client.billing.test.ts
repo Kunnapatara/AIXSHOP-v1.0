@@ -9,6 +9,8 @@ import {
   isValidShopDomain,
   validateAndNormalizeShopDomain,
   isValidExternalHttpUrl,
+  isValidBillingRedirectUrl,
+  parseTrustedStripeCustomDomains,
   isValidShopifyAuthUrl,
 } from '../domain/validation/shopify';
 
@@ -66,6 +68,129 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
         isValidShopifyAuthUrl('https://solstice.myshopify.com/some/other/path'),
         false
       );
+    });
+
+    test('strictly validates Stripe Checkout & Portal URLs, rejects lookalikes, arbitrary HTTPS hosts, HTTP in production, and embedded credentials', () => {
+      // Valid standard Stripe destinations
+      assert.equal(
+        isValidBillingRedirectUrl('https://checkout.stripe.com/c/pay/cs_live_123', { flow: 'checkout', provider: 'stripe' }),
+        true
+      );
+      assert.equal(
+        isValidBillingRedirectUrl('https://billing.stripe.com/p/session/bps_live_123', { flow: 'portal', provider: 'stripe' }),
+        true
+      );
+
+      // Cross-flow mismatch must fail closed
+      assert.equal(
+        isValidBillingRedirectUrl('https://billing.stripe.com/p/session/bps_1', { flow: 'checkout', provider: 'stripe' }),
+        false
+      );
+      assert.equal(
+        isValidBillingRedirectUrl('https://checkout.stripe.com/c/pay/cs_1', { flow: 'portal', provider: 'stripe' }),
+        false
+      );
+
+      // Explicitly configured trusted Stripe custom domain
+      const prevCustom = process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+      try {
+        process.env.VITE_STRIPE_CUSTOM_DOMAINS = 'https://pay.solsticecraft.com, billing.solsticecraft.com';
+        assert.equal(
+          isValidBillingRedirectUrl('https://pay.solsticecraft.com/c/pay/cs_custom_1', { flow: 'checkout', provider: 'stripe' }),
+          true
+        );
+        assert.equal(
+          isValidBillingRedirectUrl('https://billing.solsticecraft.com/p/session/bps_custom_1', { flow: 'portal', provider: 'stripe' }),
+          true
+        );
+        // Subdomain or suffix lookalike of configured custom domain must be rejected
+        assert.equal(
+          isValidBillingRedirectUrl('https://sub.pay.solsticecraft.com/c/pay/cs_bad', { flow: 'checkout', provider: 'stripe' }),
+          false
+        );
+        assert.equal(
+          isValidBillingRedirectUrl('https://pay.solsticecraft.com.evil.com/c/pay/cs_bad', { flow: 'checkout', provider: 'stripe' }),
+          false
+        );
+      } finally {
+        if (prevCustom === undefined) delete process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+        else process.env.VITE_STRIPE_CUSTOM_DOMAINS = prevCustom;
+      }
+
+      // Custom domain parser rejects wildcards, HTTP, IPs, localhost, paths, credentials
+      const parsedDomains = parseTrustedStripeCustomDomains(
+        '*.stripe.com, http://insecure.brand.com, https://127.0.0.1, https://localhost, https://user:pass@pay.brand.com, https://pay.brand.com/path, https://checkout.verifiedbrand.com'
+      );
+      assert.deepEqual([...parsedDomains], ['checkout.verifiedbrand.com']);
+
+      // Arbitrary external HTTPS hostnames rejected
+      assert.equal(
+        isValidBillingRedirectUrl('https://evil.example.com/c/pay/cs_123', { flow: 'checkout', provider: 'stripe' }),
+        false
+      );
+      assert.equal(
+        isValidBillingRedirectUrl('https://attacker.dev/portal', { flow: 'portal', provider: 'stripe' }),
+        false
+      );
+
+      // Lookalike Stripe domains (broad suffix check trap) rejected
+      for (const lookalike of [
+        'https://checkout.stripe.com.evil.com/pay',
+        'https://evil-checkout.stripe.com/pay',
+        'https://fake.stripe.com/pay',
+        'https://billing.stripe.com.attacker.org/session',
+        'https://stripe.com/pay',
+        'https://checkout.stripe.com./pay',
+        'https://checkout.stripe.com:8443/pay',
+      ]) {
+        assert.equal(
+          isValidBillingRedirectUrl(lookalike, { flow: 'checkout', provider: 'stripe' }),
+          false,
+          `Must reject lookalike/port/dot URL: ${lookalike}`
+        );
+        assert.equal(
+          isValidBillingRedirectUrl(lookalike, { flow: 'portal', provider: 'stripe' }),
+          false,
+          `Must reject lookalike/port/dot URL for portal: ${lookalike}`
+        );
+      }
+
+      // Malformed, non-HTTP(S), whitespace, and embedded credential URLs rejected
+      for (const bad of [
+        '',
+        '   ',
+        'not-a-url',
+        'javascript:alert(1)',
+        'data:text/html,<script>alert(1)</script>',
+        'file:///etc/passwd',
+        'https://user:pass@checkout.stripe.com/c/pay/cs_1',
+        'https://checkout.stripe.com@evil.com/c/pay/cs_1',
+        'http://checkout.stripe.com/c/pay/cs_1',
+        'http://billing.stripe.com/p/session/bps_1',
+      ]) {
+        assert.equal(isValidBillingRedirectUrl(bad, { flow: 'checkout', provider: 'stripe' }), false, `Must reject: ${bad}`);
+      }
+
+      // Production mode rejects HTTP everywhere (including sandbox localhost)
+      const prevNodeEnv = process.env.NODE_ENV;
+      try {
+        process.env.NODE_ENV = 'production';
+        assert.equal(
+          isValidBillingRedirectUrl('http://localhost:3000/?session_id=1', { flow: 'checkout', provider: 'sandbox' }),
+          false
+        );
+        assert.equal(
+          isValidBillingRedirectUrl('http://checkout.stripe.com/c/pay/cs_1', { flow: 'checkout', provider: 'stripe' }),
+          false
+        );
+        assert.equal(
+          isValidBillingRedirectUrl('https://checkout.stripe.com/c/pay/cs_prod_1', { flow: 'checkout', provider: 'stripe' }),
+          true
+        );
+      } finally {
+        if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = prevNodeEnv;
+      }
     });
   });
 
@@ -215,11 +340,19 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
       assert.equal(res.checkoutUrl, 'https://checkout.stripe.com/c/pay/cs_test_999');
     });
 
-    test('rejects missing, empty, or unsafe checkoutUrl and HTTP errors', async () => {
+    test('rejects missing, empty, lookalike, arbitrary external HTTPS, HTTP-in-production, and credentialed checkoutUrl / portalUrl', async () => {
       for (const badPayload of [
-        { success: true, sessionId: 'cs_1', checkoutUrl: '' },
-        { success: true, sessionId: 'cs_1', checkoutUrl: 'javascript:alert(1)' },
-        { success: false, sessionId: 'cs_1', checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_1' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: '', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'javascript:alert(1)', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'data:text/html,<script>', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'not-a-valid-url', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'https://evil.example.com/checkout', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'https://checkout.stripe.com.evil.com/pay', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'https://evil-checkout.stripe.com/pay', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'https://user:pass@checkout.stripe.com/c/pay/cs_1', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'http://checkout.stripe.com/c/pay/cs_1', provider: 'stripe' },
+        { success: true, sessionId: 'cs_1', checkoutUrl: 'https://billing.stripe.com/p/session/bps_1', provider: 'stripe' },
+        { success: false, sessionId: 'cs_1', checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_1', provider: 'stripe' },
       ]) {
         globalThis.fetch = (async () =>
           new Response(JSON.stringify(badPayload), { status: 200 })) as typeof fetch;
@@ -231,7 +364,43 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
       await assert.rejects(() => apiClient.createCheckoutSession({ tier: 'Starter' }), /Stripe credentials/);
     });
 
-    test('creates portal session and rejects missing or unsafe portalUrl', async () => {
+    test('accepts configured trusted Stripe custom domain for checkout & portal and rejects untrusted custom domains', async () => {
+      const prevCustom = process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+      process.env.VITE_STRIPE_CUSTOM_DOMAINS = 'https://pay.solsticecraft.com';
+      try {
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              success: true,
+              sessionId: 'cs_custom_1',
+              checkoutUrl: 'https://pay.solsticecraft.com/c/pay/cs_custom_1',
+              provider: 'stripe',
+            }),
+            { status: 200 }
+          )) as typeof fetch;
+
+        const checkout = await apiClient.createCheckoutSession({ tier: 'Growth' });
+        assert.equal(checkout.checkoutUrl, 'https://pay.solsticecraft.com/c/pay/cs_custom_1');
+
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              success: true,
+              portalUrl: 'https://pay.solsticecraft.com/p/session/bps_custom_1',
+              provider: 'stripe',
+            }),
+            { status: 200 }
+          )) as typeof fetch;
+
+        const portal = await apiClient.createPortalSession();
+        assert.equal(portal.portalUrl, 'https://pay.solsticecraft.com/p/session/bps_custom_1');
+      } finally {
+        if (prevCustom === undefined) delete process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+        else process.env.VITE_STRIPE_CUSTOM_DOMAINS = prevCustom;
+      }
+    });
+
+    test('creates portal session and rejects missing, arbitrary HTTPS, lookalike, HTTP, or unsafe portalUrl', async () => {
       globalThis.fetch = (async () =>
         new Response(
           JSON.stringify({
@@ -245,16 +414,26 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
       const portal = await apiClient.createPortalSession({ returnUrl: 'http://localhost:3000/settings' });
       assert.equal(portal.portalUrl, 'https://billing.stripe.com/p/session/bps_test_1');
 
-      globalThis.fetch = (async () =>
-        new Response(
-          JSON.stringify({
-            success: true,
-            portalUrl: 'javascript:void(0)',
-            provider: 'stripe',
-          }),
-          { status: 200 }
-        )) as typeof fetch;
-      await assert.rejects(() => apiClient.createPortalSession(), /portal URL/i);
+      for (const badUrl of [
+        '',
+        'javascript:void(0)',
+        'https://evil.example.com/billing',
+        'https://billing.stripe.com.evil.com/p/session/bps_1',
+        'https://checkout.stripe.com/c/pay/cs_1',
+        'http://billing.stripe.com/p/session/bps_1',
+        'https://user:secret@billing.stripe.com/p/session/bps_1',
+      ]) {
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              success: true,
+              portalUrl: badUrl,
+              provider: 'stripe',
+            }),
+            { status: 200 }
+          )) as typeof fetch;
+        await assert.rejects(() => apiClient.createPortalSession(), /portal URL/i);
+      }
     });
   });
 

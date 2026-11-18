@@ -35,6 +35,7 @@ import {
   ShopifyStatusResponse,
 } from '../api/client';
 import {
+  isValidBillingRedirectUrl,
   isValidExternalHttpUrl,
   isValidShopifyAuthUrl,
   redirectBrowser,
@@ -308,13 +309,22 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
     setBillingLoadError(null);
 
     try {
-      const plansPromise = apiClient.getBillingPlans().catch(() => null);
+      let plansFetchError: string | null = null;
+      const plansPromise = apiClient.getBillingPlans().catch((err: any) => {
+        plansFetchError = err?.message || 'Unable to load authoritative billing plans from server.';
+        return null;
+      });
       const subPromise = isAuthenticated ? apiClient.getBillingSubscription() : Promise.resolve(null);
 
       const [plansRes, subRes] = await Promise.all([plansPromise, subPromise]);
 
       if (plansRes?.plans) {
         setBillingPlans(plansRes.plans);
+      } else {
+        setBillingPlans([]);
+        if (plansFetchError) {
+          setBillingLoadError(plansFetchError);
+        }
       }
 
       if (isAuthenticated && subRes) {
@@ -494,7 +504,14 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
       }
 
       const res = await apiClient.createPortalSession(returnUrl ? { returnUrl } : undefined);
-      if (!res || res.success !== true || !isValidExternalHttpUrl(res.portalUrl)) {
+      if (
+        !res ||
+        res.success !== true ||
+        !isValidBillingRedirectUrl(res.portalUrl, {
+          flow: 'portal',
+          provider: typeof res.provider === 'string' ? res.provider : undefined,
+        })
+      ) {
         throw new Error('Customer portal response missing a valid portal URL.');
       }
       redirectBrowser(res.portalUrl);
@@ -507,6 +524,10 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   };
 
   const handleStartUpgradeCheckout = async (tier: PlanTier) => {
+    if (isLoadingBilling || billingLoadError || billingPlans.length === 0) {
+      setCheckoutError('Authoritative billing plans have not loaded. Retry before starting checkout.');
+      return;
+    }
     if (checkoutInFlightRef.current || checkoutTierLoading !== null) {
       return;
     }
@@ -538,7 +559,14 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
         ...(successUrl ? { successUrl } : {}),
         ...(cancelUrl ? { cancelUrl } : {}),
       });
-      if (!res || res.success !== true || !isValidExternalHttpUrl(res.checkoutUrl)) {
+      if (
+        !res ||
+        res.success !== true ||
+        !isValidBillingRedirectUrl(res.checkoutUrl, {
+          flow: 'checkout',
+          provider: typeof res.provider === 'string' ? res.provider : undefined,
+        })
+      ) {
         throw new Error('Checkout session response missing a valid checkout URL.');
       }
       redirectBrowser(res.checkoutUrl);
@@ -1773,7 +1801,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                         </div>
                         <button
                           type="button"
-                          disabled={isAnyLoading}
+                          disabled={isAnyLoading || isLoadingBilling || Boolean(billingLoadError)}
                           onClick={() => void handleStartUpgradeCheckout(plan.tier)}
                           className="w-full py-2 px-3 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed cursor-pointer"
                         >

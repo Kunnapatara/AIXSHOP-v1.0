@@ -1,7 +1,7 @@
 import { StoragePayloadV1 } from '../domain/storage/storageTypes';
 import { StoreProfile, ActionItem, Product, CatalogImportResult, ProductCandidate } from '../types';
 import {
-  isValidExternalHttpUrl,
+  isValidBillingRedirectUrl,
   isValidShopifyAuthUrl,
   validateAndNormalizeShopDomain,
 } from '../domain/validation/shopify';
@@ -279,7 +279,10 @@ class ApiClient {
       data.success !== true ||
       typeof data.sessionId !== 'string' ||
       !data.sessionId.trim() ||
-      !isValidExternalHttpUrl(data.checkoutUrl)
+      !isValidBillingRedirectUrl(data.checkoutUrl, {
+        flow: 'checkout',
+        provider: typeof data.provider === 'string' ? data.provider : undefined,
+      })
     ) {
       throw new Error('Checkout session response missing a valid checkout URL');
     }
@@ -296,7 +299,15 @@ class ApiClient {
       body: JSON.stringify(payload),
     });
 
-    if (!data || typeof data !== 'object' || data.success !== true || !isValidExternalHttpUrl(data.portalUrl)) {
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      data.success !== true ||
+      !isValidBillingRedirectUrl(data.portalUrl, {
+        flow: 'portal',
+        provider: typeof data.provider === 'string' ? data.provider : undefined,
+      })
+    ) {
       throw new Error('Customer portal session response missing a valid portal URL');
     }
 

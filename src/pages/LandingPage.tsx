@@ -2,7 +2,7 @@ import React, { useState, useEffect, useContext, useRef, useCallback } from 'rea
 import { useApp } from '../context/AppContext';
 import { AuthContext } from '../context/AuthContext';
 import { apiClient, BillingPlan, PlanTier } from '../api/client';
-import { isValidExternalHttpUrl, redirectBrowser } from '../domain/validation/shopify';
+import { isValidBillingRedirectUrl, isValidExternalHttpUrl, redirectBrowser } from '../domain/validation/shopify';
 import { 
   ArrowRight, 
   Search, 
@@ -139,6 +139,9 @@ export const LandingPage: React.FC = () => {
   const checkoutInFlightRef = useRef<boolean>(false);
   const prevAuthModalOpenRef = useRef<boolean>(authModalOpen);
 
+  const canStartPaidCheckout =
+    plansLoadedFromBackend && !plansLoading && !plansError && paidPlans.length > 0;
+
   const loadPlans = useCallback(async () => {
     setPlansLoading(true);
     setPlansError(null);
@@ -146,12 +149,15 @@ export const LandingPage: React.FC = () => {
       const res = await apiClient.getBillingPlans();
       const paid = res.plans.filter(p => p.priceCents > 0);
       const free = res.plans.find(p => p.priceCents === 0) || null;
-      if (paid.length > 0) {
-        setPaidPlans(paid);
+      if (paid.length === 0) {
+        throw new Error('Server returned no purchasable paid billing plans.');
       }
+      setPaidPlans(paid);
       setFreePlan(free);
       setPlansLoadedFromBackend(true);
     } catch (err: any) {
+      setPlansLoadedFromBackend(false);
+      setPendingPlanTier(null);
       setPlansError(err?.message || 'Unable to load authoritative plans from server.');
     } finally {
       setPlansLoading(false);
@@ -163,6 +169,12 @@ export const LandingPage: React.FC = () => {
   }, [loadPlans]);
 
   const initiateCheckout = useCallback(async (tier: PlanTier) => {
+    if (!plansLoadedFromBackend || plansLoading || plansError) {
+      setCheckoutError(
+        'Authoritative plan pricing could not be verified from the server. Retry loading plans before starting checkout.'
+      );
+      return;
+    }
     if (checkoutInFlightRef.current) return;
     checkoutInFlightRef.current = true;
     setCheckoutLoadingTier(tier);
@@ -187,7 +199,14 @@ export const LandingPage: React.FC = () => {
         ...(cancelUrl ? { cancelUrl } : {}),
       });
 
-      if (!session || session.success !== true || !isValidExternalHttpUrl(session.checkoutUrl)) {
+      if (
+        !session ||
+        session.success !== true ||
+        !isValidBillingRedirectUrl(session.checkoutUrl, {
+          flow: 'checkout',
+          provider: typeof session.provider === 'string' ? session.provider : undefined,
+        })
+      ) {
         throw new Error('Checkout session response missing a valid checkout URL.');
       }
 
@@ -198,16 +217,16 @@ export const LandingPage: React.FC = () => {
       checkoutInFlightRef.current = false;
       setCheckoutLoadingTier(null);
     }
-  }, []);
+  }, [plansLoadedFromBackend, plansLoading, plansError]);
 
-  // Resume pending plan checkout immediately once authentication completes
+  // Resume pending plan checkout immediately once authentication completes and plans are authoritative
   useEffect(() => {
-    if (isAuthenticated && pendingPlanTier) {
+    if (isAuthenticated && pendingPlanTier && canStartPaidCheckout) {
       const targetTier = pendingPlanTier;
       setPendingPlanTier(null);
       void initiateCheckout(targetTier);
     }
-  }, [isAuthenticated, pendingPlanTier, initiateCheckout]);
+  }, [isAuthenticated, pendingPlanTier, canStartPaidCheckout, initiateCheckout]);
 
   // Clear pending plan if user closes AuthModal without signing in
   useEffect(() => {
@@ -219,6 +238,12 @@ export const LandingPage: React.FC = () => {
   }, [authModalOpen, isAuthenticated, pendingPlanTier]);
 
   const handleSelectPlan = (tier: PlanTier) => {
+    if (!canStartPaidCheckout) {
+      setCheckoutError(
+        'Authoritative plan pricing has not been loaded from the server. Please wait or retry loading plans before starting checkout.'
+      );
+      return;
+    }
     if (checkoutInFlightRef.current || checkoutLoadingTier !== null) {
       return;
     }
@@ -801,19 +826,32 @@ export const LandingPage: React.FC = () => {
           </div>
         )}
 
+        {!plansLoadedFromBackend && !plansLoading && !plansError && (
+          <div className="mb-6 max-w-2xl mx-auto p-3 bg-stone-100 border border-stone-200 rounded-xl text-xs text-stone-700 text-center">
+            Reference pricing preview shown. Paid checkout activates only after authoritative server plans are loaded.
+          </div>
+        )}
+
         {plansError && (
           <div
             role="alert"
             className="mb-6 max-w-2xl mx-auto p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
           >
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-              <span>{plansError}</span>
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold">
+                  Authoritative billing plans could not be verified. Paid checkout is temporarily disabled.
+                </p>
+                <p className="mt-0.5 text-amber-800">
+                  {plansError} Reference pricing cards remain shown for preview only; Free Audit and Store Check remain available.
+                </p>
+              </div>
             </div>
             <button
               type="button"
               onClick={() => void loadPlans()}
-              className="px-3 py-1.5 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg font-semibold text-amber-900 shrink-0"
+              className="px-3 py-1.5 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg font-semibold text-amber-900 shrink-0 self-start sm:self-center"
             >
               Retry
             </button>
@@ -830,7 +868,7 @@ export const LandingPage: React.FC = () => {
           </div>
         )}
 
-        {pendingPlanTier && !isAuthenticated && (
+        {pendingPlanTier && !isAuthenticated && canStartPaidCheckout && (
           <div className="mb-6 max-w-2xl mx-auto p-3 bg-orange-50 border border-orange-200 rounded-xl text-xs text-orange-900 text-center">
             Sign in or create a workspace account to continue checkout for <strong>{pendingPlanTier}</strong>.
           </div>
@@ -845,6 +883,7 @@ export const LandingPage: React.FC = () => {
             const isHighlighted = plan.tier === 'Growth';
             const isSelectingThis = checkoutLoadingTier === plan.tier;
             const isAnyCheckoutLoading = checkoutLoadingTier !== null;
+            const isPlanCheckoutDisabled = !canStartPaidCheckout || isAnyCheckoutLoading;
             const intervalLabel = plan.billingInterval === 'year' ? 'year' : 'month';
 
             return (
@@ -864,13 +903,20 @@ export const LandingPage: React.FC = () => {
                 )}
 
                 <div>
-                  <span
-                    className={`text-xs font-semibold ${
-                      isHighlighted ? 'text-orange-700' : 'text-stone-500'
-                    }`}
-                  >
-                    {meta.subtitle}
-                  </span>
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className={`text-xs font-semibold ${
+                        isHighlighted ? 'text-orange-700' : 'text-stone-500'
+                      }`}
+                    >
+                      {meta.subtitle}
+                    </span>
+                    {!plansLoadedFromBackend && (
+                      <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded bg-stone-100 text-stone-600 border border-stone-200">
+                        Unverified preview
+                      </span>
+                    )}
+                  </div>
                   <h3 className="text-xl font-bold text-stone-900 mt-1">{plan.name}</h3>
                   <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">
                     {formatPlanPrice(plan.priceCents, plan.currency)}
@@ -889,25 +935,35 @@ export const LandingPage: React.FC = () => {
                   </ul>
                 </div>
 
-                <button
-                  type="button"
-                  disabled={isAnyCheckoutLoading}
-                  onClick={() => handleSelectPlan(plan.tier)}
-                  className={`mt-8 w-full py-2.5 text-xs font-semibold rounded-xl transition-colors min-h-[44px] flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed ${
-                    isHighlighted
-                      ? 'bg-orange-600 hover:bg-orange-700 text-white'
-                      : 'bg-stone-100 hover:bg-stone-200 text-stone-900'
-                  }`}
-                >
-                  {isSelectingThis ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      <span>Starting Checkout...</span>
-                    </>
-                  ) : (
-                    <span>{meta.ctaLabel}</span>
+                <div className="mt-8">
+                  <button
+                    type="button"
+                    disabled={isPlanCheckoutDisabled}
+                    aria-disabled={isPlanCheckoutDisabled}
+                    onClick={() => handleSelectPlan(plan.tier)}
+                    className={`w-full py-2.5 text-xs font-semibold rounded-xl transition-colors min-h-[44px] flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed ${
+                      isHighlighted
+                        ? 'bg-orange-600 hover:bg-orange-700 text-white'
+                        : 'bg-stone-100 hover:bg-stone-200 text-stone-900'
+                    }`}
+                  >
+                    {isSelectingThis ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Starting Checkout...</span>
+                      </>
+                    ) : (
+                      <span>{meta.ctaLabel}</span>
+                    )}
+                  </button>
+                  {!canStartPaidCheckout && !isSelectingThis && (
+                    <p className="mt-2 text-center text-[11px] font-medium text-amber-700">
+                      {plansLoading
+                        ? 'Verifying authoritative server pricing...'
+                        : 'Checkout disabled until server pricing is verified'}
+                    </p>
                   )}
-                </button>
+                </div>
               </div>
             );
           })}

@@ -723,4 +723,219 @@ describe('Task C2: LandingPage Stripe Billing Integration', () => {
       root.unmount();
     });
   });
+
+  test('fails closed when billing plans fail to load, disables paid checkout, preserves Free Audit, and recovers on Retry', async () => {
+    const dom = createUiTestDom();
+    (globalThis as any).window = dom.win;
+    (globalThis as any).document = dom.doc;
+
+    let getPlansAttempts = 0;
+    let checkoutCalls = 0;
+    const storeCheckUrls: string[] = [];
+    const navigations: string[] = [];
+    const deferredLoad = createDeferred<BillingPlansResponse>();
+
+    apiClient.getBillingPlans = async () => {
+      getPlansAttempts += 1;
+      if (getPlansAttempts === 1) {
+        return deferredLoad.promise;
+      }
+      if (getPlansAttempts === 2) {
+        return AUTHORITATIVE_PLAN_FIXTURE;
+      }
+      throw new Error('Billing service temporarily unavailable');
+    };
+    apiClient.createCheckoutSession = async params => {
+      checkoutCalls += 1;
+      return {
+        success: true,
+        sessionId: 'cs_retry_ok',
+        checkoutUrl: `https://checkout.stripe.com/c/pay/cs_${params.tier.toLowerCase()}`,
+        provider: 'stripe',
+      };
+    };
+
+    const root: Root = createRoot(dom.container);
+    await act(async () => {
+      root.render(
+        React.createElement(
+          AuthContext.Provider,
+          {
+            value: {
+              user: { id: 'u1', email: 'owner@store.com', fullName: 'Owner' },
+              activeWorkspace: { id: 'ws1', name: 'Store', slug: 'store', role: 'owner' },
+              workspaces: [],
+              isAuthenticated: true,
+              isLoading: false,
+              authModalOpen: false,
+              authModalMode: 'login',
+              openAuthModal: () => {},
+              closeAuthModal: () => {},
+              login: async () => ({ success: true }),
+              register: async () => ({ success: true }),
+              logout: async () => {},
+              switchWorkspace: async () => true,
+            },
+          },
+          React.createElement(
+            AppContext.Provider,
+            {
+              value: buildMockAppContext({
+                navigateTo: page => navigations.push(page),
+                runStoreCheck: async url => {
+                  storeCheckUrls.push(url);
+                },
+              }),
+            },
+            React.createElement(LandingPage)
+          )
+        )
+      );
+    });
+
+    // 1. While initial getBillingPlans() is still in flight -> ALL paid plan buttons MUST be disabled
+    for (const label of ['Select Starter Plan', 'Select Growth Plan', 'Select Enterprise Plan']) {
+      const btn = findButtonByText(dom.container, label);
+      assert.ok(btn, `Button ${label} should exist`);
+      assert.equal(isElementDisabled(btn), true, `${label} must be disabled while plans are loading`);
+      await act(async () => {
+        getReactProps(btn).onClick?.();
+      });
+    }
+    assert.equal(checkoutCalls, 0, 'Must NOT allow checkout while plans are loading');
+
+    // 2. Reject initial plans load -> ALL paid plan buttons MUST remain disabled, error + Retry rendered, Free Audit still works
+    await act(async () => {
+      deferredLoad.reject(new Error('503 Billing Plans API Offline'));
+    });
+
+    assert.match(dom.container.textContent, /503 Billing Plans API Offline/);
+    assert.match(dom.container.textContent, /Paid checkout is temporarily disabled/);
+    assert.match(dom.container.textContent, /Unverified preview/);
+
+    for (const label of ['Select Starter Plan', 'Select Growth Plan', 'Select Enterprise Plan']) {
+      const btn = findButtonByText(dom.container, label);
+      assert.ok(btn);
+      assert.equal(isElementDisabled(btn), true, `${label} must stay disabled when plans fail to load`);
+      await act(async () => {
+        getReactProps(btn).onClick?.();
+      });
+    }
+    assert.equal(checkoutCalls, 0, 'Fallback pricing must NEVER initiate paid checkout on failure');
+    assert.equal(dom.locationStub.href, 'http://localhost:3000/');
+
+    // Free Audit behavior (Store Check + Enter Merchant App) MUST remain usable
+    const inspectBtn = findButtonByText(dom.container, 'Inspect Catalog');
+    assert.ok(inspectBtn);
+    assert.equal(isElementDisabled(inspectBtn), false, 'Free Audit Store Check must stay enabled when plans fail');
+    const storeForm = findElements(dom.container, n => n.tagName === 'FORM')[0];
+    await act(async () => {
+      getReactProps(storeForm).onSubmit?.({ preventDefault: () => {} });
+    });
+    assert.equal(storeCheckUrls.length, 1, 'Free Store Check must execute normally');
+
+    const enterAppBtn = findButtonByText(dom.container, 'Enter Merchant App');
+    assert.ok(enterAppBtn);
+    assert.equal(isElementDisabled(enterAppBtn), false);
+    await act(async () => {
+      getReactProps(enterAppBtn).onClick?.();
+    });
+    assert.deepEqual(navigations, ['home']);
+
+    // 3. Click Retry -> succeeds and enables paid Checkout
+    const retryBtn = findButtonByText(dom.container, 'Retry');
+    assert.ok(retryBtn, 'Retry button must render on plans error');
+    await act(async () => {
+      getReactProps(retryBtn).onClick?.();
+    });
+
+    assert.equal(getPlansAttempts, 2);
+    const growthBtnAfterRetry = findButtonByText(dom.container, 'Select Growth Plan');
+    assert.ok(growthBtnAfterRetry);
+    assert.equal(isElementDisabled(growthBtnAfterRetry), false, 'Checkout must re-enable once authoritative plans load on retry');
+
+    await act(async () => {
+      getReactProps(growthBtnAfterRetry).onClick?.();
+    });
+    assert.equal(checkoutCalls, 1);
+    assert.equal(dom.locationStub.href, 'https://checkout.stripe.com/c/pay/cs_growth');
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  test('rejects arbitrary external HTTPS and HTTP-in-production redirect URLs in LandingPage without redirecting', async () => {
+    const dom = createUiTestDom();
+    (globalThis as any).window = dom.win;
+    (globalThis as any).document = dom.doc;
+
+    apiClient.getBillingPlans = async () => AUTHORITATIVE_PLAN_FIXTURE;
+    apiClient.createCheckoutSession = async () => ({
+      success: true,
+      sessionId: 'cs_evil',
+      checkoutUrl: 'https://evil.example.com/c/pay/cs_evil',
+      provider: 'stripe',
+    });
+
+    const root: Root = createRoot(dom.container);
+    await act(async () => {
+      root.render(
+        React.createElement(
+          AuthContext.Provider,
+          {
+            value: {
+              user: { id: 'u1', email: 'owner@store.com', fullName: 'Owner' },
+              activeWorkspace: { id: 'ws1', name: 'Store', slug: 'store', role: 'owner' },
+              workspaces: [],
+              isAuthenticated: true,
+              isLoading: false,
+              authModalOpen: false,
+              authModalMode: 'login',
+              openAuthModal: () => {},
+              closeAuthModal: () => {},
+              login: async () => ({ success: true }),
+              register: async () => ({ success: true }),
+              logout: async () => {},
+              switchWorkspace: async () => true,
+            },
+          },
+          React.createElement(
+            AppContext.Provider,
+            { value: buildMockAppContext() },
+            React.createElement(LandingPage)
+          )
+        )
+      );
+    });
+
+    const starterBtn = findButtonByText(dom.container, 'Select Starter Plan');
+    await act(async () => {
+      getReactProps(starterBtn).onClick?.();
+    });
+    assert.equal(dom.locationStub.href, 'http://localhost:3000/', 'Arbitrary external HTTPS host must not redirect');
+    assert.match(dom.container.textContent, /missing a valid checkout URL/i);
+
+    const prevNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      apiClient.createCheckoutSession = async () => ({
+        success: true,
+        sessionId: 'cs_http_prod',
+        checkoutUrl: 'http://checkout.stripe.com/c/pay/cs_http_prod',
+        provider: 'stripe',
+      });
+      await act(async () => {
+        getReactProps(starterBtn).onClick?.();
+      });
+      assert.equal(dom.locationStub.href, 'http://localhost:3000/', 'HTTP URL in production must not redirect');
+    } finally {
+      if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = prevNodeEnv;
+    }
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 });

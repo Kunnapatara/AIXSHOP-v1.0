@@ -659,6 +659,112 @@ describe('Task C3, C4 & C5: SettingsPage Billing & Shopify OAuth Integration', (
         root.unmount();
       });
     });
+
+    test('rejects untrusted external HTTPS, lookalike Stripe, and HTTP-in-production URLs for portal and upgrade checkout without redirecting', async () => {
+      const dom = createUiTestDom();
+      (globalThis as any).window = dom.win;
+      (globalThis as any).document = dom.doc;
+
+      apiClient.getBillingPlans = async () => AUTHORITATIVE_PLANS_FIXTURE;
+      apiClient.getBillingSubscription = async () => ({
+        workspaceId: 'ws_1',
+        subscription: {
+          provider: 'stripe',
+          tier: 'Starter',
+          status: 'canceled',
+          cancelAtPeriodEnd: false,
+        },
+        storeProfile: {
+          ...initialStoreProfile,
+          tier: 'Free Audit',
+          skuCount: 10,
+          skuLimit: 2500,
+        },
+      });
+      apiClient.createPortalSession = async () => ({
+        success: true,
+        portalUrl: 'https://billing.stripe.com.evil.com/p/session/bps_bad',
+        provider: 'stripe',
+      });
+      apiClient.createCheckoutSession = async () => ({
+        success: true,
+        sessionId: 'cs_evil',
+        checkoutUrl: 'https://evil-attacker.example.com/c/pay/cs_evil',
+        provider: 'stripe',
+      });
+
+      const { root, renderPromise } = renderSettings(dom, { initialTab: 'subscription' });
+      await renderPromise;
+
+      const manageBtn = findButtonByText(dom.container, 'Manage Billing');
+      assert.ok(manageBtn);
+      await act(async () => {
+        getReactProps(manageBtn).onClick?.();
+      });
+      assert.equal(dom.locationStub.href, 'http://localhost:3000/', 'Lookalike portal URL must not redirect');
+      assert.match(dom.container.textContent, /missing a valid portal URL/i);
+
+      const upgradeGrowthBtn = findButtonByText(dom.container, 'Upgrade to Growth');
+      assert.ok(upgradeGrowthBtn);
+      await act(async () => {
+        getReactProps(upgradeGrowthBtn).onClick?.();
+      });
+      assert.equal(dom.locationStub.href, 'http://localhost:3000/', 'Arbitrary external checkout URL must not redirect');
+      assert.match(dom.container.textContent, /missing a valid checkout URL/i);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    test('fails closed on upgrade plans when getBillingPlans fails and recovers on Retry', async () => {
+      const dom = createUiTestDom();
+      (globalThis as any).window = dom.win;
+      (globalThis as any).document = dom.doc;
+
+      let plansCalls = 0;
+      apiClient.getBillingPlans = async () => {
+        plansCalls += 1;
+        if (plansCalls === 1) {
+          throw new Error('Plans endpoint unavailable');
+        }
+        return AUTHORITATIVE_PLANS_FIXTURE;
+      };
+      apiClient.getBillingSubscription = async () => ({
+        workspaceId: 'ws_1',
+        subscription: {
+          provider: 'none',
+          tier: 'Free Audit',
+          status: 'active',
+          cancelAtPeriodEnd: false,
+        },
+        storeProfile: {
+          ...initialStoreProfile,
+          tier: 'Free Audit',
+          skuCount: 15,
+          skuLimit: 2500,
+        },
+      });
+
+      const { root, renderPromise } = renderSettings(dom, { initialTab: 'subscription' });
+      await renderPromise;
+
+      assert.match(dom.container.textContent, /Plans endpoint unavailable/);
+      assert.equal(findButtonByText(dom.container, 'Upgrade to Growth'), undefined, 'Upgrade checkout buttons must not render when plans fail');
+
+      const retryBtn = findButtonByText(dom.container, 'Retry');
+      assert.ok(retryBtn);
+      await act(async () => {
+        getReactProps(retryBtn).onClick?.();
+      });
+
+      assert.equal(plansCalls, 2);
+      assert.ok(findButtonByText(dom.container, 'Upgrade to Growth'), 'Upgrade button should appear once plans load on Retry');
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
   });
 
   describe('Task C4 & C5: Shopify OAuth Connect Flow', () => {

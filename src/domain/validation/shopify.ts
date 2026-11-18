@@ -68,9 +68,150 @@ export function validateAndNormalizeShopDomain(rawShop: string): ShopDomainValid
   };
 }
 
+export type BillingRedirectFlow = 'checkout' | 'portal';
+
+export interface BillingRedirectValidationOptions {
+  flow?: BillingRedirectFlow;
+  provider?: string;
+  requireHttps?: boolean;
+  trustedCustomDomains?: string[];
+  currentOrigin?: string;
+}
+
+const TRUSTED_STRIPE_CHECKOUT_HOSTS = new Set<string>(['checkout.stripe.com']);
+const TRUSTED_STRIPE_PORTAL_HOSTS = new Set<string>(['billing.stripe.com']);
+const LOCAL_SANDBOX_HOSTS = new Set<string>(['localhost', '127.0.0.1', '[::1]', '::1']);
+
 /**
- * Validates that an external redirect URL returned by the backend (Checkout / Portal)
- * is a well-formed absolute HTTP/HTTPS URL with no embedded credentials or dangerous schemes.
+ * Detects whether the frontend or test runtime is executing in production mode.
+ */
+export function isProductionEnvironment(): boolean {
+  try {
+    const metaEnv = (import.meta as any)?.env;
+    if (metaEnv && (metaEnv.PROD === true || metaEnv.MODE === 'production')) {
+      return true;
+    }
+  } catch {
+    // Ignore import.meta access errors in non-ESM contexts
+  }
+
+  if (typeof process !== 'undefined' && process?.env?.NODE_ENV === 'production') {
+    return true;
+  }
+
+  return false;
+}
+
+function isIpOrLocalHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  if (
+    LOCAL_SANDBOX_HOSTS.has(normalized) ||
+    normalized.endsWith('.localhost') ||
+    normalized.endsWith('.local')
+  ) {
+    return true;
+  }
+  // Reject IPv4 literals and bracketed IPv6 literals
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(normalized)) {
+    return true;
+  }
+  if (normalized.startsWith('[') || normalized.includes(':')) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeTrustedCustomDomainEntry(rawEntry: string): string | null {
+  if (typeof rawEntry !== 'string') return null;
+  const trimmed = rawEntry.trim();
+  if (!trimmed || /[\s\\*]/.test(trimmed)) return null;
+
+  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed);
+  const candidateUrl = hasScheme ? trimmed : `https://${trimmed}`;
+
+  try {
+    const parsed = new URL(candidateUrl);
+    if (parsed.protocol !== 'https:') {
+      return null;
+    }
+    if (parsed.username || parsed.password || parsed.port) {
+      return null;
+    }
+    if (parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      return null;
+    }
+
+    const hostname = parsed.hostname.toLowerCase();
+    if (
+      !hostname ||
+      hostname.endsWith('.') ||
+      hostname.includes('..') ||
+      !hostname.includes('.') ||
+      isIpOrLocalHostname(hostname)
+    ) {
+      return null;
+    }
+
+    // Strict label validation (prevent invalid characters or lookalike control tricks)
+    if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/.test(hostname)) {
+      return null;
+    }
+
+    return hostname;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parses an explicit list or comma-separated string of trusted Stripe custom domains
+ * into exact normalized HTTPS hostnames. Invalid, wildcard, HTTP, IP, or local entries are ignored.
+ */
+export function parseTrustedStripeCustomDomains(rawConfig?: string | string[] | null): Set<string> {
+  const result = new Set<string>();
+  if (!rawConfig) return result;
+
+  const entries = Array.isArray(rawConfig)
+    ? rawConfig
+    : typeof rawConfig === 'string'
+    ? rawConfig.split(',')
+    : [];
+
+  for (const entry of entries) {
+    const normalized = normalizeTrustedCustomDomainEntry(entry);
+    if (normalized) {
+      result.add(normalized);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Reads explicitly configured trusted Stripe custom domains from Vite client config (VITE_STRIPE_CUSTOM_DOMAINS)
+ * or Node environment fallback during SSR/tests.
+ */
+export function getConfiguredStripeCustomDomains(): Set<string> {
+  let raw: string | undefined;
+
+  try {
+    const metaEnv = (import.meta as any)?.env;
+    if (typeof metaEnv?.VITE_STRIPE_CUSTOM_DOMAINS === 'string' && metaEnv.VITE_STRIPE_CUSTOM_DOMAINS.trim()) {
+      raw = metaEnv.VITE_STRIPE_CUSTOM_DOMAINS;
+    }
+  } catch {
+    // Ignore import.meta access errors
+  }
+
+  if (!raw && typeof process !== 'undefined' && typeof process.env?.VITE_STRIPE_CUSTOM_DOMAINS === 'string') {
+    raw = process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+  }
+
+  return parseTrustedStripeCustomDomains(raw);
+}
+
+/**
+ * Validates that an external HTTP(S) URL is well-formed with no embedded credentials or dangerous schemes.
  */
 export function isValidExternalHttpUrl(
   rawUrl: unknown,
@@ -78,7 +219,7 @@ export function isValidExternalHttpUrl(
 ): rawUrl is string {
   if (typeof rawUrl !== 'string') return false;
   const trimmed = rawUrl.trim();
-  if (!trimmed || /[\s]/.test(trimmed)) return false;
+  if (!trimmed || /[\s\\]/.test(trimmed)) return false;
 
   try {
     const parsed = new URL(trimmed);
@@ -93,6 +234,93 @@ export function isValidExternalHttpUrl(
       return false;
     }
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Strictly validates Stripe Checkout and Customer Portal redirect URLs returned by billing endpoints.
+ * - Requires HTTPS in production and for all Stripe / custom-domain redirects.
+ * - Matches hostnames strictly (exact equality, no suffix wildcards) against trusted Stripe domains
+ *   (checkout.stripe.com / billing.stripe.com) and explicitly configured custom domains.
+ * - Rejects arbitrary external hostnames, lookalike domains, embedded credentials, and malformed URLs.
+ * - Permits SandboxBillingProvider local-origin redirects ONLY in explicit non-production mode.
+ */
+export function isValidBillingRedirectUrl(
+  rawUrl: unknown,
+  options?: BillingRedirectValidationOptions
+): rawUrl is string {
+  const isProd = isProductionEnvironment();
+  const requireHttps = options?.requireHttps ?? isProd;
+
+  if (!isValidExternalHttpUrl(rawUrl, { requireHttps })) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(rawUrl.trim());
+    const hostname = parsed.hostname.toLowerCase();
+
+    // Reject trailing dots (e.g. checkout.stripe.com.) or empty hostnames
+    if (!hostname || hostname.endsWith('.')) {
+      return false;
+    }
+
+    // Explicit non-production SandboxBillingProvider allowance restricted strictly to local/current origin
+    if (options?.provider === 'sandbox' && !isProd && !options?.requireHttps) {
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        return false;
+      }
+
+      if (LOCAL_SANDBOX_HOSTS.has(hostname)) {
+        return true;
+      }
+
+      const originToCheck =
+        options.currentOrigin ||
+        (typeof window !== 'undefined' && window.location ? window.location.origin : undefined);
+
+      if (originToCheck && isValidExternalHttpUrl(originToCheck)) {
+        try {
+          const parsedOrigin = new URL(originToCheck);
+          if (parsed.origin === parsedOrigin.origin) {
+            return true;
+          }
+        } catch {
+          return false;
+        }
+      }
+
+      return false;
+    }
+
+    // All real Stripe / custom-domain redirects strictly require HTTPS with standard port (no HTTP downgrade)
+    if (parsed.protocol !== 'https:' || parsed.port !== '') {
+      return false;
+    }
+
+    const flow = options?.flow;
+    if (flow === 'checkout' && TRUSTED_STRIPE_CHECKOUT_HOSTS.has(hostname)) {
+      return true;
+    }
+    if (flow === 'portal' && TRUSTED_STRIPE_PORTAL_HOSTS.has(hostname)) {
+      return true;
+    }
+    if (!flow && (TRUSTED_STRIPE_CHECKOUT_HOSTS.has(hostname) || TRUSTED_STRIPE_PORTAL_HOSTS.has(hostname))) {
+      return true;
+    }
+
+    const customDomains =
+      options?.trustedCustomDomains !== undefined
+        ? parseTrustedStripeCustomDomains(options.trustedCustomDomains)
+        : getConfiguredStripeCustomDomains();
+
+    if (customDomains.has(hostname)) {
+      return true;
+    }
+
+    return false;
   } catch {
     return false;
   }
@@ -126,6 +354,9 @@ export function isValidShopifyAuthUrl(rawUrl: unknown): rawUrl is string {
  * Safely navigates the browser to a validated external URL.
  */
 export function redirectBrowser(url: string): void {
+  if (!isValidExternalHttpUrl(url)) {
+    return;
+  }
   if (typeof window !== 'undefined' && window.location) {
     window.location.href = url;
   }
