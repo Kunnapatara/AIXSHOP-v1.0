@@ -91,10 +91,14 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
         false
       );
 
-      // Explicitly configured trusted Stripe custom domain
-      const prevCustom = process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+      // Explicitly configured flow-specific trusted Stripe custom domains
+      const prevCheckoutDomains = process.env.VITE_STRIPE_CHECKOUT_DOMAINS;
+      const prevPortalDomains = process.env.VITE_STRIPE_PORTAL_DOMAINS;
       try {
-        process.env.VITE_STRIPE_CUSTOM_DOMAINS = 'https://pay.solsticecraft.com, billing.solsticecraft.com';
+        process.env.VITE_STRIPE_CHECKOUT_DOMAINS = 'https://pay.solsticecraft.com';
+        process.env.VITE_STRIPE_PORTAL_DOMAINS = 'billing.solsticecraft.com';
+
+        // Matching flow succeeds
         assert.equal(
           isValidBillingRedirectUrl('https://pay.solsticecraft.com/c/pay/cs_custom_1', { flow: 'checkout', provider: 'stripe' }),
           true
@@ -103,6 +107,17 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
           isValidBillingRedirectUrl('https://billing.solsticecraft.com/p/session/bps_custom_1', { flow: 'portal', provider: 'stripe' }),
           true
         );
+
+        // Cross-flow mismatch: Checkout-only domain rejected for Portal and Portal-only domain rejected for Checkout
+        assert.equal(
+          isValidBillingRedirectUrl('https://pay.solsticecraft.com/p/session/bps_cross', { flow: 'portal', provider: 'stripe' }),
+          false
+        );
+        assert.equal(
+          isValidBillingRedirectUrl('https://billing.solsticecraft.com/c/pay/cs_cross', { flow: 'checkout', provider: 'stripe' }),
+          false
+        );
+
         // Subdomain or suffix lookalike of configured custom domain must be rejected
         assert.equal(
           isValidBillingRedirectUrl('https://sub.pay.solsticecraft.com/c/pay/cs_bad', { flow: 'checkout', provider: 'stripe' }),
@@ -113,8 +128,10 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
           false
         );
       } finally {
-        if (prevCustom === undefined) delete process.env.VITE_STRIPE_CUSTOM_DOMAINS;
-        else process.env.VITE_STRIPE_CUSTOM_DOMAINS = prevCustom;
+        if (prevCheckoutDomains === undefined) delete process.env.VITE_STRIPE_CHECKOUT_DOMAINS;
+        else process.env.VITE_STRIPE_CHECKOUT_DOMAINS = prevCheckoutDomains;
+        if (prevPortalDomains === undefined) delete process.env.VITE_STRIPE_PORTAL_DOMAINS;
+        else process.env.VITE_STRIPE_PORTAL_DOMAINS = prevPortalDomains;
       }
 
       // Custom domain parser rejects wildcards, HTTP, IPs, localhost, paths, credentials
@@ -364,10 +381,13 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
       await assert.rejects(() => apiClient.createCheckoutSession({ tier: 'Starter' }), /Stripe credentials/);
     });
 
-    test('accepts configured trusted Stripe custom domain for checkout & portal and rejects untrusted custom domains', async () => {
-      const prevCustom = process.env.VITE_STRIPE_CUSTOM_DOMAINS;
-      process.env.VITE_STRIPE_CUSTOM_DOMAINS = 'https://pay.solsticecraft.com';
+    test('accepts configured flow-specific Stripe custom domains for checkout & portal and rejects cross-flow usage', async () => {
+      const prevCheckoutDomains = process.env.VITE_STRIPE_CHECKOUT_DOMAINS;
+      const prevPortalDomains = process.env.VITE_STRIPE_PORTAL_DOMAINS;
+      process.env.VITE_STRIPE_CHECKOUT_DOMAINS = 'https://pay.solsticecraft.com';
+      process.env.VITE_STRIPE_PORTAL_DOMAINS = 'https://portal.solsticecraft.com';
       try {
+        // 1. Valid checkout custom domain accepted
         globalThis.fetch = (async () =>
           new Response(
             JSON.stringify({
@@ -382,21 +402,49 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
         const checkout = await apiClient.createCheckoutSession({ tier: 'Growth' });
         assert.equal(checkout.checkoutUrl, 'https://pay.solsticecraft.com/c/pay/cs_custom_1');
 
+        // 2. Portal-only custom domain rejected on Checkout
         globalThis.fetch = (async () =>
           new Response(
             JSON.stringify({
               success: true,
-              portalUrl: 'https://pay.solsticecraft.com/p/session/bps_custom_1',
+              sessionId: 'cs_cross',
+              checkoutUrl: 'https://portal.solsticecraft.com/c/pay/cs_cross',
+              provider: 'stripe',
+            }),
+            { status: 200 }
+          )) as typeof fetch;
+        await assert.rejects(() => apiClient.createCheckoutSession({ tier: 'Growth' }), /checkout URL/i);
+
+        // 3. Valid portal custom domain accepted
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              success: true,
+              portalUrl: 'https://portal.solsticecraft.com/p/session/bps_custom_1',
               provider: 'stripe',
             }),
             { status: 200 }
           )) as typeof fetch;
 
         const portal = await apiClient.createPortalSession();
-        assert.equal(portal.portalUrl, 'https://pay.solsticecraft.com/p/session/bps_custom_1');
+        assert.equal(portal.portalUrl, 'https://portal.solsticecraft.com/p/session/bps_custom_1');
+
+        // 4. Checkout-only custom domain rejected on Portal
+        globalThis.fetch = (async () =>
+          new Response(
+            JSON.stringify({
+              success: true,
+              portalUrl: 'https://pay.solsticecraft.com/p/session/bps_cross',
+              provider: 'stripe',
+            }),
+            { status: 200 }
+          )) as typeof fetch;
+        await assert.rejects(() => apiClient.createPortalSession(), /portal URL/i);
       } finally {
-        if (prevCustom === undefined) delete process.env.VITE_STRIPE_CUSTOM_DOMAINS;
-        else process.env.VITE_STRIPE_CUSTOM_DOMAINS = prevCustom;
+        if (prevCheckoutDomains === undefined) delete process.env.VITE_STRIPE_CHECKOUT_DOMAINS;
+        else process.env.VITE_STRIPE_CHECKOUT_DOMAINS = prevCheckoutDomains;
+        if (prevPortalDomains === undefined) delete process.env.VITE_STRIPE_PORTAL_DOMAINS;
+        else process.env.VITE_STRIPE_PORTAL_DOMAINS = prevPortalDomains;
       }
     });
 

@@ -335,6 +335,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
         setBillingSubscription(null);
       }
     } catch (err: any) {
+      setBillingSubscription(null);
       setBillingLoadError(err?.message || 'Failed to load subscription details from server.');
     } finally {
       setIsLoadingBilling(false);

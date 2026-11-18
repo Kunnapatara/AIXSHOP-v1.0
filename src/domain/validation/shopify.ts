@@ -74,6 +74,8 @@ export interface BillingRedirectValidationOptions {
   flow?: BillingRedirectFlow;
   provider?: string;
   requireHttps?: boolean;
+  trustedCheckoutDomains?: string[];
+  trustedPortalDomains?: string[];
   trustedCustomDomains?: string[];
   currentOrigin?: string;
 }
@@ -187,27 +189,46 @@ export function parseTrustedStripeCustomDomains(rawConfig?: string | string[] | 
   return result;
 }
 
-/**
- * Reads explicitly configured trusted Stripe custom domains from Vite client config (VITE_STRIPE_CUSTOM_DOMAINS)
- * or Node environment fallback during SSR/tests.
- */
-export function getConfiguredStripeCustomDomains(): Set<string> {
+function readEnvVar(name: 'VITE_STRIPE_CHECKOUT_DOMAINS' | 'VITE_STRIPE_PORTAL_DOMAINS'): string | undefined {
   let raw: string | undefined;
 
   try {
     const metaEnv = (import.meta as any)?.env;
-    if (typeof metaEnv?.VITE_STRIPE_CUSTOM_DOMAINS === 'string' && metaEnv.VITE_STRIPE_CUSTOM_DOMAINS.trim()) {
-      raw = metaEnv.VITE_STRIPE_CUSTOM_DOMAINS;
+    if (typeof metaEnv?.[name] === 'string' && metaEnv[name].trim()) {
+      raw = metaEnv[name];
     }
   } catch {
     // Ignore import.meta access errors
   }
 
-  if (!raw && typeof process !== 'undefined' && typeof process.env?.VITE_STRIPE_CUSTOM_DOMAINS === 'string') {
-    raw = process.env.VITE_STRIPE_CUSTOM_DOMAINS;
+  if (!raw && typeof process !== 'undefined' && typeof process.env?.[name] === 'string') {
+    raw = process.env[name];
   }
 
-  return parseTrustedStripeCustomDomains(raw);
+  return raw;
+}
+
+/**
+ * Reads explicitly configured trusted Stripe custom domains from Vite client config
+ * (VITE_STRIPE_CHECKOUT_DOMAINS / VITE_STRIPE_PORTAL_DOMAINS) or Node env fallback.
+ * Strictly separates Checkout and Customer Portal custom domain allowlists by flow.
+ */
+export function getConfiguredStripeCustomDomains(flow?: BillingRedirectFlow): Set<string> {
+  if (flow === 'checkout') {
+    return parseTrustedStripeCustomDomains(readEnvVar('VITE_STRIPE_CHECKOUT_DOMAINS'));
+  }
+  if (flow === 'portal') {
+    return parseTrustedStripeCustomDomains(readEnvVar('VITE_STRIPE_PORTAL_DOMAINS'));
+  }
+
+  const combined = new Set<string>();
+  for (const host of parseTrustedStripeCustomDomains(readEnvVar('VITE_STRIPE_CHECKOUT_DOMAINS'))) {
+    combined.add(host);
+  }
+  for (const host of parseTrustedStripeCustomDomains(readEnvVar('VITE_STRIPE_PORTAL_DOMAINS'))) {
+    combined.add(host);
+  }
+  return combined;
 }
 
 /**
@@ -301,13 +322,29 @@ export function isValidBillingRedirectUrl(
     }
 
     const flow = options?.flow;
-    if (flow === 'checkout' && TRUSTED_STRIPE_CHECKOUT_HOSTS.has(hostname)) {
-      return true;
+    if (flow === 'checkout') {
+      if (TRUSTED_STRIPE_CHECKOUT_HOSTS.has(hostname)) {
+        return true;
+      }
+      const checkoutDomains =
+        options?.trustedCheckoutDomains !== undefined
+          ? parseTrustedStripeCustomDomains(options.trustedCheckoutDomains)
+          : getConfiguredStripeCustomDomains('checkout');
+      return checkoutDomains.has(hostname);
     }
-    if (flow === 'portal' && TRUSTED_STRIPE_PORTAL_HOSTS.has(hostname)) {
-      return true;
+
+    if (flow === 'portal') {
+      if (TRUSTED_STRIPE_PORTAL_HOSTS.has(hostname)) {
+        return true;
+      }
+      const portalDomains =
+        options?.trustedPortalDomains !== undefined
+          ? parseTrustedStripeCustomDomains(options.trustedPortalDomains)
+          : getConfiguredStripeCustomDomains('portal');
+      return portalDomains.has(hostname);
     }
-    if (!flow && (TRUSTED_STRIPE_CHECKOUT_HOSTS.has(hostname) || TRUSTED_STRIPE_PORTAL_HOSTS.has(hostname))) {
+
+    if (TRUSTED_STRIPE_CHECKOUT_HOSTS.has(hostname) || TRUSTED_STRIPE_PORTAL_HOSTS.has(hostname)) {
       return true;
     }
 

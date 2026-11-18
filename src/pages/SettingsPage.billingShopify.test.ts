@@ -765,6 +765,61 @@ describe('Task C3, C4 & C5: SettingsPage Billing & Shopify OAuth Integration', (
         root.unmount();
       });
     });
+
+    test('fails closed and disables upgrade checkout buttons when getBillingSubscription fails', async () => {
+      const dom = createUiTestDom();
+      (globalThis as any).window = dom.win;
+      (globalThis as any).document = dom.doc;
+
+      let subCalls = 0;
+      apiClient.getBillingPlans = async () => AUTHORITATIVE_PLANS_FIXTURE;
+      apiClient.getBillingSubscription = async () => {
+        subCalls += 1;
+        if (subCalls === 1) {
+          throw new Error('Subscription service temporarily unreachable');
+        }
+        return {
+          workspaceId: 'ws_1',
+          subscription: {
+            provider: 'none',
+            tier: 'Free Audit',
+            status: 'active',
+            cancelAtPeriodEnd: false,
+          },
+          storeProfile: {
+            ...initialStoreProfile,
+            tier: 'Free Audit',
+            skuCount: 15,
+            skuLimit: 2500,
+          },
+        };
+      };
+
+      const { root, renderPromise } = renderSettings(dom, { initialTab: 'subscription' });
+      await renderPromise;
+
+      assert.match(dom.container.textContent, /Subscription service temporarily unreachable/);
+      assert.equal(findButtonByText(dom.container, 'Manage Billing'), undefined);
+      const upgradeGrowthDuringError = findButtonByText(dom.container, 'Upgrade to Growth');
+      if (upgradeGrowthDuringError) {
+        assert.equal(isElementDisabled(upgradeGrowthDuringError), true, 'Upgrade CTA must be disabled when subscription fetch fails');
+      }
+
+      const retryBtn = findButtonByText(dom.container, 'Retry');
+      assert.ok(retryBtn);
+      await act(async () => {
+        getReactProps(retryBtn).onClick?.();
+      });
+
+      assert.equal(subCalls, 2);
+      const upgradeGrowthAfterRetry = findButtonByText(dom.container, 'Upgrade to Growth');
+      assert.ok(upgradeGrowthAfterRetry);
+      assert.equal(isElementDisabled(upgradeGrowthAfterRetry), false);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
   });
 
   describe('Task C4 & C5: Shopify OAuth Connect Flow', () => {
