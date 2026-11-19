@@ -20,7 +20,6 @@ import {
 } from '../data/mockData';
 import { CatalogStorageAdapter } from '../domain/storage/storageAdapter';
 import { StoragePayloadV1, StorageLoadResult } from '../domain/storage/storageTypes';
-import { isValidGtin13 } from '../domain/validation/gtin';
 import {
   executeActionApproval,
   executeActionDismissal,
@@ -41,7 +40,7 @@ import {
   DemoOverwriteProtectionEvaluation,
 } from '../domain/catalog/demoMigrationProtection';
 import { useAuth } from './AuthContext';
-import { apiClient } from '../api/client';
+import { apiClient, PreliminaryAuditSummary, ReportEntitlement } from '../api/client';
 
 export interface ToastMessage {
   id: string;
@@ -77,6 +76,9 @@ export interface AppContextType {
   loadedWorkspaceId?: string | null;
   cloudCatalogError?: string | null;
   catalogVersion?: number;
+  reportEntitlement?: ReportEntitlement | null;
+  preliminarySummary?: PreliminaryAuditSummary | null;
+  selectedSettingsTab?: 'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics' | null;
   demoOverwriteProtection: DemoOverwriteProtectionEvaluation;
   setMobileMenuOpen: (open: boolean) => void;
   setSelectedActionId: (id: string | null) => void;
@@ -184,6 +186,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [cloudCatalogError, setCloudCatalogError] = useState<string | null>(null);
   const [cloudCatalogErrorIdentity, setCloudCatalogErrorIdentity] = useState<string | null>(null);
   const [catalogVersion, setCatalogVersion] = useState<number | undefined>(undefined);
+  const [reportEntitlement, setReportEntitlement] = useState<ReportEntitlement | null>(null);
+  const [preliminarySummary, setPreliminarySummary] = useState<PreliminaryAuditSummary | null>(null);
+  const [selectedSettingsTab, setSelectedSettingsTab] = useState<
+    'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics' | null
+  >(null);
 
   const isInitializedRef = useRef<boolean>(false);
   const wasCloudSessionRef = useRef<boolean>(false);
@@ -316,6 +323,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     storeCheckGenRef.current += 1;
     catalogVersionRef.current = undefined;
     setCatalogVersion(undefined);
+    setReportEntitlement(null);
+    setPreliminarySummary(null);
     setLoadedWorkspaceId(null);
     setLoadedCloudIdentity(null);
     setProducts([]);
@@ -441,6 +450,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
       catalogVersionRef.current = undefined;
       setCatalogVersion(undefined);
+      setReportEntitlement(null);
+      setPreliminarySummary(null);
       setLoadedWorkspaceId(null);
       setLoadedCloudIdentity(null);
       setCloudCatalogStatus('idle');
@@ -484,6 +495,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
           throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
         }
         applyCatalogSnapshot(res.catalog, targetWorkspaceId, targetUserId);
+        setReportEntitlement(res.reportEntitlement ?? null);
+        setPreliminarySummary(res.preliminarySummary ?? null);
         setCloudCatalogStatus('loaded');
         setIsReadOnlyMode(false);
         setReadOnlyReason(null);
@@ -535,6 +548,20 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
     if (page === 'actions' && entityId) {
       setSelectedActionId(entityId);
+    }
+
+    if (
+      page === 'settings' &&
+      (entityId === 'profile' ||
+        entityId === 'workspace' ||
+        entityId === 'connectors' ||
+        entityId === 'subscription' ||
+        entityId === 'policies' ||
+        entityId === 'diagnostics')
+    ) {
+      setSelectedSettingsTab(entityId);
+    } else if (page !== 'settings') {
+      setSelectedSettingsTab(null);
     }
 
     setPreviousPage(fromPage || currentPage);
@@ -641,6 +668,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
             throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
           }
           applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
+          setReportEntitlement(catRes.reportEntitlement ?? null);
+          setPreliminarySummary(catRes.preliminarySummary ?? null);
           setCloudCatalogStatus('loaded');
           addToast('Catalog Import Complete', res.result.message, 'success');
           return res.result;
@@ -734,6 +763,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
       } catch (err: any) {
         if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
+        if (err?.code === 'REPORT_PAYMENT_REQUIRED') {
+          if (err.reportEntitlement) setReportEntitlement(err.reportEntitlement);
+          addToast('Paid Plan Required', err.message || 'Upgrade to an active paid plan to approve remediation actions.', 'warning');
+          return;
+        }
         addToast('Action Failed (Rolled Back)', err.message || 'Failed to approve action on server.', 'error');
       }
       return;
@@ -808,6 +842,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
       } catch (err: any) {
         if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
+        if (err?.code === 'REPORT_PAYMENT_REQUIRED') {
+          if (err.reportEntitlement) setReportEntitlement(err.reportEntitlement);
+          addToast('Paid Plan Required', err.message || 'Upgrade to an active paid plan to dismiss remediation actions.', 'warning');
+          return;
+        }
         addToast('Dismiss Failed', err.message || 'Failed to dismiss action on server.', 'error');
       }
       return;
@@ -866,6 +905,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
       } catch (err: any) {
         if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return;
+        if (err?.code === 'REPORT_PAYMENT_REQUIRED') {
+          if (err.reportEntitlement) setReportEntitlement(err.reportEntitlement);
+          addToast('Paid Plan Required', err.message || 'Upgrade to an active paid plan to re-check remediation actions.', 'warning');
+          return;
+        }
         addToast('Re-check Failed', err.message || 'Failed to re-check action on server.', 'error');
       }
       return;
@@ -1127,6 +1171,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
           throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
         }
         applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
+        setReportEntitlement(catRes.reportEntitlement ?? null);
+        setPreliminarySummary(catRes.preliminarySummary ?? null);
         const nextVer =
           typeof res.catalogVersion === 'number'
             ? res.catalogVersion
@@ -1168,11 +1214,17 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, (res as any)?.workspaceId)) return null;
         if (res.success && res.catalog) {
           applyCatalogSnapshot(res.catalog, targetWsId, targetUserId);
+          setReportEntitlement(res.reportEntitlement ?? null);
+          setPreliminarySummary(res.preliminarySummary ?? null);
           setCloudCatalogStatus('loaded');
+          const accessNote =
+            res.reportEntitlement && !res.reportEntitlement.hasFullReportAccess
+              ? ' Preliminary summary ready — upgrade plan to unlock full findings & remediation.'
+              : ' Results durably persisted.';
           addToast(
             'Audit Completed',
-            `Audit evaluated ${res.auditRun.productsEvaluated} products across ${res.auditRun.rulesEvaluated} rule checks. Results durably persisted.`,
-            'success'
+            `Audit evaluated ${res.auditRun.productsEvaluated} products across ${res.auditRun.rulesEvaluated} rule checks.${accessNote}`,
+            res.reportEntitlement && !res.reportEntitlement.hasFullReportAccess ? 'info' : 'success'
           );
           return res.auditRun;
         }
@@ -1260,6 +1312,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         throw new Error('Workspace catalog response failed validation (missing or mismatched workspaceId).');
       }
       applyCatalogSnapshot(res.catalog, targetWsId, targetUserId);
+      setReportEntitlement(res.reportEntitlement ?? null);
+      setPreliminarySummary(res.preliminarySummary ?? null);
       setCloudCatalogStatus('loaded');
     } catch (err: any) {
       if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) {
@@ -1364,6 +1418,9 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         loadedWorkspaceId: effectiveLoadedWorkspaceId,
         cloudCatalogError: effectiveCloudCatalogError,
         catalogVersion: effectiveCatalogVersion,
+        reportEntitlement: isStateWorkspaceMismatch ? null : reportEntitlement,
+        preliminarySummary: isStateWorkspaceMismatch ? null : preliminarySummary,
+        selectedSettingsTab,
         demoOverwriteProtection,
         setMobileMenuOpen,
         setSelectedActionId,

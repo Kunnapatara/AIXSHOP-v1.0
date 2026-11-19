@@ -68,6 +68,13 @@ STRIPE_WEBHOOK_SECRET="whsec_..."
 STRIPE_PRICE_STARTER="price_starter_..."
 STRIPE_PRICE_GROWTH="price_growth_..."
 STRIPE_PRICE_ENTERPRISE="price_enterprise_..."
+
+# Transactional Email / Password Reset SMTP (Optional in dev, required for password reset delivery in production)
+SMTP_HOST="smtp.example.com"
+SMTP_PORT="587"
+SMTP_USER="<smtp_username>"
+SMTP_PASS="<smtp_password>"
+EMAIL_FROM="AIXSHOP <noreply@your-domain.com>"
 ```
 
 ---
@@ -97,6 +104,15 @@ Expected schema elements:
 - `ai_visibility_imports` & `ai_visibility_metrics` & `ai_visibility_observation_history`: Content-hash deduplication, conflict detection, append-only version history, and `topic_presence` (`NULL` vs `''` distinction).
 - `schema_migrations`: SHA-256 migration checksum verification (`checksum`, `checksum_verified_at`).
 - `audit_runs(id, workspace_id)` and `audit_history_snapshots(id, workspace_id, audit_run_id)` composite foreign key integrity.
+- `password_reset_tokens`: Single-use SHA-256 hashed password-recovery tokens with expiration and `consumed_at` timestamps (Migration `014`).
+- `workspace_operation_leases`: DB-backed workspace concurrency leases (`shopify_sync`, `demo_migrate`, etc.) enforcing `409 OPERATION_IN_PROGRESS` across multi-instance pods (Migration `014`).
+
+### Authentication, Commercial Model & SKU Quota Semantics
+
+- **Cookie-Only Session Security**: Browser sessions use `HttpOnly`, `SameSite=Lax` cookies (`aixshop_session`) with `Origin`/`Referer` + `X-Requested-With` CSRF enforcement and automatic session rotation on `/login`, `/register`, and `/switch-workspace`.
+- **Commercial Plan Boundaries**:
+  - `Free Audit` ($0): Covers up to `2,500` SKUs as preliminary evaluation/screening capacity only (returns redacted summary & severity counts; blocks full audit findings, evidence trails, remediation mutations, historical inspection, and feed exports on backend).
+  - `Starter` ($49/mo / 250 verified SKUs), `Growth` ($149/mo / 2,500 verified SKUs), `Enterprise` ($499/mo / Unlimited verified SKUs): Unlock full reporting and remediation strictly upon verified `active` or `trialing` subscription status.
 
 ---
 
@@ -152,7 +168,7 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 |:---|:---|:---|:---|
 | **TypeScript Build** | Zero type errors | `npm run lint` / `tsc --noEmit` | **PASS** |
 | **Vite Bundle Build** | Zero bundling errors | `npm run build` | **PASS** |
-| **Unit & Integration Suite** | All unit & integration tests passing | `npm test` | **PASS** (347 passed, 0 failed, 3 external Postgres skipped) |
+| **Unit & Integration Suite** | All unit & integration tests passing | `npm test` | **PASS** (541 passed, 0 failed, 3 external Postgres skipped) |
 | **Composite Snapshot Integrity** | Foreign key on (audit_run_id, workspace_id) | Migration 006 / 008 checks | **PASS** |
 | **AES-256-GCM Encryption** | No plaintext tokens stored | `src/server/security/encryption.ts` | **PASS** |
 | **Multi-Instance Refresh Lock** | Transaction-scoped `saveConnection` inside `withShopifyRefreshLock` | `oauthService.ts` / `postgresRepository.ts` / `shopify.test.ts` | **PASS** |
@@ -164,4 +180,4 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 | **AI Visibility Monitoring** | `DATA_SOURCE_NOT_CONNECTED` empty state & CSV ingestion deduplication | `visibilityRoutes.ts` / `AiVisibilityPage.tsx` / `workstreams.test.ts` | **PASS** |
 | **Billing & Stale Event Recovery** | Stripe webhook idempotency & >5m `processing` lock reclaim | `billingService.ts` / `postgresRepository.ts` / `workstreams.test.ts` | **PASS** |
 | **Real Shopify Store Live OAuth** | Live Admin GraphQL exchange with Shopify | Live merchant install flow | **BLOCKED — AWAITING CREDENTIALS** (Requires live Shopify store & partner app secrets) |
-| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–009) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |
+| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–014) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |

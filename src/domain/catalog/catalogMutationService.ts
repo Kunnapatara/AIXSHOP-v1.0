@@ -1,5 +1,5 @@
 import { Product, Finding, ActionItem, StoreProfile, CatalogImportResult } from '../../types';
-import { isValidGtin13 } from '../validation/gtin';
+import { isValidGtin, validateGtin } from '../validation/gtin';
 import { evaluateCandidateProducts } from '../ingestion/storeIngestion';
 import { DECIMAL_PRICE_REGEX, parseDecimalPrice } from '../validation/price';
 import { calculateProductCompleteness, calculateStoreCompletenessAvg } from './completeness';
@@ -547,9 +547,12 @@ export function executeActionRecheck(
             if (targetVariant.barcode !== expectedValue) {
               isValid = false;
               failureReason = `Variant barcode "${targetVariant.barcode || '(empty)'}" does not match approved value "${expectedValue}".`;
-            } else if (!isValidGtin13(targetVariant.barcode)) {
-              isValid = false;
-              failureReason = `Variant barcode "${targetVariant.barcode}" fails GTIN-13 check digit validation.`;
+            } else {
+              const gtinRes = validateGtin(targetVariant.barcode);
+              if (!gtinRes.isValid) {
+                isValid = false;
+                failureReason = `Variant barcode "${targetVariant.barcode}" fails GTIN check digit validation: ${gtinRes.reason || 'invalid format'}.`;
+              }
             }
           } else if (targetProperty === 'sku') {
             if (targetVariant.sku !== expectedValue) {
@@ -685,7 +688,7 @@ export function executeProductRecheck(
     };
   }
 
-  const hasInvalidBarcode = prod.variants.some(v => v.barcode && !isValidGtin13(v.barcode));
+  const hasInvalidBarcode = prod.variants.some(v => v.barcode && !isValidGtin(v.barcode));
   const hasMissingBarcode = prod.variants.some(v => !v.barcode);
 
   const nextProducts = ctx.products.map(p => {

@@ -4,7 +4,12 @@ import {
   CatalogVersionValidationError,
   DatabaseRepository,
 } from '../db/repository';
-import { createAuthMiddleware } from '../middleware/auth';
+import {
+  createAuthMiddleware,
+  createWorkspaceRateLimiter,
+  OperationInProgressError,
+  withWorkspaceOperationLease,
+} from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { 
@@ -16,21 +21,55 @@ import {
   calculateImportUsage,
   checkPlanQuota,
   countCatalogSkus,
+  redactCatalogForPreliminaryAccess,
+  resolveReportEntitlement,
 } from '../services/entitlementService';
+
+const MAX_CATALOG_PUT_PRODUCTS = 5000;
+const MAX_IMPORT_CANDIDATES = 1000;
 
 export function createCatalogRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  const catalogWriteLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'catalog_write',
+      maxAttempts: 30,
+      windowMs: 60_000,
+      message: 'Catalog write rate limit reached. Please retry shortly.',
+    },
+    repo
+  );
+  const catalogImportLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'catalog_import',
+      maxAttempts: 15,
+      windowMs: 60_000,
+      message: 'Catalog import rate limit reached. Please retry shortly.',
+    },
+    repo
+  );
 
-  // GET /api/catalog — Get workspace catalog
+  async function enforcePaidActionEntitlement(workspaceId: string) {
+    const [store, subscription] = await Promise.all([
+      repo.getStoreByWorkspace(workspaceId),
+      repo.getSubscriptionByWorkspace(workspaceId),
+    ]);
+    return resolveReportEntitlement(store, subscription);
+  }
+
+  // GET /api/catalog — Get workspace catalog (redacts paid report findings & actions on unpaid/lapsed workspaces)
   router.get('/', requireAuth, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      let catalog = await repo.loadWorkspaceCatalog(workspaceId);
+      const [loadedCatalog, store, subscription] = await Promise.all([
+        repo.loadWorkspaceCatalog(workspaceId),
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
 
+      let catalog = loadedCatalog;
       if (!catalog) {
-        // Return clean empty catalog for new workspace
-        const store = await repo.getStoreByWorkspace(workspaceId);
         catalog = {
           products: [],
           variants: [],
@@ -51,9 +90,17 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         };
       }
 
+      const reportEntitlement = resolveReportEntitlement(store || catalog.storeProfile, subscription);
+      const { catalog: safeCatalog, preliminarySummary } = redactCatalogForPreliminaryAccess(
+        catalog,
+        reportEntitlement
+      );
+
       return res.json({
         workspaceId,
-        catalog,
+        catalog: safeCatalog,
+        reportEntitlement,
+        preliminarySummary,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Failed to load catalog:', err);
@@ -62,13 +109,20 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   });
 
   // PUT /api/catalog — Persist entire workspace catalog atomically
-  router.put('/', requireAuth, async (req: AuthRequest, res) => {
+  router.put('/', requireAuth, catalogWriteLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const payload: StoragePayloadV1 = req.body?.payload || req.body;
 
       if (!payload || !Array.isArray(payload.products) || !Array.isArray(payload.actions)) {
         return res.status(400).json({ error: 'Invalid catalog payload format' });
+      }
+
+      if (payload.products.length > MAX_CATALOG_PUT_PRODUCTS) {
+        return res.status(413).json({
+          error: `Catalog payload exceeds maximum limit of ${MAX_CATALOG_PUT_PRODUCTS} products per request.`,
+          code: 'BATCH_LIMIT_EXCEEDED',
+        });
       }
 
       const hasBodyExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expectedVersion');
@@ -163,20 +217,28 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/catalog/actions/:id/approve
-  router.post('/actions/:id/approve', requireAuth, async (req: AuthRequest, res) => {
+  router.post('/actions/:id/approve', requireAuth, catalogWriteLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const actionId = req.params.id;
       const { customApprovedValue } = req.body || {};
 
-      // Load workspace catalog to verify action belongs to this workspace
+      // Load workspace catalog to verify action belongs to this workspace (404 before entitlement check)
       const catalog = await repo.loadWorkspaceCatalog(workspaceId);
       const existingAction = catalog?.actions.find(a => a.id === actionId);
       if (!existingAction) {
-        // Enforce strict workspace isolation: if action does not exist in this workspace, return 404
         return res.status(404).json({ 
           error: `Action ${actionId} not found in current workspace`,
           code: 'ACTION_NOT_FOUND' 
+        });
+      }
+
+      const reportEntitlement = await enforcePaidActionEntitlement(workspaceId);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
         });
       }
 
@@ -195,7 +257,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/catalog/actions/:id/dismiss
-  router.post('/actions/:id/dismiss', requireAuth, async (req: AuthRequest, res) => {
+  router.post('/actions/:id/dismiss', requireAuth, catalogWriteLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const actionId = req.params.id;
@@ -206,6 +268,15 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(404).json({ 
           error: `Action ${actionId} not found in current workspace`,
           code: 'ACTION_NOT_FOUND' 
+        });
+      }
+
+      const reportEntitlement = await enforcePaidActionEntitlement(workspaceId);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
         });
       }
 
@@ -223,7 +294,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/catalog/actions/:id/recheck
-  router.post('/actions/:id/recheck', requireAuth, async (req: AuthRequest, res) => {
+  router.post('/actions/:id/recheck', requireAuth, catalogWriteLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const actionId = req.params.id;
@@ -234,6 +305,15 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(404).json({ 
           error: `Action ${actionId} not found in current workspace`,
           code: 'ACTION_NOT_FOUND' 
+        });
+      }
+
+      const reportEntitlement = await enforcePaidActionEntitlement(workspaceId);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
         });
       }
 
@@ -251,7 +331,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/catalog/import — Import candidate products
-  router.post('/import', requireAuth, async (req: AuthRequest, res) => {
+  router.post('/import', requireAuth, catalogImportLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const { candidates } = req.body || {};
@@ -260,18 +340,22 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Invalid candidates array' });
       }
 
+      if (candidates.length > MAX_IMPORT_CANDIDATES) {
+        return res.status(413).json({
+          error: `Import batch exceeds maximum limit of ${MAX_IMPORT_CANDIDATES} candidates per request.`,
+          code: 'BATCH_LIMIT_EXCEEDED',
+        });
+      }
+
       // Serialize concurrent import requests per workspace via distributed repository lock
       return await repo.withWorkspaceLock(workspaceId, async () => {
-        // Authoritative server-side store & catalog resolution (ignoring any client-supplied body params)
         const store = await repo.getStoreByWorkspace(workspaceId);
         const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
         const catalog = await repo.loadWorkspaceCatalog(workspaceId);
         const existingProducts = catalog?.products || [];
 
-        // Deduplicate and calculate additional usage according to domain rules
         const { additionalSkus } = calculateImportUsage(candidates, existingProducts);
 
-        // Authoritative server-side quota validation
         const quotaCheck = checkPlanQuota(store, existingProducts, additionalSkus, subscription);
         if (!quotaCheck.allowed) {
           return res.status(403).json({
@@ -312,7 +396,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/catalog/migrate-demo — Import demo dataset into the user's workspace
-  router.post('/migrate-demo', requireAuth, async (req: AuthRequest, res) => {
+  router.post('/migrate-demo', requireAuth, catalogImportLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const hasBodyExpected = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expectedVersion');
@@ -333,59 +417,68 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       const expectedVersion =
         hasBodyExpected && typeof rawExpected === 'number' ? rawExpected : undefined;
 
-      return await repo.withWorkspaceLock(workspaceId, async () => {
-        const currentStore = await repo.getStoreByWorkspace(workspaceId);
-        const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
+      return await withWorkspaceOperationLease(repo, workspaceId, 'catalog_migrate_demo', 120_000, () =>
+        repo.withWorkspaceLock(workspaceId, async () => {
+          const currentStore = await repo.getStoreByWorkspace(workspaceId);
+          const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
 
-        const demoSkus = countCatalogSkus(initialProducts);
-        const storeProfile = currentStore || {
-          name: `${req.workspace!.name} Store`,
-          domain: `${req.workspace!.slug}.myshopify.com`,
-          currency: 'USD',
-          skuCount: demoSkus,
-          catalogCompletenessAvg: 88,
-          truthBoundaryStrictness: 'standard' as const,
-          tier: 'Free Audit' as const,
-          connectors: [],
-        };
-
-        const quotaCheck = checkPlanQuota(currentStore, [], demoSkus, subscription);
-        if (!quotaCheck.allowed) {
-          return res.status(403).json({
-            error: quotaCheck.error,
-            code: 'PLAN_QUOTA_EXCEEDED',
-            limit: quotaCheck.limit,
-            currentUsage: 0,
-            additionalUsage: demoSkus,
-            projectedUsage: demoSkus,
-            tier: quotaCheck.tier,
-          });
-        }
-
-        const demoPayload: StoragePayloadV1 = {
-          products: JSON.parse(JSON.stringify(initialProducts)),
-          variants: initialProducts.flatMap(p => p.variants || []),
-          offers: initialProducts.flatMap(p => p.offers || []),
-          findings: JSON.parse(JSON.stringify(initialFindings)),
-          actions: JSON.parse(JSON.stringify(initialActionItems)),
-          evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
-          storeProfile: {
-            ...storeProfile,
+          const demoSkus = countCatalogSkus(initialProducts);
+          const storeProfile = currentStore || {
+            name: `${req.workspace!.name} Store`,
+            domain: `${req.workspace!.slug}.myshopify.com`,
+            currency: 'USD',
             skuCount: demoSkus,
-          },
-        };
+            catalogCompletenessAvg: 88,
+            truthBoundaryStrictness: 'standard' as const,
+            tier: 'Free Audit' as const,
+            connectors: [],
+          };
 
-        await repo.saveWorkspaceCatalog(workspaceId, demoPayload, { expectedVersion });
-        const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
+          const quotaCheck = checkPlanQuota(currentStore, [], demoSkus, subscription);
+          if (!quotaCheck.allowed) {
+            return res.status(403).json({
+              error: quotaCheck.error,
+              code: 'PLAN_QUOTA_EXCEEDED',
+              limit: quotaCheck.limit,
+              currentUsage: 0,
+              additionalUsage: demoSkus,
+              projectedUsage: demoSkus,
+              tier: quotaCheck.tier,
+            });
+          }
 
-        return res.json({
-          success: true,
-          message: 'Demo catalog successfully imported to cloud workspace',
-          skuCount: demoSkus,
-          catalogVersion: savedCatalog?.catalogVersion,
-        });
-      });
+          const demoPayload: StoragePayloadV1 = {
+            products: JSON.parse(JSON.stringify(initialProducts)),
+            variants: initialProducts.flatMap(p => p.variants || []),
+            offers: initialProducts.flatMap(p => p.offers || []),
+            findings: JSON.parse(JSON.stringify(initialFindings)),
+            actions: JSON.parse(JSON.stringify(initialActionItems)),
+            evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
+            storeProfile: {
+              ...storeProfile,
+              skuCount: demoSkus,
+            },
+          };
+
+          await repo.saveWorkspaceCatalog(workspaceId, demoPayload, { expectedVersion });
+          const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
+
+          return res.json({
+            success: true,
+            message: 'Demo catalog successfully imported to cloud workspace',
+            skuCount: demoSkus,
+            catalogVersion: savedCatalog?.catalogVersion,
+          });
+        })
+      );
     } catch (err: any) {
+      if (err instanceof OperationInProgressError || err.code === 'OPERATION_IN_PROGRESS') {
+        return res.status(409).json({
+          error: err.message,
+          code: 'OPERATION_IN_PROGRESS',
+          operationKey: err.operationKey,
+        });
+      }
       if (err instanceof CatalogVersionValidationError || err.code === 'INVALID_CATALOG_VERSION') {
         return res.status(400).json({
           error: err.message,

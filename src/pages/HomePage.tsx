@@ -1,5 +1,6 @@
 import React from 'react';
 import { useApp } from '../context/AppContext';
+import { ReportPaywallBanner } from '../components/billing/ReportPaywallBanner';
 import { 
   ArrowRight, 
   SearchCheck, 
@@ -17,13 +18,16 @@ import {
 } from 'lucide-react';
 
 export const HomePage: React.FC = () => {
-  const { 
-    storeProfile, 
-    products, 
-    findings, 
-    actionItems, 
-    navigateTo, 
-    viewProductDetail 
+  const {
+    storeProfile,
+    products,
+    findings,
+    actionItems,
+    navigateTo,
+    viewProductDetail,
+    isCloudWorkspace,
+    reportEntitlement,
+    preliminarySummary,
   } = useApp();
 
   const totalVariants = products.reduce((sum, p) => sum + p.variants.length, 0);
@@ -31,9 +35,17 @@ export const HomePage: React.FC = () => {
   const criticalFindings = findings.filter(f => f.severity === 'critical');
   const pendingActions = actionItems.filter(a => a.status === 'pending_review');
   const recentFindings = findings.slice(0, 4);
+  const isReportLocked = Boolean(isCloudWorkspace && reportEntitlement && !reportEntitlement.hasFullReportAccess);
 
   return (
     <div className="space-y-8">
+      {isReportLocked && reportEntitlement && (
+        <ReportPaywallBanner
+          entitlement={reportEntitlement}
+          preliminarySummary={preliminarySummary}
+          onUpgrade={() => navigateTo('settings', 'subscription')}
+        />
+      )}
       {/* Store Identity & Banner */}
       <div className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-6 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div className="flex items-start sm:items-center gap-3.5">

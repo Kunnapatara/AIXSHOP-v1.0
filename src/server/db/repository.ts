@@ -137,6 +137,20 @@ export interface DatabaseRepository {
   createUser(data: CreateUserData): Promise<UserRecord>;
   getUserByEmail(email: string): Promise<UserRecord | null>;
   getUserById(id: string): Promise<UserRecord | null>;
+  updateUserPassword?(userId: string, passwordHash: string): Promise<void>;
+
+  // Password Reset Recovery Tokens (Migration 014)
+  createPasswordResetToken(data: {
+    id: string;
+    userId: string;
+    tokenHash: string;
+    expiresAt: string;
+    requestedIp?: string;
+  }): Promise<void>;
+  consumePasswordResetTokenAndUpdatePassword(
+    tokenHash: string,
+    newPasswordHash: string
+  ): Promise<{ userId: string } | null>;
 
   // Workspaces & Memberships
   createWorkspace(data: CreateWorkspaceData, ownerUserId: string): Promise<{ workspace: WorkspaceRecord; membership: WorkspaceMembershipRecord }>;
@@ -150,6 +164,19 @@ export interface DatabaseRepository {
   deleteSession(tokenHash: string): Promise<void>;
   deleteUserSessions(userId: string): Promise<void>;
   updateSessionWorkspace(sessionId: string, newWorkspaceId: string): Promise<void>;
+
+  // Workspace Operation Leases (Migration 014)
+  acquireWorkspaceOperationLease(
+    workspaceId: string,
+    operationKey: string,
+    leaseOwner: string,
+    ttlMs: number
+  ): Promise<{ acquired: boolean; leaseOwner?: string; expiresAt?: string }>;
+  releaseWorkspaceOperationLease(
+    workspaceId: string,
+    operationKey: string,
+    leaseOwner: string
+  ): Promise<void>;
 
   // Stores
   getStoreByWorkspace(workspaceId: string): Promise<StoreProfile | null>;

@@ -23,6 +23,20 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Security dependency audit (high/critical)
+        run: bun audit --audit-level=high
+
+      - name: Static security checks (no client Bearer auth or hardcoded live secrets)
+        run: |
+          if grep -rnE 'sk_live_[A-Za-z0-9]{16,}|whsec_[A-Za-z0-9]{16,}' src/ ; then
+            echo "ERROR: Potential hardcoded live Stripe secret detected in src/"
+            exit 1
+          fi
+          if grep -rnE "headers\['Authorization'\]\s*=" src/api/client.ts ; then
+            echo "ERROR: Browser API client must remain cookie-only without Authorization headers"
+            exit 1
+          fi
+
       - name: Type check (Lint)
         run: bun run lint
 
@@ -69,7 +83,7 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Apply PostgreSQL migrations 001-013
+      - name: Apply PostgreSQL migrations 001-014
         run: bun run db:migrate
 
       - name: Verify migration checksums and readiness

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { apiClient } from '../api/client';
+import { ReportPaywallBanner } from '../components/billing/ReportPaywallBanner';
 import { 
   FindingScope, 
   FindingSeverity, 
@@ -44,8 +45,20 @@ import {
 } from 'lucide-react';
 
 export const AuditPage: React.FC = () => {
-  const { findings, navigateTo, viewProductDetail, addToast, runAudit, storeProfile, products } = useApp();
+  const {
+    findings,
+    navigateTo,
+    viewProductDetail,
+    addToast,
+    runAudit,
+    storeProfile,
+    products,
+    isCloudWorkspace,
+    reportEntitlement,
+    preliminarySummary,
+  } = useApp();
   const { isAuthenticated, activeWorkspace } = useAuth();
+  const isReportLocked = Boolean(isCloudWorkspace && reportEntitlement && !reportEntitlement.hasFullReportAccess);
 
   // Primary workspace mode: 'current' (Phase 1 live audit view), 'history' (list of past runs), 'detail' (inspecting a snapshot), 'compare' (comparing two snapshots)
   const [activeTab, setActiveTab] = useState<'current' | 'history' | 'detail' | 'compare'>('current');
@@ -114,6 +127,11 @@ export const AuditPage: React.FC = () => {
 
   // Load historical audit snapshot
   const openAuditDetail = async (runId: string) => {
+    if (isReportLocked) {
+      addToast('Paid Plan Required', 'Upgrade your plan to inspect historical audit snapshots.', 'warning');
+      navigateTo('settings', 'subscription');
+      return;
+    }
     setSelectedAuditId(runId);
     setActiveTab('detail');
     setSnapshotLoading(true);
@@ -130,6 +148,11 @@ export const AuditPage: React.FC = () => {
 
   // Run audit comparison
   const handleRunComparison = async (baseId: string, targetId: string) => {
+    if (isReportLocked) {
+      addToast('Paid Plan Required', 'Upgrade your plan to compare historical audit runs.', 'warning');
+      navigateTo('settings', 'subscription');
+      return;
+    }
     if (!baseId || !targetId || baseId === targetId) {
       setComparisonError('Please select two distinct completed audit runs to compare.');
       return;
@@ -213,6 +236,15 @@ export const AuditPage: React.FC = () => {
       </div>
 
       {/* Top Navigation Tabs */}
+      {isReportLocked && reportEntitlement && (
+        <ReportPaywallBanner
+          entitlement={reportEntitlement}
+          preliminarySummary={preliminarySummary}
+          contextLabel="Preliminary catalog check completed. Upgrade to Starter, Growth, or Enterprise to unlock full audit findings, evidence trails, historical snapshots, and comparisons."
+          onUpgrade={() => navigateTo('settings', 'subscription')}
+        />
+      )}
+
       <div className="flex items-center border-b border-stone-200 gap-1 bg-stone-100/60 p-1 rounded-xl">
         <button
           onClick={() => setActiveTab('current')}
@@ -390,7 +422,15 @@ export const AuditPage: React.FC = () => {
           </div>
 
           {/* Current Findings Listing */}
-          {filteredCurrentFindings.length === 0 ? (
+          {isReportLocked ? (
+            <div className="bg-white border border-stone-200 rounded-2xl p-12 text-center shadow-xs">
+              <ShieldCheck className="w-12 h-12 text-amber-500 mx-auto mb-3" />
+              <h3 className="text-base font-bold text-stone-900">Full Audit Report Locked</h3>
+              <p className="text-xs text-stone-500 mt-1 max-w-md mx-auto">
+                Your Free Audit provides preliminary screening capacity and severity counts. Upgrade to a paid plan to inspect complete findings, evidence trails, and proposed remediations.
+              </p>
+            </div>
+          ) : filteredCurrentFindings.length === 0 ? (
             <div className="bg-white border border-stone-200 rounded-2xl p-12 text-center shadow-xs">
               <SearchCheck className="w-12 h-12 text-stone-300 mx-auto mb-3" />
               <h3 className="text-base font-bold text-stone-900">No findings match active filters</h3>
@@ -642,9 +682,10 @@ export const AuditPage: React.FC = () => {
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         onClick={() => openAuditDetail(run.id)}
-                        className="px-3.5 py-1.5 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors shadow-xs"
+                        disabled={isReportLocked}
+                        className="px-3.5 py-1.5 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        <span>Inspect Snapshot</span>
+                        <span>{isReportLocked ? 'Snapshot Locked' : 'Inspect Snapshot'}</span>
                         <ChevronRight className="w-3.5 h-3.5" />
                       </button>
 
@@ -653,8 +694,9 @@ export const AuditPage: React.FC = () => {
                           setCompareBaseId(run.id);
                           setActiveTab('compare');
                         }}
-                        title="Use as base for comparison"
-                        className="px-3 py-1.5 bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-medium rounded-lg flex items-center gap-1 transition-colors"
+                        disabled={isReportLocked}
+                        title={isReportLocked ? 'Paid plan required for historical comparison' : 'Use as base for comparison'}
+                        className="px-3 py-1.5 bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-medium rounded-lg flex items-center gap-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <GitCompare className="w-3.5 h-3.5" />
                         <span>Compare</span>
@@ -1060,11 +1102,11 @@ export const AuditPage: React.FC = () => {
             <div className="flex justify-end pt-2">
               <button
                 onClick={() => handleRunComparison(compareBaseId, compareTargetId)}
-                disabled={comparisonLoading || !compareBaseId || !compareTargetId}
+                disabled={isReportLocked || comparisonLoading || !compareBaseId || !compareTargetId}
                 className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50 shadow-xs"
               >
                 <GitCompare className={`w-3.5 h-3.5 ${comparisonLoading ? 'animate-spin' : ''}`} />
-                <span>{comparisonLoading ? 'Computing Comparison...' : 'Compare Audit Runs'}</span>
+                <span>{isReportLocked ? 'Upgrade to Compare Runs' : comparisonLoading ? 'Computing Comparison...' : 'Compare Audit Runs'}</span>
               </button>
             </div>
           </div>

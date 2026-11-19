@@ -275,10 +275,12 @@ export function authRateLimiter(
             loginAttempts.set(k, { count: result.count, resetAt: result.resetAt });
           }
           if (!result.allowed) {
+            const retryAfterSeconds = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
+            res.setHeader('Retry-After', String(retryAfterSeconds));
             return res.status(429).json({
               error: 'Too many authentication attempts. Please try again later.',
               code: 'RATE_LIMITED',
-              retryAfterSeconds: Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000)),
+              retryAfterSeconds,
             });
           }
         }
@@ -320,16 +322,139 @@ export function authRateLimiter(
     for (const k of keysToCheck) {
       const localRes = consumeLocalBoundedRateLimit(k, maxAttempts, windowMs, maxEntries);
       if (!localRes.allowed) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((localRes.resetAt - Date.now()) / 1000));
+        res.setHeader('Retry-After', String(retryAfterSeconds));
         return res.status(429).json({
           error: 'Too many authentication attempts. Please try again later.',
           code: 'RATE_LIMITED',
-          retryAfterSeconds: Math.max(1, Math.ceil((localRes.resetAt - Date.now()) / 1000)),
+          retryAfterSeconds,
         });
       }
     }
 
     return next();
   };
+}
+
+export interface WorkspaceRateLimiterOptions extends AuthRateLimiterOptions {
+  keyPrefix: string;
+  maxAttempts: number;
+  windowMs: number;
+  message?: string;
+}
+
+/**
+ * Shared rate limiter for expensive workspace-scoped operational endpoints
+ * (audit runs, catalog imports, Shopify syncs, feed validation/export, visibility uploads).
+ */
+export function createWorkspaceRateLimiter(
+  options: WorkspaceRateLimiterOptions,
+  repo?: DatabaseRepository
+) {
+  const maxEntries = Math.max(10, options.maxMemoryEntries ?? DEFAULT_MAX_RATE_LIMITER_ENTRIES);
+  if (repo && typeof (repo as any).clearRateLimits === 'function') {
+    resetHooks.add(() => (repo as any).clearRateLimits());
+  }
+
+  return async (req: AuthRequest, res: Response, next: NextFunction) => {
+    const scopeId = req.workspace?.id
+      ? `ws:${req.workspace.id}`
+      : `ip:${String(req.ip || req.socket?.remoteAddress || 'unknown').trim()}`;
+    const bucketKey = `rl:${options.keyPrefix}:${scopeId}`;
+
+    const policy = resolveAuthRateLimitFailurePolicy();
+    const failClosed =
+      options.failClosedOnStorageError !== undefined
+        ? options.failClosedOnStorageError
+        : policy.failClosedOnStorageError;
+
+    try {
+      if (repo && typeof repo.consumeRateLimit === 'function') {
+        const result = await repo.consumeRateLimit(bucketKey, options.maxAttempts, options.windowMs);
+        if (!result.allowed) {
+          const retryAfterSeconds = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
+          res.setHeader('Retry-After', String(retryAfterSeconds));
+          return res.status(429).json({
+            error: options.message || 'Rate limit exceeded for this operation. Please try again shortly.',
+            code: 'RATE_LIMITED',
+            retryAfterSeconds,
+          });
+        }
+        return next();
+      }
+    } catch {
+      if (failClosed) {
+        return res.status(503).json({
+          error: 'Rate limiter temporarily unavailable. Please retry shortly.',
+          code: 'RATE_LIMITER_UNAVAILABLE',
+        });
+      }
+    }
+
+    if (failClosed && (!repo || typeof repo.consumeRateLimit !== 'function')) {
+      return res.status(503).json({
+        error: 'Rate limiter temporarily unavailable. Please retry shortly.',
+        code: 'RATE_LIMITER_UNAVAILABLE',
+      });
+    }
+
+    const localRes = consumeLocalBoundedRateLimit(
+      bucketKey,
+      options.maxAttempts,
+      options.windowMs,
+      maxEntries
+    );
+    if (!localRes.allowed) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((localRes.resetAt - Date.now()) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSeconds));
+      return res.status(429).json({
+        error: options.message || 'Rate limit exceeded for this operation. Please try again shortly.',
+        code: 'RATE_LIMITED',
+        retryAfterSeconds,
+      });
+    }
+
+    return next();
+  };
+}
+
+export class OperationInProgressError extends Error {
+  public readonly code = 'OPERATION_IN_PROGRESS';
+  public readonly statusCode = 409;
+  public readonly operationKey: string;
+
+  constructor(operationKey: string, message?: string) {
+    super(
+      message ||
+        `Operation "${operationKey}" is already in progress for this workspace. Wait for completion before retrying.`
+    );
+    this.name = 'OperationInProgressError';
+    this.operationKey = operationKey;
+  }
+}
+
+/**
+ * Acquires a shared database-backed workspace operation lease (Migration 014)
+ * so concurrent syncs / imports across multiple instances fail fast with 409 OPERATION_IN_PROGRESS.
+ */
+export async function withWorkspaceOperationLease<T>(
+  repo: DatabaseRepository,
+  workspaceId: string,
+  operationKey: string,
+  ttlMs: number,
+  fn: () => Promise<T>
+): Promise<T> {
+  const leaseOwner = `op_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  const lease = await repo.acquireWorkspaceOperationLease(workspaceId, operationKey, leaseOwner, ttlMs);
+  if (!lease.acquired) {
+    throw new OperationInProgressError(operationKey);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await repo.releaseWorkspaceOperationLease(workspaceId, operationKey, leaseOwner).catch(() => {});
+  }
 }
 
 /**
@@ -354,7 +479,6 @@ export function csrfProtection(req: any, res: Response, next: NextFunction) {
   }
 
   // Validate custom anti-CSRF header
-  const customHeader = req.headers['x-requested-with'] || req.headers['x-csrf-token'];
   const hasValidHeader = (
     req.headers['x-requested-with'] === 'XMLHttpRequest' ||
     (typeof req.headers['x-csrf-token'] === 'string' && req.headers['x-csrf-token'].trim().length > 0)
@@ -367,12 +491,13 @@ export function csrfProtection(req: any, res: Response, next: NextFunction) {
     });
   }
 
-  // Validate Origin header when present
+  const reqHost = req.headers['host'];
+
+  // Validate Origin header when present, with Referer same-origin fallback when Origin is absent
   const origin = req.headers['origin'];
   if (origin && typeof origin === 'string') {
     try {
       const originUrl = new URL(origin);
-      const reqHost = req.headers['host'];
       if (reqHost && originUrl.host !== reqHost) {
         return res.status(403).json({
           error: 'Forbidden: Cross-origin state modification rejected.',
@@ -385,7 +510,26 @@ export function csrfProtection(req: any, res: Response, next: NextFunction) {
         code: 'CSRF_ORIGIN_INVALID',
       });
     }
+  } else {
+    const referer = req.headers['referer'];
+    if (referer && typeof referer === 'string') {
+      try {
+        const refererUrl = new URL(referer);
+        if (reqHost && refererUrl.host !== reqHost) {
+          return res.status(403).json({
+            error: 'Forbidden: Cross-origin Referer state modification rejected.',
+            code: 'CSRF_ORIGIN_MISMATCH',
+          });
+        }
+      } catch {
+        return res.status(403).json({
+          error: 'Forbidden: Malformed Referer header.',
+          code: 'CSRF_REFERER_INVALID',
+        });
+      }
+    }
   }
 
   next();
 }
+

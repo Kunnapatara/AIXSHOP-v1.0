@@ -271,6 +271,168 @@ export class BillingService {
     return this.provider.createPortalSession(workspaceId, customerId || `cust_${workspaceId}`, returnUrl);
   }
 
+  /**
+   * Authoritatively verifies a Checkout Session directly with the configured billing provider
+   * upon return from checkout redirect, without trusting client query params like ?tier=... or ?checkout=success.
+   */
+  async verifyCheckoutSession(workspaceId: string, sessionId: string): Promise<{
+    verified: boolean;
+    subscription: SubscriptionRecord;
+    storeProfile: StoreProfile | null;
+  }> {
+    if (!sessionId || typeof sessionId !== 'string' || !sessionId.trim()) {
+      const err: any = new Error('Checkout session_id is required for payment verification.');
+      err.statusCode = 400;
+      err.code = 'INVALID_SESSION_ID';
+      throw err;
+    }
+
+    if (typeof this.provider.retrieveCheckoutSession !== 'function') {
+      const err: any = new Error('Active billing provider does not support checkout session verification.');
+      err.statusCode = 501;
+      err.code = 'VERIFICATION_UNSUPPORTED';
+      throw err;
+    }
+
+    const session = await this.provider.retrieveCheckoutSession(sessionId.trim());
+    if (!session) {
+      const err: any = new Error(`Checkout session "${sessionId}" could not be found or verified.`);
+      err.statusCode = 404;
+      err.code = 'CHECKOUT_SESSION_NOT_FOUND';
+      throw err;
+    }
+
+    const sessionWorkspaceId = session.client_reference_id || session.metadata?.workspaceId;
+    if (!sessionWorkspaceId || sessionWorkspaceId !== workspaceId) {
+      const err: any = new Error('Checkout session does not belong to the active workspace.');
+      err.statusCode = 403;
+      err.code = 'CHECKOUT_WORKSPACE_MISMATCH';
+      throw err;
+    }
+
+    const isStripe = this.provider.providerName === 'stripe';
+    const paymentStatus = typeof session.payment_status === 'string' ? session.payment_status.trim().toLowerCase() : '';
+    const sessionStatus = typeof session.status === 'string' ? session.status.trim().toLowerCase() : '';
+
+    if (sessionStatus !== 'complete' || (paymentStatus !== 'paid' && paymentStatus !== 'no_payment_required')) {
+      const err: any = new Error(
+        `Checkout session has not completed payment (status=${sessionStatus || 'unknown'}, payment_status=${paymentStatus || 'unknown'}).`
+      );
+      err.statusCode = 402;
+      err.code = 'PAYMENT_NOT_VERIFIED';
+      throw err;
+    }
+
+    const priceId = session.line_items?.data?.[0]?.price?.id || session.metadata?.priceId;
+    const planFromPrice = priceId ? findPlanByPriceId(priceId, this.provider.getPlanPriceMap?.()) : null;
+    if (isStripe && priceId && !planFromPrice) {
+      const err: any = new Error(`Stripe price "${priceId}" is not mapped to an authoritative paid plan.`);
+      err.statusCode = 400;
+      err.code = 'UNMAPPED_PRICE_ID';
+      throw err;
+    }
+
+    const tierCandidate = planFromPrice?.tier || session.metadata?.tier;
+    const planKey = tierCandidate
+      ? Object.keys(AUTHORITATIVE_PLANS).find(k => AUTHORITATIVE_PLANS[k].tier.toLowerCase() === String(tierCandidate).toLowerCase())
+      : undefined;
+    const plan = planKey ? AUTHORITATIVE_PLANS[planKey] : null;
+
+    if (!plan || plan.priceCents <= 0) {
+      const err: any = new Error('Checkout session does not correspond to a paid AIXSHOP plan.');
+      err.statusCode = 400;
+      err.code = 'INVALID_PAID_PLAN';
+      throw err;
+    }
+
+    const customerId = typeof session.customer === 'string'
+      ? session.customer
+      : session.customer?.id;
+    let subscriptionObj = typeof session.subscription === 'object' && session.subscription !== null
+      ? session.subscription
+      : null;
+    const subscriptionId = typeof session.subscription === 'string'
+      ? session.subscription
+      : subscriptionObj?.id;
+
+    if (!subscriptionObj && subscriptionId && typeof this.provider.retrieveSubscription === 'function') {
+      subscriptionObj = await this.provider.retrieveSubscription(subscriptionId);
+    }
+
+    if (isStripe) {
+      if (!customerId || !customerId.startsWith('cus_')) {
+        const err: any = new Error('Stripe checkout session missing valid customer ID.');
+        err.statusCode = 400;
+        throw err;
+      }
+      if (!subscriptionId || !subscriptionId.startsWith('sub_')) {
+        const err: any = new Error('Stripe checkout session missing valid subscription ID.');
+        err.statusCode = 400;
+        throw err;
+      }
+    }
+
+    const normalizedFromSub = subscriptionObj?.status
+      ? normalizeStripeSubscriptionStatus(subscriptionObj.status)
+      : {
+          status: (paymentStatus === 'no_payment_required' ? 'trialing' : 'active') as SubscriptionRecord['status'],
+          isKnownStatus: true,
+          isAuthorizedPaidTier: true,
+          rawStatus: paymentStatus,
+        };
+
+    if (!normalizedFromSub.isAuthorizedPaidTier) {
+      const err: any = new Error(`Subscription status "${normalizedFromSub.rawStatus}" is not active or trialing.`);
+      err.statusCode = 402;
+      err.code = 'SUBSCRIPTION_NOT_ACTIVE';
+      throw err;
+    }
+
+    const now = new Date();
+    const periodStartIso = typeof subscriptionObj?.current_period_start === 'number'
+      ? new Date(subscriptionObj.current_period_start * 1000).toISOString()
+      : now.toISOString();
+    const periodEndIso = typeof subscriptionObj?.current_period_end === 'number'
+      ? new Date(subscriptionObj.current_period_end * 1000).toISOString()
+      : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    return this.repo.withWorkspaceLock(workspaceId, async () => {
+      const existingSub = await this.repo.getSubscriptionByWorkspace(workspaceId);
+      const subRecord: SubscriptionRecord = {
+        id: existingSub?.id || `subrec_${workspaceId}`,
+        workspaceId,
+        provider: this.provider.providerName,
+        customerId: customerId || existingSub?.customerId || `cust_${workspaceId}`,
+        subscriptionId: subscriptionId || existingSub?.subscriptionId || `sub_${session.id}`,
+        tier: plan.tier,
+        status: normalizedFromSub.status,
+        currentPeriodStart: periodStartIso,
+        currentPeriodEnd: periodEndIso,
+        cancelAtPeriodEnd: Boolean(subscriptionObj?.cancel_at_period_end),
+        lastEventCreated: Math.max(existingSub?.lastEventCreated || 0, Math.floor(now.getTime() / 1000)),
+        createdAt: existingSub?.createdAt || now.toISOString(),
+        updatedAt: now.toISOString(),
+      };
+
+      const savedSub = await this.repo.saveSubscription(subRecord);
+      const currentStore = await this.repo.getStoreByWorkspace(workspaceId);
+      let updatedStore: StoreProfile | null = currentStore;
+      if (currentStore) {
+        updatedStore = await this.repo.saveStoreProfile(workspaceId, {
+          ...currentStore,
+          tier: plan.tier,
+          skuLimit: plan.skuLimit === Infinity ? undefined : plan.skuLimit,
+        });
+      }
+
+      return {
+        verified: true,
+        subscription: savedSub,
+        storeProfile: updatedStore,
+      };
+    });
+  }
+
   async renewEventLease(
     eventId: string,
     leaseOwner: string,

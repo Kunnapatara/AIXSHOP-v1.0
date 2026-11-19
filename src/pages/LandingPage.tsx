@@ -809,13 +809,13 @@ export const LandingPage: React.FC = () => {
             Transparent Pricing by Catalog Capacity
           </h2>
           <p className="text-sm text-stone-600 mt-2">
-            Pricing scaled by verified SKU limits with manual audit and remediation workflows across all plans.
+            Free Audit screens up to 2,500 SKUs with a preliminary summary; paid plans unlock full audit findings, evidence trails, remediation workflows, and feed exports by verified catalog capacity.
           </p>
           <p className="text-xs text-stone-500 mt-1.5">
             {freePlan
-              ? `Free Audit available (${freePlan.skuLimit?.toLocaleString() ?? '2,500'} SKU capacity). `
+              ? `Free Audit ($0): ${freePlan.skuLimit?.toLocaleString() ?? '2,500'}-SKU preliminary evaluation capacity (no full report or export). `
               : ''}
-            Live recurring checkout requires configured server Stripe credentials; unconfigured preview environments operate on Free Audit limits.
+            Starter (250 verified SKUs), Growth (2,500 verified SKUs), and Enterprise (Unlimited SKUs) unlock full reporting upon verified Stripe payment.
           </p>
         </div>
 

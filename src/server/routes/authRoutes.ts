@@ -1,9 +1,27 @@
-import { Router, Response } from 'express';
+import { Router, Request, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
 import { hashPassword, verifyPassword } from '../security/passwords';
 import { generateSessionToken, hashSessionToken } from '../security/tokens';
 import { createAuthMiddleware, authRateLimiter } from '../middleware/auth';
 import { AuthRequest } from '../types';
+import { getTrustedBaseUrl } from '../config/productionConfig';
+import { sendPasswordResetEmail } from '../services/emailService';
+
+function validatePasswordInput(password: unknown): { valid: boolean; error?: string } {
+  if (typeof password !== 'string') {
+    return { valid: false, error: 'Password is required' };
+  }
+  if (password.length < 8) {
+    return { valid: false, error: 'Password must be at least 8 characters long' };
+  }
+  if (password.length > 128) {
+    return { valid: false, error: 'Password must not exceed 128 characters' };
+  }
+  if (password.trim().length === 0) {
+    return { valid: false, error: 'Password cannot consist solely of whitespace' };
+  }
+  return { valid: true };
+}
 
 export function createAuthRoutes(repo: DatabaseRepository): Router {
   const router = Router();
@@ -11,6 +29,22 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
 
   const COOKIE_NAME = 'aixshop_session';
   const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+  const extractIncomingToken = (req: Request): string | undefined => {
+    let token: string | undefined = req.cookies?.[COOKIE_NAME];
+    const authHeader = req.headers.authorization;
+    if (!token && authHeader?.startsWith('Bearer ')) {
+      token = authHeader.substring(7).trim();
+    }
+    return token;
+  };
+
+  const revokeIncomingToken = async (req: Request): Promise<void> => {
+    const incoming = extractIncomingToken(req);
+    if (incoming) {
+      await repo.deleteSession(hashSessionToken(incoming)).catch(() => {});
+    }
+  };
 
   const setSessionCookie = (res: Response, token: string) => {
     res.cookie(COOKIE_NAME, token, {
@@ -39,8 +73,9 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
       if (!email || typeof email !== 'string' || !email.includes('@')) {
         return res.status(400).json({ error: 'Valid email address is required' });
       }
-      if (!password || typeof password !== 'string' || password.length < 8) {
-        return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+      const pwCheck = validatePasswordInput(password);
+      if (!pwCheck.valid) {
+        return res.status(400).json({ error: pwCheck.error });
       }
       if (!fullName || typeof fullName !== 'string' || !fullName.trim()) {
         return res.status(400).json({ error: 'Full name is required' });
@@ -49,11 +84,16 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: 'Workspace name is required' });
       }
 
+      const normalizedEmail = email.trim().toLowerCase();
+
       // Check existing user
-      const existingUser = await repo.getUserByEmail(email.trim().toLowerCase());
+      const existingUser = await repo.getUserByEmail(normalizedEmail);
       if (existingUser) {
         return res.status(409).json({ error: 'An account with this email already exists' });
       }
+
+      // Rotate away any pre-existing session cookie
+      await revokeIncomingToken(req);
 
       // Hash password
       const passwordHash = await hashPassword(password);
@@ -74,7 +114,7 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
       const { user, workspace } = await repo.registerUser({
         user: {
           id: userId,
-          email: email.trim().toLowerCase(),
+          email: normalizedEmail,
           passwordHash,
           fullName: fullName.trim(),
         },
@@ -108,7 +148,6 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
           slug: workspace.slug,
           role: 'owner',
         },
-        token: rawToken,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Auth] Registration error:', err);
@@ -143,7 +182,9 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
 
       const activeWorkspace = workspaces[0];
 
-      // Create session
+      // Session rotation on login: revoke any prior incoming session before creating fresh token
+      await revokeIncomingToken(req);
+
       const rawToken = generateSessionToken();
       const tokenHash = hashSessionToken(rawToken);
       const expiresAt = new Date(Date.now() + THIRTY_DAYS_MS).toISOString();
@@ -173,7 +214,6 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
           role: activeWorkspace.role,
         },
         workspaces,
-        token: rawToken,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Auth] Login error:', err);
@@ -181,20 +221,109 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
     }
   });
 
+  // POST /api/auth/forgot-password — Non-enumerating account recovery initiation
+  router.post(
+    '/forgot-password',
+    authRateLimiter(10, 15 * 60 * 1000, repo, { keyPrefix: 'forgot_pw' }),
+    async (req, res) => {
+      try {
+        const rawEmail = req.body?.email;
+        if (!rawEmail || typeof rawEmail !== 'string' || !rawEmail.includes('@')) {
+          return res.status(400).json({ error: 'Valid email address is required' });
+        }
+
+        const normalizedEmail = rawEmail.trim().toLowerCase();
+        const user = await repo.getUserByEmail(normalizedEmail);
+
+        if (user) {
+          const ttlMinutesRaw = Number(process.env.PASSWORD_RESET_TOKEN_TTL_MINUTES || 30);
+          const ttlMinutes = Number.isFinite(ttlMinutesRaw) && ttlMinutesRaw > 0 ? Math.min(120, ttlMinutesRaw) : 30;
+          const rawResetToken = generateSessionToken();
+          const tokenHash = hashSessionToken(rawResetToken);
+          const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString();
+
+          await repo.createPasswordResetToken({
+            id: `pwr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+            userId: user.id,
+            tokenHash,
+            expiresAt,
+            requestedIp: req.ip,
+          });
+
+          const baseUrl = getTrustedBaseUrl(req);
+          const resetUrl = `${baseUrl}/?reset_token=${encodeURIComponent(rawResetToken)}`;
+          await sendPasswordResetEmail({
+            to: user.email,
+            fullName: user.fullName,
+            resetUrl,
+            ttlMinutes,
+          });
+        }
+
+        // Strict non-enumeration response: identical regardless of whether email matched an account
+        return res.json({
+          success: true,
+          message: 'If an account matches that email address, password reset instructions have been sent.',
+        });
+      } catch (err: any) {
+        console.error('[AIXSHOP Auth] Forgot password error:', err);
+        return res.status(500).json({ error: 'Unable to process password reset request' });
+      }
+    }
+  );
+
+  // POST /api/auth/reset-password — Single-use token verification, password update, and full session revocation
+  router.post(
+    '/reset-password',
+    authRateLimiter(10, 15 * 60 * 1000, repo, { keyPrefix: 'reset_pw' }),
+    async (req, res) => {
+      try {
+        const rawToken = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+        const rawNewPassword =
+          typeof req.body?.newPassword === 'string' ? req.body.newPassword : req.body?.password;
+
+        if (!rawToken) {
+          return res.status(400).json({
+            error: 'Password reset token is required',
+            code: 'INVALID_RESET_TOKEN',
+          });
+        }
+
+        const pwCheck = validatePasswordInput(rawNewPassword);
+        if (!pwCheck.valid) {
+          return res.status(400).json({
+            error: pwCheck.error,
+            code: 'INVALID_PASSWORD',
+          });
+        }
+
+        const tokenHash = hashSessionToken(rawToken);
+        const newPasswordHash = await hashPassword(rawNewPassword as string);
+        const consumed = await repo.consumePasswordResetTokenAndUpdatePassword(tokenHash, newPasswordHash);
+
+        if (!consumed) {
+          return res.status(400).json({
+            error: 'Password reset link is invalid, expired, or has already been used.',
+            code: 'INVALID_RESET_TOKEN',
+          });
+        }
+
+        clearSessionCookie(res);
+        return res.json({
+          success: true,
+          message: 'Password updated successfully. All active sessions have been signed out; please sign in again.',
+        });
+      } catch (err: any) {
+        console.error('[AIXSHOP Auth] Reset password error:', err);
+        return res.status(500).json({ error: 'Unable to reset password' });
+      }
+    }
+  );
+
   // POST /api/auth/logout
   router.post('/logout', async (req, res) => {
     try {
-      let token: string | undefined = req.cookies?.[COOKIE_NAME];
-      const authHeader = req.headers.authorization;
-      if (!token && authHeader?.startsWith('Bearer ')) {
-        token = authHeader.substring(7).trim();
-      }
-
-      if (token) {
-        const tokenHash = hashSessionToken(token);
-        await repo.deleteSession(tokenHash);
-      }
-
+      await revokeIncomingToken(req);
       clearSessionCookie(res);
       return res.json({ success: true, message: 'Logged out successfully' });
     } catch (err: any) {
@@ -255,7 +384,27 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
         return res.status(404).json({ error: 'Target workspace not found' });
       }
 
-      await repo.updateSessionWorkspace(req.sessionId!, workspaceId);
+      // Rotate session token on workspace context transition
+      const incomingToken = extractIncomingToken(req);
+      const newRawToken = generateSessionToken();
+      const newTokenHash = hashSessionToken(newRawToken);
+      const expiresAt = new Date(Date.now() + THIRTY_DAYS_MS).toISOString();
+
+      await repo.createSession({
+        id: `sess_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        sessionTokenHash: newTokenHash,
+        userId: req.user!.id,
+        activeWorkspaceId: workspaceId,
+        expiresAt,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+      });
+
+      if (incomingToken) {
+        await repo.deleteSession(hashSessionToken(incomingToken)).catch(() => {});
+      }
+
+      setSessionCookie(res, newRawToken);
 
       return res.json({
         success: true,

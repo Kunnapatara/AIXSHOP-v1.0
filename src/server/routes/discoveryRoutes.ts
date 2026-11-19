@@ -1,34 +1,78 @@
 import { Router, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
-import { createAuthMiddleware } from '../middleware/auth';
+import { createAuthMiddleware, createWorkspaceRateLimiter } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { evaluateDiscoveryReadiness, buildBusinessHubChecklist } from '../../domain/aiDiscovery/discoveryEngine';
+import { resolveReportEntitlement } from '../services/entitlementService';
 
 export function createDiscoveryRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  const discoveryLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'discovery_audit',
+      maxAttempts: 20,
+      windowMs: 60_000,
+      message: 'AI Discovery audit rate limit exceeded. Please retry shortly.',
+    },
+    repo
+  );
 
   // GET /api/discovery/audit — Deterministic 8-dimension AI Discovery Evaluation
-  router.get('/audit', requireAuth, async (req: AuthRequest, res: Response) => {
+  router.get('/audit', requireAuth, discoveryLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
-      const catalog = await repo.loadWorkspaceCatalog(workspaceId);
-      const store = await repo.getStoreByWorkspace(workspaceId);
-      const shopifyConn = await repo.getShopifyConnection(workspaceId);
-      const profile = await repo.getWorkspaceBusinessProfile(workspaceId);
+      const [catalog, store, shopifyConn, profile, subscription] = await Promise.all([
+        repo.loadWorkspaceCatalog(workspaceId),
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getShopifyConnection(workspaceId),
+        repo.getWorkspaceBusinessProfile(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
 
+      const reportEntitlement = resolveReportEntitlement(store || catalog?.storeProfile, subscription);
       const storeDomain = shopifyConn?.shopDomain || store?.domain || 'myshopify.com';
       const products = catalog?.products || [];
 
       const readinessResult = evaluateDiscoveryReadiness(products, storeDomain);
       const checklist = buildBusinessHubChecklist(profile, products.length, readinessResult.overallScore);
 
+      if (!reportEntitlement.hasFullReportAccess) {
+        const redactedDimensions = Object.fromEntries(
+          Object.entries(readinessResult.dimensions).map(([key, dim]) => [
+            key,
+            {
+              ...dim,
+              evidence: [],
+            },
+          ])
+        );
+
+        return res.json({
+          success: true,
+          readiness: {
+            ...readinessResult,
+            dimensions: redactedDimensions,
+            findings: [],
+          },
+          findingsCount: readinessResult.findings.length,
+          hubChecklist: checklist,
+          productCount: products.length,
+          storeDomain,
+          reportEntitlement,
+          isLocked: true,
+        });
+      }
+
       return res.json({
         success: true,
         readiness: readinessResult,
+        findingsCount: readinessResult.findings.length,
         hubChecklist: checklist,
         productCount: products.length,
         storeDomain,
+        reportEntitlement,
+        isLocked: false,
       });
     } catch (err: any) {
       console.error('[AI Discovery API] Error generating audit:', err);

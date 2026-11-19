@@ -29,6 +29,38 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
     });
   });
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
+  async function seedActiveGrowthSubscription(workspaceId: string) {
+    await repo.saveSubscription({
+      id: `sub_test_${workspaceId}`,
+      workspaceId,
+      provider: 'sandbox',
+      customerId: `cus_test_${workspaceId}`,
+      subscriptionId: `sub_live_${workspaceId}`,
+      tier: 'Growth',
+      status: 'active',
+      currentPeriodStart: new Date().toISOString(),
+      currentPeriodEnd: new Date(Date.now() + 30 * 86400_000).toISOString(),
+      cancelAtPeriodEnd: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const store = await repo.getStoreByWorkspace(workspaceId);
+    if (store) {
+      await repo.saveStoreProfile(workspaceId, { ...store, tier: 'Growth', skuLimit: 2500 });
+    }
+  }
+
   // Helper to register a test user and obtain auth session token
   async function registerTenant(email: string, wsName: string) {
     const res = await fetch(`${baseUrl}/api/auth/register`, {
@@ -43,7 +75,10 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
     });
     assert.equal(res.status, 201);
     const data = await res.json();
-    return { token: data.token, workspace: data.workspace, user: data.user };
+    assert.equal(data.token, undefined);
+    const token = extractSessionCookie(res);
+    assert.ok(token);
+    return { token, workspace: data.workspace, user: data.user };
   }
 
   describe('Authentication & Workspace Authorization Guard', () => {
@@ -73,11 +108,12 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
   describe('Real Catalog Audit Execution Lifecycle', () => {
     test('executes real audit on populated workspace catalog, records metrics, and persists results', async () => {
       const tenantA = await registerTenant('audit_tenant_a@example.com', 'Tenant A Goods');
+      await seedActiveGrowthSubscription(tenantA.workspace.id);
 
-      // Seed catalog with products for Tenant A
+      // Seed catalog with products for Tenant A (factory/standard item requiring GS1 GTIN)
       const testProduct: Product = {
         id: 'p_prod_a',
-        title: 'Handmade Stoneware Pour Over Coffee Dripper',
+        title: 'Stoneware Pour Over Coffee Dripper',
         brand: 'Ceramics Co',
         category: 'Coffee & Tea',
         description: 'Ceramic coffee dripper with spiral ridges for pour over brewing.',
@@ -302,6 +338,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
   describe('Workstream B: Audit History & Evidence Snapshot Suite', () => {
     test('A. Historical Persistence: newly completed audit persists durable findings, evidence, and product observations', async () => {
       const tenant = await registerTenant('persist_snapshot@example.com', 'Persistence Goods');
+      await seedActiveGrowthSubscription(tenant.workspace.id);
 
       const testProduct: Product = {
         id: 'prod_persist_01',
@@ -419,11 +456,12 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('B. Historical Immutability: modifying current catalog and re-auditing does NOT alter historical snapshot of previous audit', async () => {
       const tenant = await registerTenant('immutability_tenant@example.com', 'Immutability Works');
+      await seedActiveGrowthSubscription(tenant.workspace.id);
 
       // Initial Product state: missing barcode
       const initialProduct: Product = {
         id: 'prod_immutable_01',
-        title: 'Handmade Ceramic Planter Pot',
+        title: 'Glazed Ceramic Planter Pot',
         brand: 'Clay & Co',
         category: 'Home & Garden / Planters',
         description: 'Terracotta ceramic plant pot with drainage dish included.',
@@ -561,15 +599,15 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
       const snapA2 = await snapResA2.json();
 
       // STRICT IMMUTABILITY VERIFICATION:
-      // Audit A product title must still be the original title ('Handmade Ceramic Planter Pot')
-      assert.equal(snapA2.products[0].title, 'Handmade Ceramic Planter Pot');
+      // Audit A product title must still be the original title ('Glazed Ceramic Planter Pot')
+      assert.equal(snapA2.products[0].title, 'Glazed Ceramic Planter Pot');
       // Audit A variant barcode must still be empty
       assert.equal(snapA2.products[0].variants[0].barcode, '');
       // Audit A findings must still include the missing GTIN finding with observed value '(empty)'
       const barcodeFindingA2 = snapA2.findings.find((f: any) => f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
       assert.ok(barcodeFindingA2);
       assert.equal(barcodeFindingA2.currentValue, '(empty)');
-      assert.equal(barcodeFindingA2.productTitle, 'Handmade Ceramic Planter Pot');
+      assert.equal(barcodeFindingA2.productTitle, 'Glazed Ceramic Planter Pot');
 
       // Now inspect Audit B snapshot: it must reflect the new title and NO missing barcode finding
       const snapResB = await fetch(`${baseUrl}/api/audit/${auditRunIdB}`, {
@@ -587,6 +625,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('C. Historical API & Pagination: GET /api/audit/history supports ordering and pagination', async () => {
       const tenant = await registerTenant('paging_tenant@example.com', 'Paging WS');
+      await seedActiveGrowthSubscription(tenant.workspace.id);
 
       // Run 3 audits
       await fetch(`${baseUrl}/api/audit/run`, {
@@ -655,6 +694,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('E. Historical Comparison: GET /api/audit/compare detects resolved, persistent, and new findings', async () => {
       const tenant = await registerTenant('compare_tenant@example.com', 'Comparison Store');
+      await seedActiveGrowthSubscription(tenant.workspace.id);
 
       // Base catalog: has candle burn time conflict and missing GTIN
       const p1: Product = {
@@ -791,6 +831,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('Zero-findings audit correctly marks snapshotAvailable: true via completion manifest', async () => {
       const cleanTenant = await registerTenant('clean_catalog_user@example.com', 'Clean Catalog Store');
+      await seedActiveGrowthSubscription(cleanTenant.workspace.id);
       const storeRes = await fetch(`${baseUrl}/api/store/profile`, {
         headers: { 'Authorization': `Bearer ${cleanTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
       });
@@ -848,6 +889,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('Evidence documents retain their associated productId in historical snapshots', async () => {
       const evidenceTenant = await registerTenant('evidence_test_user@example.com', 'Evidence Test Store');
+      await seedActiveGrowthSubscription(evidenceTenant.workspace.id);
       const storeRes = await fetch(`${baseUrl}/api/store/profile`, {
         headers: { 'Authorization': `Bearer ${evidenceTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
       });
@@ -930,6 +972,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('executeWorkspaceAudit handles 16-digit Shopify product & variant IDs without identifier overflow or relationship loss', async () => {
       const shopifyTenant = await registerTenant('shopify_16digit_audit@example.com', 'Shopify 16Digit Store');
+      await seedActiveGrowthSubscription(shopifyTenant.workspace.id);
       const storeRes = await fetch(`${baseUrl}/api/store/profile`, {
         headers: { 'Authorization': `Bearer ${shopifyTenant.token}`, 'X-Requested-With': 'XMLHttpRequest' },
       });

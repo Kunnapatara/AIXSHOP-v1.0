@@ -1,5 +1,5 @@
 import { Product } from '../../types';
-import { isValidGtin13 } from '../validation/gtin';
+import { isValidGtin } from '../validation/gtin';
 
 /**
  * Calculates a deterministic catalog completeness score (0-100) based on actual product fields.
@@ -7,7 +7,7 @@ import { isValidGtin13 } from '../validation/gtin';
  * Rules:
  * 1. Core entity properties (up to 40 pts)
  * 2. Structured attributes (up to 30 pts)
- * 3. Variant integrity and valid GTIN-13 barcodes (up to 20 pts)
+ * 3. Variant integrity and valid GTIN (GTIN-8/12/13/14) barcodes (up to 20 pts)
  * 4. Evidence documents verified (up to 10 pts)
  */
 export function calculateProductCompleteness(product: Product): number {
@@ -33,7 +33,7 @@ export function calculateProductCompleteness(product: Product): number {
   // 3. Variant integrity (up to 20 pts)
   if (product.variants && product.variants.length > 0) {
     const validVariants = product.variants.filter(
-      v => v.barcode && isValidGtin13(v.barcode)
+      v => v.barcode && isValidGtin(v.barcode)
     ).length;
     const ratio = validVariants / product.variants.length;
     score += Math.round(ratio * 20);

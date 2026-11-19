@@ -53,14 +53,12 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   app.use(blockInternalPromptArtifactsMiddleware);
 
   // Narrowly scoped raw-body capture for billing and Shopify webhook routes
-  // Preserves exact original request bytes for HMAC signature verification
-  // All other application routes receive standard express.json() parsing
+  // Scoped JSON body size limits: 256kb default, 5mb for /api/catalog, 2mb for /api/visibility/upload
   app.use((req, res, next) => {
+    const reqPath = req.path || req.originalUrl?.split('?')[0] || '';
     const isWebhook =
-      req.path === '/api/billing/webhook' ||
-      req.originalUrl?.split('?')[0] === '/api/billing/webhook' ||
-      req.path === '/api/shopify/webhooks' ||
-      req.originalUrl?.split('?')[0] === '/api/shopify/webhooks';
+      reqPath === '/api/billing/webhook' ||
+      reqPath === '/api/shopify/webhooks';
 
     if (isWebhook) {
       return express.raw({ type: '*/*', limit: '5mb' })(req, res, (err) => {
@@ -69,7 +67,15 @@ export function createApp(customRepo?: DatabaseRepository): Express {
         next();
       });
     }
-    return express.json({ limit: '10mb' })(req, res, next);
+
+    const jsonLimit =
+      reqPath.startsWith('/api/catalog')
+        ? '5mb'
+        : reqPath.startsWith('/api/visibility/upload')
+        ? '2mb'
+        : '256kb';
+
+    return express.json({ limit: jsonLimit })(req, res, next);
   });
   app.use(cookieParser());
   app.use(csrfProtection);
@@ -229,7 +235,13 @@ export function createApp(customRepo?: DatabaseRepository): Express {
     if (res.headersSent) {
       return next(err);
     }
-    const statusCode = typeof err.statusCode === 'number' ? err.statusCode : 500;
+    if (err?.type === 'entity.too.large' || err?.statusCode === 413 || err?.status === 413) {
+      return res.status(413).json({
+        error: 'Request payload exceeds the maximum allowed size limit for this endpoint.',
+        code: 'PAYLOAD_TOO_LARGE',
+      });
+    }
+    const statusCode = typeof err.statusCode === 'number' ? err.statusCode : (typeof err.status === 'number' ? err.status : 500);
     res.status(statusCode).json({
       error: err.expose ? err.message : 'An unexpected server error occurred',
       code: err.code || 'INTERNAL_SERVER_ERROR',

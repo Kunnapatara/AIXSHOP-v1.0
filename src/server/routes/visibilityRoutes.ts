@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { Router, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
-import { createAuthMiddleware, requireRole } from '../middleware/auth';
+import { createAuthMiddleware, createWorkspaceRateLimiter, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import {
   TopicPresenceState,
@@ -198,9 +198,27 @@ export function computeCsvContentHash(csvContent: string): string {
 export function createVisibilityRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  const visibilityReadLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'visibility_read',
+      maxAttempts: 60,
+      windowMs: 60_000,
+      message: 'Visibility read rate limit exceeded. Please retry shortly.',
+    },
+    repo
+  );
+  const visibilityUploadLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'visibility_upload',
+      maxAttempts: 15,
+      windowMs: 60_000,
+      message: 'Visibility CSV upload rate limit exceeded. Please wait before uploading again.',
+    },
+    repo
+  );
 
   // GET /api/visibility/summary — Evidence-backed AI Visibility Monitoring
-  router.get('/summary', requireAuth, async (req: AuthRequest, res: Response) => {
+  router.get('/summary', requireAuth, visibilityReadLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const summary = await repo.getVisibilitySummary(workspaceId);
@@ -216,7 +234,7 @@ export function createVisibilityRoutes(repo: DatabaseRepository): Router {
   });
 
   // POST /api/visibility/upload — Strict transactional CSV analytics ingestion with deduplication
-  router.post('/upload', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+  router.post('/upload', requireAuth, requireRole(['owner', 'admin']), visibilityUploadLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const { csvContent, filename, sourcePlatform, conflictPolicy } = req.body || {};

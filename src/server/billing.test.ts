@@ -22,6 +22,17 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
   let memberToken: string;
   let workspaceId: string;
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
   before(async () => {
     repo = new MemoryRepository(false);
     sandboxProvider = new SandboxBillingProvider('test_webhook_secret_key_abc123');
@@ -52,7 +63,9 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
     });
     assert.equal(regRes.status, 201);
     const data = await regRes.json();
-    ownerToken = data.token;
+    assert.equal(data.token, undefined);
+    ownerToken = extractSessionCookie(regRes);
+    assert.ok(ownerToken);
     workspaceId = data.workspace.id;
 
     // Create a member in the same workspace

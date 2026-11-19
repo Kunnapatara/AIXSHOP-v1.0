@@ -75,6 +75,17 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
     });
   });
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
   async function registerTestUser(email: string, wsName: string) {
     const res = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
@@ -88,7 +99,10 @@ describe('AIXSHOP v1.0 — Workstream C: Real Shopify Integration Suite', () => 
     });
     assert.equal(res.status, 201);
     const data = await res.json();
-    return { token: data.token, workspace: data.workspace, user: data.user };
+    assert.equal(data.token, undefined);
+    const token = extractSessionCookie(res);
+    assert.ok(token);
+    return { token, workspace: data.workspace, user: data.user };
   }
 
   // 1. Security & Encryption Layer (AES-256-GCM)

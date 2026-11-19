@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { apiClient, AuthUser, WorkspaceSummary } from '../api/client';
 
+export type AuthModalMode = 'login' | 'register' | 'forgot' | 'reset';
+
 interface AuthContextType {
   user: AuthUser | null;
   activeWorkspace: WorkspaceSummary | null;
@@ -8,11 +10,15 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   authModalOpen: boolean;
-  authModalMode: 'login' | 'register';
-  openAuthModal: (mode?: 'login' | 'register') => void;
+  authModalMode: AuthModalMode;
+  pendingResetToken?: string | null;
+  openAuthModal: (mode?: AuthModalMode) => void;
   closeAuthModal: () => void;
+  clearPendingResetToken?: () => void;
   login: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
   register: (data: { email: string; password: string; fullName: string; workspaceName: string }) => Promise<{ success: boolean; error?: string }>;
+  forgotPassword?: (email: string) => Promise<{ success: boolean; message?: string; error?: string }>;
+  resetPassword?: (token: string, newPassword: string) => Promise<{ success: boolean; message?: string; error?: string }>;
   logout: () => Promise<void>;
   switchWorkspace: (workspaceId: string) => Promise<boolean>;
 }
@@ -25,7 +31,24 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
-  const [authModalMode, setAuthModalMode] = useState<'login' | 'register'>('login');
+  const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('login');
+  const [pendingResetToken, setPendingResetToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location && typeof window.location.search === 'string') {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const token = params.get('reset_token');
+        if (token && token.trim()) {
+          setPendingResetToken(token.trim());
+          setAuthModalMode('reset');
+          setAuthModalOpen(true);
+        }
+      } catch {
+        // Ignore restricted URL environments
+      }
+    }
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -58,7 +81,24 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     };
   }, []);
 
-  const openAuthModal = (mode: 'login' | 'register' = 'login') => {
+  const clearPendingResetToken = () => {
+    setPendingResetToken(null);
+    if (typeof window !== 'undefined' && window.location && typeof window.history?.replaceState === 'function') {
+      try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.has('reset_token')) {
+          url.searchParams.delete('reset_token');
+          const nextSearch = url.searchParams.toString();
+          const nextUrl = `${url.pathname}${nextSearch ? `?${nextSearch}` : ''}${url.hash || ''}`;
+          window.history.replaceState({}, typeof document !== 'undefined' ? document.title : '', nextUrl);
+        }
+      } catch {
+        // Ignore invalid URL environments
+      }
+    }
+  };
+
+  const openAuthModal = (mode: AuthModalMode = 'login') => {
     setAuthModalMode(mode);
     setAuthModalOpen(true);
   };
@@ -90,6 +130,28 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       return { success: true };
     } catch (err: any) {
       return { success: false, error: err.message || 'Registration failed' };
+    }
+  };
+
+  const forgotPassword = async (email: string) => {
+    try {
+      const res = await apiClient.forgotPassword(email);
+      return { success: true, message: res.message };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Unable to process password reset request' };
+    }
+  };
+
+  const resetPassword = async (token: string, newPassword: string) => {
+    try {
+      const res = await apiClient.resetPassword(token, newPassword);
+      setUser(null);
+      setActiveWorkspace(null);
+      setWorkspaces([]);
+      clearPendingResetToken();
+      return { success: true, message: res.message };
+    } catch (err: any) {
+      return { success: false, error: err.message || 'Unable to reset password' };
     }
   };
 
@@ -126,10 +188,14 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         isLoading,
         authModalOpen,
         authModalMode,
+        pendingResetToken,
         openAuthModal,
         closeAuthModal,
+        clearPendingResetToken,
         login,
         register,
+        forgotPassword,
+        resetPassword,
         logout,
         switchWorkspace,
       }}

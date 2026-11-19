@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
-import { apiClient } from '../api/client';
+import { apiClient, ReportEntitlement } from '../api/client';
+import { ReportPaywallBanner } from '../components/billing/ReportPaywallBanner';
 import {
   evaluateDiscoveryReadiness,
   buildBusinessHubChecklist,
@@ -22,16 +23,31 @@ import {
 } from 'lucide-react';
 
 export const AiDiscoveryPage: React.FC = () => {
-  const { products, storeProfile, navigateTo, viewProductDetail, addToast } = useApp();
+  const {
+    products,
+    storeProfile,
+    navigateTo,
+    viewProductDetail,
+    addToast,
+    reportEntitlement: contextEntitlement,
+    preliminarySummary,
+  } = useApp();
   const { isAuthenticated } = useAuth();
 
   const [readiness, setReadiness] = useState<DiscoveryAuditResult | null>(null);
   const [hubChecklist, setHubChecklist] = useState<BusinessHubChecklistResult | null>(null);
+  const [discoveryEntitlement, setDiscoveryEntitlement] = useState<ReportEntitlement | null>(null);
+  const [isDiscoveryLocked, setIsDiscoveryLocked] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedDimension, setSelectedDimension] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [activeSection, setActiveSection] = useState<'dimensions' | 'findings' | 'business-hub'>('dimensions');
+
+  const effectiveEntitlement = discoveryEntitlement || contextEntitlement || null;
+  const isLocked = Boolean(
+    isAuthenticated && (isDiscoveryLocked || (effectiveEntitlement && !effectiveEntitlement.hasFullReportAccess))
+  );
 
   const loadDiscoveryAudit = React.useCallback(async () => {
     setLoading(true);
@@ -41,7 +57,11 @@ export const AiDiscoveryPage: React.FC = () => {
         const res = await apiClient.getDiscoveryAudit();
         setReadiness(res.readiness);
         setHubChecklist(res.hubChecklist);
+        setDiscoveryEntitlement(res.reportEntitlement || null);
+        setIsDiscoveryLocked(Boolean(res.isLocked || (res.reportEntitlement && !res.reportEntitlement.hasFullReportAccess)));
       } else {
+        setDiscoveryEntitlement(null);
+        setIsDiscoveryLocked(false);
         const localReadiness = evaluateDiscoveryReadiness(products, storeProfile.domain);
         const localChecklist = buildBusinessHubChecklist(null, products.length, localReadiness.overallScore);
         setReadiness(localReadiness);
@@ -128,6 +148,15 @@ export const AiDiscoveryPage: React.FC = () => {
             </span>
           </div>
         </div>
+      )}
+
+      {isLocked && effectiveEntitlement && (
+        <ReportPaywallBanner
+          entitlement={effectiveEntitlement}
+          preliminarySummary={preliminarySummary}
+          contextLabel="Detailed AI discovery evidence trails and SKU-level findings require an active paid plan."
+          onUpgrade={() => navigateTo('settings', 'subscription')}
+        />
       )}
 
       {error && (

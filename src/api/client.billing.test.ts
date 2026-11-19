@@ -17,13 +17,8 @@ import {
 const originalFetch = globalThis.fetch;
 
 describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
-  beforeEach(() => {
-    apiClient.setToken(null);
-  });
-
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    apiClient.setToken(null);
   });
 
   describe('Shop domain & redirect URL validators', () => {
@@ -272,10 +267,9 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
   });
 
   describe('apiClient.getBillingSubscription', () => {
-    test('forwards Bearer token and validates subscription response structure', async () => {
-      let authHeader = '';
+    test('uses cookie-only credentials without Bearer Authorization header and validates subscription response structure', async () => {
+      let authHeader: string | undefined;
       let creds: RequestCredentials | undefined;
-      apiClient.setToken('tok_sub_123');
 
       globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
         const headers = (init?.headers || {}) as Record<string, string>;
@@ -309,7 +303,7 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
       }) as typeof fetch;
 
       const res = await apiClient.getBillingSubscription();
-      assert.equal(authHeader, 'Bearer tok_sub_123');
+      assert.equal(authHeader, undefined, 'Browser client must not send Bearer Authorization header');
       assert.equal(creds, 'include');
       assert.equal(res.workspaceId, 'ws_1');
       assert.equal(res.subscription.tier, 'Growth');
@@ -331,7 +325,6 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
     test('creates checkout session and validates returned checkoutUrl', async () => {
       let method = '';
       let sentBody: any = null;
-      apiClient.setToken('tok_chk_123');
 
       globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
         method = init?.method || 'GET';
@@ -486,14 +479,15 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
   });
 
   describe('apiClient.connectShopify', () => {
-    test('normalizes shop domain, sends authenticated GET request, and validates Shopify authUrl', async () => {
+    test('normalizes shop domain, sends authenticated cookie GET request, and validates Shopify authUrl', async () => {
       let calledUrl = '';
-      let authHeader = '';
-      apiClient.setToken('tok_shop_123');
+      let authHeader: string | undefined;
+      let creds: RequestCredentials | undefined;
 
       globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         calledUrl = String(input);
         authHeader = ((init?.headers || {}) as Record<string, string>)['Authorization'];
+        creds = init?.credentials;
         return new Response(
           JSON.stringify({
             success: true,
@@ -507,7 +501,8 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
 
       const res = await apiClient.connectShopify('demo-store');
       assert.equal(calledUrl, '/api/shopify/connect?shop=demo-store.myshopify.com');
-      assert.equal(authHeader, 'Bearer tok_shop_123');
+      assert.equal(authHeader, undefined);
+      assert.equal(creds, 'include');
       assert.equal(res.shopDomain, 'demo-store.myshopify.com');
       assert.match(res.authUrl, /^https:\/\/demo-store\.myshopify\.com\/admin\/oauth\/authorize/);
     });
@@ -535,8 +530,44 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
     });
   });
 
+  describe('apiClient.verifyCheckoutSession & auth recovery methods', () => {
+    test('sends checkout session verification and password recovery requests cleanly', async () => {
+      const calls: Array<{ url: string; body: any }> = [];
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        calls.push({ url, body });
+        if (url === '/api/billing/checkout-session/verify') {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              verified: true,
+              workspaceId: 'ws_1',
+              subscription: { provider: 'sandbox', tier: 'Growth', status: 'active', cancelAtPeriodEnd: false },
+              storeProfile: null,
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ success: true, message: 'ok' }), { status: 200 });
+      }) as typeof fetch;
+
+      const verifyRes = await apiClient.verifyCheckoutSession('cs_sandbox_123');
+      assert.equal(verifyRes.verified, true);
+      assert.equal(verifyRes.subscription.tier, 'Growth');
+
+      await apiClient.forgotPassword('merchant@example.com');
+      await apiClient.resetPassword('tok_reset_123', 'NewStrongPass123!');
+
+      assert.equal(calls.length, 3);
+      assert.deepEqual(calls[0], { url: '/api/billing/checkout-session/verify', body: { sessionId: 'cs_sandbox_123' } });
+      assert.deepEqual(calls[1], { url: '/api/auth/forgot-password', body: { email: 'merchant@example.com' } });
+      assert.deepEqual(calls[2], { url: '/api/auth/reset-password', body: { token: 'tok_reset_123', newPassword: 'NewStrongPass123!' } });
+    });
+  });
+
   describe('End-to-End Backend Route Compatibility via Express App', () => {
-    test('apiClient communicates cleanly with real /api/billing/* and /api/shopify/connect endpoints', async () => {
+    test('apiClient communicates cleanly with real /api/billing/* and /api/shopify/connect endpoints via HttpOnly cookies', async () => {
       const repo = new MemoryRepository();
       const prevApiKey = process.env.SHOPIFY_API_KEY;
       const prevApiSecret = process.env.SHOPIFY_API_SECRET;
@@ -551,9 +582,32 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
       const addr = server.address() as { port: number };
       const baseUrl = `http://127.0.0.1:${addr.port}`;
 
-      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      // Lightweight Node fetch cookie jar simulating browser HttpOnly cookie persistence + Origin header
+      const cookieJar = new Map<string, string>();
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === 'string' && input.startsWith('/') ? `${baseUrl}${input}` : input;
-        return originalFetch(url, init);
+        const headers: Record<string, string> = {
+          Origin: baseUrl,
+          ...((init?.headers as Record<string, string>) || {}),
+        };
+        if (cookieJar.size > 0) {
+          headers.Cookie = Array.from(cookieJar.entries())
+            .map(([k, v]) => `${k}=${v}`)
+            .join('; ');
+        }
+        const res = await originalFetch(url, { ...init, headers });
+        const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+        for (const raw of setCookies) {
+          const pair = raw.split(';')[0];
+          const eq = pair.indexOf('=');
+          if (eq > 0) {
+            const name = pair.slice(0, eq).trim();
+            const val = pair.slice(eq + 1).trim();
+            if (val) cookieJar.set(name, val);
+            else cookieJar.delete(name);
+          }
+        }
+        return res;
       }) as typeof fetch;
 
       try {
@@ -561,12 +615,14 @@ describe('Task C1 & Validation: Billing & Shopify Frontend API Client', () => {
         assert.equal(plans.plans.length, 4);
         assert.ok(plans.plans.some(p => p.tier === 'Growth' && p.priceCents === 14900));
 
-        await apiClient.register({
+        const regRes = await apiClient.register({
           email: 'billing-client-e2e@example.com',
           password: 'Password123!',
           fullName: 'E2E Merchant',
           workspaceName: 'E2E Shop',
         });
+        assert.equal((regRes as any).token, undefined, 'Register response JSON must not expose raw token');
+        assert.ok(cookieJar.get('aixshop_session'), 'HttpOnly aixshop_session cookie must be set');
 
         const sub = await apiClient.getBillingSubscription();
         assert.equal(sub.subscription.tier, 'Free Audit');

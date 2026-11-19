@@ -65,6 +65,38 @@ describe('AIXSHOP v1.0 — Comprehensive Workstream Regression Suite', () => {
     });
   });
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
+  async function seedActiveGrowthSubscription(workspaceId: string) {
+    await repo.saveSubscription({
+      id: `sub_test_${workspaceId}`,
+      workspaceId,
+      provider: 'sandbox',
+      customerId: `cus_test_${workspaceId}`,
+      subscriptionId: `sub_live_${workspaceId}`,
+      tier: 'Growth',
+      status: 'active',
+      currentPeriodStart: new Date().toISOString(),
+      currentPeriodEnd: new Date(Date.now() + 30 * 86400_000).toISOString(),
+      cancelAtPeriodEnd: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const store = await repo.getStoreByWorkspace(workspaceId);
+    if (store) {
+      await repo.saveStoreProfile(workspaceId, { ...store, tier: 'Growth', skuLimit: 2500 });
+    }
+  }
+
   async function registerUser(email: string, workspaceName: string) {
     const res = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
@@ -78,7 +110,10 @@ describe('AIXSHOP v1.0 — Comprehensive Workstream Regression Suite', () => {
     });
     assert.equal(res.status, 201);
     const body = await res.json();
-    return { token: body.token as string, workspace: body.workspace };
+    assert.equal(body.token, undefined);
+    const token = extractSessionCookie(res);
+    assert.ok(token);
+    return { token, workspace: body.workspace };
   }
 
   describe('Workstream A: Shopify Gap Closure Hardening', () => {
@@ -418,6 +453,7 @@ describe('AIXSHOP v1.0 — Comprehensive Workstream Regression Suite', () => {
 
     test('HTTP endpoints for Business Profile, Discovery Audit, and Feed Export respect workspace isolation', async () => {
       const tenant = await registerUser(`ws-bc-${Date.now()}@test.com`, 'Discovery & Feed Store');
+      await seedActiveGrowthSubscription(tenant.workspace.id);
       await repo.saveWorkspaceCatalog(tenant.workspace.id, {
         storeProfile: {
           name: 'Discovery & Feed Store',

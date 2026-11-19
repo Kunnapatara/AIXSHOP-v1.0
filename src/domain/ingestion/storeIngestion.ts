@@ -7,7 +7,7 @@ import {
   CandidateEligibilityStatus 
 } from '../../types';
 import { initialProducts, initialFindings } from '../../data/mockData';
-import { isValidGtin13 } from '../validation/gtin';
+import { isValidGtin } from '../validation/gtin';
 import { calculateProductCompleteness } from '../catalog/completeness';
 import { CURRENT_SCHEMA_VERSION } from '../storage/storageAdapter';
 import { 
@@ -719,16 +719,16 @@ export function evaluateProductsCatalog(
     const vList = p.variants || [];
     totalVariants += vList.length;
     for (const v of vList) {
-      if (v.barcode && isValidGtin13(v.barcode)) {
+      if (v.barcode && isValidGtin(v.barcode)) {
         validGtinVariants++;
       } else {
         if (!v.barcode) {
           if (issues.length < 3 && !issues.some(i => i.includes('Missing GTIN/UPC'))) {
             issues.push(`Missing GTIN/UPC identifier on "${p.title}" (${v.title || v.sku})`);
           }
-        } else if (!isValidGtin13(v.barcode)) {
+        } else if (!isValidGtin(v.barcode)) {
           if (issues.length < 3 && !issues.some(i => i.includes('invalid GTIN check digit'))) {
-            issues.push(`Variant "${v.sku}" has invalid GTIN-13 check digit: ${v.barcode}`);
+            issues.push(`Variant "${v.sku}" has invalid GTIN check digit: ${v.barcode}`);
           }
         }
       }

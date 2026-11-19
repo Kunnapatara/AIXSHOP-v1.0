@@ -1,5 +1,5 @@
 import { Product, Variant } from '../../types';
-import { isValidGtin13 } from '../validation/gtin';
+import { isValidGtin, validateGtin } from '../validation/gtin';
 
 export type FeedPlatform = 'google_merchant_center' | 'meta_commerce' | 'schema_org';
 
@@ -79,7 +79,10 @@ export interface SchemaOrgProductJsonLd {
   image?: string;
   sku?: string;
   mpn?: string;
+  gtin8?: string;
+  gtin12?: string;
   gtin13?: string;
+  gtin14?: string;
   brand?: {
     '@type': 'Brand';
     name: string;
@@ -363,11 +366,12 @@ function validateVariantsCommon(
           severity: 'warning',
         });
       }
-    } else if (!isValidGtin13(barcode)) {
+    } else if (!isValidGtin(barcode)) {
+      const gtinInfo = validateGtin(barcode);
       errors.push({
         field: options.gtinField,
         variantId: variant.id,
-        message: `Barcode "${barcode}" fails GS1 GTIN check-digit validation (variant: ${vLabel})`,
+        message: `Barcode "${barcode}" fails GS1 GTIN check-digit validation (${gtinInfo.reason || 'invalid format'}) (variant: ${vLabel})`,
         severity: 'error',
       });
     }
@@ -615,7 +619,7 @@ export function mapProductToGmcRow(
   const cleanBrand = isGenericOrMissingBrand(brand) ? '' : brand;
 
   const rawBarcode = (targetVariant?.barcode || '').trim();
-  const validGtin = rawBarcode && isValidGtin13(rawBarcode) ? rawBarcode : undefined;
+  const validGtin = rawBarcode && isValidGtin(rawBarcode) ? rawBarcode : undefined;
   const sku = (targetVariant?.sku || '').trim();
   const mpn = resolveVariantMpn(product, targetVariant);
   const validMpn = mpn && isValidMpnFormat(mpn) ? mpn : undefined;
@@ -699,7 +703,7 @@ export function mapProductToMetaRow(
 
   const sku = (targetVariant?.sku || '').trim();
   const rawBarcode = (targetVariant?.barcode || '').trim();
-  const validGtin = rawBarcode && isValidGtin13(rawBarcode) ? rawBarcode : undefined;
+  const validGtin = rawBarcode && isValidGtin(rawBarcode) ? rawBarcode : undefined;
   const mpn = resolveVariantMpn(product, targetVariant);
   const validMpn = mpn && isValidMpnFormat(mpn) ? mpn : undefined;
 
@@ -779,8 +783,12 @@ export function mapProductToSchemaOrgJsonLd(product: Product, currency: string =
     result.mpn = mpn;
   }
 
-  if (gtin && isValidGtin13(gtin)) {
-    result.gtin13 = gtin;
+  const gtinValidation = gtin ? validateGtin(gtin) : null;
+  if (gtinValidation?.isValid) {
+    if (gtinValidation.format === 'GTIN-8') result.gtin8 = gtinValidation.normalized;
+    else if (gtinValidation.format === 'GTIN-12') result.gtin12 = gtinValidation.normalized;
+    else if (gtinValidation.format === 'GTIN-13') result.gtin13 = gtinValidation.normalized;
+    else if (gtinValidation.format === 'GTIN-14') result.gtin14 = gtinValidation.normalized;
   }
 
   if (isValidHttpUrl(imageLink)) {

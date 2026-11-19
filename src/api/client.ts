@@ -23,26 +23,59 @@ export interface AuthSessionResponse {
   user: AuthUser;
   workspace: WorkspaceSummary;
   workspaces?: WorkspaceSummary[];
-  token?: string;
+}
+
+export type ReportAccessReasonCode =
+  | 'ACTIVE_PAID_SUBSCRIPTION'
+  | 'TRIALING_PAID_SUBSCRIPTION'
+  | 'FREE_AUDIT_PRELIMINARY_ONLY'
+  | 'SUBSCRIPTION_PAST_DUE'
+  | 'SUBSCRIPTION_CANCELED'
+  | 'SUBSCRIPTION_UNPAID'
+  | 'SUBSCRIPTION_INCOMPLETE'
+  | 'SUBSCRIPTION_EXPIRED'
+  | 'STORE_PROFILE_UNAVAILABLE';
+
+export interface ReportEntitlement {
+  hasFullReportAccess: boolean;
+  accessLevel: 'full' | 'preliminary';
+  activeTier: string;
+  subscriptionStatus: string;
+  reasonCode: ReportAccessReasonCode;
+  reasonMessage: string;
+  upgradeRequired: boolean;
+}
+
+export interface PreliminaryAuditSummary {
+  totalFindingsCount: number;
+  criticalCount: number;
+  highCount: number;
+  mediumCount: number;
+  lowCount: number;
+  actionsCount: number;
+  recommendedTier: 'Starter' | 'Growth' | 'Enterprise';
+  skuCount: number;
+  note: string;
+}
+
+export interface CommercialPlanSummaryItem {
+  tier: string;
+  priceCents: number;
+  billingInterval: 'month' | 'year';
+  skuLimit: number | null;
+  isUnlimited: boolean;
+  quotaSemantics: 'preliminary_evaluation_capacity' | 'verified_monthly_catalog_skus';
+  reportAccess: 'preliminary_only' | 'full_report_and_remediation';
+  explanation: string;
 }
 
 class ApiClient {
-  private token: string | null = null;
-
-  setToken(token: string | null) {
-    this.token = token;
-  }
-
   private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-Requested-With': 'XMLHttpRequest',
       ...(options.headers as Record<string, string> || {}),
     };
-
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${this.token}`;
-    }
 
     const res = await fetch(path, {
       ...options,
@@ -65,6 +98,8 @@ class ApiClient {
         if (body.code !== undefined) error.code = body.code;
         if (body.currentVersion !== undefined) error.currentVersion = body.currentVersion;
         if (body.expectedVersion !== undefined) error.expectedVersion = body.expectedVersion;
+        if (body.reportEntitlement !== undefined) error.reportEntitlement = body.reportEntitlement;
+        if (body.preliminarySummary !== undefined) error.preliminarySummary = body.preliminarySummary;
       }
       throw error;
     }
@@ -76,28 +111,37 @@ class ApiClient {
     }
   }
 
-  // Auth Endpoints
+  // Auth Endpoints (cookie-only browser sessions)
   async register(params: { email: string; password: string; fullName: string; workspaceName: string }): Promise<AuthSessionResponse> {
-    const data = await this.request<AuthSessionResponse>('/api/auth/register', {
+    return this.request<AuthSessionResponse>('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify(params),
     });
-    if (data.token) this.setToken(data.token);
-    return data;
   }
 
   async login(params: { email: string; password: string }): Promise<AuthSessionResponse> {
-    const data = await this.request<AuthSessionResponse>('/api/auth/login', {
+    return this.request<AuthSessionResponse>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify(params),
     });
-    if (data.token) this.setToken(data.token);
-    return data;
   }
 
   async logout(): Promise<void> {
     await this.request('/api/auth/logout', { method: 'POST' });
-    this.setToken(null);
+  }
+
+  async forgotPassword(email: string): Promise<{ success: boolean; message: string }> {
+    return this.request<{ success: boolean; message: string }>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<{ success: boolean; message: string }> {
+    return this.request<{ success: boolean; message: string }>('/api/auth/reset-password', {
+      method: 'POST',
+      body: JSON.stringify({ token, newPassword }),
+    });
   }
 
   async getSession(): Promise<AuthSessionResponse | null> {
@@ -119,8 +163,13 @@ class ApiClient {
   }
 
   // Catalog Endpoints
-  async getCatalog(): Promise<{ workspaceId: string; catalog: StoragePayloadV1 }> {
-    return this.request<{ workspaceId: string; catalog: StoragePayloadV1 }>('/api/catalog');
+  async getCatalog(): Promise<{
+    workspaceId: string;
+    catalog: StoragePayloadV1;
+    reportEntitlement?: ReportEntitlement;
+    preliminarySummary?: PreliminaryAuditSummary;
+  }> {
+    return this.request('/api/catalog');
   }
 
   async saveCatalog(
@@ -190,26 +239,36 @@ class ApiClient {
   }
 
   // Audit Endpoints
-  async runAudit(): Promise<{ success: boolean; auditRun: any; catalog: StoragePayloadV1 }> {
-    return this.request<{ success: boolean; auditRun: any; catalog: StoragePayloadV1 }>('/api/audit/run', {
+  async runAudit(): Promise<{
+    success: boolean;
+    auditRun: any;
+    catalog: StoragePayloadV1;
+    reportEntitlement?: ReportEntitlement;
+    preliminarySummary?: PreliminaryAuditSummary;
+  }> {
+    return this.request('/api/audit/run', {
       method: 'POST',
     });
   }
 
-  async getLatestAuditRun(): Promise<{ workspaceId: string; auditRun: any | null }> {
-    return this.request<{ workspaceId: string; auditRun: any | null }>('/api/audit/latest');
+  async getLatestAuditRun(): Promise<{
+    workspaceId: string;
+    auditRun: any | null;
+    reportEntitlement?: ReportEntitlement;
+  }> {
+    return this.request('/api/audit/latest');
   }
 
-  async getAuditHistory(options?: { limit?: number; cursor?: string }): Promise<import('../domain/audit/historicalTypes').AuditHistoryResponse> {
+  async getAuditHistory(options?: { limit?: number; cursor?: string }): Promise<import('../domain/audit/historicalTypes').AuditHistoryResponse & { reportEntitlement?: ReportEntitlement }> {
     const params = new URLSearchParams();
     if (options?.limit) params.set('limit', String(options.limit));
     if (options?.cursor) params.set('cursor', options.cursor);
     const query = params.toString() ? `?${params.toString()}` : '';
-    return this.request<import('../domain/audit/historicalTypes').AuditHistoryResponse>(`/api/audit/history${query}`);
+    return this.request(`/api/audit/history${query}`);
   }
 
-  async getAuditRun(id: string): Promise<import('../domain/audit/historicalTypes').HistoricalAuditSnapshot> {
-    return this.request<import('../domain/audit/historicalTypes').HistoricalAuditSnapshot>(`/api/audit/${encodeURIComponent(id)}`);
+  async getAuditRun(id: string): Promise<import('../domain/audit/historicalTypes').HistoricalAuditSnapshot & { reportEntitlement?: ReportEntitlement }> {
+    return this.request(`/api/audit/${encodeURIComponent(id)}`);
   }
 
   async compareAudits(baseId: string, targetId: string): Promise<{ success: boolean; comparison: import('../domain/audit/historicalTypes').AuditComparisonResult }> {
@@ -239,6 +298,7 @@ class ApiClient {
     }
     return {
       plans: validPlans,
+      ...(Array.isArray(data.commercialSummary) ? { commercialSummary: data.commercialSummary } : {}),
       currency: typeof data.currency === 'string' && data.currency ? data.currency : 'USD',
     };
   }
@@ -258,6 +318,16 @@ class ApiClient {
       throw new Error('Malformed subscription response from server');
     }
     return data;
+  }
+
+  async verifyCheckoutSession(sessionId: string): Promise<CheckoutVerificationResponse> {
+    if (!sessionId || typeof sessionId !== 'string' || !sessionId.trim()) {
+      throw new Error('A valid checkout sessionId is required for verification');
+    }
+    return this.request<CheckoutVerificationResponse>('/api/billing/checkout-session/verify', {
+      method: 'POST',
+      body: JSON.stringify({ sessionId: sessionId.trim() }),
+    });
   }
 
   async createCheckoutSession(params: CreateCheckoutSessionRequest): Promise<CheckoutSessionResponse> {
@@ -414,7 +484,10 @@ class ApiClient {
     readiness: any;
     hubChecklist: any;
     productCount: number;
+    findingsCount?: number;
     storeDomain: string;
+    reportEntitlement?: ReportEntitlement;
+    isLocked?: boolean;
   }> {
     return this.request('/api/discovery/audit');
   }
@@ -432,7 +505,12 @@ class ApiClient {
   }
 
   // Feed Readiness Endpoints
-  async validateFeed(platform: string): Promise<{ success: boolean; report: any }> {
+  async validateFeed(platform: string): Promise<{
+    success: boolean;
+    report: any;
+    reportEntitlement?: ReportEntitlement;
+    isLocked?: boolean;
+  }> {
     return this.request('/api/feed/validate', {
       method: 'POST',
       body: JSON.stringify({ platform }),
@@ -538,6 +616,7 @@ export interface BillingPlan {
 
 export interface BillingPlansResponse {
   plans: BillingPlan[];
+  commercialSummary?: CommercialPlanSummaryItem[];
   currency: string;
 }
 
@@ -558,6 +637,16 @@ export interface BillingSubscriptionResponse {
   workspaceId: string;
   subscription: BillingSubscriptionInfo;
   storeProfile: StoreProfile | null;
+  reportEntitlement?: ReportEntitlement;
+}
+
+export interface CheckoutVerificationResponse {
+  success: boolean;
+  verified: boolean;
+  workspaceId: string;
+  subscription: BillingSubscriptionInfo;
+  storeProfile: StoreProfile | null;
+  reportEntitlement?: ReportEntitlement;
 }
 
 export interface CreateCheckoutSessionRequest {

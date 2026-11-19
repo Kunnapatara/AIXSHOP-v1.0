@@ -24,6 +24,17 @@ describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suit
   let tokenUserB: string;
   let workspaceIdB: string;
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
   before(async () => {
     repo = new MemoryRepository(false);
     const app = createApp(repo);
@@ -50,7 +61,9 @@ describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suit
     });
     assert.equal(regResA.status, 201);
     const dataA = await regResA.json();
-    tokenUserA = dataA.token;
+    assert.equal(dataA.token, undefined);
+    tokenUserA = extractSessionCookie(regResA);
+    assert.ok(tokenUserA);
     workspaceIdA = dataA.workspace.id;
 
     // 2. Register Workspace B (Tenant isolation testing)
@@ -66,7 +79,9 @@ describe('AIXSHOP v1.0 — Server-Side Plan Entitlement & Quota Enforcement Suit
     });
     assert.equal(regResB.status, 201);
     const dataB = await regResB.json();
-    tokenUserB = dataB.token;
+    assert.equal(dataB.token, undefined);
+    tokenUserB = extractSessionCookie(regResB);
+    assert.ok(tokenUserB);
     workspaceIdB = dataB.workspace.id;
   });
 

@@ -274,6 +274,14 @@ export class StripeBillingProvider implements IBillingProvider {
 export class SandboxBillingProvider implements IBillingProvider {
   readonly providerName = 'sandbox';
   private secret: string;
+  private sessions = new Map<string, {
+    sessionId: string;
+    workspaceId: string;
+    tier: PlanTier;
+    customerId: string;
+    subscriptionId: string;
+    createdAt: number;
+  }>();
 
   constructor(secret = process.env.BILLING_WEBHOOK_SECRET || 'sandbox_test_webhook_secret_key_123') {
     this.secret = secret;
@@ -298,7 +306,30 @@ export class SandboxBillingProvider implements IBillingProvider {
     }
 
     const sessionId = `sbx_cs_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-    const checkoutUrl = `${options.successUrl}?session_id=${sessionId}&provider=sandbox&tier=${encodeURIComponent(options.tier)}`;
+    const customerId = options.customerId || `sbx_cus_${crypto.randomBytes(6).toString('hex')}`;
+    const subscriptionId = `sbx_sub_${crypto.randomBytes(6).toString('hex')}`;
+
+    this.sessions.set(sessionId, {
+      sessionId,
+      workspaceId: options.workspaceId,
+      tier: plan.tier,
+      customerId,
+      subscriptionId,
+      createdAt: Date.now(),
+    });
+
+    let checkoutUrl: string;
+    try {
+      const normalizedTemplate = options.successUrl.replace('{CHECKOUT_SESSION_ID}', sessionId);
+      const parsed = new URL(normalizedTemplate);
+      parsed.searchParams.set('session_id', sessionId);
+      parsed.searchParams.set('provider', 'sandbox');
+      parsed.searchParams.set('tier', options.tier);
+      checkoutUrl = parsed.toString();
+    } catch {
+      const separator = options.successUrl.includes('?') ? '&' : '?';
+      checkoutUrl = `${options.successUrl}${separator}session_id=${sessionId}&provider=sandbox&tier=${encodeURIComponent(options.tier)}`;
+    }
 
     return {
       sessionId,
@@ -307,10 +338,47 @@ export class SandboxBillingProvider implements IBillingProvider {
     };
   }
 
+  async retrieveCheckoutSession(sessionId: string): Promise<any | null> {
+    if (!sessionId) return null;
+    const record = this.sessions.get(sessionId);
+    if (!record) return null;
+
+    const nowSec = Math.floor(record.createdAt / 1000);
+    return {
+      id: record.sessionId,
+      object: 'checkout.session',
+      status: 'complete',
+      payment_status: 'paid',
+      client_reference_id: record.workspaceId,
+      customer: record.customerId,
+      subscription: {
+        id: record.subscriptionId,
+        status: 'active',
+        current_period_start: nowSec,
+        current_period_end: nowSec + 30 * 24 * 60 * 60,
+        cancel_at_period_end: false,
+      },
+      metadata: {
+        workspaceId: record.workspaceId,
+        tier: record.tier,
+      },
+    };
+  }
+
   async createPortalSession(workspaceId: string, customerId: string, returnUrl: string): Promise<CustomerPortalSessionResult> {
     const portalId = `sbx_bps_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+    let portalUrl: string;
+    try {
+      const parsed = new URL(returnUrl);
+      parsed.searchParams.set('portal_session_id', portalId);
+      parsed.searchParams.set('provider', 'sandbox');
+      portalUrl = parsed.toString();
+    } catch {
+      const separator = returnUrl.includes('?') ? '&' : '?';
+      portalUrl = `${returnUrl}${separator}portal_session_id=${portalId}&provider=sandbox`;
+    }
     return {
-      portalUrl: `${returnUrl}?portal_session_id=${portalId}&provider=sandbox`,
+      portalUrl,
       provider: this.providerName,
     };
   }

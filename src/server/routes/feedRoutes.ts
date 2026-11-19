@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
-import { createAuthMiddleware } from '../middleware/auth';
+import { createAuthMiddleware, createWorkspaceRateLimiter } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { Product } from '../../types';
 import {
@@ -12,6 +12,7 @@ import {
   FeedPlatform,
   ProductFeedEvaluation,
 } from '../../domain/feed/feedValidationEngine';
+import { resolveReportEntitlement } from '../services/entitlementService';
 
 const SUPPORTED_PLATFORMS: ReadonlySet<FeedPlatform> = new Set([
   'google_merchant_center',
@@ -19,12 +20,23 @@ const SUPPORTED_PLATFORMS: ReadonlySet<FeedPlatform> = new Set([
   'schema_org',
 ]);
 
+const MAX_EXPORT_PRODUCTS = 5000;
+
 export function createFeedRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  const feedLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'feed_ops',
+      maxAttempts: 20,
+      windowMs: 60_000,
+      message: 'Feed validation/export rate limit exceeded. Please retry shortly.',
+    },
+    repo
+  );
 
   // POST /api/feed/validate — Evaluates catalog against platform feed requirements (local structural check)
-  router.post('/validate', requireAuth, async (req: AuthRequest, res: Response) => {
+  router.post('/validate', requireAuth, feedLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const platform = (req.body?.platform || 'google_merchant_center') as FeedPlatform;
@@ -32,11 +44,22 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: `Unsupported feed platform "${platform}".` });
       }
 
-      const catalog = await repo.loadWorkspaceCatalog(workspaceId);
-      const store = await repo.getStoreByWorkspace(workspaceId);
+      const [catalog, store, subscription] = await Promise.all([
+        repo.loadWorkspaceCatalog(workspaceId),
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store || catalog?.storeProfile, subscription);
       const products: Product[] = catalog?.products || [];
 
-      const report = evaluateFeedReadiness(products, platform, store?.currency || 'USD');
+      const fullReport = evaluateFeedReadiness(products, platform, store?.currency || 'USD');
+      const report = reportEntitlement.hasFullReportAccess
+        ? fullReport
+        : {
+            ...fullReport,
+            evaluations: [],
+            isLocked: true,
+          };
 
       res.setHeader('X-AIXSHOP-Validation-Scope', 'local_structural_check_only');
       res.setHeader('X-AIXSHOP-External-Platform-Accepted', 'false');
@@ -44,6 +67,8 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
       return res.json({
         success: true,
         report,
+        reportEntitlement,
+        isLocked: !reportEntitlement.hasFullReportAccess,
       });
     } catch (err: any) {
       console.error('[Feed API] Error evaluating feed:', err);
@@ -51,8 +76,8 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // GET /api/feed/export — Exports feed in CSV or JSON format without fabricating missing fields
-  router.get('/export', requireAuth, async (req: AuthRequest, res: Response) => {
+  // GET /api/feed/export — Exports feed in CSV or JSON format (requires active paid subscription)
+  router.get('/export', requireAuth, feedLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const platform = ((req.query.platform as string) || 'google_merchant_center') as FeedPlatform;
@@ -70,10 +95,24 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({ error: `Unsupported filter "${filter}". Expected "all" or "valid_only".` });
       }
 
-      const catalog = await repo.loadWorkspaceCatalog(workspaceId);
-      const store = await repo.getStoreByWorkspace(workspaceId);
+      const [catalog, store, subscription] = await Promise.all([
+        repo.loadWorkspaceCatalog(workspaceId),
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store || catalog?.storeProfile, subscription);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
+
       const currency = store?.currency || 'USD';
-      const allProducts: Product[] = catalog?.products || [];
+      const rawProducts: Product[] = catalog?.products || [];
+      const isTruncated = rawProducts.length > MAX_EXPORT_PRODUCTS;
+      const allProducts = isTruncated ? rawProducts.slice(0, MAX_EXPORT_PRODUCTS) : rawProducts;
 
       const report = evaluateFeedReadiness(allProducts, platform, currency);
       const evalByProductId = new Map<string, ProductFeedEvaluation>(
@@ -101,6 +140,10 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
       res.setHeader('X-AIXSHOP-External-Platform-Accepted', 'false');
       res.setHeader('X-AIXSHOP-Exported-Products', String(products.length));
       res.setHeader('X-AIXSHOP-Skipped-Products', String(skippedSummaries.length));
+      if (isTruncated) {
+        res.setHeader('X-AIXSHOP-Export-Truncated', 'true');
+        res.setHeader('X-AIXSHOP-Export-Max-Products', String(MAX_EXPORT_PRODUCTS));
+      }
       if (skippedSummaries.length > 0) {
         const serializedSkipped = JSON.stringify(skippedSummaries.slice(0, 20));
         res.setHeader('X-AIXSHOP-Skipped-Reasons', serializedSkipped.slice(0, 2048));

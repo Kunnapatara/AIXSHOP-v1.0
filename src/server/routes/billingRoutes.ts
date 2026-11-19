@@ -5,6 +5,7 @@ import { AuthRequest } from '../types';
 import { getBillingProvider } from '../billing/providerAdapter';
 import { BillingLeaseConfig, BillingService, sanitizeBillingErrorMessage } from '../services/billingService';
 import { AUTHORITATIVE_PLANS, IBillingProvider } from '../billing/types';
+import { getCommercialPlanSummary, resolveReportEntitlement } from '../services/entitlementService';
 import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/productionConfig';
 
 export function createBillingRoutes(
@@ -21,16 +22,18 @@ export function createBillingRoutes(
   router.get('/plans', (req, res) => {
     return res.json({
       plans: Object.values(AUTHORITATIVE_PLANS),
+      commercialSummary: getCommercialPlanSummary(),
       currency: 'USD',
     });
   });
 
-  // GET /api/billing/subscription — Returns active workspace subscription & capacity status
+  // GET /api/billing/subscription — Returns active workspace subscription, capacity status, and report entitlement
   router.get('/subscription', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
       const store = await repo.getStoreByWorkspace(workspaceId);
+      const reportEntitlement = resolveReportEntitlement(store, subscription);
 
       return res.json({
         workspaceId,
@@ -41,6 +44,7 @@ export function createBillingRoutes(
           cancelAtPeriodEnd: false,
         },
         storeProfile: store,
+        reportEntitlement,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Billing] Error loading subscription:', err);
@@ -62,12 +66,12 @@ export function createBillingRoutes(
       const effectiveSuccessUrl = resolveTrustedRedirectUrl(
         trustedBaseUrl,
         successUrl,
-        '/settings?tab=subscription&session_id={CHECKOUT_SESSION_ID}'
+        '/?page=settings&tab=subscription&checkout=success&session_id={CHECKOUT_SESSION_ID}'
       );
       const effectiveCancelUrl = resolveTrustedRedirectUrl(
         trustedBaseUrl,
         cancelUrl,
-        '/settings?tab=subscription'
+        '/?page=settings&tab=subscription&checkout=canceled'
       );
 
       const billingService = getBillingService();
@@ -91,6 +95,42 @@ export function createBillingRoutes(
     }
   });
 
+  // POST /api/billing/checkout-session/verify — Authoritatively verifies completed checkout session with billing provider
+  router.post('/checkout-session/verify', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+
+      if (!sessionId) {
+        return res.status(400).json({
+          error: 'Checkout sessionId is required for verification',
+          code: 'INVALID_SESSION_ID',
+        });
+      }
+
+      const billingService = getBillingService();
+      const verification = await billingService.verifyCheckoutSession(workspaceId, sessionId);
+      const reportEntitlement = resolveReportEntitlement(verification.storeProfile, verification.subscription);
+
+      return res.json({
+        success: true,
+        verified: verification.verified,
+        workspaceId,
+        subscription: verification.subscription,
+        storeProfile: verification.storeProfile,
+        reportEntitlement,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Billing] Error verifying checkout session:', sanitizeBillingErrorMessage(err));
+      const status = typeof err?.statusCode === 'number' ? err.statusCode : 400;
+      return res.status(status).json({
+        verified: false,
+        error: err.message || 'Failed to verify checkout session',
+        code: err?.code || 'CHECKOUT_VERIFICATION_FAILED',
+      });
+    }
+  });
+
   // POST /api/billing/portal-session — Customer portal session for managing payment methods / canceling
   router.post('/portal-session', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
     try {
@@ -101,7 +141,7 @@ export function createBillingRoutes(
       const effectiveReturnUrl = resolveTrustedRedirectUrl(
         trustedBaseUrl,
         returnUrl,
-        '/settings?tab=subscription'
+        '/?page=settings&tab=subscription'
       );
 
       const billingService = getBillingService();

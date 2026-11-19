@@ -1,5 +1,5 @@
 import { Product, Variant } from '../../types';
-import { isValidGtin13 } from '../validation/gtin';
+import { validateGtin } from '../validation/gtin';
 import { WorkspaceBusinessProfile, BusinessHubChecklistResult } from '../businessProfile/types';
 
 export interface DiscoveryDimensionScore {
@@ -370,7 +370,8 @@ export function evaluateDiscoveryReadiness(
 
       const barcode = (v.barcode || '').trim();
       if (barcode) {
-        if (isValidGtin13(barcode)) {
+        const gtinCheck = validateGtin(barcode);
+        if (gtinCheck.isValid) {
           dimStats.productIdentifiers.passed++;
         } else {
           dimStats.productIdentifiers.failed++;
@@ -384,8 +385,8 @@ export function evaluateDiscoveryReadiness(
             severity: 'critical',
             title: `Invalid GTIN Check Digit on Barcode "${barcode}"`,
             observedValue: barcode,
-            expectedCondition: 'Valid GS1 Modulo-10 checksum verified',
-            evidence: `Barcode "${barcode}" fails GS1 checksum calculation.`,
+            expectedCondition: 'Valid GS1 Modulo-10 checksum verified (GTIN-8, GTIN-12/UPC, GTIN-13/EAN, GTIN-14)',
+            evidence: gtinCheck.reason || `Barcode "${barcode}" fails GS1 checksum calculation.`,
             recommendation: 'Merchant input required: correct barcode check digit against GS1 allocation.',
             needsMerchantInput: true,
             recheckStatus: 'unverified',

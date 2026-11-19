@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
-import { apiClient } from '../api/client';
+import { apiClient, ReportEntitlement } from '../api/client';
+import { ReportPaywallBanner } from '../components/billing/ReportPaywallBanner';
 import {
   evaluateFeedReadiness,
   mapProductVariantsToGmcRows,
@@ -20,14 +21,29 @@ const PLATFORMS: { id: FeedPlatform; label: string }[] = [
 ];
 
 export const FeedReadinessPage: React.FC = () => {
-  const { products, storeProfile, viewProductDetail, addToast } = useApp();
+  const {
+    products,
+    storeProfile,
+    viewProductDetail,
+    addToast,
+    navigateTo,
+    reportEntitlement: contextEntitlement,
+    preliminarySummary,
+  } = useApp();
   const { isAuthenticated } = useAuth();
 
   const [platform, setPlatform] = useState<FeedPlatform>('google_merchant_center');
   const [report, setReport] = useState<FeedReadinessReport | null>(null);
+  const [feedEntitlement, setFeedEntitlement] = useState<ReportEntitlement | null>(null);
+  const [isFeedLocked, setIsFeedLocked] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filterMode, setFilterMode] = useState<'all' | 'invalid' | 'valid'>('all');
+
+  const effectiveEntitlement = feedEntitlement || contextEntitlement || null;
+  const exportLocked = Boolean(
+    isAuthenticated && (isFeedLocked || (effectiveEntitlement && !effectiveEntitlement.hasFullReportAccess))
+  );
 
   const runValidation = React.useCallback(async () => {
     setLoading(true);
@@ -36,7 +52,11 @@ export const FeedReadinessPage: React.FC = () => {
       if (isAuthenticated) {
         const res = await apiClient.validateFeed(platform);
         setReport(res.report);
+        setFeedEntitlement(res.reportEntitlement || null);
+        setIsFeedLocked(Boolean(res.isLocked || (res.reportEntitlement && !res.reportEntitlement.hasFullReportAccess)));
       } else {
+        setFeedEntitlement(null);
+        setIsFeedLocked(false);
         setReport(evaluateFeedReadiness(products, platform));
       }
     } catch (err: any) {
@@ -51,6 +71,11 @@ export const FeedReadinessPage: React.FC = () => {
   }, [runValidation]);
 
   const handleExport = (exportFilter: 'all' | 'valid_only') => {
+    if (exportLocked) {
+      addToast('Paid Plan Required', 'Upgrade to Starter, Growth, or Enterprise to export canonical feeds.', 'warning');
+      navigateTo('settings', 'subscription');
+      return;
+    }
     const format = platform === 'schema_org' ? 'json' : 'csv';
     if (isAuthenticated) {
       window.location.href = apiClient.getFeedExportUrl(platform, format, exportFilter);
@@ -151,7 +176,7 @@ export const FeedReadinessPage: React.FC = () => {
         <div className="flex flex-wrap items-center gap-2 shrink-0">
           <button
             onClick={() => handleExport('valid_only')}
-            disabled={!report || report.validProductsCount === 0}
+            disabled={exportLocked || !report || report.validProductsCount === 0}
             className="px-3.5 py-2 border border-stone-200 bg-white hover:bg-stone-50 text-stone-800 text-xs font-semibold rounded-lg flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
@@ -159,7 +184,7 @@ export const FeedReadinessPage: React.FC = () => {
           </button>
           <button
             onClick={() => handleExport('all')}
-            disabled={!report || report.totalProducts === 0}
+            disabled={exportLocked || !report || report.totalProducts === 0}
             className="px-3.5 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
@@ -167,6 +192,15 @@ export const FeedReadinessPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {exportLocked && effectiveEntitlement && (
+        <ReportPaywallBanner
+          entitlement={effectiveEntitlement}
+          preliminarySummary={preliminarySummary}
+          contextLabel="Per-SKU feed diagnostics and CSV/JSON-LD feed exports require an active paid subscription."
+          onUpgrade={() => navigateTo('settings', 'subscription')}
+        />
+      )}
 
       {/* Platform Tabs */}
       <div className="flex flex-wrap items-center justify-between gap-3">

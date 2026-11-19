@@ -106,6 +106,38 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
     });
   });
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
+  async function seedActiveGrowthSubscription(workspaceId: string) {
+    await repo.saveSubscription({
+      id: `sub_test_${workspaceId}`,
+      workspaceId,
+      provider: 'sandbox',
+      customerId: `cus_test_${workspaceId}`,
+      subscriptionId: `sub_live_${workspaceId}`,
+      tier: 'Growth',
+      status: 'active',
+      currentPeriodStart: new Date().toISOString(),
+      currentPeriodEnd: new Date(Date.now() + 30 * 86400_000).toISOString(),
+      cancelAtPeriodEnd: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const store = await repo.getStoreByWorkspace(workspaceId);
+    if (store) {
+      await repo.saveStoreProfile(workspaceId, { ...store, tier: 'Growth', skuLimit: 2500 });
+    }
+  }
+
   async function registerTenant(prefix: string) {
     const res = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
@@ -119,7 +151,10 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
     });
     assert.equal(res.status, 201);
     const body = await res.json();
-    return { token: body.token as string, workspace: body.workspace };
+    assert.equal(body.token, undefined);
+    const token = extractSessionCookie(res);
+    assert.ok(token);
+    return { token, workspace: body.workspace };
   }
 
   // =========================================================================
@@ -356,6 +391,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
 
     test('9. HTTP /api/feed/export?filter=valid_only excludes invalid products, reports X-AIXSHOP-Skipped-Products / Skipped-Reasons, and never leaks MPN from SKU', async () => {
       const tenant = await registerTenant('feed_exp');
+      await seedActiveGrowthSubscription(tenant.workspace.id);
       const validP = makeValidProduct({ id: 'p_good_http' });
       const brokenP = makeValidProduct({
         id: 'p_bad_http',
@@ -842,7 +878,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         'audit_run_evidence', 'audit_run_products', 'shopify_connections', 'shopify_sync_runs',
         'shopify_webhook_events', 'shopify_oauth_states', 'workspace_business_profiles',
         'ai_visibility_imports', 'ai_visibility_metrics', 'ai_visibility_observation_history',
-        'auth_rate_limits',
+        'auth_rate_limits', 'password_reset_tokens', 'workspace_operation_leases',
       ];
       const validCols = [
         { table_name: 'variants', column_name: 'price', data_type: 'numeric', numeric_precision: 14, numeric_scale: 2, is_nullable: 'NO', character_maximum_length: null },
@@ -857,6 +893,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         '011_corrective_integrity_and_visibility_provenance.sql',
         '012_production_blockers_integrity.sql',
         '013_billing_webhook_recovery.sql',
+        '014_auth_recovery_and_operation_leases.sql',
       ];
       const baseConstraints = [
         { source_schema: 'tenant_prod', source_table: 'stores', target_schema: '', target_table: '', constraint_name: 'uq_stores_ws_id', constraint_type: 'u', source_columns: 'workspace_id,id', target_columns: '', is_partial_index: false },

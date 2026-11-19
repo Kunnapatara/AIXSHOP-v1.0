@@ -235,6 +235,8 @@ export class PostgresRepository implements DatabaseRepository {
       'ai_visibility_metrics',
       'ai_visibility_observation_history',
       'auth_rate_limits',
+      'password_reset_tokens',
+      'workspace_operation_leases',
     ];
 
     try {
@@ -471,6 +473,7 @@ export class PostgresRepository implements DatabaseRepository {
           '011_corrective_integrity_and_visibility_provenance.sql',
           '012_production_blockers_integrity.sql',
           '013_billing_webhook_recovery.sql',
+          '014_auth_recovery_and_operation_leases.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -4435,6 +4438,130 @@ export class PostgresRepository implements DatabaseRepository {
       imports,
     };
   }
+
+  async updateUserPassword(userId: string, passwordHash: string): Promise<void> {
+    await this.query(
+      `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+      [passwordHash, userId]
+    );
+  }
+
+  async createPasswordResetToken(data: {
+    id: string;
+    userId: string;
+    tokenHash: string;
+    expiresAt: string;
+    requestedIp?: string;
+  }): Promise<void> {
+    await this.withTransaction(async (client) => {
+      await client.query(
+        `UPDATE password_reset_tokens
+         SET used_at = NOW()
+         WHERE user_id = $1 AND used_at IS NULL`,
+        [data.userId]
+      );
+      await client.query(
+        `INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at, requested_ip, created_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())`,
+        [data.id, data.userId, data.tokenHash, data.expiresAt, data.requestedIp || null]
+      );
+    });
+  }
+
+  async consumePasswordResetTokenAndUpdatePassword(
+    tokenHash: string,
+    newPasswordHash: string
+  ): Promise<{ userId: string } | null> {
+    return this.withTransaction(async (client) => {
+      const claimRes = await client.query<{ id: string; userId: string }>(
+        `UPDATE password_reset_tokens
+         SET used_at = NOW()
+         WHERE token_hash = $1
+           AND used_at IS NULL
+           AND expires_at > NOW()
+         RETURNING id, user_id AS "userId"`,
+        [tokenHash]
+      );
+      const claimed = claimRes.rows[0];
+      if (!claimed) {
+        return null;
+      }
+
+      await client.query(
+        `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+        [newPasswordHash, claimed.userId]
+      );
+      await client.query(
+        `UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`,
+        [claimed.userId]
+      );
+      await client.query(
+        `DELETE FROM sessions WHERE user_id = $1`,
+        [claimed.userId]
+      );
+
+      return { userId: claimed.userId };
+    });
+  }
+
+  async acquireWorkspaceOperationLease(
+    workspaceId: string,
+    operationKey: string,
+    leaseOwner: string,
+    ttlMs: number
+  ): Promise<{ acquired: boolean; leaseOwner?: string; expiresAt?: string }> {
+    const safeTtlMs = Math.max(1000, ttlMs);
+    const res = await this.query<{ leaseOwner: string; expiresAt: string }>(
+      `INSERT INTO workspace_operation_leases (
+         workspace_id, operation_key, lease_owner, lease_expires_at, acquired_at, updated_at
+       ) VALUES (
+         $1, $2, $3, clock_timestamp() + ($4 * INTERVAL '1 millisecond'), clock_timestamp(), clock_timestamp()
+       )
+       ON CONFLICT (workspace_id, operation_key) DO UPDATE SET
+         lease_owner = EXCLUDED.lease_owner,
+         lease_expires_at = EXCLUDED.lease_expires_at,
+         acquired_at = clock_timestamp(),
+         updated_at = clock_timestamp()
+       WHERE workspace_operation_leases.lease_expires_at <= clock_timestamp()
+          OR workspace_operation_leases.lease_owner = EXCLUDED.lease_owner
+       RETURNING lease_owner AS "leaseOwner", lease_expires_at::text AS "expiresAt"`,
+      [workspaceId, operationKey, leaseOwner, safeTtlMs]
+    );
+
+    if (res.rows[0]) {
+      return {
+        acquired: true,
+        leaseOwner: res.rows[0].leaseOwner,
+        expiresAt: res.rows[0].expiresAt,
+      };
+    }
+
+    const holderRes = await this.query<{ leaseOwner: string; expiresAt: string }>(
+      `SELECT lease_owner AS "leaseOwner", lease_expires_at::text AS "expiresAt"
+       FROM workspace_operation_leases
+       WHERE workspace_id = $1 AND operation_key = $2
+       LIMIT 1`,
+      [workspaceId, operationKey]
+    );
+    return {
+      acquired: false,
+      leaseOwner: holderRes.rows[0]?.leaseOwner,
+      expiresAt: holderRes.rows[0]?.expiresAt,
+    };
+  }
+
+  async releaseWorkspaceOperationLease(
+    workspaceId: string,
+    operationKey: string,
+    leaseOwner: string
+  ): Promise<void> {
+    await this.query(
+      `DELETE FROM workspace_operation_leases
+       WHERE workspace_id = $1 AND operation_key = $2 AND lease_owner = $3`,
+      [workspaceId, operationKey, leaseOwner]
+    );
+  }
 }
+
 
 

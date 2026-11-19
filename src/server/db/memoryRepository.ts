@@ -81,6 +81,8 @@ export class MemoryRepository implements DatabaseRepository {
   private shopifyOAuthStates: Map<string, { id: string; workspaceId: string; shopDomain: string; expiresAt: string; createdAt: string }> = new Map(); // stateNonce -> state
   private shopifySyncRuns: Map<string, import('../shopify/types').ShopifySyncRunRecord> = new Map(); // id -> run
   private shopifyWebhookEvents: Map<string, import('../shopify/types').ShopifyWebhookEventRecord> = new Map(); // deliveryKey -> event
+  private passwordResetTokens: Map<string, { id: string; userId: string; tokenHash: string; expiresAt: string; usedAt: string | null; requestedIp?: string; createdAt: string }> = new Map();
+  private workspaceOperationLeases: Map<string, { workspaceId: string; operationKey: string; leaseOwner: string; leaseExpiresAt: number }> = new Map();
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -2131,5 +2133,112 @@ export class MemoryRepository implements DatabaseRepository {
       imports: wsImports,
     };
   }
+
+  async updateUserPassword(userId: string, passwordHash: string): Promise<void> {
+    const user = this.users.get(userId);
+    if (user) {
+      user.passwordHash = passwordHash;
+      user.updatedAt = new Date().toISOString();
+    }
+  }
+
+  async createPasswordResetToken(data: {
+    id: string;
+    userId: string;
+    tokenHash: string;
+    expiresAt: string;
+    requestedIp?: string;
+  }): Promise<void> {
+    const nowIso = new Date().toISOString();
+    // Invalidate any prior unused reset tokens for this user
+    for (const token of this.passwordResetTokens.values()) {
+      if (token.userId === data.userId && token.usedAt === null) {
+        token.usedAt = nowIso;
+      }
+    }
+    this.passwordResetTokens.set(data.tokenHash, {
+      id: data.id,
+      userId: data.userId,
+      tokenHash: data.tokenHash,
+      expiresAt: data.expiresAt,
+      usedAt: null,
+      requestedIp: data.requestedIp,
+      createdAt: nowIso,
+    });
+  }
+
+  async consumePasswordResetTokenAndUpdatePassword(
+    tokenHash: string,
+    newPasswordHash: string
+  ): Promise<{ userId: string } | null> {
+    const record = this.passwordResetTokens.get(tokenHash);
+    if (!record || record.usedAt !== null) {
+      return null;
+    }
+    if (new Date(record.expiresAt).getTime() <= Date.now()) {
+      return null;
+    }
+    const user = this.users.get(record.userId);
+    if (!user) {
+      return null;
+    }
+    const nowIso = new Date().toISOString();
+    record.usedAt = nowIso;
+    for (const token of this.passwordResetTokens.values()) {
+      if (token.userId === record.userId && token.usedAt === null) {
+        token.usedAt = nowIso;
+      }
+    }
+    user.passwordHash = newPasswordHash;
+    user.updatedAt = nowIso;
+    await this.deleteUserSessions(record.userId);
+    return { userId: record.userId };
+  }
+
+  async acquireWorkspaceOperationLease(
+    workspaceId: string,
+    operationKey: string,
+    leaseOwner: string,
+    ttlMs: number
+  ): Promise<{ acquired: boolean; leaseOwner?: string; expiresAt?: string }> {
+    const key = `${workspaceId}::${operationKey}`;
+    const now = Date.now();
+    const safeTtlMs = Math.max(1000, ttlMs);
+    const existing = this.workspaceOperationLeases.get(key);
+
+    if (existing && existing.leaseExpiresAt > now && existing.leaseOwner !== leaseOwner) {
+      return {
+        acquired: false,
+        leaseOwner: existing.leaseOwner,
+        expiresAt: new Date(existing.leaseExpiresAt).toISOString(),
+      };
+    }
+
+    const leaseExpiresAt = now + safeTtlMs;
+    this.workspaceOperationLeases.set(key, {
+      workspaceId,
+      operationKey,
+      leaseOwner,
+      leaseExpiresAt,
+    });
+    return {
+      acquired: true,
+      leaseOwner,
+      expiresAt: new Date(leaseExpiresAt).toISOString(),
+    };
+  }
+
+  async releaseWorkspaceOperationLease(
+    workspaceId: string,
+    operationKey: string,
+    leaseOwner: string
+  ): Promise<void> {
+    const key = `${workspaceId}::${operationKey}`;
+    const existing = this.workspaceOperationLeases.get(key);
+    if (existing && existing.leaseOwner === leaseOwner) {
+      this.workspaceOperationLeases.delete(key);
+    }
+  }
 }
+
 

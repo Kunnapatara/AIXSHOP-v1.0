@@ -1,5 +1,6 @@
 import { Product, Finding, ActionItem, StoreProfile } from '../../types';
-import { isValidGtin13 } from '../validation/gtin';
+import { validateGtin } from '../validation/gtin';
+import { classifyProductDomain } from './categoryApplicability';
 import { calculateProductCompleteness, calculateStoreCompletenessAvg } from '../catalog/completeness';
 
 export type AuditRunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
@@ -327,13 +328,18 @@ export function executeCatalogAudit(
     let productFindingsCount = 0;
     const variants = p.variants || [];
     totalVariants += variants.length;
+    const domainClass = classifyProductDomain(p);
 
-    // Rule: Barcode / GTIN integrity
+    // Rule: Barcode / GTIN integrity (GTIN-8, GTIN-12/UPC-A, GTIN-13/EAN-13, GTIN-14) with exemptions
     recordRule('RULE_VARIANT_GTIN_CHECK_DIGIT');
     variants.forEach((v, vIdx) => {
       const barcode = (v.barcode || '').trim();
       const variantKey = v.sku || v.id || `idx_${vIdx}`;
       if (!barcode) {
+        if (domainClass.isGtinExempt) {
+          // Handmade, custom-made, bespoke, vintage, or explicitly exempted goods do not require a manufacturer GTIN
+          return;
+        }
         const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
           ruleSlug: 'gtin_missing',
           productId: p.id,
@@ -350,12 +356,12 @@ export function executeCatalogAudit(
           type: 'missing_information',
           severity: 'critical',
           title: `Missing GTIN / Barcode on Variant (${variantKey})`,
-          description: `Variant "${v.title || variantKey}" lacks a standard GTIN-13, UPC, or EAN barcode required for shopping channels.`,
+          description: `Variant "${v.title || variantKey}" lacks a standard GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), or GTIN-14 barcode required for shopping channels.`,
           observedEvidence: `Variant barcode is empty on product "${p.title}".`,
-          derivedConclusion: 'Shopping recommendation engines suppress products with missing global trade identifiers.',
+          derivedConclusion: 'Shopping recommendation engines suppress products with missing global trade identifiers unless exempt.',
           merchantVerified: prevAction?.status === 'approved',
-          whyItMatters: 'Global identifiers like GTIN are required for Google Merchant Center and marketplace indexing.',
-          suggestedCorrection: 'Assign a valid GTIN-13 barcode with accurate check digit.',
+          whyItMatters: 'Global identifiers like GTIN (UPC/EAN) are required for Google Merchant Center and marketplace indexing.',
+          suggestedCorrection: 'Assign a valid GS1 GTIN barcode (GTIN-8, GTIN-12/UPC, GTIN-13/EAN, or GTIN-14) with accurate check digit, or mark custom goods exempt.',
           targetField: `variants[${vIdx}].barcode`,
           currentValue: '(empty)',
           recommendedValue: '',
@@ -369,12 +375,12 @@ export function executeCatalogAudit(
           findingId,
           productId: p.id,
           productTitle: p.title,
-          title: `Assign Valid GTIN-13 Barcode to Variant ${variantKey}`,
+          title: `Assign Valid GTIN Barcode to Variant ${variantKey}`,
           severity: 'critical',
           status: 'pending_review',
           evidenceRequired: true,
           needsMerchantInput: true,
-          evidenceProvided: 'GS1-allocated barcode verification required.',
+          evidenceProvided: 'GS1-allocated GTIN (UPC/EAN) verification required.',
           proposedChange: {
             field: `variants[${vIdx}].barcode`,
             from: '(empty)',
@@ -384,56 +390,60 @@ export function executeCatalogAudit(
           auditLog: [],
         }));
         productFindingsCount++;
-      } else if (!isValidGtin13(barcode)) {
-        const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
-          ruleSlug: 'gtin_invalid',
-          productId: p.id,
-          variantId: v.id,
-          variantIndex: vIdx,
-        });
-        const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
+      } else {
+        const gtinValidation = validateGtin(barcode);
+        if (!gtinValidation.isValid) {
+          const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+            ruleSlug: 'gtin_invalid',
+            productId: p.id,
+            variantId: v.id,
+            variantIndex: vIdx,
+          });
+          const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
+          const formatLabel = gtinValidation.format ? `${gtinValidation.format} Check Digit` : 'GTIN / Barcode Format';
 
-        findings.push({
-          id: findingId,
-          scope: 'product',
-          productId: p.id,
-          productTitle: p.title,
-          type: 'inconsistent_attributes',
-          severity: 'critical',
-          title: `Invalid GTIN-13 Check Digit on Variant (${variantKey})`,
-          description: `Barcode "${barcode}" fails the official modulo-10 checksum algorithm.`,
-          observedEvidence: `Calculated checksum does not match check digit on barcode "${barcode}".`,
-          derivedConclusion: 'Search engines reject feeds containing mathematically invalid GTIN check digits.',
-          merchantVerified: prevAction?.status === 'approved',
-          whyItMatters: 'Invalid barcodes result in feed disapproval and merchant account warnings.',
-          suggestedCorrection: 'Correct barcode check digit according to GS1 specification.',
-          targetField: `variants[${vIdx}].barcode`,
-          currentValue: barcode,
-          recommendedValue: '',
-          actionItemId: actionId,
-          ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
-          needsMerchantInput: true,
-        });
+          findings.push({
+            id: findingId,
+            scope: 'product',
+            productId: p.id,
+            productTitle: p.title,
+            type: 'inconsistent_attributes',
+            severity: 'critical',
+            title: `Invalid ${formatLabel} on Variant (${variantKey})`,
+            description: gtinValidation.reason || `Barcode "${barcode}" fails GS1 GTIN validation.`,
+            observedEvidence: `GS1 GTIN-8/12/13/14 validation rejected barcode "${barcode}": ${gtinValidation.reason || 'invalid checksum or length'}.`,
+            derivedConclusion: 'Search engines reject feeds containing mathematically invalid or malformed GTIN barcodes.',
+            merchantVerified: prevAction?.status === 'approved',
+            whyItMatters: 'Invalid barcodes result in feed disapproval and merchant account warnings.',
+            suggestedCorrection: 'Provide a valid GS1 GTIN-8, GTIN-12 (UPC-A), GTIN-13 (EAN-13), or GTIN-14 barcode with accurate check digit.',
+            targetField: `variants[${vIdx}].barcode`,
+            currentValue: barcode,
+            recommendedValue: '',
+            actionItemId: actionId,
+            ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
+            needsMerchantInput: true,
+          });
 
-        actionItems.push(buildScopedActionItem(prevAction, {
-          id: actionId,
-          findingId,
-          productId: p.id,
-          productTitle: p.title,
-          title: `Correct Barcode Check Digit on Variant ${variantKey}`,
-          severity: 'critical',
-          status: 'pending_review',
-          evidenceRequired: true,
-          needsMerchantInput: true,
-          proposedChange: {
-            field: `variants[${vIdx}].barcode`,
-            from: barcode,
-            to: '',
-          },
-          verificationStatus: 'unverified',
-          auditLog: [],
-        }));
-        productFindingsCount++;
+          actionItems.push(buildScopedActionItem(prevAction, {
+            id: actionId,
+            findingId,
+            productId: p.id,
+            productTitle: p.title,
+            title: `Correct Barcode Check Digit on Variant ${variantKey}`,
+            severity: 'critical',
+            status: 'pending_review',
+            evidenceRequired: true,
+            needsMerchantInput: true,
+            proposedChange: {
+              field: `variants[${vIdx}].barcode`,
+              from: barcode,
+              to: '',
+            },
+            verificationStatus: 'unverified',
+            auditLog: [],
+          }));
+          productFindingsCount++;
+        }
       }
     });
 
@@ -697,12 +707,9 @@ export function executeCatalogAudit(
       productFindingsCount++;
     }
 
-    // Rule: Dishwasher / Microwave safety attributes on Drinkware / Ceramic products
+    // Rule: Dishwasher / Microwave safety attributes strictly scoped to Drinkware, Tableware, and Cookware
     recordRule('RULE_DISHWASHER_MICROWAVE_SAFETY');
-    const isDrinkwareOrCeramic = (p.category || '').toLowerCase().includes('drinkware') || 
-                                (p.title || '').toLowerCase().includes('mug') ||
-                                (p.attributes?.material || '').toLowerCase().includes('ceramic');
-    if (isDrinkwareOrCeramic) {
+    if (domainClass.isDrinkwareOrTableware) {
       const microwave = p.attributes?.microwaveSafe;
       if (!microwave || microwave.toLowerCase() === 'unspecified' || microwave.trim() === '') {
         const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
@@ -721,9 +728,9 @@ export function executeCatalogAudit(
           productTitle: p.title,
           type: 'missing_information',
           severity: 'high',
-          title: `Missing microwave safety specification on ceramic item "${p.title}"`,
-          description: 'Product description indicates handcrafted stoneware, but machine and thermal safety attribute is marked unspecified.',
-          observedEvidence: 'Structured attribute `microwaveSafe: "Unspecified"`.',
+          title: `Missing microwave safety specification on drinkware/tableware item "${p.title}"`,
+          description: 'Product is categorized under drinkware, tableware, or cookware, but its thermal/microwave safety attribute is missing or unspecified.',
+          observedEvidence: `Structured attribute \`microwaveSafe\`: "${microwave || 'Unspecified'}".`,
           derivedConclusion: 'Conversational shopping queries filter on microwave suitability.',
           merchantVerified: prevAction?.status === 'approved',
           whyItMatters: 'Conversational shopping queries filter on microwave capability; missing specs result in dropped recommendations.',
@@ -760,8 +767,19 @@ export function executeCatalogAudit(
 
     // Rule: Unverified Textile Evidence / Chemical Claims (e.g. OEKO-TEX)
     recordRule('RULE_UNVERIFIED_EVIDENCE_CLAIMS');
-    const hasUnverifiedOekoTex = (p.description || '').toLowerCase().includes('oeko-tex') &&
-      (!p.attributes?.oekoTexCertified || p.attributes.oekoTexCertified.includes('Unverified'));
+    const hasOekoTexClaim =
+      (p.description || '').toLowerCase().includes('oeko-tex') ||
+      (p.title || '').toLowerCase().includes('oeko-tex') ||
+      Boolean(p.attributes?.oekoTexCertified);
+    const hasVerifiedEvidenceDoc = (p.evidenceDocuments || []).some(
+      (doc) => doc.status === 'verified' && (doc.title || '').toLowerCase().includes('oeko')
+    );
+    const hasUnverifiedOekoTex =
+      hasOekoTexClaim &&
+      !hasVerifiedEvidenceDoc &&
+      (!p.attributes?.oekoTexCertified ||
+        p.attributes.oekoTexCertified.toLowerCase().includes('unverified') ||
+        p.attributes.oekoTexCertified.trim() === '');
     if (hasUnverifiedOekoTex) {
       const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
         ruleSlug: '03',
@@ -780,17 +798,18 @@ export function executeCatalogAudit(
         type: 'unverified_evidence',
         severity: 'high',
         title: `Unverified OEKO-TEX Standard 100 claim without registry number on "${p.title}"`,
-        description: 'Product description claims OEKO-TEX Standard 100 certification, but manufacturer documentation lacks a valid certificate number.',
-        observedEvidence: 'Text references certification without official license ID in evidence documents.',
+        description: 'Product listing references OEKO-TEX certification, but lacks a verified certificate registry number or backing evidence document.',
+        observedEvidence: 'Certification claim detected without a verified certificate ID or registry record in attached evidence.',
         derivedConclusion: 'AI evaluation engines flag unverified safety claims and score evidence coverage low.',
         merchantVerified: prevAction?.status === 'approved',
         whyItMatters: 'Search models and commerce registries penalize unsubstantiated environmental or safety claims.',
-        suggestedCorrection: 'Link verified OEKO-TEX Certificate ID `21.HLT.84920` or update marketing copy.',
+        suggestedCorrection: 'Merchant input required: attach a verified third-party certification registry ID or remove unverified claims from product copy.',
         targetField: 'attributes.oekoTexCertified',
         currentValue: p.attributes?.oekoTexCertified || 'Standard 100 (Unverified)',
-        recommendedValue: 'OEKO-TEX Certificate #21.HLT.84920 (Verified)',
+        recommendedValue: '',
         actionItemId: actionId,
         ruleCode: 'RULE_UNVERIFIED_EVIDENCE_CLAIMS',
+        needsMerchantInput: true,
       });
 
       actionItems.push(buildScopedActionItem(prevAction, {
@@ -798,15 +817,15 @@ export function executeCatalogAudit(
         findingId,
         productId: p.id,
         productTitle: p.title,
-        title: 'Attach OEKO-TEX Standard 100 Verification Number',
+        title: 'Attach Verified Certification Registry Number',
         severity: 'high',
         status: 'pending_review',
         evidenceRequired: true,
-        evidenceProvided: 'Textile Certificate issued by Hohenstein Textile Testing Institute.',
+        needsMerchantInput: true,
         proposedChange: {
           field: 'attributes.oekoTexCertified',
           from: p.attributes?.oekoTexCertified || 'Standard 100 (Unverified)',
-          to: 'OEKO-TEX Certificate #21.HLT.84920 (Verified)',
+          to: '',
         },
         verificationStatus: 'unverified',
         auditLog: [],
@@ -814,10 +833,9 @@ export function executeCatalogAudit(
       productFindingsCount++;
     }
 
-    // Rule: Structured Coffee Brew Methods
+    // Rule: Structured Coffee & Tea Brew Methods (consumable coffee/tea only, excludes mugs/tables/candles)
     recordRule('RULE_STRUCTURED_BREW_METHODS');
-    const isCoffee = (p.category || '').toLowerCase().includes('coffee') || (p.title || '').toLowerCase().includes('coffee');
-    if (isCoffee && (!p.attributes?.recommendedBrewMethods || p.attributes.recommendedBrewMethods === '(none)')) {
+    if (domainClass.isConsumableCoffeeOrTea && (!p.attributes?.recommendedBrewMethods || p.attributes.recommendedBrewMethods === '(none)' || p.attributes.recommendedBrewMethods.trim() === '')) {
       const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
         ruleSlug: '05',
         productId: p.id,
@@ -835,17 +853,18 @@ export function executeCatalogAudit(
         type: 'missing_information',
         severity: 'medium',
         title: `Recommended brewing equipment and grind suitability not structured on "${p.title}"`,
-        description: 'Coffee listing describes tasting notes in prose but lacks structured attributes for recommended brew methods.',
-        observedEvidence: 'Prose contains brewing recommendations, but structured key `recommendedBrewMethods` is absent.',
-        derivedConclusion: 'AI shopping assistants filtering for Chemex or V60 cannot reliably index this product via structured tags.',
+        description: 'Consumable coffee or tea listing lacks structured attributes for recommended brewing equipment and preparation methods.',
+        observedEvidence: `Structured key \`recommendedBrewMethods\` is "${p.attributes?.recommendedBrewMethods || 'absent'}".`,
+        derivedConclusion: 'AI shopping assistants filtering by brewer compatibility cannot reliably index this product via structured tags.',
         merchantVerified: prevAction?.status === 'approved',
-        whyItMatters: 'Assistants parse structured tags 4x more reliably than unstructured body prose.',
-        suggestedCorrection: 'Add structured attribute `recommendedBrewMethods: ["V60", "Chemex", "Pour-Over", "Aeropress"]`.',
+        whyItMatters: 'Assistants parse structured tags more reliably than unstructured body prose.',
+        suggestedCorrection: 'Merchant input required: specify verified brewing methods suited to this product roast and grind profile.',
         targetField: 'attributes.recommendedBrewMethods',
         currentValue: p.attributes?.recommendedBrewMethods || '(none)',
-        recommendedValue: '["V60", "Chemex", "Pour-Over", "Aeropress"]',
+        recommendedValue: '',
         actionItemId: actionId,
         ruleCode: 'RULE_STRUCTURED_BREW_METHODS',
+        needsMerchantInput: true,
       });
 
       actionItems.push(buildScopedActionItem(prevAction, {
@@ -857,10 +876,11 @@ export function executeCatalogAudit(
         severity: 'medium',
         status: 'pending_review',
         evidenceRequired: false,
+        needsMerchantInput: true,
         proposedChange: {
           field: 'attributes.recommendedBrewMethods',
-          from: '(none)',
-          to: '["V60", "Chemex", "Pour-Over", "Aeropress"]',
+          from: p.attributes?.recommendedBrewMethods || '(none)',
+          to: '',
         },
         verificationStatus: 'unverified',
         auditLog: [],
@@ -868,60 +888,74 @@ export function executeCatalogAudit(
       productFindingsCount++;
     }
 
-    // Rule: Marketing headline vs technical burn time conflict on candles
+    // Rule: Marketing headline/description burn-time claim vs structured technical burn-time attribute on candles
     recordRule('RULE_MARKETING_BURN_TIME_CONFLICT');
-    const isCandle = (p.title || '').toLowerCase().includes('candle');
-    const titleBurnClaim = (p.title || '').toLowerCase().includes('60-hour') || (p.description || '').toLowerCase().includes('60-hour burn');
-    const techBurnSpec = (p.attributes?.burnTime || p.attributes?.verifiedBurnTime || '').toLowerCase();
-    if (isCandle && titleBurnClaim && (techBurnSpec.includes('45') || techBurnSpec.includes('50'))) {
-      const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
-        ruleSlug: '07',
-        productId: p.id,
-      });
-      const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, {
-        productId: p.id,
-        fallbackKeys: ['act_07'],
-      });
+    const rawTechBurn = (p.attributes?.burnTime || p.attributes?.verifiedBurnTime || '').trim();
+    if (domainClass.isCandleOrHomeFragrance && rawTechBurn) {
+      const claimSource = `${p.title || ''} ${p.description || ''}`;
+      const claimMatch = claimSource.match(/(\d{1,3})\s*(?:-\s*(\d{1,3}))?\s*(?:-|\s)?(?:hr|hrs|hour|hours|h)\b/i);
+      const specMatch = rawTechBurn.match(/(\d{1,3})\s*(?:-\s*(\d{1,3}))?/);
+      if (claimMatch && specMatch) {
+        const claimedMin = parseInt(claimMatch[1], 10);
+        const claimedMax = claimMatch[2] ? parseInt(claimMatch[2], 10) : claimedMin;
+        const specMin = parseInt(specMatch[1], 10);
+        const specMax = specMatch[2] ? parseInt(specMatch[2], 10) : specMin;
+        // Flag conflict if marketing headline overstates or is disjoint from technical specification
+        const hasConflict = claimedMax > specMax || claimedMin > specMax || claimedMax < specMin;
+        if (hasConflict) {
+          const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+            ruleSlug: '07',
+            productId: p.id,
+          });
+          const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, {
+            productId: p.id,
+            fallbackKeys: ['act_07'],
+          });
+          const claimLabel = claimMatch[0].trim();
 
-      findings.push({
-        id: findingId,
-        scope: 'product',
-        productId: p.id,
-        productTitle: p.title,
-        type: 'conflicting_claims',
-        severity: 'high',
-        title: `Conflicting burn time stated in title vs technical attribute on "${p.title}"`,
-        description: 'Hero marketing banner mentions "60-hour burn time" while technical specification attribute indicates "45-50 Hours".',
-        observedEvidence: 'Headline says "60h long burn", while structured metadata explicitly specifies 45-50 Hours.',
-        derivedConclusion: 'AI fact-checking algorithms identify internal conflict between marketing claims and technical data.',
-        merchantVerified: prevAction?.status === 'approved',
-        whyItMatters: 'Conflicting factual claims trigger confidence penalties in AI recommendation synthesis.',
-        suggestedCorrection: 'Harmonize marketing copy to reflect tested lab burn duration of 50 hours.',
-        targetField: 'title / marketing claims',
-        currentValue: '60-hour claim vs 45-50h spec',
-        recommendedValue: 'Up to 50 hours (Tested burn rate)',
-        actionItemId: actionId,
-        ruleCode: 'RULE_MARKETING_BURN_TIME_CONFLICT',
-      });
+          findings.push({
+            id: findingId,
+            scope: 'product',
+            productId: p.id,
+            productTitle: p.title,
+            type: 'conflicting_claims',
+            severity: 'high',
+            title: `Conflicting burn time stated in title vs technical attribute on "${p.title}"`,
+            description: `Marketing copy states "${claimLabel}" while structured technical specification indicates "${rawTechBurn}".`,
+            observedEvidence: `Headline/description claims "${claimLabel}", whereas structured burnTime attribute specifies "${rawTechBurn}".`,
+            derivedConclusion: 'AI fact-checking algorithms identify internal conflict between marketing claims and technical data.',
+            merchantVerified: prevAction?.status === 'approved',
+            whyItMatters: 'Conflicting factual claims trigger confidence penalties in AI recommendation synthesis.',
+            suggestedCorrection: 'Merchant input required: harmonize marketing copy and structured burn time to match verified lab testing.',
+            targetField: 'title / marketing claims',
+            currentValue: `${claimLabel} claim vs ${rawTechBurn} spec`,
+            recommendedValue: '',
+            actionItemId: actionId,
+            ruleCode: 'RULE_MARKETING_BURN_TIME_CONFLICT',
+            needsMerchantInput: true,
+          });
 
-      actionItems.push(buildScopedActionItem(prevAction, {
-        id: actionId,
-        findingId,
-        productId: p.id,
-        productTitle: p.title,
-        title: 'Reconcile 60-Hour Title Claim with 50-Hour Lab Specification',
-        severity: 'high',
-        status: 'pending_review',
-        evidenceRequired: true,
-        proposedChange: {
-          field: 'title / marketing claims',
-          from: '60-Hour Burn Time claim',
-          to: 'Up to 50 Hours (Verified Lab Burn Rate)',
-        },
-        verificationStatus: 'unverified',
-        auditLog: [],
-      }));
-      productFindingsCount++;
+          actionItems.push(buildScopedActionItem(prevAction, {
+            id: actionId,
+            findingId,
+            productId: p.id,
+            productTitle: p.title,
+            title: `Reconcile "${claimLabel}" Marketing Claim with "${rawTechBurn}" Specification`,
+            severity: 'high',
+            status: 'pending_review',
+            evidenceRequired: true,
+            needsMerchantInput: true,
+            proposedChange: {
+              field: 'title / marketing claims',
+              from: `${claimLabel} claim`,
+              to: '',
+            },
+            verificationStatus: 'unverified',
+            auditLog: [],
+          }));
+          productFindingsCount++;
+        }
+      }
     }
 
     // Update product stats
@@ -948,14 +982,14 @@ export function executeCatalogAudit(
       type: 'inconsistent_attributes',
       severity: 'medium',
       title: 'Inconsistent weight and dimension units across catalog categories',
-      description: 'Drinkware records capacity in milliliters while candles record in ounces without dual-unit reporting.',
-      observedEvidence: 'Drinkware and Fragrance use disparate measurement systems without secondary unit tags.',
-      derivedConclusion: 'Cross-regional AI queries (e.g. US vs EU shoppers) encounter mismatched volume filters.',
+      description: 'Catalog measurement unit policy uses mixed single-system units without consistent dual Metric/Imperial tagging.',
+      observedEvidence: `Store catalogPolicy.units is "${unitPolicy}".`,
+      derivedConclusion: 'Cross-regional AI queries (e.g. US vs EU shoppers) encounter mismatched volume and weight filters.',
       merchantVerified: prevAction?.status === 'approved',
       whyItMatters: 'Standardized dual-unit specs ensure visibility across both US imperial and European metric shopping filters.',
-      suggestedCorrection: 'Standardize catalog attribute format to include dual units across all volumetric products.',
+      suggestedCorrection: 'Standardize catalog attribute format to include dual units (Metric and Imperial) where applicable.',
       targetField: 'store.catalogPolicy.units',
-      currentValue: 'Mixed single-system units',
+      currentValue: unitPolicy,
       recommendedValue: 'Dual-unit standard: Metric (Imperial)',
       actionItemId: actionId,
       ruleCode: 'RULE_DUAL_UNIT_MEASUREMENT_POLICY',
@@ -970,7 +1004,7 @@ export function executeCatalogAudit(
       evidenceRequired: false,
       proposedChange: {
         field: 'store.catalogPolicy.units',
-        from: 'Mixed single-system units',
+        from: unitPolicy,
         to: 'Dual-unit standard: Metric (Imperial)',
       },
       verificationStatus: 'unverified',
@@ -980,10 +1014,17 @@ export function executeCatalogAudit(
 
   // Rule: Shipping SLA conflict between storefront and feed
   recordRule('RULE_SHIPPING_SLA_RECONCILIATION');
-  const gmcSla = (storeProfile.shippingSla?.gmc || '').toLowerCase();
-  if (products.length > 0 && gmcSla.includes('3-5')) {
+  const rawGmcSla = (storeProfile.shippingSla?.gmc || '').trim();
+  const rawStorefrontSla = (storeProfile.shippingSla?.storefront || '').trim();
+  const normGmcSla = rawGmcSla.toLowerCase();
+  const normStorefrontSla = rawStorefrontSla.toLowerCase();
+  const hasExplicitSlaConflict = Boolean(rawGmcSla && rawStorefrontSla && normGmcSla !== normStorefrontSla);
+  const hasLegacyUnalignedGmcSla = Boolean(!rawStorefrontSla && normGmcSla.includes('3-5'));
+
+  if (products.length > 0 && (hasExplicitSlaConflict || hasLegacyUnalignedGmcSla)) {
     const { findingId, actionId: defaultActionId } = buildAuditEntityIds({ ruleSlug: '06' });
     const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId);
+    const hasKnownStorefront = Boolean(rawStorefrontSla);
 
     findings.push({
       id: findingId,
@@ -991,30 +1032,40 @@ export function executeCatalogAudit(
       type: 'conflicting_claims',
       severity: 'critical',
       title: 'Discrepancy between storefront shipping policy and feed delivery SLA',
-      description: 'Storefront checkout footer advertises 2-day dispatch, whereas Google Merchant Center feed policy specifies 3-5 business days.',
-      observedEvidence: 'Storefront policy: 2 business days. GMC feed metadata: 3-5 business days. Conflicting customer SLA detected.',
+      description: hasKnownStorefront
+        ? `Storefront policy states "${rawStorefrontSla}", whereas Google Merchant Center feed policy specifies "${rawGmcSla}".`
+        : `Google Merchant Center feed SLA ("${rawGmcSla}") has not been reconciled with the verified storefront delivery SLA.`,
+      observedEvidence: hasKnownStorefront
+        ? `Storefront policy: "${rawStorefrontSla}". GMC feed metadata: "${rawGmcSla}".`
+        : `GMC feed metadata specifies "${rawGmcSla}" with unverified storefront SLA parity.`,
       derivedConclusion: 'External shopping portals penalize merchant trust scores when shipping speed claims conflict.',
       merchantVerified: prevAction?.status === 'approved',
       whyItMatters: 'Google and AI shopping agents check delivery speed consistency across merchant feeds and storefront pages.',
-      suggestedCorrection: 'Align Google Merchant Center feed SLA to match storefront (2 business days).',
+      suggestedCorrection: hasKnownStorefront
+        ? `Align Google Merchant Center feed SLA to match storefront ("${rawStorefrontSla}").`
+        : 'Merchant input required: configure Google Merchant Center feed SLA to match your published storefront delivery policy.',
       targetField: 'connectors.gmc.shipping_sla',
-      currentValue: '3-5 business days',
-      recommendedValue: '2 business days',
+      currentValue: rawGmcSla,
+      recommendedValue: rawStorefrontSla,
       actionItemId: actionId,
       ruleCode: 'RULE_SHIPPING_SLA_RECONCILIATION',
+      needsMerchantInput: !hasKnownStorefront,
     });
 
     actionItems.push(buildScopedActionItem(prevAction, {
       id: actionId,
       findingId,
-      title: 'Reconcile Storefront 2-Day Shipping SLA with GMC Feed',
+      title: hasKnownStorefront
+        ? `Reconcile Storefront (${rawStorefrontSla}) Shipping SLA with GMC Feed`
+        : 'Reconcile Storefront Shipping SLA with GMC Feed',
       severity: 'critical',
       status: 'pending_review',
       evidenceRequired: true,
+      needsMerchantInput: !hasKnownStorefront,
       proposedChange: {
         field: 'connectors.gmc.shipping_sla',
-        from: '3-5 business days',
-        to: '2 business days',
+        from: rawGmcSla,
+        to: rawStorefrontSla,
       },
       verificationStatus: 'unverified',
       auditLog: [],

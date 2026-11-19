@@ -1,22 +1,56 @@
 import { Router } from 'express';
 import { DatabaseRepository } from '../db/repository';
-import { createAuthMiddleware } from '../middleware/auth';
+import { createAuthMiddleware, createWorkspaceRateLimiter } from '../middleware/auth';
 import { AuthRequest } from '../types';
+import {
+  redactCatalogForPreliminaryAccess,
+  resolveReportEntitlement,
+} from '../services/entitlementService';
 
 export function createAuditRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  const auditRunLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'audit_run',
+      maxAttempts: 20,
+      windowMs: 60_000,
+      message: 'Audit execution rate limit reached. Please wait a minute before starting another audit.',
+    },
+    repo
+  );
+  const auditReadLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'audit_read',
+      maxAttempts: 60,
+      windowMs: 60_000,
+      message: 'Too many audit read requests. Please retry shortly.',
+    },
+    repo
+  );
 
-  // POST /api/audit/run — Start a real catalog audit execution
-  router.post('/run', requireAuth, async (req: AuthRequest, res) => {
+  // POST /api/audit/run — Start a catalog audit execution
+  router.post('/run', requireAuth, auditRunLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const result = await repo.executeWorkspaceAudit(workspaceId);
+      const [store, subscription] = await Promise.all([
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store, subscription);
+      const { catalog: safeCatalog, preliminarySummary } = redactCatalogForPreliminaryAccess(
+        result.catalog,
+        reportEntitlement,
+        result.auditRun
+      );
 
       return res.status(200).json({
         success: true,
         auditRun: result.auditRun,
-        catalog: result.catalog,
+        catalog: safeCatalog,
+        reportEntitlement,
+        preliminarySummary,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit Run Error]:', err);
@@ -28,21 +62,35 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
   });
 
   // GET /api/audit/history — Retrieve historical Audit Runs with pagination (workspace scoped)
-  router.get('/history', requireAuth, async (req: AuthRequest, res) => {
+  router.get('/history', requireAuth, auditReadLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const limitRaw = req.query.limit ? parseInt(String(req.query.limit), 10) : 20;
-      const limit = isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 100);
+      const limit = isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 50);
       const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
 
-      const history = await repo.getAuditRunsHistory(workspaceId, { limit, cursor });
+      const [history, store, subscription] = await Promise.all([
+        repo.getAuditRunsHistory(workspaceId, { limit, cursor }),
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store, subscription);
+
+      const items = reportEntitlement.hasFullReportAccess
+        ? history.items
+        : history.items.map((item) => ({
+            ...item,
+            snapshotAvailable: false,
+            lockedByPlan: true,
+          }));
 
       return res.status(200).json({
         success: true,
         workspaceId,
-        items: history.items,
+        items,
         nextCursor: history.nextCursor,
         totalCount: history.totalCount,
+        reportEntitlement,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit History Error]:', err);
@@ -52,8 +100,8 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // GET /api/audit/compare — Compare two historical audit runs (workspace scoped)
-  router.get('/compare', requireAuth, async (req: AuthRequest, res) => {
+  // GET /api/audit/compare — Compare two historical audit runs (workspace scoped, paid plans only)
+  router.get('/compare', requireAuth, auditReadLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const baseId = typeof req.query.baseId === 'string' ? req.query.baseId.trim() : '';
@@ -63,6 +111,19 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
         return res.status(400).json({
           error: 'Both baseId and targetId query parameters are required for audit comparison',
           code: 'COMPARISON_PARAMS_REQUIRED',
+        });
+      }
+
+      const [store, subscription] = await Promise.all([
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store, subscription);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
         });
       }
 
@@ -79,6 +140,7 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
         success: true,
         workspaceId,
         comparison,
+        reportEntitlement,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit Compare Error]:', err);
@@ -89,14 +151,20 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
   });
 
   // GET /api/audit/latest — Get the latest audit run for authenticated workspace
-  router.get('/latest', requireAuth, async (req: AuthRequest, res) => {
+  router.get('/latest', requireAuth, auditReadLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const auditRun = await repo.getLatestAuditRunByWorkspace(workspaceId);
+      const [auditRun, store, subscription] = await Promise.all([
+        repo.getLatestAuditRunByWorkspace(workspaceId),
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store, subscription);
 
       return res.status(200).json({
         workspaceId,
         auditRun,
+        reportEntitlement,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit Latest Error]:', err);
@@ -106,8 +174,8 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // GET /api/audit/:id — Get a specific audit run by ID with historical snapshots (workspace scoped)
-  router.get('/:id', requireAuth, async (req: AuthRequest, res) => {
+  // GET /api/audit/:id — Get a specific audit run by ID with historical snapshots (workspace scoped, paid plans only)
+  router.get('/:id', requireAuth, auditReadLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
       const auditRunId = req.params.id;
@@ -125,6 +193,20 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
         });
       }
 
+      const [store, subscription] = await Promise.all([
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
+      const reportEntitlement = resolveReportEntitlement(store, subscription);
+
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
+
       return res.status(200).json({
         success: true,
         workspaceId,
@@ -134,6 +216,7 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
         products: snapshot.products,
         snapshotAvailable: snapshot.snapshotAvailable,
         message: snapshot.message,
+        reportEntitlement,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit Fetch Error]:', err);

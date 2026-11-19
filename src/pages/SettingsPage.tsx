@@ -240,7 +240,8 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
     cloudCatalogStatus,
     catalogVersion,
     demoOverwriteProtection,
-    reloadWorkspaceCatalog
+    reloadWorkspaceCatalog,
+    selectedSettingsTab
   } = useApp();
 
   const overwriteProtection =
@@ -356,6 +357,15 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
     }
   }, [activeTab, fetchBillingState]);
 
+  const [pendingVerifySessionId, setPendingVerifySessionId] = useState<string | null>(null);
+  const verifiedCheckoutSessionsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!initialTab && selectedSettingsTab) {
+      setActiveTab(selectedSettingsTab);
+    }
+  }, [initialTab, selectedSettingsTab]);
+
   // Check URL query parameters for Shopify OAuth and Stripe Checkout return feedback
   useEffect(() => {
     if (typeof window === 'undefined' || !window.location || typeof window.location.search !== 'string') {
@@ -395,6 +405,9 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
         'Verifying your subscription status with the billing server...',
         'info'
       );
+      if (sessionIdParam && sessionIdParam !== '{CHECKOUT_SESSION_ID}' && sessionIdParam.trim().length > 0) {
+        setPendingVerifySessionId(sessionIdParam.trim());
+      }
       setActiveTab('subscription');
       handled = true;
     } else if (checkoutParam === 'canceled') {
@@ -414,6 +427,48 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
       window.history.replaceState({}, typeof document !== 'undefined' ? document.title : '', cleanPath);
     }
   }, [addToast, initialTab]);
+
+  useEffect(() => {
+    if (
+      !isAuthenticated ||
+      !pendingVerifySessionId ||
+      verifiedCheckoutSessionsRef.current.has(pendingVerifySessionId) ||
+      typeof apiClient.verifyCheckoutSession !== 'function'
+    ) {
+      return;
+    }
+    const targetSessionId = pendingVerifySessionId;
+    verifiedCheckoutSessionsRef.current.add(targetSessionId);
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const verified = await apiClient.verifyCheckoutSession(targetSessionId);
+        if (cancelled) return;
+        if (verified?.verified) {
+          addToast(
+            'Subscription Verified',
+            `Your ${verified.subscription?.tier || 'paid'} plan is now active and full audit reports are unlocked.`,
+            'success'
+          );
+          await Promise.all([fetchBillingState(), reloadWorkspaceCatalog()]);
+        }
+      } catch {
+        // Leave authoritative billing state unchanged if server verification fails or session is unverified
+        if (!cancelled) {
+          await fetchBillingState();
+        }
+      } finally {
+        if (!cancelled) {
+          setPendingVerifySessionId(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, pendingVerifySessionId, addToast, fetchBillingState, reloadWorkspaceCatalog]);
 
   const fetchShopifyStatus = useCallback(async () => {
     if (!isAuthenticated) {
@@ -1625,9 +1680,9 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
 
               <p className="text-xs text-stone-500">
                 Capacity baseline: {isUnlimitedLimit ? 'Unlimited' : `${effectiveLimit} SKUs`} (1 variant = 1 SKU).
-                {sub && effectiveProvider !== 'none'
-                  ? ' Plan limits are enforced by your workspace subscription record.'
-                  : ' Unsubscribed workspaces operate under Free Audit capacity.'}
+                {sub && effectiveProvider !== 'none' && (effectiveStatus === 'active' || effectiveStatus === 'trialing')
+                  ? ' Full audit reports, evidence trails, remediation actions, and feed exports are unlocked by your active paid subscription.'
+                  : ' Free Audit covers up to 2,500 SKUs for preliminary screening only; full findings, evidence trails, remediation, and feed exports require an active Starter (250 SKUs), Growth (2,500 SKUs), or Enterprise (Unlimited) plan.'}
               </p>
             </div>
 

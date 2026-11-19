@@ -369,3 +369,336 @@ export async function withWorkspaceLock<T>(workspaceId: string, fn: () => Promis
 export function getActiveWorkspaceLockCount(): number {
   return workspaceLocks.size;
 }
+
+export type ReportAccessReasonCode =
+  | 'ACTIVE_PAID_SUBSCRIPTION'
+  | 'TRIALING_PAID_SUBSCRIPTION'
+  | 'FREE_AUDIT_PRELIMINARY_ONLY'
+  | 'SUBSCRIPTION_PAST_DUE'
+  | 'SUBSCRIPTION_CANCELED'
+  | 'SUBSCRIPTION_UNPAID'
+  | 'SUBSCRIPTION_INCOMPLETE'
+  | 'SUBSCRIPTION_EXPIRED'
+  | 'STORE_PROFILE_UNAVAILABLE';
+
+export interface ReportEntitlement {
+  hasFullReportAccess: boolean;
+  accessLevel: 'full' | 'preliminary';
+  activeTier: string;
+  subscriptionStatus: string;
+  reasonCode: ReportAccessReasonCode;
+  reasonMessage: string;
+  upgradeRequired: boolean;
+}
+
+export interface PreliminaryAuditSummary {
+  totalFindingsCount: number;
+  criticalCount: number;
+  highCount: number;
+  mediumCount: number;
+  lowCount: number;
+  actionsCount: number;
+  recommendedTier: 'Starter' | 'Growth' | 'Enterprise';
+  skuCount: number;
+  note: string;
+}
+
+export interface CommercialPlanSummaryItem {
+  tier: string;
+  priceCents: number;
+  billingInterval: 'month' | 'year';
+  skuLimit: number | null;
+  isUnlimited: boolean;
+  quotaSemantics: 'preliminary_evaluation_capacity' | 'verified_monthly_catalog_skus';
+  reportAccess: 'preliminary_only' | 'full_report_and_remediation';
+  explanation: string;
+}
+
+function isPaidTierName(tier: string): boolean {
+  const norm = (tier || '').trim().toLowerCase();
+  return (
+    norm === 'starter' ||
+    norm === 'starter tier' ||
+    norm === 'growth' ||
+    norm === 'growth tier' ||
+    norm === 'enterprise' ||
+    norm === 'enterprise tier'
+  );
+}
+
+function canonicalTierDisplayName(tier: string): string {
+  const norm = (tier || '').trim().toLowerCase();
+  if (norm === 'starter' || norm === 'starter tier') return 'Starter';
+  if (norm === 'growth' || norm === 'growth tier') return 'Growth';
+  if (norm === 'enterprise' || norm === 'enterprise tier') return 'Enterprise';
+  if (norm === 'free audit' || norm === '') return 'Free Audit';
+  return tier.trim();
+}
+
+/**
+ * Authoritative server-side commercial entitlement check for Full Report Access,
+ * detailed Findings/Evidence disclosure, Remediation Actions, Historical Snapshots, and Feed Exports.
+ *
+ * Fail-closed rules:
+ * - Free Audit ($0) provides preliminary screening only (no full findings, evidence, remediation, or exports).
+ * - Only paid plans ('Starter', 'Growth', 'Enterprise') backed by a verified 'active' or 'trialing'
+ *   subscription record grant full report access.
+ * - past_due, canceled, unpaid, incomplete, expired, pending, or missing subscription records fail closed.
+ */
+export function resolveReportEntitlement(
+  storeProfile: StoreProfile | null | undefined,
+  subscription?: SubscriptionRecord | null
+): ReportEntitlement {
+  if (!storeProfile) {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: 'Free Audit',
+      subscriptionStatus: 'none',
+      reasonCode: 'STORE_PROFILE_UNAVAILABLE',
+      reasonMessage: 'Store profile unavailable. Full audit reports require a verified paid subscription.',
+      upgradeRequired: true,
+    };
+  }
+
+  if (!subscription) {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: 'Free Audit',
+      subscriptionStatus: 'none',
+      reasonCode: 'FREE_AUDIT_PRELIMINARY_ONLY',
+      reasonMessage:
+        'Free Audit provides a preliminary catalog check only. Upgrade to a paid plan to unlock full findings, evidence trails, remediation actions, and feed exports.',
+      upgradeRequired: true,
+    };
+  }
+
+  const normalizedStatus = typeof subscription.status === 'string'
+    ? subscription.status.trim().toLowerCase()
+    : 'incomplete';
+  const tierName = canonicalTierDisplayName(subscription.tier || storeProfile.tier || 'Free Audit');
+  const paidTier = isPaidTierName(tierName);
+
+  if (!paidTier) {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: 'Free Audit',
+      subscriptionStatus: normalizedStatus || 'none',
+      reasonCode: 'FREE_AUDIT_PRELIMINARY_ONLY',
+      reasonMessage:
+        'Free Audit provides a preliminary catalog check only. Upgrade to a paid plan to unlock full findings, evidence trails, remediation actions, and feed exports.',
+      upgradeRequired: true,
+    };
+  }
+
+  if (normalizedStatus === 'active') {
+    return {
+      hasFullReportAccess: true,
+      accessLevel: 'full',
+      activeTier: tierName,
+      subscriptionStatus: 'active',
+      reasonCode: 'ACTIVE_PAID_SUBSCRIPTION',
+      reasonMessage: `Full audit report and remediation unlocked under active ${tierName} plan.`,
+      upgradeRequired: false,
+    };
+  }
+
+  if (normalizedStatus === 'trialing') {
+    return {
+      hasFullReportAccess: true,
+      accessLevel: 'full',
+      activeTier: tierName,
+      subscriptionStatus: 'trialing',
+      reasonCode: 'TRIALING_PAID_SUBSCRIPTION',
+      reasonMessage: `Full audit report and remediation unlocked under ${tierName} trial.`,
+      upgradeRequired: false,
+    };
+  }
+
+  if (normalizedStatus === 'past_due') {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: tierName,
+      subscriptionStatus: 'past_due',
+      reasonCode: 'SUBSCRIPTION_PAST_DUE',
+      reasonMessage: `Your ${tierName} subscription payment is past due. Update your billing method to restore full audit reports and remediation access.`,
+      upgradeRequired: true,
+    };
+  }
+
+  if (normalizedStatus === 'canceled' || normalizedStatus === 'cancelled') {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: 'Free Audit',
+      subscriptionStatus: 'canceled',
+      reasonCode: 'SUBSCRIPTION_CANCELED',
+      reasonMessage:
+        'Your paid subscription has been canceled or refunded. Resubscribe to unlock full audit findings, evidence trails, and exports.',
+      upgradeRequired: true,
+    };
+  }
+
+  if (normalizedStatus === 'unpaid') {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: tierName,
+      subscriptionStatus: 'unpaid',
+      reasonCode: 'SUBSCRIPTION_UNPAID',
+      reasonMessage: 'Your subscription is unpaid. Complete payment to restore full report access.',
+      upgradeRequired: true,
+    };
+  }
+
+  if (normalizedStatus === 'expired' || normalizedStatus === 'incomplete_expired') {
+    return {
+      hasFullReportAccess: false,
+      accessLevel: 'preliminary',
+      activeTier: 'Free Audit',
+      subscriptionStatus: 'expired',
+      reasonCode: 'SUBSCRIPTION_EXPIRED',
+      reasonMessage: 'Your subscription has expired. Renew or upgrade your plan to unlock full audit reports.',
+      upgradeRequired: true,
+    };
+  }
+
+  return {
+    hasFullReportAccess: false,
+    accessLevel: 'preliminary',
+    activeTier: 'Free Audit',
+    subscriptionStatus: normalizedStatus || 'incomplete',
+    reasonCode: 'SUBSCRIPTION_INCOMPLETE',
+    reasonMessage:
+      'Payment verification is still pending or incomplete. Complete checkout to unlock full audit reports.',
+    upgradeRequired: true,
+  };
+}
+
+export function recommendPaidTierForSkuCount(skuCount: number): 'Starter' | 'Growth' | 'Enterprise' {
+  if (skuCount <= 250) return 'Starter';
+  if (skuCount <= 2500) return 'Growth';
+  return 'Enterprise';
+}
+
+export function buildPreliminaryAuditSummary(
+  catalog: import('../../domain/storage/storageTypes').StoragePayloadV1 | null | undefined,
+  auditRun?: { summary?: Record<string, any> } | null
+): PreliminaryAuditSummary {
+  const findings = catalog?.findings || [];
+  const actions = catalog?.actions || [];
+  const skuCount = countCatalogSkus(catalog?.products || []);
+  const criticalCount = findings.length > 0
+    ? findings.filter(f => f.severity === 'critical').length
+    : Number(auditRun?.summary?.criticalCount || 0);
+  const highCount = findings.length > 0
+    ? findings.filter(f => f.severity === 'high').length
+    : Number(auditRun?.summary?.highCount || 0);
+  const mediumCount = findings.length > 0
+    ? findings.filter(f => f.severity === 'medium').length
+    : Number(auditRun?.summary?.mediumCount || 0);
+  const lowCount = findings.length > 0
+    ? findings.filter(f => f.severity === 'low').length
+    : Number(auditRun?.summary?.lowCount || 0);
+  const totalFindingsCount = findings.length > 0
+    ? findings.length
+    : Number(auditRun?.summary?.findingsCount || (criticalCount + highCount + mediumCount + lowCount));
+
+  return {
+    totalFindingsCount,
+    criticalCount,
+    highCount,
+    mediumCount,
+    lowCount,
+    actionsCount: actions.length,
+    recommendedTier: recommendPaidTierForSkuCount(skuCount),
+    skuCount,
+    note:
+      'Preliminary check only. Detailed findings, evidence provenance, recommended fixes, historical comparisons, and feed exports require an active paid plan.',
+  };
+}
+
+/**
+ * Redacts paid report deliverables (detailed findings and remediation actions) from a catalog response
+ * while keeping the merchant's own catalog inventory (products, variants, offers, evidence, storeProfile) intact.
+ */
+export function redactCatalogForPreliminaryAccess(
+  catalog: import('../../domain/storage/storageTypes').StoragePayloadV1,
+  entitlement: ReportEntitlement,
+  auditRun?: { summary?: Record<string, any> } | null
+): {
+  catalog: import('../../domain/storage/storageTypes').StoragePayloadV1;
+  preliminarySummary: PreliminaryAuditSummary;
+} {
+  const preliminarySummary = buildPreliminaryAuditSummary(catalog, auditRun);
+
+  if (entitlement.hasFullReportAccess) {
+    return {
+      catalog,
+      preliminarySummary,
+    };
+  }
+
+  return {
+    catalog: {
+      ...catalog,
+      findings: [],
+      actions: [],
+      products: (catalog.products || []).map(p => ({
+        ...p,
+        findingsCount: typeof p.findingsCount === 'number' ? p.findingsCount : 0,
+      })),
+    },
+    preliminarySummary,
+  };
+}
+
+export function getCommercialPlanSummary(): CommercialPlanSummaryItem[] {
+  return [
+    {
+      tier: 'Free Audit',
+      priceCents: 0,
+      billingInterval: 'month',
+      skuLimit: 2500,
+      isUnlimited: false,
+      quotaSemantics: 'preliminary_evaluation_capacity',
+      reportAccess: 'preliminary_only',
+      explanation:
+        'Free Audit ($0) permits preliminary screening for up to 2,500 SKUs so stores with larger catalogs can gauge eligibility and issue severity counts without receiving full audit findings, evidence, remediation actions, or feed exports.',
+    },
+    {
+      tier: 'Starter',
+      priceCents: 4900,
+      billingInterval: 'month',
+      skuLimit: 250,
+      isUnlimited: false,
+      quotaSemantics: 'verified_monthly_catalog_skus',
+      reportAccess: 'full_report_and_remediation',
+      explanation: 'Starter ($49/month) unlocks full audit reports, remediation actions, and feed exports for up to 250 verified SKUs.',
+    },
+    {
+      tier: 'Growth',
+      priceCents: 14900,
+      billingInterval: 'month',
+      skuLimit: 2500,
+      isUnlimited: false,
+      quotaSemantics: 'verified_monthly_catalog_skus',
+      reportAccess: 'full_report_and_remediation',
+      explanation: 'Growth ($149/month) unlocks full audit reports, remediation actions, and feed exports for up to 2,500 verified SKUs.',
+    },
+    {
+      tier: 'Enterprise',
+      priceCents: 49900,
+      billingInterval: 'month',
+      skuLimit: null,
+      isUnlimited: true,
+      quotaSemantics: 'verified_monthly_catalog_skus',
+      reportAccess: 'full_report_and_remediation',
+      explanation: 'Enterprise ($499/month) unlocks full audit reports, remediation actions, and feed exports for unlimited verified SKUs.',
+    },
+  ];
+}
+

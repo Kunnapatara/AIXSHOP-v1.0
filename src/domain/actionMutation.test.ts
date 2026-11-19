@@ -328,7 +328,10 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       const recheckRes = coordinator.recheckAction('act_01');
       assert.equal(recheckRes.isVerified, false);
       assert.equal(recheckRes.verificationStatus, 'verification_failed');
-      assert.ok(recheckRes.recheckNotes.includes('fails GTIN-13 check digit validation'));
+      assert.ok(
+        recheckRes.recheckNotes.includes('fails GTIN check digit validation') &&
+          recheckRes.recheckNotes.includes('GTIN-13')
+      );
     });
 
     it('re-check fails if catalog attribute value diverges from approved value', () => {

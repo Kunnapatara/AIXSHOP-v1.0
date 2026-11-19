@@ -172,20 +172,28 @@ export async function handleShopifyCallback(
   // 3. Exchange authorization code for access token with expiring=1 for expiring offline token flow
   const tokenUrl = `https://${shop}/admin/oauth/access_token`;
   const fetchFn = options.customFetch || fetch;
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutTimer = controller ? setTimeout(() => controller.abort(), 15000) : null;
 
-  const tokenResponse = await fetchFn(tokenUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify({
-      client_id: apiKey,
-      client_secret: apiSecret,
-      code,
-      expiring: 1,
-    }),
-  });
+  let tokenResponse: Response;
+  try {
+    tokenResponse = await fetchFn(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: apiKey,
+        client_secret: apiSecret,
+        code,
+        expiring: 1,
+      }),
+      signal: controller ? controller.signal : undefined,
+    });
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+  }
 
   if (!tokenResponse.ok) {
     const errText = await tokenResponse.text();
@@ -344,20 +352,28 @@ export async function refreshShopifyToken(
       const refreshToken = decryptCredential(connection.refreshTokenEncrypted);
       const tokenUrl = `https://${connection.shopDomain}/admin/oauth/access_token`;
       const fetchFn = options.customFetch || fetch;
+      const refreshController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const refreshTimer = refreshController ? setTimeout(() => refreshController.abort(), 15000) : null;
 
-      const response = await fetchFn(tokenUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify({
-          client_id: apiKey,
-          client_secret: apiSecret,
-          refresh_token: refreshToken,
-          grant_type: 'refresh_token',
-        }),
-      });
+      let response: Response;
+      try {
+        response = await fetchFn(tokenUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({
+            client_id: apiKey,
+            client_secret: apiSecret,
+            refresh_token: refreshToken,
+            grant_type: 'refresh_token',
+          }),
+          signal: refreshController ? refreshController.signal : undefined,
+        });
+      } finally {
+        if (refreshTimer) clearTimeout(refreshTimer);
+      }
 
       if (!response.ok) {
         const errText = typeof response.text === 'function' ? await response.text() : '';

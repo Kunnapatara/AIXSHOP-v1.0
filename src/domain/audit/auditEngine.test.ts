@@ -769,6 +769,205 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
       }
     });
   });
+
+  // =========================================================================
+  // Workstream A — Multi-Format GTIN (8/12/13/14), Exemptions & Category Matrix
+  // =========================================================================
+  describe('Workstream A: Multi-Format GTIN Validation, Exemptions & Category Applicability', async () => {
+    const { validateGtin, isValidGtin, isValidGtin13 } = await import('../validation/gtin');
+    const { mapProductToSchemaOrgJsonLd, mapProductToGmcRow } = await import('../feed/feedValidationEngine');
+
+    const baseStore: StoreProfile = {
+      name: 'Generic Merchant',
+      domain: 'merchant.myshopify.com',
+      currency: 'USD',
+      skuCount: 1,
+      catalogCompletenessAvg: 80,
+      truthBoundaryStrictness: 'standard',
+      tier: 'Growth',
+      connectors: [],
+    };
+
+    const makeBaseProduct = (overrides: Partial<Product>): Product => ({
+      id: 'p_matrix_test',
+      title: 'Standard Product',
+      brand: 'Merchant Brand',
+      category: 'Home & Living',
+      description: 'Substantive product description meeting minimum length requirements for feeds.',
+      image: 'https://example.com/product.jpg',
+      status: 'active',
+      completenessScore: 80,
+      evidenceCoverageScore: 60,
+      externalDiscoveryStatus: 'observed_in_sample',
+      attributes: {},
+      variants: [
+        { id: 'v_1', sku: 'SKU-1', title: 'Default', barcode: '036000291452', price: 29.99, inventoryCount: 10, attributes: {} },
+      ],
+      offers: [{ id: 'off_1', channel: 'Direct Storefront', price: 29.99, currency: 'USD', availability: 'in_stock', condition: 'new', url: 'https://merchant.myshopify.com/products/test', merchantId: 'm1', lastSync: '2026-11-18T00:00:00Z' }],
+      evidenceDocuments: [],
+      findingsCount: 0,
+      lastAudited: '',
+      ...overrides,
+    });
+
+    it('validates GTIN-8, GTIN-12 (UPC-A), GTIN-13 (EAN-13), and GTIN-14 with leading-zero preservation', () => {
+      // GTIN-8
+      assert.deepEqual(validateGtin('96385074'), { isValid: true, format: 'GTIN-8', normalized: '96385074' });
+      assert.equal(validateGtin('96385075').isValid, false);
+      // GTIN-12 (UPC-A with leading zero)
+      assert.deepEqual(validateGtin('036000291452'), { isValid: true, format: 'GTIN-12', normalized: '036000291452' });
+      assert.equal(validateGtin('036000291453').isValid, false);
+      // GTIN-13 (EAN-13 with leading zero)
+      assert.deepEqual(validateGtin('0850029381044'), { isValid: true, format: 'GTIN-13', normalized: '0850029381044' });
+      assert.equal(isValidGtin13('036000291452'), false);
+      assert.equal(isValidGtin('036000291452'), true);
+      // GTIN-14
+      assert.deepEqual(validateGtin('10012345678902'), { isValid: true, format: 'GTIN-14', normalized: '10012345678902' });
+      assert.equal(validateGtin('10012345678903').isValid, false);
+      // Invalid lengths & dummy all-zeros
+      assert.equal(validateGtin('123456').isValid, false);
+      assert.equal(validateGtin('000000000000').isValid, false);
+
+      // Audit engine accepts valid UPC-A (GTIN-12), GTIN-8, and GTIN-14 without critical GTIN finding
+      const upcProduct = makeBaseProduct({
+        variants: [
+          { id: 'v8', sku: 'S8', title: '8', barcode: '96385074', price: 10, inventoryCount: 5, attributes: {} },
+          { id: 'v12', sku: 'S12', title: '12', barcode: '036000291452', price: 10, inventoryCount: 5, attributes: {} },
+          { id: 'v14', sku: 'S14', title: '14', barcode: '10012345678902', price: 10, inventoryCount: 5, attributes: {} },
+        ],
+      });
+      const auditRes = executeCatalogAudit([upcProduct], baseStore, []);
+      assert.equal(
+        auditRes.findings.filter(f => f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT').length,
+        0,
+        'Valid GTIN-8/12/14 barcodes must not trigger GTIN errors'
+      );
+
+      // Feed / Schema.org preserves leading zero & emits gtin12
+      const jsonLd = mapProductToSchemaOrgJsonLd(makeBaseProduct({}), 'USD');
+      assert.equal(jsonLd.gtin12, '036000291452');
+      assert.equal(jsonLd.gtin13, undefined);
+      const gmcRow = mapProductToGmcRow(makeBaseProduct({}), 'USD');
+      assert.equal(gmcRow.gtin, '036000291452');
+    });
+
+    it('suppresses missing-GTIN critical findings on handmade or explicitly GTIN-exempt products while still rejecting invalid supplied barcodes', () => {
+      const handmadePlanter = makeBaseProduct({
+        id: 'p_handmade_planter',
+        title: 'Handmade Ceramic Planter Pot',
+        category: 'Home & Garden / Planters',
+        attributes: { material: 'Ceramic' },
+        variants: [{ id: 'v1', sku: 'PLANT-01', title: 'Terracotta', barcode: '', price: 32, inventoryCount: 5, attributes: {} }],
+      });
+      const customExempt = makeBaseProduct({
+        id: 'p_custom_exempt',
+        title: 'Standard T-Shirt',
+        category: 'Apparel',
+        attributes: { identifierExists: 'no' },
+        variants: [{ id: 'v1', sku: 'TEE-01', title: 'M', barcode: '', price: 24, inventoryCount: 10, attributes: {} }],
+      });
+      const handmadeInvalidBarcode = makeBaseProduct({
+        id: 'p_handmade_bad_gtin',
+        title: 'Handmade Bowl',
+        category: 'Home & Kitchen / Tableware',
+        attributes: { microwaveSafe: 'True' },
+        variants: [{ id: 'v1', sku: 'BOWL-BAD', title: 'Default', barcode: '036000291459', price: 40, inventoryCount: 3, attributes: {} }],
+      });
+
+      const res = executeCatalogAudit([handmadePlanter, customExempt, handmadeInvalidBarcode], baseStore, []);
+      assert.equal(
+        res.findings.some(f => f.productId === 'p_handmade_planter' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
+        false
+      );
+      assert.equal(
+        res.findings.some(f => f.productId === 'p_custom_exempt' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
+        false
+      );
+      assert.equal(
+        res.findings.some(f => f.productId === 'p_handmade_bad_gtin' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
+        true,
+        'Explicitly supplied invalid GTIN check digit must still be flagged even if product is handmade'
+      );
+    });
+
+    it('enforces Product-Category Applicability Matrix to eliminate cross-category false positives and Solstice leakage', () => {
+      const ceramicPlanter = makeBaseProduct({
+        id: 'p_planter_ceramic',
+        title: 'Ceramic Planter Pot with Drainage Tray',
+        category: 'Home & Garden / Planters',
+        attributes: { material: 'Ceramic' },
+      });
+      const coffeeTable = makeBaseProduct({
+        id: 'p_coffee_table',
+        title: 'Oak Coffee Table',
+        category: 'Furniture / Living Room',
+      });
+      const coffeeMug = makeBaseProduct({
+        id: 'p_coffee_mug',
+        title: 'Stoneware Coffee Mug',
+        category: 'Home & Kitchen / Drinkware',
+        attributes: { microwaveSafe: 'Unspecified' },
+      });
+      const unverifiedOekoTextiles = makeBaseProduct({
+        id: 'p_oeko',
+        title: 'Organic Cotton Towel Set',
+        category: 'Textiles / Bath',
+        description: 'Soft OEKO-TEX certified bath towels made from combed cotton.',
+      });
+      const dynamicCandle = makeBaseProduct({
+        id: 'p_candle_40',
+        title: 'Cedarwood Jar Candle 40-Hour Burn',
+        category: 'Home Fragrance / Candles',
+        attributes: { burnTime: '25 Hours' },
+      });
+      const alignedCandle = makeBaseProduct({
+        id: 'p_candle_ok',
+        title: 'Lavender Candle Up to 50 Hours Burn',
+        category: 'Home Fragrance / Candles',
+        attributes: { burnTime: '45-50 Hours' },
+      });
+
+      const result = executeCatalogAudit(
+        [ceramicPlanter, coffeeTable, coffeeMug, unverifiedOekoTextiles, dynamicCandle, alignedCandle],
+        baseStore,
+        []
+      );
+
+      // Ceramic Planter must NOT receive microwave safety finding
+      assert.equal(
+        result.findings.some(f => f.productId === 'p_planter_ceramic' && f.ruleCode === 'RULE_DISHWASHER_MICROWAVE_SAFETY'),
+        false
+      );
+      // Coffee Table must NOT receive brew methods finding
+      assert.equal(
+        result.findings.some(f => f.productId === 'p_coffee_table' && f.ruleCode === 'RULE_STRUCTURED_BREW_METHODS'),
+        false
+      );
+      // Coffee Mug in Drinkware MUST receive microwave safety, NOT brew methods
+      assert.equal(
+        result.findings.some(f => f.productId === 'p_coffee_mug' && f.ruleCode === 'RULE_DISHWASHER_MICROWAVE_SAFETY'),
+        true
+      );
+      assert.equal(
+        result.findings.some(f => f.productId === 'p_coffee_mug' && f.ruleCode === 'RULE_STRUCTURED_BREW_METHODS'),
+        false
+      );
+      // Unverified OEKO-TEX finding must NOT leak Solstice cert 21.HLT.84920
+      const oekoFinding = result.findings.find(f => f.productId === 'p_oeko' && f.ruleCode === 'RULE_UNVERIFIED_EVIDENCE_CLAIMS');
+      assert.ok(oekoFinding);
+      assert.equal(JSON.stringify(oekoFinding).includes('21.HLT.84920'), false);
+      assert.equal(oekoFinding.recommendedValue, '');
+      // Dynamic candle burn conflict triggers on 40-Hour vs 25 Hours, and does NOT trigger on aligned 50 vs 45-50 Hours
+      const candleFinding = result.findings.find(f => f.productId === 'p_candle_40' && f.ruleCode === 'RULE_MARKETING_BURN_TIME_CONFLICT');
+      assert.ok(candleFinding);
+      assert.ok(candleFinding.currentValue?.includes('40-Hour') && candleFinding.currentValue?.includes('25 Hours'));
+      assert.equal(
+        result.findings.some(f => f.productId === 'p_candle_ok' && f.ruleCode === 'RULE_MARKETING_BURN_TIME_CONFLICT'),
+        false
+      );
+    });
+  });
 });
+
 
 

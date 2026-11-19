@@ -1,6 +1,12 @@
 import { Router, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
-import { createAuthMiddleware, requireRole } from '../middleware/auth';
+import {
+  createAuthMiddleware,
+  createWorkspaceRateLimiter,
+  OperationInProgressError,
+  requireRole,
+  withWorkspaceOperationLease,
+} from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { 
   initiateShopifyConnect, 
@@ -21,6 +27,24 @@ import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/producti
 export function createShopifyRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  const shopifySyncLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'shopify_sync',
+      maxAttempts: 10,
+      windowMs: 60_000,
+      message: 'Shopify sync rate limit exceeded. Please wait before starting another sync.',
+    },
+    repo
+  );
+  const shopifyControlLimiter = createWorkspaceRateLimiter(
+    {
+      keyPrefix: 'shopify_ctrl',
+      maxAttempts: 20,
+      windowMs: 60_000,
+      message: 'Shopify integration rate limit exceeded. Please retry shortly.',
+    },
+    repo
+  );
 
   // 1. GET /api/shopify/status — Retrieves workspace connection status (NO SECRETS EXPOSED)
   router.get('/status', requireAuth, async (req: AuthRequest, res: Response) => {
@@ -113,7 +137,6 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
       } else if (storedStatus === 'verification_unavailable' || storedStatus === 'verification_incomplete' || storedStatus === 'mismatch' || storedStatus === 'partially_registered' || storedStatus === 'registered_unverified') {
         cachedWebhookStatus = storedStatus;
       } else if (storedStatus === 'active' || storedSubs.length > 0) {
-        // Previous registration or prior live verification exists in cache; still not freshly live-verified
         cachedWebhookStatus = 'registered_unverified';
       } else {
         cachedWebhookStatus = 'unverified';
@@ -156,7 +179,7 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
   });
 
   // 2. GET /api/shopify/connect — Initiates Authorization Code Grant flow
-  router.get('/connect', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+  router.get('/connect', requireAuth, requireRole(['owner', 'admin']), shopifyControlLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const rawShop = String(req.query.shop || '');
@@ -194,7 +217,6 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     try {
       const result = await handleShopifyCallback(repo, req.query);
 
-      // If request accepts HTML/browser redirect:
       const acceptHeader = req.headers.accept || '';
       if (acceptHeader.includes('text/html')) {
         const base = resolveRedirectBase();
@@ -237,16 +259,25 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // 4. POST /api/shopify/sync — Triggers full paginated catalog synchronization
-  router.post('/sync', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+  // 4. POST /api/shopify/sync — Triggers full paginated catalog synchronization with workspace operation lease
+  router.post('/sync', requireAuth, requireRole(['owner', 'admin']), shopifySyncLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const { maxPages, pageSize, resumeCursor } = req.body || {};
-      const result = await syncShopifyCatalog(repo, workspaceId, {
-        maxPages: typeof maxPages === 'number' ? maxPages : undefined,
-        pageSize: typeof pageSize === 'number' ? pageSize : undefined,
-        resumeCursor: typeof resumeCursor === 'string' ? resumeCursor : undefined,
-      });
+      const clampedMaxPages = typeof maxPages === 'number' && Number.isFinite(maxPages)
+        ? Math.min(Math.max(Math.trunc(maxPages), 1), 50)
+        : undefined;
+      const clampedPageSize = typeof pageSize === 'number' && Number.isFinite(pageSize)
+        ? Math.min(Math.max(Math.trunc(pageSize), 1), 100)
+        : undefined;
+
+      const result = await withWorkspaceOperationLease(repo, workspaceId, 'shopify_sync', 300_000, () =>
+        syncShopifyCatalog(repo, workspaceId, {
+          maxPages: clampedMaxPages,
+          pageSize: clampedPageSize,
+          resumeCursor: typeof resumeCursor === 'string' ? resumeCursor : undefined,
+        })
+      );
 
       return res.json({
         success: true,
@@ -259,21 +290,37 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         message: result.message,
       });
     } catch (err: any) {
+      if (err instanceof OperationInProgressError || err?.code === 'OPERATION_IN_PROGRESS') {
+        return res.status(409).json({
+          error: err.message,
+          code: 'OPERATION_IN_PROGRESS',
+          operationKey: err.operationKey,
+        });
+      }
       console.error('[AIXSHOP Shopify Routes] Error syncing catalog:', err);
       return res.status(500).json({ error: err.message || 'Catalog synchronization failed' });
     }
   });
 
-  // 4a. POST /api/shopify/sync/resume — Resumes partially completed sync from stored cursor
-  router.post('/sync/resume', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+  // 4a. POST /api/shopify/sync/resume — Resumes partially completed sync from stored cursor with workspace operation lease
+  router.post('/sync/resume', requireAuth, requireRole(['owner', 'admin']), shopifySyncLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const { maxPages, pageSize, syncRunId } = req.body || {};
-      const result = await resumeShopifySync(repo, workspaceId, {
-        syncRunId: typeof syncRunId === 'string' ? syncRunId : undefined,
-        maxPages: typeof maxPages === 'number' ? maxPages : undefined,
-        pageSize: typeof pageSize === 'number' ? pageSize : undefined,
-      });
+      const clampedMaxPages = typeof maxPages === 'number' && Number.isFinite(maxPages)
+        ? Math.min(Math.max(Math.trunc(maxPages), 1), 50)
+        : undefined;
+      const clampedPageSize = typeof pageSize === 'number' && Number.isFinite(pageSize)
+        ? Math.min(Math.max(Math.trunc(pageSize), 1), 100)
+        : undefined;
+
+      const result = await withWorkspaceOperationLease(repo, workspaceId, 'shopify_sync', 300_000, () =>
+        resumeShopifySync(repo, workspaceId, {
+          syncRunId: typeof syncRunId === 'string' ? syncRunId : undefined,
+          maxPages: clampedMaxPages,
+          pageSize: clampedPageSize,
+        })
+      );
 
       return res.json({
         success: true,
@@ -286,13 +333,20 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         message: result.message,
       });
     } catch (err: any) {
+      if (err instanceof OperationInProgressError || err?.code === 'OPERATION_IN_PROGRESS') {
+        return res.status(409).json({
+          error: err.message,
+          code: 'OPERATION_IN_PROGRESS',
+          operationKey: err.operationKey,
+        });
+      }
       console.error('[AIXSHOP Shopify Routes] Error resuming catalog sync:', err);
       return res.status(500).json({ error: err.message || 'Resuming synchronization failed' });
     }
   });
 
   // 4b. POST /api/shopify/webhooks/register — Registers real webhooks via GraphQL
-  router.post('/webhooks/register', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+  router.post('/webhooks/register', requireAuth, requireRole(['owner', 'admin']), shopifyControlLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const connection = await repo.getShopifyConnection(workspaceId);
@@ -345,7 +399,7 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
   });
 
   // 4c. POST /api/shopify/webhooks/verify — Verifies live Shopify webhook subscriptions via Admin API
-  router.post('/webhooks/verify', requireAuth, requireRole(['owner', 'admin']), async (req: AuthRequest, res: Response) => {
+  router.post('/webhooks/verify', requireAuth, requireRole(['owner', 'admin']), shopifyControlLimiter, async (req: AuthRequest, res: Response) => {
     try {
       const workspaceId = req.workspace!.id;
       const result = await verifyShopifyWebhookSubscriptionsLive(repo, workspaceId);

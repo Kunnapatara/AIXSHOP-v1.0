@@ -15,6 +15,17 @@ describe('AIXSHOP v1.0 — Security Audit & Tenant Isolation Suite', () => {
   let userA: { id: string; email: string; token: string; workspaceId: string };
   let userB: { id: string; email: string; token: string; workspaceId: string };
 
+  function extractSessionCookie(res: Response): string {
+    const setCookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+    for (const raw of setCookies) {
+      const m = raw.match(/aixshop_session=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    const single = res.headers.get('set-cookie') || '';
+    const m = single.match(/aixshop_session=([^;]+)/);
+    return m?.[1] || '';
+  }
+
   before(async () => {
     repo = new MemoryRepository(false);
     const app = createApp(repo);
@@ -41,10 +52,13 @@ describe('AIXSHOP v1.0 — Security Audit & Tenant Isolation Suite', () => {
     });
     assert.equal(regResA.status, 201);
     const dataA = await regResA.json();
+    assert.equal(dataA.token, undefined);
+    const tokenA = extractSessionCookie(regResA);
+    assert.ok(tokenA);
     userA = {
       id: dataA.user.id,
       email: dataA.user.email,
-      token: dataA.token,
+      token: tokenA,
       workspaceId: dataA.workspace.id,
     };
 
@@ -61,10 +75,13 @@ describe('AIXSHOP v1.0 — Security Audit & Tenant Isolation Suite', () => {
     });
     assert.equal(regResB.status, 201);
     const dataB = await regResB.json();
+    assert.equal(dataB.token, undefined);
+    const tokenB = extractSessionCookie(regResB);
+    assert.ok(tokenB);
     userB = {
       id: dataB.user.id,
       email: dataB.user.email,
-      token: dataB.token,
+      token: tokenB,
       workspaceId: dataB.workspace.id,
     };
   });
@@ -253,7 +270,9 @@ describe('AIXSHOP v1.0 — Security Audit & Tenant Isolation Suite', () => {
         body: JSON.stringify({ email: userA.email, password: 'passwordAlice123' }),
       });
       const loginData = await loginRes.json();
-      const sessionToken = loginData.token;
+      assert.equal(loginData.token, undefined);
+      const sessionToken = extractSessionCookie(loginRes);
+      assert.ok(sessionToken);
 
       // Verify session works
       const meRes1 = await fetch(`${baseUrl}/api/auth/me`, {
@@ -283,7 +302,9 @@ describe('AIXSHOP v1.0 — Security Audit & Tenant Isolation Suite', () => {
         body: JSON.stringify({ email: userB.email, password: 'passwordBob123' }),
       });
       const dev1Data = await dev1Res.json();
-      const tokenDev1 = dev1Data.token;
+      assert.equal(dev1Data.token, undefined);
+      const tokenDev1 = extractSessionCookie(dev1Res);
+      assert.ok(tokenDev1);
 
       // Device 2
       const dev2Res = await fetch(`${baseUrl}/api/auth/login`, {
@@ -292,7 +313,9 @@ describe('AIXSHOP v1.0 — Security Audit & Tenant Isolation Suite', () => {
         body: JSON.stringify({ email: userB.email, password: 'passwordBob123' }),
       });
       const dev2Data = await dev2Res.json();
-      const tokenDev2 = dev2Data.token;
+      assert.equal(dev2Data.token, undefined);
+      const tokenDev2 = extractSessionCookie(dev2Res);
+      assert.ok(tokenDev2);
 
       // Both devices active
       assert.equal((await fetch(`${baseUrl}/api/auth/me`, { headers: { Authorization: `Bearer ${tokenDev1}`, 'X-Requested-With': 'XMLHttpRequest' } })).status, 200);
