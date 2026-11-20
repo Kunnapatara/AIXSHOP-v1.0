@@ -10,6 +10,10 @@ import {
 export function createAuditRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
   const auditRunLimiter = createWorkspaceRateLimiter(
     {
       keyPrefix: 'audit_run',
@@ -29,17 +33,25 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     repo
   );
 
-  // POST /api/audit/run — Start a catalog audit execution
+  // POST /api/audit/run — Start a catalog audit execution (paid plans only)
   router.post('/run', requireAuth, auditRunLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const result = await repo.executeWorkspaceAudit(workspaceId);
       const [store, subscription] = await Promise.all([
         repo.getStoreByWorkspace(workspaceId),
         repo.getSubscriptionByWorkspace(workspaceId),
       ]);
       const reportEntitlement = resolveReportEntitlement(store, subscription);
-      const { catalog: safeCatalog, preliminarySummary } = redactCatalogForPreliminaryAccess(
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
+
+      const result = await repo.executeWorkspaceAudit(workspaceId);
+      const { catalog: safeCatalog } = redactCatalogForPreliminaryAccess(
         result.catalog,
         reportEntitlement,
         result.auditRun
@@ -50,7 +62,6 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
         auditRun: result.auditRun,
         catalog: safeCatalog,
         reportEntitlement,
-        preliminarySummary,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Audit Run Error]:', err);
@@ -61,33 +72,32 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // GET /api/audit/history — Retrieve historical Audit Runs with pagination (workspace scoped)
+  // GET /api/audit/history — Retrieve historical Audit Runs with pagination (workspace scoped, paid plans only)
   router.get('/history', requireAuth, auditReadLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const limitRaw = req.query.limit ? parseInt(String(req.query.limit), 10) : 20;
-      const limit = isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 50);
-      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
-
-      const [history, store, subscription] = await Promise.all([
-        repo.getAuditRunsHistory(workspaceId, { limit, cursor }),
+      const [store, subscription] = await Promise.all([
         repo.getStoreByWorkspace(workspaceId),
         repo.getSubscriptionByWorkspace(workspaceId),
       ]);
       const reportEntitlement = resolveReportEntitlement(store, subscription);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
 
-      const items = reportEntitlement.hasFullReportAccess
-        ? history.items
-        : history.items.map((item) => ({
-            ...item,
-            snapshotAvailable: false,
-            lockedByPlan: true,
-          }));
+      const limitRaw = req.query.limit ? parseInt(String(req.query.limit), 10) : 20;
+      const limit = isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 50);
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      const history = await repo.getAuditRunsHistory(workspaceId, { limit, cursor });
 
       return res.status(200).json({
         success: true,
         workspaceId,
-        items,
+        items: history.items,
         nextCursor: history.nextCursor,
         totalCount: history.totalCount,
         reportEntitlement,
@@ -150,16 +160,24 @@ export function createAuditRoutes(repo: DatabaseRepository): Router {
     }
   });
 
-  // GET /api/audit/latest — Get the latest audit run for authenticated workspace
+  // GET /api/audit/latest — Get the latest audit run for authenticated workspace (paid plans only)
   router.get('/latest', requireAuth, auditReadLimiter, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const [auditRun, store, subscription] = await Promise.all([
-        repo.getLatestAuditRunByWorkspace(workspaceId),
+      const [store, subscription] = await Promise.all([
         repo.getStoreByWorkspace(workspaceId),
         repo.getSubscriptionByWorkspace(workspaceId),
       ]);
       const reportEntitlement = resolveReportEntitlement(store, subscription);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
+
+      const auditRun = await repo.getLatestAuditRunByWorkspace(workspaceId);
 
       return res.status(200).json({
         workspaceId,

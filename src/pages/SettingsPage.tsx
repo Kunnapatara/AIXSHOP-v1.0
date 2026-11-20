@@ -204,14 +204,18 @@ function getTierMonthlyPriceLabel(tier?: string, authoritativePlan?: BillingPlan
   if (authoritativePlan && typeof authoritativePlan.priceCents === 'number') {
     const amount = authoritativePlan.priceCents / 100;
     const symbol = authoritativePlan.currency?.toUpperCase() === 'EUR' ? '€' : authoritativePlan.currency?.toUpperCase() === 'GBP' ? '£' : '$';
+    const formattedAmount = `${symbol}${Number.isInteger(amount) ? amount : amount.toFixed(2)}`;
+    if (authoritativePlan.billingInterval === 'none' || authoritativePlan.priceCents === 0) {
+      return formattedAmount;
+    }
     const interval = authoritativePlan.billingInterval === 'year' ? 'yr' : 'mo';
-    return `${symbol}${Number.isInteger(amount) ? amount : amount.toFixed(2)} / ${interval}`;
+    return `${formattedAmount} / ${interval}`;
   }
   const normalized = (tier || '').toLowerCase();
   if (normalized.includes('enterprise')) return '$499 / mo';
   if (normalized.includes('growth')) return '$149 / mo';
   if (normalized.includes('starter')) return '$49 / mo';
-  return '$0 / mo';
+  return '$0';
 }
 
 function formatSubscriptionDate(iso?: string): string | null {
@@ -1682,7 +1686,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                 Capacity baseline: {isUnlimitedLimit ? 'Unlimited' : `${effectiveLimit} SKUs`} (1 variant = 1 SKU).
                 {sub && effectiveProvider !== 'none' && (effectiveStatus === 'active' || effectiveStatus === 'trialing')
                   ? ' Full audit reports, evidence trails, remediation actions, and feed exports are unlocked by your active paid subscription.'
-                  : ' Free Audit covers up to 2,500 SKUs for preliminary screening only; full findings, evidence trails, remediation, and feed exports require an active Starter (250 SKUs), Growth (2,500 SKUs), or Enterprise (Unlimited) plan.'}
+                  : ' Free Audit allows catalog onboarding and capacity sizing only (non-recurring, no audit findings before payment). Full audits, findings, evidence trails, remediation, and feed exports require an active Starter (250 SKUs), Growth (2,500 SKUs), or Enterprise (Unlimited) plan.'}
               </p>
             </div>
 
@@ -1691,15 +1695,21 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
               <div className="p-4 bg-white border border-stone-200 rounded-xl text-xs space-y-1.5">
                 <div className="flex items-center justify-between">
                   <span className="text-stone-500">Billing Cadence</span>
-                  <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-700 border border-stone-200 capitalize">
-                    {matchedPlan?.billingInterval ? `${matchedPlan.billingInterval}ly` : isFreeOrUnpaidProvider ? 'Free Audit' : 'Monthly'}
+                  <span className="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded bg-stone-100 text-stone-700 border border-stone-200">
+                    {matchedPlan?.billingInterval === 'none' || isFreeOrUnpaidProvider
+                      ? 'Non-Recurring (Free)'
+                      : matchedPlan?.billingInterval === 'year'
+                      ? 'Yearly'
+                      : 'Monthly'}
                   </span>
                 </div>
                 <p className="text-base font-bold text-stone-900 font-mono">
                   {getTierMonthlyPriceLabel(effectiveTier, matchedPlan)}
                 </p>
                 <p className="text-stone-500">
-                  {periodEndFormatted
+                  {matchedPlan?.billingInterval === 'none' || isFreeOrUnpaidProvider
+                    ? 'Non-recurring free workspace tier · No automatic charges or invoices'
+                    : periodEndFormatted
                     ? sub?.cancelAtPeriodEnd
                       ? `Cancels on ${periodEndFormatted}`
                       : `Current period ends ${periodEndFormatted}`

@@ -324,6 +324,7 @@ export async function fetchProductsPage(
             productType
             handle
             status
+            isGiftCard
             tags
             createdAt
             updatedAt

@@ -18,8 +18,9 @@ export function createDiscoveryRoutes(repo: DatabaseRepository): Router {
     repo
   );
 
-  // GET /api/discovery/audit — Deterministic 8-dimension AI Discovery Evaluation
+  // GET /api/discovery/audit — Deterministic 8-dimension AI Discovery Evaluation (paid plans only)
   router.get('/audit', requireAuth, discoveryLimiter, async (req: AuthRequest, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
     try {
       const workspaceId = req.workspace!.id;
       const [catalog, store, shopifyConn, profile, subscription] = await Promise.all([
@@ -31,38 +32,19 @@ export function createDiscoveryRoutes(repo: DatabaseRepository): Router {
       ]);
 
       const reportEntitlement = resolveReportEntitlement(store || catalog?.storeProfile, subscription);
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
+
       const storeDomain = shopifyConn?.shopDomain || store?.domain || 'myshopify.com';
       const products = catalog?.products || [];
 
       const readinessResult = evaluateDiscoveryReadiness(products, storeDomain);
       const checklist = buildBusinessHubChecklist(profile, products.length, readinessResult.overallScore);
-
-      if (!reportEntitlement.hasFullReportAccess) {
-        const redactedDimensions = Object.fromEntries(
-          Object.entries(readinessResult.dimensions).map(([key, dim]) => [
-            key,
-            {
-              ...dim,
-              evidence: [],
-            },
-          ])
-        );
-
-        return res.json({
-          success: true,
-          readiness: {
-            ...readinessResult,
-            dimensions: redactedDimensions,
-            findings: [],
-          },
-          findingsCount: readinessResult.findings.length,
-          hubChecklist: checklist,
-          productCount: products.length,
-          storeDomain,
-          reportEntitlement,
-          isLocked: true,
-        });
-      }
 
       return res.json({
         success: true,

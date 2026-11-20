@@ -1,7 +1,8 @@
-import { Product } from '../../types';
+import { GtinEligibilityStatus, Product } from '../../types';
 
 export interface ProductDomainClassification {
   isGtinExempt: boolean;
+  gtinEligibilityStatus: GtinEligibilityStatus;
   gtinExemptionReason?: string;
   isDrinkwareOrTableware: boolean;
   isConsumableCoffeeOrTea: boolean;
@@ -9,7 +10,8 @@ export interface ProductDomainClassification {
   isTextileOrApparel: boolean;
 }
 
-const GTIN_EXEMPT_REGEX = /\b(handmade|hand-made|handcrafted|custom[- ]made|bespoke|made[- ]to[- ]order|one[- ]of[- ]a[- ]kind|vintage|antique|digital[- ]download|gift[- ]card)\b/i;
+const VERIFIED_GTIN_EXEMPTION_DOC_REGEX =
+  /\b(gtin|barcode|upc|ean|gs1|gtin[- ]?exempt(?:ion)?|identifier[- ]?exempt(?:ion)?|custom[- ]?made|bespoke|handmade|vintage|antique|digital[- ]?(?:download|good|product)|gift[- ]?card)\b/i;
 
 const THERMAL_FOODWARE_CATEGORY_REGEX = /\b(drinkware|tableware|dinnerware|cookware|bakeware|kitchenware)\b/i;
 
@@ -31,38 +33,90 @@ function normalizedAttrBool(value?: string): boolean {
   return v === 'true' || v === 'yes' || v === '1';
 }
 
+function hasAuthoritativeVerifiedGtinExemption(product: Product): { verified: boolean; reason?: string } {
+  const attrs = product.attributes || {};
+
+  // Authoritative Shopify platform gift card boolean flag synced from Admin GraphQL `isGiftCard`
+  if (normalizedAttrBool(attrs.shopifyIsGiftCard)) {
+    return {
+      verified: true,
+      reason: 'Shopify Admin API marks product as an authoritative Gift Card (isGiftCard=true).',
+    };
+  }
+
+  // Verified merchant exemption backing reference (requires explicit verified flag + evidence reference)
+  if (normalizedAttrBool(attrs.gtinExemptionVerified) && Boolean((attrs.gtinExemptionEvidenceRef || '').trim())) {
+    return {
+      verified: true,
+      reason: `Verified GTIN exemption evidence reference supplied (${attrs.gtinExemptionEvidenceRef.trim()}).`,
+    };
+  }
+
+  // Verified evidence document attached to product establishing GS1/marketplace GTIN exemption
+  const matchingVerifiedDoc = (product.evidenceDocuments || []).find((doc) => {
+    if (!doc || doc.status !== 'verified') return false;
+    const text = `${doc.title || ''} ${doc.issuer || ''} ${doc.type || ''}`;
+    return VERIFIED_GTIN_EXEMPTION_DOC_REGEX.test(text);
+  });
+
+  if (matchingVerifiedDoc) {
+    return {
+      verified: true,
+      reason: `Verified evidence document "${matchingVerifiedDoc.title}" (${matchingVerifiedDoc.issuer}) documents GTIN exemption eligibility.`,
+    };
+  }
+
+  return { verified: false };
+}
+
 /**
  * Classifies a product into explicit domain & category applicability buckets
  * so category-specific audit rules never trigger false positives on unrelated goods.
+ *
+ * GTIN exemption uses strict evidence-based eligibility:
+ * - Keyword matches in title/category (e.g. "Handmade", "Vintage", "Digital") are NEVER treated as proof of exemption.
+ * - Missing barcodes are NEVER treated as proof of exemption.
+ * - Only verified exemption evidence grants `verified_exempt`.
+ * - Explicit merchant identifier-absence declarations (`identifierExists=no/false`) are classified distinctly as `declared_identifier_absence`.
+ * - Missing evidence defaults to `insufficient_evidence` (NEEDS_REVIEW).
  */
 export function classifyProductDomain(product: Product): ProductDomainClassification {
   const title = (product.title || '').trim();
   const category = (product.category || '').trim();
   const description = (product.description || '').trim();
   const attrs = product.attributes || {};
+  const variants = product.variants || [];
 
-  // 1. GTIN Exemption check (explicit merchant flags or handmade/custom/bespoke goods)
+  // 1. Evidence-based GTIN eligibility assessment
   let isGtinExempt = false;
+  let gtinEligibilityStatus: GtinEligibilityStatus = 'insufficient_evidence';
   let gtinExemptionReason: string | undefined;
 
+  const hasAnySuppliedBarcode = variants.some((v) => Boolean((v.barcode || '').trim()));
+  const verifiedExemption = hasAuthoritativeVerifiedGtinExemption(product);
   const identifierExists = (attrs.identifierExists || attrs.identifier_exists || '').trim().toLowerCase();
-  if (
-    normalizedAttrBool(attrs.gtinExemption) ||
-    normalizedAttrBool(attrs.handmade) ||
-    normalizedAttrBool(attrs.customMade) ||
-    normalizedAttrBool(attrs.bespoke) ||
-    normalizedAttrBool(attrs.madeToOrder) ||
+  const hasExplicitAbsenceDeclaration =
     identifierExists === 'no' ||
-    identifierExists === 'false'
-  ) {
+    identifierExists === 'false' ||
+    normalizedAttrBool(attrs.gtinExemption);
+
+  if (verifiedExemption.verified) {
     isGtinExempt = true;
-    gtinExemptionReason = 'Product metadata declares GTIN exemption / custom-made goods.';
+    gtinEligibilityStatus = 'verified_exempt';
+    gtinExemptionReason = verifiedExemption.reason;
+  } else if (hasExplicitAbsenceDeclaration) {
+    isGtinExempt = false;
+    gtinEligibilityStatus = 'declared_identifier_absence';
+    gtinExemptionReason =
+      'Merchant explicitly declared identifier absence / exemption without verified supporting documentation.';
+  } else if (hasAnySuppliedBarcode) {
+    isGtinExempt = false;
+    gtinEligibilityStatus = 'gtin_present';
   } else {
-    const match = `${title} ${category}`.match(GTIN_EXEMPT_REGEX);
-    if (match) {
-      isGtinExempt = true;
-      gtinExemptionReason = `Listing title or category indicates ${match[0].toLowerCase()} goods exempt from mandatory manufacturer GTIN.`;
-    }
+    isGtinExempt = false;
+    gtinEligibilityStatus = 'insufficient_evidence';
+    gtinExemptionReason =
+      'NEEDS_REVIEW: Insufficient evidence for GTIN exemption; listing title keywords or a missing barcode do not establish exemption.';
   }
 
   // 2. Drinkware / Tableware / Cookware applicability
@@ -97,6 +151,7 @@ export function classifyProductDomain(product: Product): ProductDomainClassifica
 
   return {
     isGtinExempt,
+    gtinEligibilityStatus,
     gtinExemptionReason,
     isDrinkwareOrTableware,
     isConsumableCoffeeOrTea,

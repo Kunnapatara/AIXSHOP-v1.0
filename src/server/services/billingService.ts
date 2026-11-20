@@ -239,8 +239,8 @@ export class BillingService {
     );
     const plan = planKey ? AUTHORITATIVE_PLANS[planKey] : null;
 
-    if (!plan || plan.priceCents <= 0) {
-      throw new Error(`Invalid plan tier "${tier}". Paid checkout is not available for free tiers.`);
+    if (!plan || plan.priceCents <= 0 || plan.billingInterval === 'none') {
+      throw new Error(`Invalid plan tier "${tier}". Paid checkout is not available for free or non-recurring tiers.`);
     }
 
     const store = await this.repo.getStoreByWorkspace(workspaceId);
@@ -338,7 +338,7 @@ export class BillingService {
       : undefined;
     const plan = planKey ? AUTHORITATIVE_PLANS[planKey] : null;
 
-    if (!plan || plan.priceCents <= 0) {
+    if (!plan || plan.priceCents <= 0 || plan.billingInterval === 'none') {
       const err: any = new Error('Checkout session does not correspond to a paid AIXSHOP plan.');
       err.statusCode = 400;
       err.code = 'INVALID_PAID_PLAN';
@@ -1170,9 +1170,17 @@ export class BillingService {
 
         const tierName = planFromPrice?.tier || dataObj.metadata?.tier || dataObj.tier || 'Starter';
         const planKey = Object.keys(AUTHORITATIVE_PLANS).find(
-          k => AUTHORITATIVE_PLANS[k].tier.toLowerCase() === tierName.toLowerCase()
+          k => AUTHORITATIVE_PLANS[k].tier.toLowerCase() === String(tierName).toLowerCase()
         );
         const plan = planKey ? AUTHORITATIVE_PLANS[planKey] : AUTHORITATIVE_PLANS['starter'];
+
+        if (plan.priceCents <= 0 || plan.billingInterval === 'none') {
+          return {
+            success: true,
+            action: 'ignored',
+            message: 'Free Audit is non-recurring (billingInterval=none) and does not create a recurring subscription record.',
+          };
+        }
 
         // Evaluate payment status: in Stripe mode, missing/invalid payment_status fails closed;
         // only 'paid' or 'no_payment_required' grant paid store entitlements.
@@ -1295,9 +1303,17 @@ export class BillingService {
         }
 
         const planKey = Object.keys(AUTHORITATIVE_PLANS).find(
-          k => AUTHORITATIVE_PLANS[k].tier.toLowerCase() === tier.toLowerCase()
+          k => AUTHORITATIVE_PLANS[k].tier.toLowerCase() === String(tier).toLowerCase()
         );
         const plan = planKey ? AUTHORITATIVE_PLANS[planKey] : AUTHORITATIVE_PLANS['starter'];
+
+        if (plan.priceCents <= 0 || plan.billingInterval === 'none') {
+          return {
+            success: true,
+            action: 'ignored',
+            message: 'Free Audit is non-recurring (billingInterval=none) and does not create a recurring subscription record.',
+          };
+        }
 
         const subRecord: SubscriptionRecord = {
           id: existingSub?.id || `subrec_${workspaceId}`,

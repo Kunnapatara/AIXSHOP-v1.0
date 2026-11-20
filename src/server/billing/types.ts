@@ -16,7 +16,7 @@ export interface BillingPlanDefinition {
   name: string;
   priceCents: number;
   currency: string;
-  billingInterval: 'month' | 'year';
+  billingInterval: 'month' | 'year' | 'none';
   skuLimit: number;
   features: string[];
 }
@@ -28,9 +28,9 @@ export const AUTHORITATIVE_PLANS: Readonly<Record<string, BillingPlanDefinition>
     name: 'Free Audit',
     priceCents: 0,
     currency: 'USD',
-    billingInterval: 'month',
+    billingInterval: 'none',
     skuLimit: 2500,
-    features: ['Catalog completeness auditing', 'Single-pass issue discovery', '2,500 SKU capacity'],
+    features: ['Storefront & catalog onboarding', '2,500 SKU capacity', 'Upgrade to a paid plan to unlock audits & reports'],
   },
   'starter': {
     id: 'plan_starter',

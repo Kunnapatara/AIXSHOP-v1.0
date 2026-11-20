@@ -146,9 +146,7 @@ export const ActionsPage: React.FC = () => {
           <ShieldCheck className="w-12 h-12 text-amber-500 mx-auto mb-3" />
           <h3 className="text-base font-bold text-stone-900">Action Center Locked</h3>
           <p className="text-xs text-stone-500 mt-1 max-w-md mx-auto">
-            {preliminarySummary
-              ? `${preliminarySummary.actionsCount} remediation actions were identified during your preliminary audit. Upgrade your workspace plan to review and approve corrections.`
-              : 'Upgrade your workspace plan to unlock prioritized remediation actions and evidence verification.'}
+            Upgrade your workspace plan to unlock catalog audit findings, prioritized remediation actions, and evidence verification.
           </p>
         </div>
       ) : filteredActions.length === 0 ? (

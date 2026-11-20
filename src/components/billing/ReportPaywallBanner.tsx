@@ -11,8 +11,7 @@ interface ReportPaywallBannerProps {
 
 export const ReportPaywallBanner: React.FC<ReportPaywallBannerProps> = ({
   entitlement,
-  preliminarySummary,
-  contextLabel = 'Full audit findings, evidence trails, remediation actions, and feed exports require an active paid plan.',
+  contextLabel = 'Audit execution, full findings, evidence trails, remediation actions, and feed exports require an active paid plan.',
   onUpgrade,
 }) => {
   return (
@@ -25,7 +24,7 @@ export const ReportPaywallBanner: React.FC<ReportPaywallBannerProps> = ({
           <div className="space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-sm font-bold text-amber-950">
-                Preliminary Check Only — Full Report Locked
+                Paid Plan Required — Audit &amp; Reports Locked
               </h3>
               <span className="text-[11px] font-mono font-semibold px-2 py-0.5 rounded bg-white border border-amber-200 text-amber-900">
                 {entitlement.activeTier} ({entitlement.subscriptionStatus})
@@ -46,31 +45,6 @@ export const ReportPaywallBanner: React.FC<ReportPaywallBannerProps> = ({
           <ArrowRight className="w-3.5 h-3.5" />
         </button>
       </div>
-
-      {preliminarySummary && (
-        <div className="pt-3 border-t border-amber-200/80 grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs">
-          <div className="bg-white/80 rounded-lg px-3 py-2 border border-amber-200/70">
-            <span className="text-[10px] uppercase font-bold text-stone-500 block">SKUs Screened</span>
-            <span className="font-mono font-bold text-stone-900">{preliminarySummary.skuCount}</span>
-          </div>
-          <div className="bg-white/80 rounded-lg px-3 py-2 border border-amber-200/70">
-            <span className="text-[10px] uppercase font-bold text-stone-500 block">Total Findings</span>
-            <span className="font-mono font-bold text-stone-900">{preliminarySummary.totalFindingsCount}</span>
-          </div>
-          <div className="bg-white/80 rounded-lg px-3 py-2 border border-amber-200/70">
-            <span className="text-[10px] uppercase font-bold text-rose-700 block">Critical</span>
-            <span className="font-mono font-bold text-rose-700">{preliminarySummary.criticalCount}</span>
-          </div>
-          <div className="bg-white/80 rounded-lg px-3 py-2 border border-amber-200/70">
-            <span className="text-[10px] uppercase font-bold text-amber-700 block">High Severity</span>
-            <span className="font-mono font-bold text-amber-700">{preliminarySummary.highCount}</span>
-          </div>
-          <div className="bg-white/80 rounded-lg px-3 py-2 border border-amber-200/70">
-            <span className="text-[10px] uppercase font-bold text-stone-500 block">Recommended Plan</span>
-            <span className="font-mono font-bold text-orange-700">{preliminarySummary.recommendedTier}</span>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

@@ -1,10 +1,13 @@
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
 import { _resetRateLimiter } from './middleware/auth';
-import { clearDevEmailOutbox, getDevEmailOutbox } from './services/emailService';
+import { clearDevEmailOutbox, getDevEmailOutbox, sendPasswordResetEmail } from './services/emailService';
 import { SandboxBillingProvider, setBillingProvider } from './billing/providerAdapter';
 import { hashSessionToken } from './security/tokens';
 import { encryptCredential } from './security/encryption';
@@ -145,98 +148,177 @@ describe('AIXSHOP v1.0 — Commercial Paywall, Workstream B (Auth/Recovery) & Wo
   });
 
   describe('1. Commercial Product Model & Backend Paywall Enforcement', () => {
-    test('GET /api/billing/plans reconciles Free Audit preliminary capacity vs paid verified monthly SKU plans', async () => {
+    test('GET /api/billing/plans defines Free Audit as non-recurring (billingInterval=none) and preserves paid monthly SKU capacities', async () => {
       const res = await originalFetch(`${baseUrl}/api/billing/plans`);
       assert.equal(res.status, 200);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
       const data = await res.json();
 
       assert.equal(data.currency, 'USD');
       assert.ok(Array.isArray(data.commercialSummary));
 
+      const freePlan = data.plans.find((p: any) => p.tier === 'Free Audit');
       const free = data.commercialSummary.find((p: any) => p.tier === 'Free Audit');
       const starter = data.commercialSummary.find((p: any) => p.tier === 'Starter');
       const growth = data.commercialSummary.find((p: any) => p.tier === 'Growth');
       const enterprise = data.commercialSummary.find((p: any) => p.tier === 'Enterprise');
 
-      assert.ok(free && starter && growth && enterprise);
+      assert.ok(freePlan && free && starter && growth && enterprise);
+      assert.equal(freePlan.billingInterval, 'none');
       assert.equal(free.priceCents, 0);
+      assert.equal(free.billingInterval, 'none');
       assert.equal(free.skuLimit, 2500);
       assert.equal(free.quotaSemantics, 'preliminary_evaluation_capacity');
       assert.equal(free.reportAccess, 'preliminary_only');
 
       assert.equal(starter.priceCents, 4900);
+      assert.equal(starter.billingInterval, 'month');
       assert.equal(starter.skuLimit, 250);
       assert.equal(starter.quotaSemantics, 'verified_monthly_catalog_skus');
       assert.equal(starter.reportAccess, 'full_report_and_remediation');
 
       assert.equal(growth.priceCents, 14900);
+      assert.equal(growth.billingInterval, 'month');
       assert.equal(growth.skuLimit, 2500);
       assert.equal(growth.quotaSemantics, 'verified_monthly_catalog_skus');
       assert.equal(growth.reportAccess, 'full_report_and_remediation');
 
       assert.equal(enterprise.priceCents, 49900);
+      assert.equal(enterprise.billingInterval, 'month');
       assert.equal(enterprise.isUnlimited, true);
       assert.equal(enterprise.skuLimit, null);
       assert.equal(enterprise.quotaSemantics, 'verified_monthly_catalog_skus');
       assert.equal(enterprise.reportAccess, 'full_report_and_remediation');
     });
 
-    test('Free Audit withholds full findings/actions on /catalog & /audit/run and blocks paid endpoints with 403', async () => {
+    test('Free Audit blocks all audit results, scores, summaries, history, discovery, and feed endpoints with 403 + no-store before payment', async () => {
       const merchantA = await registerMerchant('free-paywall-a@example.com', 'Free Paywall Shop A');
       const merchantB = await registerMerchant('free-paywall-b@example.com', 'Free Paywall Shop B');
 
       const seededA = await seedCatalogWithIssue(merchantA.workspace.id);
       const seededB = await seedCatalogWithIssue(merchantB.workspace.id);
 
-      // 1. GET /api/catalog redacts findings & actions while surfacing preliminarySummary counts
+      // 0. Free Audit cannot create checkout sessions or recurring subscriptions
+      const freeCheckoutRes = await originalFetch(`${baseUrl}/api/billing/checkout-session`, {
+        method: 'POST',
+        headers: { ...buildCookieHeader(merchantA.cookieToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tier: 'Free Audit' }),
+      });
+      assert.equal(freeCheckoutRes.status, 400);
+
+      const subRes = await originalFetch(`${baseUrl}/api/billing/subscription`, {
+        headers: buildCookieHeader(merchantA.cookieToken),
+      });
+      assert.equal(subRes.status, 200);
+      assert.equal(subRes.headers.get('cache-control'), 'no-store');
+      const subData = await subRes.json();
+      assert.equal(subData.subscription.tier, 'Free Audit');
+      assert.equal(subData.subscription.billingInterval, 'none');
+      assert.equal(subData.subscription.isRecurring, false);
+      assert.equal(subData.subscription.provider, 'none');
+      assert.equal(subData.reportEntitlement.hasFullReportAccess, false);
+      assert.equal(subData.storeProfile.catalogCompletenessAvg, 0);
+      assert.equal(subData.storeProfile.evidenceCoverageAvg, undefined);
+      assert.equal(subData.storeProfile.lastAuditDate, undefined);
+
+      // 1. GET /api/catalog returns redacted catalog with NO preliminarySummary, NO findings, NO actions, and masked scores
       const catRes = await originalFetch(`${baseUrl}/api/catalog`, {
         headers: buildCookieHeader(merchantA.cookieToken),
       });
       assert.equal(catRes.status, 200);
+      assert.equal(catRes.headers.get('cache-control'), 'no-store');
       const catData = await catRes.json();
       assert.equal(catData.reportEntitlement.hasFullReportAccess, false);
       assert.equal(catData.reportEntitlement.accessLevel, 'preliminary');
       assert.equal(catData.reportEntitlement.reasonCode, 'FREE_AUDIT_PRELIMINARY_ONLY');
+      assert.equal(catData.preliminarySummary, undefined, 'Must not expose preliminarySummary before payment');
       assert.deepEqual(catData.catalog.findings, []);
       assert.deepEqual(catData.catalog.actions, []);
-      assert.ok(catData.preliminarySummary.totalFindingsCount > 0);
-      assert.ok(catData.preliminarySummary.actionsCount > 0);
+      assert.equal(catData.catalog.storeProfile?.catalogCompletenessAvg, 0);
+      assert.equal(catData.catalog.storeProfile?.evidenceCoverageAvg, undefined);
+      assert.equal(catData.catalog.storeProfile?.lastAuditDate, undefined);
+      assert.equal(catData.catalog.products[0].findingsCount, 0);
+      assert.equal(catData.catalog.products[0].completenessScore, 0);
+      assert.equal(catData.catalog.products[0].evidenceCoverageScore, 0);
+      assert.equal(catData.catalog.products[0].externalDiscoveryStatus, 'not_checked');
 
-      // 2. POST /api/audit/run redacts findings & actions for Free Audit
+      // 1b. GET /api/store/profile omits audit scores before payment
+      const storeRes = await originalFetch(`${baseUrl}/api/store/profile`, {
+        headers: buildCookieHeader(merchantA.cookieToken),
+      });
+      assert.equal(storeRes.status, 200);
+      assert.equal(storeRes.headers.get('cache-control'), 'no-store');
+      const storeData = await storeRes.json();
+      assert.equal(storeData.catalogCompletenessAvg, 0);
+      assert.equal(storeData.evidenceCoverageAvg, undefined);
+      assert.equal(storeData.lastAuditDate, undefined);
+
+      // 2. POST /api/audit/run is blocked with 403 REPORT_PAYMENT_REQUIRED
       const runRes = await originalFetch(`${baseUrl}/api/audit/run`, {
         method: 'POST',
         headers: buildCookieHeader(merchantA.cookieToken),
       });
-      assert.equal(runRes.status, 200);
+      assert.equal(runRes.status, 403);
+      assert.equal(runRes.headers.get('cache-control'), 'no-store');
       const runData = await runRes.json();
-      assert.equal(runData.reportEntitlement.hasFullReportAccess, false);
-      assert.deepEqual(runData.catalog.findings, []);
-      assert.deepEqual(runData.catalog.actions, []);
-      assert.ok(runData.preliminarySummary.totalFindingsCount > 0);
+      assert.equal(runData.code, 'REPORT_PAYMENT_REQUIRED');
+      assert.equal(runData.preliminarySummary, undefined);
+      assert.equal(runData.auditRun, undefined);
+      assert.equal(runData.catalog, undefined);
 
-      // 3. GET /api/audit/history marks snapshots locked on unpaid workspace
+      // 3. GET /api/audit/latest & GET /api/audit/history are blocked with 403 REPORT_PAYMENT_REQUIRED
+      const latestRes = await originalFetch(`${baseUrl}/api/audit/latest`, {
+        headers: buildCookieHeader(merchantA.cookieToken),
+      });
+      assert.equal(latestRes.status, 403);
+      assert.equal(latestRes.headers.get('cache-control'), 'no-store');
+      assert.equal((await latestRes.json()).code, 'REPORT_PAYMENT_REQUIRED');
+
       const histRes = await originalFetch(`${baseUrl}/api/audit/history`, {
         headers: buildCookieHeader(merchantA.cookieToken),
       });
-      assert.equal(histRes.status, 200);
+      assert.equal(histRes.status, 403);
+      assert.equal(histRes.headers.get('cache-control'), 'no-store');
       const histData = await histRes.json();
-      assert.ok(histData.items.length >= 1);
-      assert.equal(histData.items[0].snapshotAvailable, false);
-      assert.equal(histData.items[0].lockedByPlan, true);
+      assert.equal(histData.code, 'REPORT_PAYMENT_REQUIRED');
+      assert.equal(histData.items, undefined);
 
-      // 4. Paid-only routes return 403 REPORT_PAYMENT_REQUIRED for Free Audit workspace's own resources
+      // 4. Paid-only routes return 403 REPORT_PAYMENT_REQUIRED + no-store for Free Audit workspace
       const detailRes = await originalFetch(`${baseUrl}/api/audit/${seededA.auditRun.id}`, {
         headers: buildCookieHeader(merchantA.cookieToken),
       });
       assert.equal(detailRes.status, 403);
+      assert.equal(detailRes.headers.get('cache-control'), 'no-store');
       assert.equal((await detailRes.json()).code, 'REPORT_PAYMENT_REQUIRED');
 
       const compareRes = await originalFetch(
-        `${baseUrl}/api/audit/compare?baseId=${seededA.auditRun.id}&targetId=${runData.auditRun.id}`,
+        `${baseUrl}/api/audit/compare?baseId=${seededA.auditRun.id}&targetId=${seededA.auditRun.id}`,
         { headers: buildCookieHeader(merchantA.cookieToken) }
       );
       assert.equal(compareRes.status, 403);
+      assert.equal(compareRes.headers.get('cache-control'), 'no-store');
       assert.equal((await compareRes.json()).code, 'REPORT_PAYMENT_REQUIRED');
+
+      const feedValidateRes = await originalFetch(`${baseUrl}/api/feed/validate`, {
+        method: 'POST',
+        headers: { ...buildCookieHeader(merchantA.cookieToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform: 'google_merchant_center' }),
+      });
+      assert.equal(feedValidateRes.status, 403);
+      assert.equal(feedValidateRes.headers.get('cache-control'), 'no-store');
+      const feedValidateBody = await feedValidateRes.json();
+      assert.equal(feedValidateBody.code, 'REPORT_PAYMENT_REQUIRED');
+      assert.equal(feedValidateBody.report, undefined);
+
+      const discoveryRes = await originalFetch(`${baseUrl}/api/discovery/audit`, {
+        headers: buildCookieHeader(merchantA.cookieToken),
+      });
+      assert.equal(discoveryRes.status, 403);
+      assert.equal(discoveryRes.headers.get('cache-control'), 'no-store');
+      const discoveryBody = await discoveryRes.json();
+      assert.equal(discoveryBody.code, 'REPORT_PAYMENT_REQUIRED');
+      assert.equal(discoveryBody.readiness, undefined);
+      assert.equal(discoveryBody.hubChecklist, undefined);
 
       for (const op of ['approve', 'dismiss', 'recheck']) {
         const mutRes = await originalFetch(
@@ -255,6 +337,7 @@ describe('AIXSHOP v1.0 — Commercial Paywall, Workstream B (Auth/Recovery) & Wo
         headers: buildCookieHeader(merchantA.cookieToken),
       });
       assert.equal(exportRes.status, 403);
+      assert.equal(exportRes.headers.get('cache-control'), 'no-store');
       assert.equal((await exportRes.json()).code, 'REPORT_PAYMENT_REQUIRED');
 
       // 5. Tenant ownership check MUST still return 404 before paywall 403 on cross-workspace IDs
@@ -540,20 +623,26 @@ describe('AIXSHOP v1.0 — Commercial Paywall, Workstream B (Auth/Recovery) & Wo
       assert.equal((await activeRes.json()).workspace.id, extraWs.workspace.id);
     });
 
-    test('Forgot/Reset Password enforces non-enumeration, single-use & expiry validation, password change, and full session revocation', async () => {
+    test('Forgot/Reset Password enforces non-enumeration, fragment reset_token, Referrer-Policy, single-use/expiry validation, and full session revocation', async () => {
       const m = await registerMerchant('recover-user@example.com', 'Recovery Shop', 'InitialPass123!');
 
-      // 1. Unknown email yields identical uniform 200 without sending email
+      // Check HTML meta no-referrer and HTTP Referrer-Policy header
+      const indexHtml = fs.readFileSync(path.join(process.cwd(), 'index.html'), 'utf8');
+      assert.match(indexHtml, /<meta\s+name="referrer"\s+content="no-referrer"/i);
+
+      // 1. Unknown email yields identical uniform 200 without sending email + no-referrer header
       const unknownRes = await originalFetch(`${baseUrl}/api/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
         body: JSON.stringify({ email: 'does-not-exist@example.com' }),
       });
       assert.equal(unknownRes.status, 200);
+      assert.equal(unknownRes.headers.get('referrer-policy'), 'no-referrer');
+      assert.equal(unknownRes.headers.get('cache-control'), 'no-store');
       const unknownData = await unknownRes.json();
       assert.equal(getDevEmailOutbox().length, 0);
 
-      // 2. Existing email yields uniform 200 and dispatches single-use reset link to outbox
+      // 2. Existing email yields uniform 200 and dispatches single-use reset link using URL fragment (#reset_token=...)
       const knownRes = await originalFetch(`${baseUrl}/api/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
@@ -565,8 +654,9 @@ describe('AIXSHOP v1.0 — Commercial Paywall, Workstream B (Auth/Recovery) & Wo
 
       const outbox = getDevEmailOutbox();
       assert.equal(outbox.length, 1);
-      const match = outbox[0].text.match(/reset_token=([A-Za-z0-9._~+/=-]+)/);
-      assert.ok(match?.[1], 'Reset email must contain reset_token query param');
+      assert.doesNotMatch(outbox[0].text, /\?reset_token=/, 'Reset link must NEVER place reset_token in query string');
+      const match = outbox[0].text.match(/#reset_token=([A-Za-z0-9._~+/=-]+)/);
+      assert.ok(match?.[1], 'Reset email must place reset_token in URL fragment (#reset_token=...)');
       const rawResetToken = decodeURIComponent(match[1]);
 
       // 3. Rejects invalid reset token
@@ -632,6 +722,204 @@ describe('AIXSHOP v1.0 — Commercial Paywall, Workstream B (Auth/Recovery) & Wo
       });
       assert.equal(expiredRes.status, 400);
       assert.equal((await expiredRes.json()).code, 'INVALID_RESET_TOKEN');
+    });
+
+    test('SMTP delivery handles multi-line EHLO, AUTH PLAIN & LOGIN, rejects missing STARTTLS when required, handles socket close, and never logs secrets or reset tokens', async () => {
+      async function startMockSmtpServer(opts: {
+        authModes?: string[];
+        failAuth?: boolean;
+        dropOnMail?: boolean;
+      }) {
+        const receivedMessages: string[] = [];
+        const commands: string[] = [];
+        const srv = net.createServer((socket) => {
+          let buffer = '';
+          let inData = false;
+          let authLoginStep: 0 | 1 | 2 = 0;
+          let dataBuf = '';
+
+          socket.write('220 mock-smtp.local ESMTP ready\r\n');
+          socket.on('data', (chunk) => {
+            buffer += chunk.toString('utf8');
+            while (true) {
+              const idx = buffer.indexOf('\r\n');
+              if (idx === -1) break;
+              const line = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 2);
+
+              if (inData) {
+                if (line === '.') {
+                  inData = false;
+                  receivedMessages.push(dataBuf);
+                  dataBuf = '';
+                  socket.write('250 2.0.0 OK queued\r\n');
+                } else {
+                  dataBuf += `${line}\r\n`;
+                }
+                continue;
+              }
+
+              commands.push(line);
+              if (authLoginStep === 1) {
+                authLoginStep = 2;
+                socket.write('334 UGFzc3dvcmQ6\r\n');
+                continue;
+              }
+              if (authLoginStep === 2) {
+                authLoginStep = 0;
+                socket.write(opts.failAuth ? '535 5.7.8 Auth failed\r\n' : '235 2.7.0 Authentication successful\r\n');
+                continue;
+              }
+
+              const upper = line.toUpperCase();
+              if (upper.startsWith('EHLO')) {
+                const modes = (opts.authModes || ['PLAIN', 'LOGIN']).join(' ');
+                socket.write('250-mock-smtp.local\r\n');
+                socket.write('250-SIZE 35882577\r\n');
+                socket.write(`250 AUTH ${modes}\r\n`);
+              } else if (upper.startsWith('AUTH PLAIN')) {
+                socket.write(opts.failAuth ? '535 5.7.8 Auth failed\r\n' : '235 2.7.0 Authentication successful\r\n');
+              } else if (upper === 'AUTH LOGIN') {
+                authLoginStep = 1;
+                socket.write('334 VXNlcm5hbWU6\r\n');
+              } else if (upper.startsWith('MAIL FROM:')) {
+                if (opts.dropOnMail) {
+                  socket.destroy();
+                  return;
+                }
+                socket.write('250 2.1.0 OK\r\n');
+              } else if (upper.startsWith('RCPT TO:')) {
+                socket.write('250 2.1.5 OK\r\n');
+              } else if (upper === 'DATA') {
+                inData = true;
+                socket.write('354 End data with <CR><LF>.<CR><LF>\r\n');
+              } else if (upper === 'QUIT') {
+                socket.write('221 Bye\r\n');
+                socket.end();
+              } else {
+                socket.write('500 Unknown command\r\n');
+              }
+            }
+          });
+        });
+
+        await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+        const port = (srv.address() as any).port;
+        return {
+          port,
+          commands,
+          receivedMessages,
+          close: () => new Promise<void>((resolve) => srv.close(() => resolve())),
+        };
+      }
+
+      const prevEnv = {
+        SMTP_HOST: process.env.SMTP_HOST,
+        SMTP_PORT: process.env.SMTP_PORT,
+        SMTP_USER: process.env.SMTP_USER,
+        SMTP_PASS: process.env.SMTP_PASS,
+        SMTP_FROM: process.env.SMTP_FROM,
+        SMTP_STARTTLS: process.env.SMTP_STARTTLS,
+        SMTP_SECURE: process.env.SMTP_SECURE,
+      };
+      const origLog = console.log;
+      const origErr = console.error;
+      const capturedLogs: string[] = [];
+      console.log = (...args: any[]) => capturedLogs.push(args.map(String).join(' '));
+      console.error = (...args: any[]) => capturedLogs.push(args.map(String).join(' '));
+
+      try {
+        // 1. Successful AUTH PLAIN delivery + zero secret/token logging
+        const srvPlain = await startMockSmtpServer({ authModes: ['PLAIN'] });
+        try {
+          process.env.SMTP_HOST = '127.0.0.1';
+          process.env.SMTP_PORT = String(srvPlain.port);
+          process.env.SMTP_USER = 'mailer@aixshop.test';
+          process.env.SMTP_PASS = 'super_secret_smtp_pass_999';
+          process.env.SMTP_FROM = 'no-reply@aixshop.test';
+          process.env.SMTP_STARTTLS = 'false';
+          process.env.SMTP_SECURE = 'false';
+
+          const secretToken = 'tok_fragment_secret_abc123';
+          const res = await sendPasswordResetEmail({
+            to: 'merchant@example.com',
+            fullName: 'Merchant',
+            resetUrl: `https://app.aixshop.test/#reset_token=${secretToken}`,
+            ttlMinutes: 30,
+          });
+          assert.equal(res.delivered, true);
+          assert.equal(res.mode, 'smtp');
+          assert.equal(srvPlain.receivedMessages.length, 1);
+          assert.match(srvPlain.receivedMessages[0], /#reset_token=tok_fragment_secret_abc123/);
+          assert.ok(srvPlain.commands.some((c) => c.startsWith('AUTH PLAIN ')));
+
+          const combinedLogs = capturedLogs.join('\n');
+          assert.doesNotMatch(combinedLogs, /super_secret_smtp_pass_999/);
+          assert.doesNotMatch(combinedLogs, /tok_fragment_secret_abc123/);
+          assert.doesNotMatch(combinedLogs, /AUTH PLAIN/);
+        } finally {
+          await srvPlain.close();
+        }
+
+        // 2. Successful AUTH LOGIN fallback when server only advertises LOGIN
+        const srvLogin = await startMockSmtpServer({ authModes: ['LOGIN'] });
+        try {
+          process.env.SMTP_PORT = String(srvLogin.port);
+          const res = await sendPasswordResetEmail({
+            to: 'merchant2@example.com',
+            fullName: 'Merchant Two',
+            resetUrl: 'https://app.aixshop.test/#reset_token=login_tok_456',
+            ttlMinutes: 30,
+          });
+          assert.equal(res.delivered, true);
+          assert.ok(srvLogin.commands.includes('AUTH LOGIN'));
+        } finally {
+          await srvLogin.close();
+        }
+
+        // 3. Rejects cleanly when SMTP_STARTTLS=require and server lacks STARTTLS
+        const srvNoTls = await startMockSmtpServer({ authModes: ['PLAIN'] });
+        try {
+          process.env.SMTP_PORT = String(srvNoTls.port);
+          process.env.SMTP_STARTTLS = 'require';
+          const resNoTls = await sendPasswordResetEmail({
+            to: 'merchant3@example.com',
+            fullName: 'Merchant Three',
+            resetUrl: 'https://app.aixshop.test/#reset_token=notls_tok',
+            ttlMinutes: 30,
+          });
+          assert.equal(resNoTls.delivered, false);
+          assert.equal(resNoTls.mode, 'smtp');
+          assert.match(resNoTls.error || '', /STARTTLS/);
+        } finally {
+          process.env.SMTP_STARTTLS = 'false';
+          await srvNoTls.close();
+        }
+
+        // 4. Fails cleanly when socket closes abruptly mid-transaction (no unhandled hang)
+        const srvDrop = await startMockSmtpServer({ authModes: ['PLAIN'], dropOnMail: true });
+        try {
+          process.env.SMTP_PORT = String(srvDrop.port);
+          const resDrop = await sendPasswordResetEmail({
+            to: 'merchant4@example.com',
+            fullName: 'Merchant Four',
+            resetUrl: 'https://app.aixshop.test/#reset_token=drop_tok',
+            ttlMinutes: 30,
+          });
+          assert.equal(resDrop.delivered, false);
+          assert.equal(resDrop.mode, 'smtp');
+          assert.match(resDrop.error || '', /closed/i);
+        } finally {
+          await srvDrop.close();
+        }
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+        for (const [k, v] of Object.entries(prevEnv)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
     });
   });
 

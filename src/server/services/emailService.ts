@@ -53,14 +53,40 @@ function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n]+/g, ' ').trim();
 }
 
+interface SmtpResponse {
+  code: number;
+  text: string;
+  lines: string[];
+}
+
+function ehloSupports(lines: string[], capability: string): boolean {
+  const re = new RegExp(`^250[- ]${capability}(?:\\s|$|=)`, 'i');
+  return lines.some((line) => re.test(line));
+}
+
+function getSmtpAuthMechanisms(lines: string[]): Set<string> {
+  const mechs = new Set<string>();
+  for (const line of lines) {
+    const m = line.match(/^250[- ]AUTH(?:=|\s+)(.+)$/i);
+    if (m?.[1]) {
+      for (const token of m[1].trim().split(/\s+/)) {
+        if (token) mechs.add(token.toUpperCase());
+      }
+    }
+  }
+  return mechs;
+}
+
 /**
- * Minimal standards-compliant SMTP delivery client using Node's built-in net/tls sockets.
- * Supports SMTPS (port 465 / SMTP_SECURE=true), STARTTLS (port 587), and AUTH PLAIN/LOGIN.
+ * Standards-compliant SMTP delivery client using Node's built-in net/tls sockets.
+ * Supports SMTPS (port 465 / SMTP_SECURE=true), STARTTLS negotiation, multi-line EHLO parsing,
+ * and AUTH PLAIN / AUTH LOGIN without logging credentials or sensitive message contents.
  */
 async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
   const host = process.env.SMTP_HOST?.trim();
   const port = Number(process.env.SMTP_PORT || 587);
   const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+  const starttlsPref = (process.env.SMTP_STARTTLS || '').trim().toLowerCase();
   const user = process.env.SMTP_USER?.trim() || '';
   const pass = process.env.SMTP_PASS || '';
   const fromRaw = process.env.SMTP_FROM?.trim() || user || 'no-reply@aixshop.local';
@@ -75,13 +101,30 @@ async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
     const TIMEOUT_MS = 10000;
     let settled = false;
     let socket: net.Socket | tls.TLSSocket = secure
-      ? tls.connect({ host, port, servername: host, rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== 'false' })
+      ? tls.connect({
+          host,
+          port,
+          servername: host,
+          rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== 'false',
+        })
       : net.connect({ host, port });
+
+    let buffer = '';
+    let pendingLines: string[] = [];
+    const waiters: Array<{
+      resolve: (res: SmtpResponse) => void;
+      reject: (err: Error) => void;
+    }> = [];
 
     const finish = (result: EmailDeliveryResult) => {
       if (settled) return;
       settled = true;
+      while (waiters.length > 0) {
+        const w = waiters.shift();
+        w?.reject(new Error(result.error || 'SMTP transport closed'));
+      }
       try {
+        socket.removeAllListeners();
         socket.destroy();
       } catch {
         // ignore
@@ -89,41 +132,58 @@ async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
       resolve(result);
     };
 
-    socket.setTimeout(TIMEOUT_MS, () => {
-      finish({ delivered: false, mode: 'smtp', error: `SMTP connection timed out after ${TIMEOUT_MS}ms` });
-    });
-
-    let buffer = '';
-    const waiters: Array<(line: { code: number; text: string }) => void> = [];
-
     const attachSocketListeners = (sock: net.Socket | tls.TLSSocket) => {
+      sock.setTimeout(TIMEOUT_MS, () => {
+        finish({ delivered: false, mode: 'smtp', error: `SMTP connection timed out after ${TIMEOUT_MS}ms` });
+      });
+
       sock.on('error', (err) => {
         finish({ delivered: false, mode: 'smtp', error: err?.message || 'SMTP socket error' });
+      });
+
+      sock.on('end', () => {
+        if (!settled) {
+          finish({ delivered: false, mode: 'smtp', error: 'SMTP server closed connection unexpectedly.' });
+        }
+      });
+
+      sock.on('close', () => {
+        if (!settled) {
+          finish({ delivered: false, mode: 'smtp', error: 'SMTP socket closed before transaction completed.' });
+        }
       });
 
       sock.on('data', (chunk) => {
         buffer += chunk.toString('utf8');
         let idx: number;
-        while ((idx = buffer.indexOf('\r\n')) !== -1) {
-          const line = buffer.slice(0, idx);
-          buffer = buffer.slice(idx + 2);
-          if (/^\d{3} /.test(line)) {
-            const code = parseInt(line.slice(0, 3), 10);
+        while ((idx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, idx).replace(/\r$/, '');
+          buffer = buffer.slice(idx + 1);
+          const match = line.match(/^(\d{3})([- ])(.*)$/);
+          if (!match) continue;
+          pendingLines.push(line);
+          if (match[2] === ' ') {
+            const code = parseInt(match[1], 10);
+            const lines = pendingLines;
+            pendingLines = [];
             const nextWaiter = waiters.shift();
             if (nextWaiter) {
-              nextWaiter({ code, text: line });
+              nextWaiter.resolve({ code, text: line, lines });
             }
           }
         }
       });
     };
 
-    const readResponse = (): Promise<{ code: number; text: string }> =>
-      new Promise((resWaiter) => {
-        waiters.push(resWaiter);
+    const readResponse = (): Promise<SmtpResponse> =>
+      new Promise((resWaiter, rejWaiter) => {
+        if (settled) {
+          return rejWaiter(new Error('SMTP connection already closed'));
+        }
+        waiters.push({ resolve: resWaiter, reject: rejWaiter });
       });
 
-    const sendCommand = async (cmd: string): Promise<{ code: number; text: string }> => {
+    const sendCommand = async (cmd: string): Promise<SmtpResponse> => {
       const waiter = readResponse();
       socket.write(`${cmd}\r\n`);
       return waiter;
@@ -135,57 +195,109 @@ async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
       try {
         const greeting = await readResponse();
         if (greeting.code >= 400) {
-          return finish({ delivered: false, mode: 'smtp', error: `SMTP greeting failed: ${greeting.text}` });
+          return finish({ delivered: false, mode: 'smtp', error: `SMTP greeting failed: ${greeting.code}` });
         }
 
         const ehloHost = 'aixshop.local';
         let ehlo = await sendCommand(`EHLO ${ehloHost}`);
         if (ehlo.code >= 400) {
-          return finish({ delivered: false, mode: 'smtp', error: `SMTP EHLO failed: ${ehlo.text}` });
+          return finish({ delivered: false, mode: 'smtp', error: `SMTP EHLO failed: ${ehlo.code}` });
         }
 
-        if (!secure && port === 587) {
+        const shouldTryStarttls = !secure && starttlsPref !== 'false' && starttlsPref !== 'off';
+        const requireStarttls = starttlsPref === 'true' || starttlsPref === 'require' || starttlsPref === 'required';
+        const serverSupportsStarttls = ehloSupports(ehlo.lines, 'STARTTLS');
+        if (!secure && requireStarttls && !serverSupportsStarttls) {
+          return finish({
+            delivered: false,
+            mode: 'smtp',
+            error: 'SMTP server did not advertise STARTTLS, which is required by SMTP_STARTTLS.',
+          });
+        }
+
+        if (shouldTryStarttls && serverSupportsStarttls) {
           const starttls = await sendCommand('STARTTLS');
-          if (starttls.code === 220) {
-            const upgraded = tls.connect({
-              socket,
-              servername: host,
-              rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== 'false',
+          if (starttls.code !== 220) {
+            return finish({
+              delivered: false,
+              mode: 'smtp',
+              error: `SMTP STARTTLS rejected with code ${starttls.code}`,
             });
-            socket.removeAllListeners();
-            socket = upgraded;
-            socket.setTimeout(TIMEOUT_MS, () => {
-              finish({ delivered: false, mode: 'smtp', error: `SMTP TLS timed out after ${TIMEOUT_MS}ms` });
-            });
-            attachSocketListeners(socket);
-            ehlo = await sendCommand(`EHLO ${ehloHost}`);
-            if (ehlo.code >= 400) {
-              return finish({ delivered: false, mode: 'smtp', error: `SMTP EHLO post-TLS failed: ${ehlo.text}` });
-            }
+          }
+
+          const previousSocket = socket;
+          previousSocket.removeAllListeners();
+          buffer = '';
+          pendingLines = [];
+
+          const upgraded = await new Promise<tls.TLSSocket>((resTls, rejTls) => {
+            const tlsSock = tls.connect(
+              {
+                socket: previousSocket,
+                servername: host,
+                rejectUnauthorized: process.env.SMTP_REJECT_UNAUTHORIZED !== 'false',
+              },
+              () => resTls(tlsSock)
+            );
+            tlsSock.once('error', rejTls);
+          });
+
+          socket = upgraded;
+          socket.removeAllListeners('error');
+          attachSocketListeners(socket);
+
+          ehlo = await sendCommand(`EHLO ${ehloHost}`);
+          if (ehlo.code >= 400) {
+            return finish({ delivered: false, mode: 'smtp', error: `SMTP EHLO post-TLS failed: ${ehlo.code}` });
           }
         }
 
         if (user && pass) {
-          const authToken = Buffer.from(`\0${user}\0${pass}`, 'utf8').toString('base64');
-          const authRes = await sendCommand(`AUTH PLAIN ${authToken}`);
-          if (authRes.code >= 400) {
-            return finish({ delivered: false, mode: 'smtp', error: `SMTP authentication failed: ${authRes.text}` });
+          const mechanisms = getSmtpAuthMechanisms(ehlo.lines);
+          const supportsPlain = mechanisms.has('PLAIN') || mechanisms.size === 0;
+          const supportsLogin = mechanisms.has('LOGIN');
+
+          if (supportsLogin && !mechanisms.has('PLAIN')) {
+            const loginInit = await sendCommand('AUTH LOGIN');
+            if (loginInit.code !== 334) {
+              return finish({ delivered: false, mode: 'smtp', error: `SMTP AUTH LOGIN rejected: ${loginInit.code}` });
+            }
+            const userResp = await sendCommand(Buffer.from(user, 'utf8').toString('base64'));
+            if (userResp.code !== 334) {
+              return finish({ delivered: false, mode: 'smtp', error: `SMTP AUTH LOGIN username rejected: ${userResp.code}` });
+            }
+            const passResp = await sendCommand(Buffer.from(pass, 'utf8').toString('base64'));
+            if (passResp.code >= 400) {
+              return finish({ delivered: false, mode: 'smtp', error: `SMTP authentication failed: ${passResp.code}` });
+            }
+          } else if (supportsPlain) {
+            const authToken = Buffer.from(`\0${user}\0${pass}`, 'utf8').toString('base64');
+            const authRes = await sendCommand(`AUTH PLAIN ${authToken}`);
+            if (authRes.code >= 400) {
+              return finish({ delivered: false, mode: 'smtp', error: `SMTP authentication failed: ${authRes.code}` });
+            }
+          } else {
+            return finish({
+              delivered: false,
+              mode: 'smtp',
+              error: 'SMTP server did not advertise a supported authentication mechanism (PLAIN or LOGIN).',
+            });
           }
         }
 
         const mailFrom = await sendCommand(`MAIL FROM:<${fromAddress}>`);
         if (mailFrom.code >= 400) {
-          return finish({ delivered: false, mode: 'smtp', error: `SMTP MAIL FROM rejected: ${mailFrom.text}` });
+          return finish({ delivered: false, mode: 'smtp', error: `SMTP MAIL FROM rejected: ${mailFrom.code}` });
         }
 
         const rcptTo = await sendCommand(`RCPT TO:<${toAddress}>`);
         if (rcptTo.code >= 400) {
-          return finish({ delivered: false, mode: 'smtp', error: `SMTP RCPT TO rejected: ${rcptTo.text}` });
+          return finish({ delivered: false, mode: 'smtp', error: `SMTP RCPT TO rejected: ${rcptTo.code}` });
         }
 
         const dataCmd = await sendCommand('DATA');
         if (dataCmd.code >= 400) {
-          return finish({ delivered: false, mode: 'smtp', error: `SMTP DATA rejected: ${dataCmd.text}` });
+          return finish({ delivered: false, mode: 'smtp', error: `SMTP DATA rejected: ${dataCmd.code}` });
         }
 
         const messageId = `<${Date.now()}.${Math.random().toString(36).slice(2)}@aixshop>`;
@@ -207,7 +319,7 @@ async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
 
         const dataDone = await sendCommand(payload);
         if (dataDone.code >= 400) {
-          return finish({ delivered: false, mode: 'smtp', error: `SMTP message rejected: ${dataDone.text}` });
+          return finish({ delivered: false, mode: 'smtp', error: `SMTP message rejected: ${dataDone.code}` });
         }
 
         await sendCommand('QUIT').catch(() => {});

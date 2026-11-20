@@ -2932,6 +2932,24 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
           expiresAt: new Date(Date.now() + 86400000).toISOString(),
         },
       });
+      await repo.saveSubscription({
+        id: 'sub_rb3',
+        workspaceId: 'ws_rb3',
+        provider: 'sandbox',
+        customerId: 'cus_rb3',
+        subscriptionId: 'sub_live_rb3',
+        tier: 'Growth',
+        status: 'active',
+        currentPeriodStart: new Date().toISOString(),
+        currentPeriodEnd: new Date(Date.now() + 30 * 86400_000).toISOString(),
+        cancelAtPeriodEnd: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      const storeRb3 = await repo.getStoreByWorkspace('ws_rb3');
+      if (storeRb3) {
+        await repo.saveStoreProfile('ws_rb3', { ...storeRb3, tier: 'Growth', skuLimit: 2500 });
+      }
 
       const app = createApp(repo);
       const { baseUrl, close } = await startTempAppServer(app);

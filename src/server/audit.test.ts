@@ -218,6 +218,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
 
     test('handles empty workspace catalog gracefully without throwing', async () => {
       const tenantEmpty = await registerTenant('empty_tenant@example.com', 'Empty WS');
+      await seedActiveGrowthSubscription(tenantEmpty.workspace.id);
 
       const auditRes = await fetch(`${baseUrl}/api/audit/run`, {
         method: 'POST',
@@ -242,6 +243,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
     test('Workspace B cannot retrieve Workspace A audit run by ID', async () => {
       const tenantA = await registerTenant('isolated_a@example.com', 'Tenant Isolation A');
       const tenantB = await registerTenant('isolated_b@example.com', 'Tenant Isolation B');
+      await seedActiveGrowthSubscription(tenantA.workspace.id);
 
       // Tenant A runs audit
       const runResA = await fetch(`${baseUrl}/api/audit/run`, {
@@ -273,6 +275,8 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
     test('Workspace B latest audit run does not return Workspace A audit run', async () => {
       const tenantA = await registerTenant('iso_latest_a@example.com', 'WS Latest A');
       const tenantB = await registerTenant('iso_latest_b@example.com', 'WS Latest B');
+      await seedActiveGrowthSubscription(tenantA.workspace.id);
+      await seedActiveGrowthSubscription(tenantB.workspace.id);
 
       // Tenant A runs audit
       await fetch(`${baseUrl}/api/audit/run`, {
@@ -301,6 +305,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
   describe('Concurrency & Idempotency Guards', () => {
     test('concurrent audit runs on same workspace are serialized under workspace lock without crashing', async () => {
       const tenantConc = await registerTenant('concurrency_audit@example.com', 'Concurrency WS');
+      await seedActiveGrowthSubscription(tenantConc.workspace.id);
 
       // Launch 2 simultaneous audit run requests
       const p1 = fetch(`${baseUrl}/api/audit/run`, {
@@ -535,7 +540,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
       assert.equal(snapA1.findings.length > 0, true);
       const barcodeFindingA = snapA1.findings.find((f: any) => f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
       assert.ok(barcodeFindingA, 'Audit A should have missing barcode finding');
-      assert.equal(barcodeFindingA.currentValue, '(empty)');
+      assert.equal(barcodeFindingA.currentValue, '(empty — NEEDS_REVIEW)');
 
       // 3. Mutate Current Catalog: Merchant assigns valid barcode and changes product title
       const modifiedProduct: Product = {
@@ -603,10 +608,10 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
       assert.equal(snapA2.products[0].title, 'Glazed Ceramic Planter Pot');
       // Audit A variant barcode must still be empty
       assert.equal(snapA2.products[0].variants[0].barcode, '');
-      // Audit A findings must still include the missing GTIN finding with observed value '(empty)'
+      // Audit A findings must still include the missing GTIN finding with observed value '(empty — NEEDS_REVIEW)'
       const barcodeFindingA2 = snapA2.findings.find((f: any) => f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
       assert.ok(barcodeFindingA2);
-      assert.equal(barcodeFindingA2.currentValue, '(empty)');
+      assert.equal(barcodeFindingA2.currentValue, '(empty — NEEDS_REVIEW)');
       assert.equal(barcodeFindingA2.productTitle, 'Glazed Ceramic Planter Pot');
 
       // Now inspect Audit B snapshot: it must reflect the new title and NO missing barcode finding
@@ -666,6 +671,8 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
     test('D. Multi-Tenant Workspace Isolation: Workspace B cannot fetch Workspace A historical snapshots', async () => {
       const tenantA = await registerTenant('history_iso_a@example.com', 'Iso A Corp');
       const tenantB = await registerTenant('history_iso_b@example.com', 'Iso B Corp');
+      await seedActiveGrowthSubscription(tenantA.workspace.id);
+      await seedActiveGrowthSubscription(tenantB.workspace.id);
 
       // Tenant A runs audit
       const runRes = await fetch(`${baseUrl}/api/audit/run`, {

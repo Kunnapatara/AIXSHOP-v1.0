@@ -316,9 +316,9 @@ const AUTHORITATIVE_PLANS_FIXTURE: BillingPlansResponse = {
       name: 'Free Audit',
       priceCents: 0,
       currency: 'USD',
-      billingInterval: 'month',
+      billingInterval: 'none',
       skuLimit: 2500,
-      features: ['Catalog completeness auditing'],
+      features: ['Catalog onboarding capacity up to 2,500 SKUs'],
     },
     {
       id: 'plan_starter',
@@ -514,6 +514,45 @@ describe('Task C3, C4 & C5: SettingsPage Billing & Shopify OAuth Integration', (
       });
 
       assert.equal(dom.locationStub.href, 'https://billing.stripe.com/p/session/bps_test_portal_123');
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    test('renders Free Audit as Non-Recurring (Free) and $0 without nonely or $0 / mo', async () => {
+      const dom = createUiTestDom();
+      (globalThis as any).window = dom.win;
+      (globalThis as any).document = dom.doc;
+
+      apiClient.getBillingPlans = async () => AUTHORITATIVE_PLANS_FIXTURE;
+      apiClient.getBillingSubscription = async () =>
+        ({
+          workspaceId: 'ws_1',
+          subscription: {
+            provider: 'none',
+            tier: 'Free Audit',
+            status: 'active',
+            billingInterval: 'none',
+            isRecurring: false,
+            cancelAtPeriodEnd: false,
+          },
+          storeProfile: {
+            ...initialStoreProfile,
+            tier: 'Free Audit',
+            skuCount: 12,
+            skuLimit: 2500,
+          },
+        } as BillingSubscriptionResponse);
+
+      const { root, renderPromise } = renderSettings(dom, { initialTab: 'subscription' });
+      await renderPromise;
+
+      const text = dom.container.textContent;
+      assert.match(text, /Non-Recurring \(Free\)/);
+      assert.match(text, /\$0/);
+      assert.doesNotMatch(text, /nonely/i, 'UI must never render malformed "nonely" interval label');
+      assert.doesNotMatch(text, /\$0\s*\/\s*mo/i, 'Free Audit must never render as recurring $0 / mo');
 
       await act(async () => {
         root.unmount();

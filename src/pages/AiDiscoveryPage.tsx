@@ -68,7 +68,17 @@ export const AiDiscoveryPage: React.FC = () => {
         setHubChecklist(localChecklist);
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to evaluate AI Discovery readiness');
+      if (err?.code === 'REPORT_PAYMENT_REQUIRED' || err?.status === 403) {
+        setReadiness(null);
+        setHubChecklist(null);
+        if (err?.reportEntitlement) {
+          setDiscoveryEntitlement(err.reportEntitlement);
+        }
+        setIsDiscoveryLocked(true);
+        setError(null);
+      } else {
+        setError(err.message || 'Failed to evaluate AI Discovery readiness');
+      }
     } finally {
       setLoading(false);
     }
@@ -171,6 +181,14 @@ export const AiDiscoveryPage: React.FC = () => {
           {[1, 2, 3, 4].map((i) => (
             <div key={i} className="h-24 bg-white border border-stone-200 rounded-xl animate-pulse" />
           ))}
+        </div>
+      ) : isLocked ? (
+        <div className="bg-white border border-stone-200 rounded-2xl p-12 text-center shadow-xs space-y-2">
+          <Compass className="w-10 h-10 text-amber-500 mx-auto" />
+          <h3 className="text-base font-bold text-stone-900">AI Discovery Audit Locked</h3>
+          <p className="text-xs text-stone-500 max-w-md mx-auto">
+            Deterministic readiness scores, 8-dimension diagnostics, and Business Hub packages require an active paid plan.
+          </p>
         </div>
       ) : readiness ? (
         <>

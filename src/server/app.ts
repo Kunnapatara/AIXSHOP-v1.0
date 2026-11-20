@@ -50,6 +50,11 @@ export function createApp(customRepo?: DatabaseRepository): Express {
   const proxyConfig = parseTrustProxySetting();
   app.set('trust proxy', proxyConfig.value);
 
+  app.use((_req, res, next) => {
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+  });
+
   app.use(blockInternalPromptArtifactsMiddleware);
 
   // Narrowly scoped raw-body capture for billing and Shopify webhook routes

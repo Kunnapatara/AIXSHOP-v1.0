@@ -102,7 +102,7 @@ export const AuditPage: React.FC = () => {
 
   // Load audit history list
   const loadHistory = async (cursor?: string) => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || isReportLocked) return;
     setHistoryLoading(true);
     setHistoryError(null);
     try {
@@ -113,17 +113,23 @@ export const AuditPage: React.FC = () => {
         if (res.totalCount !== undefined) setTotalCount(res.totalCount);
       }
     } catch (err: any) {
-      setHistoryError(err?.message || 'Failed to load audit history.');
+      if (err?.code === 'REPORT_PAYMENT_REQUIRED' || err?.status === 403) {
+        setHistoryRuns([]);
+        setTotalCount(0);
+        setHistoryError(null);
+      } else {
+        setHistoryError(err?.message || 'Failed to load audit history.');
+      }
     } finally {
       setHistoryLoading(false);
     }
   };
 
   useEffect(() => {
-    if (activeTab === 'history') {
+    if (activeTab === 'history' && !isReportLocked) {
       loadHistory();
     }
-  }, [activeTab, isAuthenticated, activeWorkspace?.id]);
+  }, [activeTab, isAuthenticated, activeWorkspace?.id, isReportLocked]);
 
   // Load historical audit snapshot
   const openAuditDetail = async (runId: string) => {
@@ -225,12 +231,18 @@ export const AuditPage: React.FC = () => {
         <div className="flex items-center gap-2">
           {/* Re-run button */}
           <button
-            onClick={handleRunFullAudit}
+            onClick={isReportLocked ? () => navigateTo('settings', 'subscription') : handleRunFullAudit}
             disabled={isAuditing}
             className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors min-h-[40px] shrink-0 disabled:opacity-60 shadow-xs"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isAuditing ? 'animate-spin' : ''}`} />
-            <span>{isAuditing ? 'Executing Catalog Audit...' : 'Re-run Store Audit'}</span>
+            <span>
+              {isReportLocked
+                ? 'Unlock Audit with Paid Plan'
+                : isAuditing
+                ? 'Executing Catalog Audit...'
+                : 'Re-run Store Audit'}
+            </span>
           </button>
         </div>
       </div>
@@ -240,7 +252,7 @@ export const AuditPage: React.FC = () => {
         <ReportPaywallBanner
           entitlement={reportEntitlement}
           preliminarySummary={preliminarySummary}
-          contextLabel="Preliminary catalog check completed. Upgrade to Starter, Growth, or Enterprise to unlock full audit findings, evidence trails, historical snapshots, and comparisons."
+          contextLabel="Paid plan verification is required before executing catalog audits or viewing findings, evidence trails, historical snapshots, and comparisons."
           onUpgrade={() => navigateTo('settings', 'subscription')}
         />
       )}
@@ -256,9 +268,11 @@ export const AuditPage: React.FC = () => {
         >
           <SearchCheck className="w-3.5 h-3.5 text-orange-600" />
           <span>Current Catalog Audit</span>
-          <span className="font-mono text-[10px] bg-stone-200/70 text-stone-700 px-1.5 py-0.2 rounded-md">
-            {findings.length}
-          </span>
+          {!isReportLocked && (
+            <span className="font-mono text-[10px] bg-stone-200/70 text-stone-700 px-1.5 py-0.2 rounded-md">
+              {findings.length}
+            </span>
+          )}
         </button>
 
         <button
@@ -271,7 +285,7 @@ export const AuditPage: React.FC = () => {
         >
           <History className="w-3.5 h-3.5 text-stone-600" />
           <span>Audit History & Evidence</span>
-          {totalCount > 0 && (
+          {!isReportLocked && totalCount > 0 && (
             <span className="font-mono text-[10px] bg-stone-200/70 text-stone-700 px-1.5 py-0.2 rounded-md">
               {totalCount}
             </span>
@@ -356,7 +370,7 @@ export const AuditPage: React.FC = () => {
               </span>
             </div>
             <div className="text-stone-400 font-mono text-[11px]">
-              Total: {findings.length} findings indexed
+              {isReportLocked ? 'Paid plan required for findings index' : `Total: ${findings.length} findings indexed`}
             </div>
           </div>
 
@@ -427,7 +441,7 @@ export const AuditPage: React.FC = () => {
               <ShieldCheck className="w-12 h-12 text-amber-500 mx-auto mb-3" />
               <h3 className="text-base font-bold text-stone-900">Full Audit Report Locked</h3>
               <p className="text-xs text-stone-500 mt-1 max-w-md mx-auto">
-                Your Free Audit provides preliminary screening capacity and severity counts. Upgrade to a paid plan to inspect complete findings, evidence trails, and proposed remediations.
+                Free Audit does not unlock catalog audit execution or findings. Upgrade to an eligible paid plan to inspect complete findings, evidence trails, and proposed remediations.
               </p>
             </div>
           ) : filteredCurrentFindings.length === 0 ? (
@@ -573,6 +587,15 @@ export const AuditPage: React.FC = () => {
 
       {/* TAB 2: AUDIT HISTORY LIST */}
       {activeTab === 'history' && (
+        isReportLocked ? (
+          <div className="bg-white border border-stone-200 rounded-2xl p-12 text-center shadow-xs">
+            <ShieldCheck className="w-12 h-12 text-amber-500 mx-auto mb-3" />
+            <h3 className="text-base font-bold text-stone-900">Audit History Locked</h3>
+            <p className="text-xs text-stone-500 mt-1 max-w-md mx-auto">
+              Historical audit runs, immutable snapshots, and evidence archives require an active paid plan.
+            </p>
+          </div>
+        ) : (
         <div className="space-y-6">
           <div className="bg-white border border-stone-200 rounded-2xl p-5 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div>
@@ -722,6 +745,7 @@ export const AuditPage: React.FC = () => {
             </div>
           )}
         </div>
+        )
       )}
 
       {/* TAB 3: HISTORICAL AUDIT DETAIL SNAPSHOT */}
@@ -1049,6 +1073,15 @@ export const AuditPage: React.FC = () => {
 
       {/* TAB 4: HISTORICAL COMPARISON */}
       {activeTab === 'compare' && (
+        isReportLocked ? (
+          <div className="bg-white border border-stone-200 rounded-2xl p-12 text-center shadow-xs">
+            <ShieldCheck className="w-12 h-12 text-amber-500 mx-auto mb-3" />
+            <h3 className="text-base font-bold text-stone-900">Historical Comparison Locked</h3>
+            <p className="text-xs text-stone-500 mt-1 max-w-md mx-auto">
+              Comparing historical audit runs and inspection diffs requires an active paid plan.
+            </p>
+          </div>
+        ) : (
         <div className="space-y-6">
           <div className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-6 shadow-xs space-y-4">
             <div>
@@ -1207,6 +1240,7 @@ export const AuditPage: React.FC = () => {
             </div>
           )}
         </div>
+        )
       )}
     </div>
   );

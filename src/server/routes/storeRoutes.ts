@@ -3,19 +3,37 @@ import { DatabaseRepository } from '../db/repository';
 import { createAuthMiddleware, requireRole } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { applyConnectorToggle, validateAndApplyProfileUpdate } from '../../domain/settings/settingsService';
+import { resolveReportEntitlement } from '../services/entitlementService';
 
 export function createStoreRoutes(repo: DatabaseRepository): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
 
   // GET /api/store/profile
   router.get('/profile', requireAuth, async (req: AuthRequest, res) => {
     try {
       const workspaceId = req.workspace!.id;
-      const store = await repo.getStoreByWorkspace(workspaceId);
+      const [store, subscription] = await Promise.all([
+        repo.getStoreByWorkspace(workspaceId),
+        repo.getSubscriptionByWorkspace(workspaceId),
+      ]);
 
       if (!store) {
         return res.status(404).json({ error: 'Store record not found for workspace' });
+      }
+
+      const entitlement = resolveReportEntitlement(store, subscription);
+      if (!entitlement.hasFullReportAccess) {
+        return res.json({
+          ...store,
+          catalogCompletenessAvg: 0,
+          evidenceCoverageAvg: undefined,
+          lastAuditDate: undefined,
+        });
       }
 
       return res.json(store);

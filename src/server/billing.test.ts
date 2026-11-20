@@ -149,6 +149,52 @@ describe('AIXSHOP v1.0 — Billing & Payment-Based Entitlements Suite', () => {
       assert.equal(AUTHORITATIVE_PLANS['enterprise'].priceCents, 49900); // $499.00
       assert.equal(AUTHORITATIVE_PLANS['enterprise'].skuLimit, Infinity);
       assert.equal(AUTHORITATIVE_PLANS['free_audit'].priceCents, 0);
+      assert.equal(AUTHORITATIVE_PLANS['free_audit'].billingInterval, 'none');
+    });
+
+    test('1.1b Free Audit cannot create checkout sessions or recurring subscription records', async () => {
+      const billingService = new BillingService(repo, sandboxProvider);
+      const wsId = `ws_free_nonrec_${Date.now()}`;
+      await repo.registerUser({
+        user: { id: `u_${wsId}`, email: `${wsId}@example.com`, passwordHash: 'h', fullName: 'Free User' },
+        workspace: { id: wsId, name: 'Free Shop', slug: wsId },
+        session: {
+          id: `s_${wsId}`,
+          sessionTokenHash: `h_${wsId}`,
+          userId: `u_${wsId}`,
+          activeWorkspaceId: wsId,
+          expiresAt: new Date(Date.now() + 86400000).toISOString(),
+        },
+      });
+
+      await assert.rejects(
+        () =>
+          billingService.createCheckoutSession(
+            wsId,
+            'Free Audit',
+            'https://example.com/ok',
+            'https://example.com/cancel'
+          ),
+        /Free Audit/
+      );
+
+      // Even if a webhook payload attempts to bind Free Audit as a subscription, no recurring subscription record is created
+      const { payload: fakeEvent, signature: sig } = sandboxProvider.generateSignedPayload({
+        id: `evt_free_${Date.now()}`,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: 'sub_free_noop',
+            customer: 'cus_free_noop',
+            status: 'active',
+            metadata: { workspaceId: wsId, tier: 'Free Audit' },
+          },
+        },
+      });
+      const webhookRes = await billingService.handleWebhook(fakeEvent, sig);
+      assert.equal(webhookRes.success, true);
+      const subAfter = await repo.getSubscriptionByWorkspace(wsId);
+      assert.equal(subAfter, null);
     });
 
     test('1.2 Sandbox provider creates valid checkout session', async () => {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import React, { act, useState } from 'react';
 import { createRoot, Root } from 'react-dom/client';
 import { LandingPage } from './LandingPage';
-import { AuthContext } from '../context/AuthContext';
+import { AuthContext, AuthProvider, useAuth } from '../context/AuthContext';
 import { AppContext, AppContextType } from '../context/AppContext';
 import { apiClient, BillingPlansResponse, CheckoutSessionResponse } from '../api/client';
 import { initialProducts, initialStoreProfile, initialFindings, initialActionItems } from '../data/mockData';
@@ -301,9 +301,9 @@ const AUTHORITATIVE_PLAN_FIXTURE: BillingPlansResponse = {
       name: 'Free Audit',
       priceCents: 0,
       currency: 'USD',
-      billingInterval: 'month',
+      billingInterval: 'none',
       skuLimit: 2500,
-      features: ['Catalog completeness auditing'],
+      features: ['Catalog onboarding capacity up to 2,500 SKUs'],
     },
     {
       id: 'plan_starter',
@@ -937,5 +937,50 @@ describe('Task C2: LandingPage Stripe Billing Integration', () => {
     await act(async () => {
       root.unmount();
     });
+  });
+
+  test('AuthProvider extracts #reset_token from URL fragment and immediately strips it via history.replaceState', async () => {
+    const dom = createUiTestDom();
+    const replacedUrls: string[] = [];
+    dom.locationStub.href = 'http://localhost:3000/#reset_token=raw_secret_fragment_token_123';
+    (dom.locationStub as any).hash = '#reset_token=raw_secret_fragment_token_123';
+    dom.win.history.replaceState = (_state: any, _title: string, nextUrl: string) => {
+      replacedUrls.push(nextUrl);
+      (dom.locationStub as any).hash = '';
+      dom.locationStub.href = `http://localhost:3000${nextUrl}`;
+    };
+    (globalThis as any).window = dom.win;
+    (globalThis as any).document = dom.doc;
+
+    const origGetSession = apiClient.getSession;
+    apiClient.getSession = async () => null;
+
+    let observedToken: string | null | undefined = null;
+    let observedMode = '';
+    let observedOpen = false;
+    const Probe: React.FC = () => {
+      const auth = useAuth();
+      observedToken = auth.pendingResetToken;
+      observedMode = auth.authModalMode;
+      observedOpen = auth.authModalOpen;
+      return null;
+    };
+
+    const root: Root = createRoot(dom.container);
+    try {
+      await act(async () => {
+        root.render(React.createElement(AuthProvider, null, React.createElement(Probe)));
+      });
+      assert.equal(observedToken, 'raw_secret_fragment_token_123');
+      assert.equal(observedMode, 'reset');
+      assert.equal(observedOpen, true);
+      assert.deepEqual(replacedUrls, ['/']);
+      assert.equal((dom.locationStub as any).hash, '');
+    } finally {
+      apiClient.getSession = origGetSession;
+      await act(async () => {
+        root.unmount();
+      });
+    }
   });
 });

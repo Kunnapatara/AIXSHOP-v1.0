@@ -330,16 +330,73 @@ export function executeCatalogAudit(
     totalVariants += variants.length;
     const domainClass = classifyProductDomain(p);
 
-    // Rule: Barcode / GTIN integrity (GTIN-8, GTIN-12/UPC-A, GTIN-13/EAN-13, GTIN-14) with exemptions
+    // Rule: Barcode / GTIN integrity (GTIN-8, GTIN-12/UPC-A, GTIN-13/EAN-13, GTIN-14) with evidence-based exemption eligibility
     recordRule('RULE_VARIANT_GTIN_CHECK_DIGIT');
     variants.forEach((v, vIdx) => {
       const barcode = (v.barcode || '').trim();
       const variantKey = v.sku || v.id || `idx_${vIdx}`;
       if (!barcode) {
-        if (domainClass.isGtinExempt) {
-          // Handmade, custom-made, bespoke, vintage, or explicitly exempted goods do not require a manufacturer GTIN
+        if (domainClass.gtinEligibilityStatus === 'verified_exempt' && domainClass.isGtinExempt) {
+          // Only authoritatively verified exemptions (e.g., Shopify isGiftCard=true or verified exemption evidence doc) suppress GTIN requirements
           return;
         }
+
+        if (domainClass.gtinEligibilityStatus === 'declared_identifier_absence') {
+          const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
+            ruleSlug: 'gtin_decl',
+            productId: p.id,
+            variantId: v.id,
+            variantIndex: vIdx,
+          });
+          const { prevAction, actionId } = resolveExistingAction(findingId, defaultActionId, { productId: p.id });
+
+          findings.push({
+            id: findingId,
+            scope: 'product',
+            productId: p.id,
+            productTitle: p.title,
+            type: 'unverified_evidence',
+            severity: 'medium',
+            title: `NEEDS_REVIEW: Declared Identifier Absence Without Exemption Proof (${variantKey})`,
+            description: `Variant "${v.title || variantKey}" has no barcode and relies on a self-declared identifier absence or exemption flag without verified supporting documentation.`,
+            observedEvidence: `Merchant declared identifierExists="no" / gtinExemption on "${p.title}", with no verified GTIN exemption document attached.`,
+            derivedConclusion: 'Self-declared identifier absence is NOT equivalent to a verified GTIN exemption and requires review before marketplace submission.',
+            merchantVerified: prevAction?.status === 'approved',
+            whyItMatters: 'Channels reject unsubstantiated identifier exemptions when a brand manufacturer GTIN actually exists.',
+            suggestedCorrection: 'Attach a verified GTIN exemption document / evidence reference, or supply a valid GS1 GTIN barcode.',
+            targetField: `variants[${vIdx}].barcode`,
+            currentValue: 'declared_identifier_absence (unverified)',
+            recommendedValue: '',
+            actionItemId: actionId,
+            ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
+            needsMerchantInput: true,
+            reviewStatus: 'NEEDS_REVIEW',
+            gtinEligibilityStatus: 'declared_identifier_absence',
+          });
+
+          actionItems.push(buildScopedActionItem(prevAction, {
+            id: actionId,
+            findingId,
+            productId: p.id,
+            productTitle: p.title,
+            title: `Verify GTIN Exemption Proof or Supply GTIN for ${variantKey}`,
+            severity: 'medium',
+            status: 'pending_review',
+            evidenceRequired: true,
+            needsMerchantInput: true,
+            evidenceProvided: 'Verified GTIN exemption evidence or valid GS1 GTIN required.',
+            proposedChange: {
+              field: `variants[${vIdx}].barcode`,
+              from: 'declared_identifier_absence',
+              to: '',
+            },
+            verificationStatus: 'unverified',
+            auditLog: [],
+          }));
+          productFindingsCount++;
+          return;
+        }
+
         const { findingId, actionId: defaultActionId } = buildAuditEntityIds({
           ruleSlug: 'gtin_missing',
           productId: p.id,
@@ -355,19 +412,21 @@ export function executeCatalogAudit(
           productTitle: p.title,
           type: 'missing_information',
           severity: 'critical',
-          title: `Missing GTIN / Barcode on Variant (${variantKey})`,
-          description: `Variant "${v.title || variantKey}" lacks a standard GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), or GTIN-14 barcode required for shopping channels.`,
-          observedEvidence: `Variant barcode is empty on product "${p.title}".`,
-          derivedConclusion: 'Shopping recommendation engines suppress products with missing global trade identifiers unless exempt.',
+          title: `Missing GTIN / Barcode — NEEDS_REVIEW (${variantKey})`,
+          description: `Variant "${v.title || variantKey}" lacks a standard GTIN-8, GTIN-12 (UPC), GTIN-13 (EAN), or GTIN-14 barcode and has insufficient evidence for GTIN exemption.`,
+          observedEvidence: `Variant barcode is empty on product "${p.title}" (insufficient evidence: missing barcode or title keywords do not prove exemption).`,
+          derivedConclusion: 'NEEDS_REVIEW: Cannot assume GTIN exemption without verified evidence; shopping channels suppress products lacking valid GTINs unless legitimately exempt.',
           merchantVerified: prevAction?.status === 'approved',
-          whyItMatters: 'Global identifiers like GTIN (UPC/EAN) are required for Google Merchant Center and marketplace indexing.',
-          suggestedCorrection: 'Assign a valid GS1 GTIN barcode (GTIN-8, GTIN-12/UPC, GTIN-13/EAN, or GTIN-14) with accurate check digit, or mark custom goods exempt.',
+          whyItMatters: 'Global identifiers like GTIN (UPC/EAN) are required for Google Merchant Center and marketplace indexing unless backed by verified exemption.',
+          suggestedCorrection: 'Assign a valid GS1 GTIN barcode (GTIN-8, GTIN-12/UPC, GTIN-13/EAN, or GTIN-14), or attach verified GTIN exemption evidence.',
           targetField: `variants[${vIdx}].barcode`,
-          currentValue: '(empty)',
+          currentValue: '(empty — NEEDS_REVIEW)',
           recommendedValue: '',
           actionItemId: actionId,
           ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
           needsMerchantInput: true,
+          reviewStatus: 'NEEDS_REVIEW',
+          gtinEligibilityStatus: 'insufficient_evidence',
         });
 
         actionItems.push(buildScopedActionItem(prevAction, {
@@ -380,7 +439,7 @@ export function executeCatalogAudit(
           status: 'pending_review',
           evidenceRequired: true,
           needsMerchantInput: true,
-          evidenceProvided: 'GS1-allocated GTIN (UPC/EAN) verification required.',
+          evidenceProvided: 'GS1-allocated GTIN (UPC/EAN) or verified exemption evidence required.',
           proposedChange: {
             field: `variants[${vIdx}].barcode`,
             from: '(empty)',
@@ -422,6 +481,7 @@ export function executeCatalogAudit(
             actionItemId: actionId,
             ruleCode: 'RULE_VARIANT_GTIN_CHECK_DIGIT',
             needsMerchantInput: true,
+            gtinEligibilityStatus: 'gtin_present',
           });
 
           actionItems.push(buildScopedActionItem(prevAction, {

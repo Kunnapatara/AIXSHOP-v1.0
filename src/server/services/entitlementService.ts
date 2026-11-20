@@ -406,7 +406,7 @@ export interface PreliminaryAuditSummary {
 export interface CommercialPlanSummaryItem {
   tier: string;
   priceCents: number;
-  billingInterval: 'month' | 'year';
+  billingInterval: 'month' | 'year' | 'none';
   skuLimit: number | null;
   isUnlimited: boolean;
   quotaSemantics: 'preliminary_evaluation_capacity' | 'verified_monthly_catalog_skus';
@@ -437,10 +437,10 @@ function canonicalTierDisplayName(tier: string): string {
 
 /**
  * Authoritative server-side commercial entitlement check for Full Report Access,
- * detailed Findings/Evidence disclosure, Remediation Actions, Historical Snapshots, and Feed Exports.
+ * audit execution/findings/scores disclosure, Remediation Actions, Historical Snapshots, and Feed Exports.
  *
  * Fail-closed rules:
- * - Free Audit ($0) provides preliminary screening only (no full findings, evidence, remediation, or exports).
+ * - Free Audit ($0, non-recurring) provides store onboarding & capacity only (NO audit results, findings, scores, remediation, or exports before payment).
  * - Only paid plans ('Starter', 'Growth', 'Enterprise') backed by a verified 'active' or 'trialing'
  *   subscription record grant full report access.
  * - past_due, canceled, unpaid, incomplete, expired, pending, or missing subscription records fail closed.
@@ -469,7 +469,7 @@ export function resolveReportEntitlement(
       subscriptionStatus: 'none',
       reasonCode: 'FREE_AUDIT_PRELIMINARY_ONLY',
       reasonMessage:
-        'Free Audit provides a preliminary catalog check only. Upgrade to a paid plan to unlock full findings, evidence trails, remediation actions, and feed exports.',
+        'A paid plan is required to view audit results, findings, readiness scores, remediation actions, and feed exports.',
       upgradeRequired: true,
     };
   }
@@ -488,7 +488,7 @@ export function resolveReportEntitlement(
       subscriptionStatus: normalizedStatus || 'none',
       reasonCode: 'FREE_AUDIT_PRELIMINARY_ONLY',
       reasonMessage:
-        'Free Audit provides a preliminary catalog check only. Upgrade to a paid plan to unlock full findings, evidence trails, remediation actions, and feed exports.',
+        'A paid plan is required to view audit results, findings, readiness scores, remediation actions, and feed exports.',
       upgradeRequired: true,
     };
   }
@@ -617,28 +617,26 @@ export function buildPreliminaryAuditSummary(
     recommendedTier: recommendPaidTierForSkuCount(skuCount),
     skuCount,
     note:
-      'Preliminary check only. Detailed findings, evidence provenance, recommended fixes, historical comparisons, and feed exports require an active paid plan.',
+      'Paid plan required to inspect audit outcomes, findings, readiness scores, remediation actions, and feed exports.',
   };
 }
 
 /**
- * Redacts paid report deliverables (detailed findings and remediation actions) from a catalog response
- * while keeping the merchant's own catalog inventory (products, variants, offers, evidence, storeProfile) intact.
+ * Redacts all paid report deliverables (detailed findings, actions, severity/action counts, and product/store audit scores)
+ * from a catalog response while keeping the merchant's own catalog inventory (products, variants, offers, evidence) intact.
  */
 export function redactCatalogForPreliminaryAccess(
   catalog: import('../../domain/storage/storageTypes').StoragePayloadV1,
   entitlement: ReportEntitlement,
-  auditRun?: { summary?: Record<string, any> } | null
+  _auditRun?: { summary?: Record<string, any> } | null
 ): {
   catalog: import('../../domain/storage/storageTypes').StoragePayloadV1;
-  preliminarySummary: PreliminaryAuditSummary;
+  preliminarySummary: PreliminaryAuditSummary | null;
 } {
-  const preliminarySummary = buildPreliminaryAuditSummary(catalog, auditRun);
-
   if (entitlement.hasFullReportAccess) {
     return {
       catalog,
-      preliminarySummary,
+      preliminarySummary: null,
     };
   }
 
@@ -647,12 +645,23 @@ export function redactCatalogForPreliminaryAccess(
       ...catalog,
       findings: [],
       actions: [],
+      storeProfile: catalog.storeProfile
+        ? {
+            ...catalog.storeProfile,
+            catalogCompletenessAvg: 0,
+            evidenceCoverageAvg: undefined,
+            lastAuditDate: undefined,
+          }
+        : catalog.storeProfile,
       products: (catalog.products || []).map(p => ({
         ...p,
-        findingsCount: typeof p.findingsCount === 'number' ? p.findingsCount : 0,
+        findingsCount: 0,
+        completenessScore: 0,
+        evidenceCoverageScore: 0,
+        externalDiscoveryStatus: 'not_checked' as any,
       })),
     },
-    preliminarySummary,
+    preliminarySummary: null,
   };
 }
 
@@ -661,13 +670,13 @@ export function getCommercialPlanSummary(): CommercialPlanSummaryItem[] {
     {
       tier: 'Free Audit',
       priceCents: 0,
-      billingInterval: 'month',
+      billingInterval: 'none',
       skuLimit: 2500,
       isUnlimited: false,
       quotaSemantics: 'preliminary_evaluation_capacity',
       reportAccess: 'preliminary_only',
       explanation:
-        'Free Audit ($0) permits preliminary screening for up to 2,500 SKUs so stores with larger catalogs can gauge eligibility and issue severity counts without receiving full audit findings, evidence, remediation actions, or feed exports.',
+        'Free Audit ($0, non-recurring) supports store onboarding and catalog capacity up to 2,500 SKUs. Upgrade to Starter, Growth, or Enterprise to unlock audit execution, findings, readiness scores, remediation actions, and feed exports.',
     },
     {
       tier: 'Starter',

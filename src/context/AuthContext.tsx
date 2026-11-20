@@ -34,15 +34,52 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('login');
   const [pendingResetToken, setPendingResetToken] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (typeof window !== 'undefined' && window.location && typeof window.location.search === 'string') {
+  const stripResetTokenFromUrl = () => {
+    if (typeof window !== 'undefined' && window.location && typeof window.history?.replaceState === 'function') {
       try {
-        const params = new URLSearchParams(window.location.search);
-        const token = params.get('reset_token');
+        const url = new URL(window.location.href);
+        let modified = false;
+        if (url.searchParams.has('reset_token')) {
+          url.searchParams.delete('reset_token');
+          modified = true;
+        }
+        if (url.hash && url.hash.includes('reset_token=')) {
+          const hashParams = new URLSearchParams(url.hash.replace(/^#/, ''));
+          if (hashParams.has('reset_token')) {
+            hashParams.delete('reset_token');
+            const remainingHash = hashParams.toString();
+            url.hash = remainingHash ? `#${remainingHash}` : '';
+            modified = true;
+          }
+        }
+        if (modified) {
+          const nextSearch = url.searchParams.toString();
+          const nextUrl = `${url.pathname}${nextSearch ? `?${nextSearch}` : ''}${url.hash || ''}`;
+          window.history.replaceState({}, typeof document !== 'undefined' ? document.title : '', nextUrl);
+        }
+      } catch {
+        // Ignore invalid URL environments
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location) {
+      try {
+        let token: string | null = null;
+        if (typeof window.location.hash === 'string' && window.location.hash.length > 1) {
+          const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+          token = hashParams.get('reset_token');
+        }
+        if (!token && typeof window.location.search === 'string' && window.location.search.length > 1) {
+          const searchParams = new URLSearchParams(window.location.search);
+          token = searchParams.get('reset_token');
+        }
         if (token && token.trim()) {
           setPendingResetToken(token.trim());
           setAuthModalMode('reset');
           setAuthModalOpen(true);
+          stripResetTokenFromUrl();
         }
       } catch {
         // Ignore restricted URL environments
@@ -83,19 +120,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const clearPendingResetToken = () => {
     setPendingResetToken(null);
-    if (typeof window !== 'undefined' && window.location && typeof window.history?.replaceState === 'function') {
-      try {
-        const url = new URL(window.location.href);
-        if (url.searchParams.has('reset_token')) {
-          url.searchParams.delete('reset_token');
-          const nextSearch = url.searchParams.toString();
-          const nextUrl = `${url.pathname}${nextSearch ? `?${nextSearch}` : ''}${url.hash || ''}`;
-          window.history.replaceState({}, typeof document !== 'undefined' ? document.title : '', nextUrl);
-        }
-      } catch {
-        // Ignore invalid URL environments
-      }
-    }
+    stripResetTokenFromUrl();
   };
 
   const openAuthModal = (mode: AuthModalMode = 'login') => {

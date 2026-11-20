@@ -121,6 +121,7 @@ export function mapShopifyProductNodeToDomain(
       shopifyGid: node.id,
       shopifyHandle: node.handle || '',
       shopifyStatus: node.status || 'ACTIVE',
+      ...(node.isGiftCard === true ? { shopifyIsGiftCard: 'true' } : {}),
       provenance: 'shopify_graphql_admin_api',
       canonicalProductUrl: productUrl,
       urlProvenance: canonicalDomain ? 'verified_shopify_store_domain' : 'unavailable_store_domain',

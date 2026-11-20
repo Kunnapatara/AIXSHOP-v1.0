@@ -60,7 +60,16 @@ export const FeedReadinessPage: React.FC = () => {
         setReport(evaluateFeedReadiness(products, platform));
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to validate product feed');
+      if (err?.code === 'REPORT_PAYMENT_REQUIRED' || err?.status === 403) {
+        setReport(null);
+        if (err?.reportEntitlement) {
+          setFeedEntitlement(err.reportEntitlement);
+        }
+        setIsFeedLocked(true);
+        setError(null);
+      } else {
+        setError(err.message || 'Failed to validate product feed');
+      }
     } finally {
       setLoading(false);
     }
@@ -237,7 +246,15 @@ export const FeedReadinessPage: React.FC = () => {
         </div>
       )}
 
-      {report && (
+      {exportLocked ? (
+        <div className="bg-white border border-stone-200 rounded-2xl p-12 text-center shadow-xs space-y-2">
+          <AlertTriangle className="w-10 h-10 text-amber-500 mx-auto" />
+          <h3 className="text-base font-bold text-stone-900">Feed Validation &amp; Export Locked</h3>
+          <p className="text-xs text-stone-500 max-w-md mx-auto">
+            Feed readiness scores, blocking defect counts, and CSV/JSON-LD exports are available only after activating a paid plan.
+          </p>
+        </div>
+      ) : report && (
         <>
           <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex items-start gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />

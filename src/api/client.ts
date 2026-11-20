@@ -61,7 +61,7 @@ export interface PreliminaryAuditSummary {
 export interface CommercialPlanSummaryItem {
   tier: string;
   priceCents: number;
-  billingInterval: 'month' | 'year';
+  billingInterval: 'month' | 'year' | 'none';
   skuLimit: number | null;
   isUnlimited: boolean;
   quotaSemantics: 'preliminary_evaluation_capacity' | 'verified_monthly_catalog_skus';
@@ -609,7 +609,7 @@ export interface BillingPlan {
   name: string;
   priceCents: number;
   currency: string;
-  billingInterval: 'month' | 'year';
+  billingInterval: 'month' | 'year' | 'none';
   skuLimit: number | null;
   features: string[];
 }
@@ -626,6 +626,8 @@ export interface BillingSubscriptionInfo {
   provider: string;
   tier: PlanTier | string;
   status: SubscriptionStatus | string;
+  billingInterval?: 'month' | 'year' | 'none';
+  isRecurring?: boolean;
   currentPeriodStart?: string;
   currentPeriodEnd?: string;
   cancelAtPeriodEnd: boolean;

@@ -35,8 +35,9 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
     repo
   );
 
-  // POST /api/feed/validate — Evaluates catalog against platform feed requirements (local structural check)
+  // POST /api/feed/validate — Evaluates catalog against platform feed requirements (paid plans only)
   router.post('/validate', requireAuth, feedLimiter, async (req: AuthRequest, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
     try {
       const workspaceId = req.workspace!.id;
       const platform = (req.body?.platform || 'google_merchant_center') as FeedPlatform;
@@ -50,25 +51,25 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
         repo.getSubscriptionByWorkspace(workspaceId),
       ]);
       const reportEntitlement = resolveReportEntitlement(store || catalog?.storeProfile, subscription);
-      const products: Product[] = catalog?.products || [];
+      if (!reportEntitlement.hasFullReportAccess) {
+        return res.status(403).json({
+          error: reportEntitlement.reasonMessage,
+          code: 'REPORT_PAYMENT_REQUIRED',
+          reportEntitlement,
+        });
+      }
 
+      const products: Product[] = catalog?.products || [];
       const fullReport = evaluateFeedReadiness(products, platform, store?.currency || 'USD');
-      const report = reportEntitlement.hasFullReportAccess
-        ? fullReport
-        : {
-            ...fullReport,
-            evaluations: [],
-            isLocked: true,
-          };
 
       res.setHeader('X-AIXSHOP-Validation-Scope', 'local_structural_check_only');
       res.setHeader('X-AIXSHOP-External-Platform-Accepted', 'false');
 
       return res.json({
         success: true,
-        report,
+        report: fullReport,
         reportEntitlement,
-        isLocked: !reportEntitlement.hasFullReportAccess,
+        isLocked: false,
       });
     } catch (err: any) {
       console.error('[Feed API] Error evaluating feed:', err);
@@ -78,6 +79,7 @@ export function createFeedRoutes(repo: DatabaseRepository): Router {
 
   // GET /api/feed/export — Exports feed in CSV or JSON format (requires active paid subscription)
   router.get('/export', requireAuth, feedLimiter, async (req: AuthRequest, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
     try {
       const workspaceId = req.workspace!.id;
       const platform = ((req.query.platform as string) || 'google_merchant_center') as FeedPlatform;

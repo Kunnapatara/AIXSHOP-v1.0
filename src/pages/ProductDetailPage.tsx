@@ -24,8 +24,11 @@ export const ProductDetailPage: React.FC = () => {
     returnFromProductDetail, 
     navigateTo, 
     findings, 
-    recheckProduct 
+    recheckProduct,
+    isCloudWorkspace,
+    reportEntitlement,
   } = useApp();
+  const isReportLocked = Boolean(isCloudWorkspace && reportEntitlement && !reportEntitlement.hasFullReportAccess);
 
   const [activeTab, setActiveTab] = useState<'attributes' | 'variants' | 'offers' | 'evidence' | 'shopper_preview'>('attributes');
   const [isRechecking, setIsRechecking] = useState(false);
@@ -122,19 +125,19 @@ export const ProductDetailPage: React.FC = () => {
               <div className="p-2.5 bg-stone-50 rounded-xl border border-stone-200/80">
                 <span className="text-[10px] text-stone-500 font-medium block">Catalog Completeness</span>
                 <span className="text-xl font-bold font-mono text-stone-900 tabular-nums">
-                  {selectedProduct.completenessScore}%
+                  {isReportLocked ? 'Locked' : `${selectedProduct.completenessScore}%`}
                 </span>
               </div>
               <div className="p-2.5 bg-stone-50 rounded-xl border border-stone-200/80">
                 <span className="text-[10px] text-stone-500 font-medium block">Evidence Coverage</span>
                 <span className="text-xl font-bold font-mono text-stone-900 tabular-nums">
-                  {selectedProduct.evidenceCoverageScore}%
+                  {isReportLocked ? 'Locked' : `${selectedProduct.evidenceCoverageScore}%`}
                 </span>
               </div>
               <div className="p-2.5 bg-stone-50 rounded-xl border border-stone-200/80">
                 <span className="text-[10px] text-stone-500 font-medium block">External Discovery</span>
                 <span className="text-xs font-semibold text-stone-800 capitalize mt-1 block">
-                  {selectedProduct.externalDiscoveryStatus.replace(/_/g, ' ')}
+                  {isReportLocked ? 'Locked (Paid Plan)' : selectedProduct.externalDiscoveryStatus.replace(/_/g, ' ')}
                 </span>
               </div>
             </div>

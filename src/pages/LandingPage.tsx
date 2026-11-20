@@ -112,8 +112,11 @@ export const LandingPage: React.FC = () => {
     importDiscoveredProducts,
     isReadOnlyMode,
     isCheckingStore, 
-    storeProfile 
+    storeProfile,
+    isCloudWorkspace,
+    reportEntitlement,
   } = useApp();
+  const canViewQuickCheckMetrics = Boolean(isCloudWorkspace && reportEntitlement?.hasFullReportAccess);
 
   const authContext = useContext(AuthContext);
   const isAuthenticated = Boolean(authContext?.isAuthenticated);
@@ -453,7 +456,7 @@ export const LandingPage: React.FC = () => {
                 <div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-semibold px-2 py-0.5 rounded bg-stone-100 text-stone-700">
-                      Quick Health Check Result
+                      {canViewQuickCheckMetrics ? 'Quick Health Check Result' : 'Storefront Catalog Discovered'}
                     </span>
                     <span className="text-xs text-stone-500 font-mono">
                       {quickCheckResult.detectedPlatform}
@@ -464,57 +467,83 @@ export const LandingPage: React.FC = () => {
                   </h3>
                 </div>
 
-                <button
-                  onClick={() => navigateTo('audit')}
-                  className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition-colors shrink-0"
-                >
-                  <span>Review Full Audit</span>
-                  <ArrowRight className="w-3.5 h-3.5" />
-                </button>
+                {canViewQuickCheckMetrics ? (
+                  <button
+                    onClick={() => navigateTo('audit')}
+                    className="px-4 py-2 bg-stone-900 hover:bg-stone-800 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition-colors shrink-0"
+                  >
+                    <span>Review Full Audit</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                ) : (
+                  <a
+                    href="#pricing"
+                    className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition-colors shrink-0"
+                  >
+                    <span>Choose Paid Plan to Unlock Audit</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </a>
+                )}
               </div>
 
-              {/* Metric Breakdown */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
-                  <p className="text-xs text-stone-500 font-medium">Catalog Completeness</p>
-                  <p className="text-2xl font-bold font-mono text-stone-900 mt-1 tabular-nums">
-                    {quickCheckResult.catalogCompletenessEstimate}%
-                  </p>
-                </div>
-                <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
-                  <p className="text-xs text-stone-500 font-medium">GTIN / UPC Coverage</p>
-                  <p className="text-2xl font-bold font-mono text-stone-900 mt-1 tabular-nums">
-                    {quickCheckResult.gtinPresentRatio}%
-                  </p>
-                </div>
-                <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
-                  <p className="text-xs text-stone-500 font-medium">Conflicting Claims</p>
-                  <p className="text-2xl font-bold font-mono text-rose-600 mt-1 tabular-nums">
-                    {quickCheckResult.conflictingClaimsCount}
-                  </p>
-                </div>
-                <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
-                  <p className="text-xs text-stone-500 font-medium">Missing Attributes</p>
-                  <p className="text-2xl font-bold font-mono text-amber-600 mt-1 tabular-nums">
-                    {quickCheckResult.missingAttributesCount}
-                  </p>
-                </div>
-              </div>
-
-              {/* Sample Issues */}
-              <div className="space-y-2">
-                <p className="text-xs font-semibold text-stone-700 uppercase tracking-wider">
-                  Sample High-Priority Gaps Detected
-                </p>
-                <div className="space-y-2">
-                  {quickCheckResult.sampleIssues.map((issue, idx) => (
-                    <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700 bg-amber-50/60 p-3 rounded-lg border border-amber-200/60">
-                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                      <span>{issue}</span>
+              {canViewQuickCheckMetrics ? (
+                <>
+                  {/* Metric Breakdown */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                    <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
+                      <p className="text-xs text-stone-500 font-medium">Catalog Completeness</p>
+                      <p className="text-2xl font-bold font-mono text-stone-900 mt-1 tabular-nums">
+                        {quickCheckResult.catalogCompletenessEstimate}%
+                      </p>
                     </div>
-                  ))}
+                    <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
+                      <p className="text-xs text-stone-500 font-medium">GTIN / UPC Coverage</p>
+                      <p className="text-2xl font-bold font-mono text-stone-900 mt-1 tabular-nums">
+                        {quickCheckResult.gtinPresentRatio}%
+                      </p>
+                    </div>
+                    <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
+                      <p className="text-xs text-stone-500 font-medium">Conflicting Claims</p>
+                      <p className="text-2xl font-bold font-mono text-rose-600 mt-1 tabular-nums">
+                        {quickCheckResult.conflictingClaimsCount}
+                      </p>
+                    </div>
+                    <div className="p-3.5 bg-stone-50 rounded-xl border border-stone-200/80">
+                      <p className="text-xs text-stone-500 font-medium">Missing Attributes</p>
+                      <p className="text-2xl font-bold font-mono text-amber-600 mt-1 tabular-nums">
+                        {quickCheckResult.missingAttributesCount}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Sample Issues */}
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-stone-700 uppercase tracking-wider">
+                      Sample High-Priority Gaps Detected
+                    </p>
+                    <div className="space-y-2">
+                      {quickCheckResult.sampleIssues.map((issue, idx) => (
+                        <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700 bg-amber-50/60 p-3 rounded-lg border border-amber-200/60">
+                          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                          <span>{issue}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="p-4 bg-amber-50/70 border border-amber-200 rounded-xl flex items-start gap-3">
+                  <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <div className="space-y-1 text-xs">
+                    <p className="font-bold text-amber-950">
+                      Audit Findings &amp; Diagnostic Metrics Locked Until Payment
+                    </p>
+                    <p className="text-amber-900 leading-relaxed">
+                      Storefront eligibility and catalog items have been discovered ({quickCheckResult.ingestionResult?.candidateProducts?.length ?? 0} candidate products detected). Paid plan verification is required before computing or displaying catalog completeness scores, GTIN gaps, severity counts, or audit reports.
+                    </p>
+                  </div>
                 </div>
-              </div>
+              )}
 
               {/* Safe Catalog Import Section */}
               {(() => {
@@ -809,11 +838,11 @@ export const LandingPage: React.FC = () => {
             Transparent Pricing by Catalog Capacity
           </h2>
           <p className="text-sm text-stone-600 mt-2">
-            Free Audit screens up to 2,500 SKUs with a preliminary summary; paid plans unlock full audit findings, evidence trails, remediation workflows, and feed exports by verified catalog capacity.
+            Free Audit enables non-recurring catalog onboarding up to 2,500 SKUs; paid plans unlock catalog audits, full findings, evidence trails, remediation workflows, and feed exports by verified catalog capacity.
           </p>
           <p className="text-xs text-stone-500 mt-1.5">
             {freePlan
-              ? `Free Audit ($0): ${freePlan.skuLimit?.toLocaleString() ?? '2,500'}-SKU preliminary evaluation capacity (no full report or export). `
+              ? `Free Audit ($0, non-recurring): ${freePlan.skuLimit?.toLocaleString() ?? '2,500'}-SKU catalog onboarding capacity (no audit results before payment). `
               : ''}
             Starter (250 verified SKUs), Growth (2,500 verified SKUs), and Enterprise (Unlimited SKUs) unlock full reporting upon verified Stripe payment.
           </p>
@@ -884,7 +913,12 @@ export const LandingPage: React.FC = () => {
             const isSelectingThis = checkoutLoadingTier === plan.tier;
             const isAnyCheckoutLoading = checkoutLoadingTier !== null;
             const isPlanCheckoutDisabled = !canStartPaidCheckout || isAnyCheckoutLoading;
-            const intervalLabel = plan.billingInterval === 'year' ? 'year' : 'month';
+            const intervalLabel =
+              plan.billingInterval === 'none'
+                ? null
+                : plan.billingInterval === 'year'
+                ? 'year'
+                : 'month';
 
             return (
               <div
@@ -920,7 +954,9 @@ export const LandingPage: React.FC = () => {
                   <h3 className="text-xl font-bold text-stone-900 mt-1">{plan.name}</h3>
                   <p className="text-2xl font-bold text-stone-900 mt-3 font-mono">
                     {formatPlanPrice(plan.priceCents, plan.currency)}
-                    <span className="text-xs font-sans text-stone-500 font-normal"> / {intervalLabel}</span>
+                    {intervalLabel && (
+                      <span className="text-xs font-sans text-stone-500 font-normal"> / {intervalLabel}</span>
+                    )}
                   </p>
                   <p className="text-xs text-stone-500 mt-1 font-medium">
                     {formatSkuCapacityLine(plan.skuLimit)}

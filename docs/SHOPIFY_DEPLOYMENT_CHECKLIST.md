@@ -111,7 +111,7 @@ Expected schema elements:
 
 - **Cookie-Only Session Security**: Browser sessions use `HttpOnly`, `SameSite=Lax` cookies (`aixshop_session`) with `Origin`/`Referer` + `X-Requested-With` CSRF enforcement and automatic session rotation on `/login`, `/register`, and `/switch-workspace`.
 - **Commercial Plan Boundaries**:
-  - `Free Audit` ($0): Covers up to `2,500` SKUs as preliminary evaluation/screening capacity only (returns redacted summary & severity counts; blocks full audit findings, evidence trails, remediation mutations, historical inspection, and feed exports on backend).
+  - `Free Audit` ($0, `billingInterval: 'none'`): Non-recurring free workspace onboarding tier covering up to `2,500` SKUs (does not create recurring subscriptions, checkout sessions, or invoices; returns redacted catalog state and blocks audit runs, findings, severity counts, evidence trails, remediation mutations, historical inspection, AI discovery audits, and feed validation/exports with `403 REPORT_PAYMENT_REQUIRED` until an eligible paid subscription is verified).
   - `Starter` ($49/mo / 250 verified SKUs), `Growth` ($149/mo / 2,500 verified SKUs), `Enterprise` ($499/mo / Unlimited verified SKUs): Unlock full reporting and remediation strictly upon verified `active` or `trialing` subscription status.
 
 ---

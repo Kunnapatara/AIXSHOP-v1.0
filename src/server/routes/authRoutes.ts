@@ -25,6 +25,10 @@ function validatePasswordInput(password: unknown): { valid: boolean; error?: str
 
 export function createAuthRoutes(repo: DatabaseRepository): Router {
   const router = Router();
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
   const requireAuth = createAuthMiddleware(repo);
 
   const COOKIE_NAME = 'aixshop_session';
@@ -251,7 +255,7 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
           });
 
           const baseUrl = getTrustedBaseUrl(req);
-          const resetUrl = `${baseUrl}/?reset_token=${encodeURIComponent(rawResetToken)}`;
+          const resetUrl = `${baseUrl}/#reset_token=${encodeURIComponent(rawResetToken)}`;
           await sendPasswordResetEmail({
             to: user.email,
             fullName: user.fullName,

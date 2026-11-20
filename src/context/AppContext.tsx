@@ -607,16 +607,21 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         setLastIngestionResult(result.ingestionResult);
       }
 
+      const canShowMetrics = Boolean(isCloudWorkspace && reportEntitlement?.hasFullReportAccess);
       if (result.scanStatus === 'demo_fixture') {
         addToast(
-          'Demo Store Check Complete',
-          `Evaluated Solstice Mercantile demo catalog (${result.catalogCompletenessEstimate}% completeness, ${result.gtinPresentRatio}% GTIN coverage).`,
+          'Demo Storefront Discovered',
+          canShowMetrics
+            ? `Evaluated Solstice Mercantile demo catalog (${result.catalogCompletenessEstimate}% completeness, ${result.gtinPresentRatio}% GTIN coverage).`
+            : 'Discovered Solstice Mercantile demo storefront catalog. Upgrade to a paid plan to run and view full audit reports.',
           'info'
         );
       } else if (result.scanStatus === 'real_scan') {
         addToast(
-          'Live Store Scan Complete',
-          `Parsed public product feed (${result.catalogCompletenessEstimate}% completeness, ${result.gtinPresentRatio}% GTIN coverage).`,
+          'Public Storefront Catalog Discovered',
+          canShowMetrics
+            ? `Parsed public product feed (${result.catalogCompletenessEstimate}% completeness, ${result.gtinPresentRatio}% GTIN coverage).`
+            : `Discovered ${result.ingestionResult?.candidateProducts?.length ?? 0} candidate products from public storefront feed. Upgrade to unlock audit findings.`,
           'success'
         );
       } else if (result.scanStatus === 'network_failure') {
@@ -1230,6 +1235,18 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         }
       } catch (err: any) {
         if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+        if (err?.code === 'REPORT_PAYMENT_REQUIRED' || err?.status === 403) {
+          if (err?.reportEntitlement) {
+            setReportEntitlement(err.reportEntitlement);
+          }
+          setPreliminarySummary(null);
+          addToast(
+            'Paid Plan Required',
+            err.message || 'An active paid subscription is required before executing or viewing audit reports.',
+            'warning'
+          );
+          throw err;
+        }
         addToast('Audit Failed', err.message || 'Failed to execute audit on server.', 'error');
         throw err;
       }

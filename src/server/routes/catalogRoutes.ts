@@ -58,8 +58,9 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
     return resolveReportEntitlement(store, subscription);
   }
 
-  // GET /api/catalog — Get workspace catalog (redacts paid report findings & actions on unpaid/lapsed workspaces)
+  // GET /api/catalog — Get workspace catalog (redacts all audit findings, actions, scores & summaries on unpaid/lapsed workspaces)
   router.get('/', requireAuth, async (req: AuthRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     try {
       const workspaceId = req.workspace!.id;
       const [loadedCatalog, store, subscription] = await Promise.all([
@@ -91,7 +92,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       }
 
       const reportEntitlement = resolveReportEntitlement(store || catalog.storeProfile, subscription);
-      const { catalog: safeCatalog, preliminarySummary } = redactCatalogForPreliminaryAccess(
+      const { catalog: safeCatalog } = redactCatalogForPreliminaryAccess(
         catalog,
         reportEntitlement
       );
@@ -100,7 +101,6 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         workspaceId,
         catalog: safeCatalog,
         reportEntitlement,
-        preliminarySummary,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Catalog] Failed to load catalog:', err);

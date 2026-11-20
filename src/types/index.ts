@@ -72,6 +72,12 @@ export interface Product {
   lastAudited: string;
 }
 
+export type GtinEligibilityStatus =
+  | 'gtin_present'
+  | 'verified_exempt'
+  | 'declared_identifier_absence'
+  | 'insufficient_evidence';
+
 export interface Finding {
   id: string;
   scope: FindingScope;
@@ -92,6 +98,8 @@ export interface Finding {
   actionItemId?: string;
   ruleCode?: string;
   needsMerchantInput?: boolean;
+  reviewStatus?: 'NEEDS_REVIEW';
+  gtinEligibilityStatus?: GtinEligibilityStatus;
 }
 
 export type ActionStatus = 'pending_review' | 'approved' | 'applied_externally' | 'dismissed';

@@ -851,43 +851,131 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
       assert.equal(gmcRow.gtin, '036000291452');
     });
 
-    it('suppresses missing-GTIN critical findings on handmade or explicitly GTIN-exempt products while still rejecting invalid supplied barcodes', () => {
-      const handmadePlanter = makeBaseProduct({
-        id: 'p_handmade_planter',
+    it('enforces evidence-based GTIN eligibility (NEEDS_REVIEW on keywords/missing barcode without evidence, distinguishes declared absence from verified exemption, and rejects invalid check digits)', async () => {
+      const { classifyProductDomain } = await import('./categoryApplicability');
+
+      const handmadeNoEvidence = makeBaseProduct({
+        id: 'p_handmade_no_ev',
         title: 'Handmade Ceramic Planter Pot',
         category: 'Home & Garden / Planters',
         attributes: { material: 'Ceramic' },
         variants: [{ id: 'v1', sku: 'PLANT-01', title: 'Terracotta', barcode: '', price: 32, inventoryCount: 5, attributes: {} }],
       });
-      const customExempt = makeBaseProduct({
-        id: 'p_custom_exempt',
-        title: 'Standard T-Shirt',
+      const vintageNoEvidence = makeBaseProduct({
+        id: 'p_vintage_no_ev',
+        title: 'Vintage Antique Brass Lamp',
+        category: 'Vintage & Antiques',
+        variants: [{ id: 'v1', sku: 'VINT-01', title: 'Default', barcode: '', price: 120, inventoryCount: 1, attributes: {} }],
+      });
+      const digitalNoEvidence = makeBaseProduct({
+        id: 'p_digital_no_ev',
+        title: 'Digital Download Roast Guide & Gift Card Bundle',
+        category: 'Digital Download / Gift Card',
+        variants: [{ id: 'v1', sku: 'DIG-01', title: 'PDF', barcode: '', price: 15, inventoryCount: 100, attributes: {} }],
+      });
+      const missingBarcodeStandard = makeBaseProduct({
+        id: 'p_missing_barcode_std',
+        title: 'Stainless Travel Bottle',
+        category: 'Drinkware',
+        attributes: { microwaveSafe: 'False' },
+        variants: [{ id: 'v1', sku: 'BOT-01', title: '500ml', barcode: '', price: 28, inventoryCount: 10, attributes: {} }],
+      });
+      const declaredAbsenceOnly = makeBaseProduct({
+        id: 'p_declared_absence',
+        title: 'Custom-Made Linen Shirt',
         category: 'Apparel',
         attributes: { identifierExists: 'no' },
         variants: [{ id: 'v1', sku: 'TEE-01', title: 'M', barcode: '', price: 24, inventoryCount: 10, attributes: {} }],
+      });
+      const verifiedExemptionDoc = makeBaseProduct({
+        id: 'p_verified_exempt_doc',
+        title: 'Small-Batch Ceramic Vase',
+        category: 'Home & Garden',
+        variants: [{ id: 'v1', sku: 'VASE-01', title: 'Natural', barcode: '', price: 54, inventoryCount: 4, attributes: {} }],
+        evidenceDocuments: [
+          {
+            id: 'ev_gtin_ex_1',
+            title: 'GS1 Custom-Made GTIN Exemption Attestation',
+            type: 'manufacturer_spec',
+            issuer: 'GS1 / Studio Registry',
+            dateVerified: '2026-11-10',
+            status: 'verified',
+          },
+        ],
+      });
+      const verifiedShopifyGiftCard = makeBaseProduct({
+        id: 'p_verified_gift_card',
+        title: 'Storefront Digital Card',
+        category: 'Gift Cards',
+        attributes: { shopifyIsGiftCard: 'true' },
+        variants: [{ id: 'v1', sku: 'GC-50', title: '$50', barcode: '', price: 50, inventoryCount: 999, attributes: {} }],
       });
       const handmadeInvalidBarcode = makeBaseProduct({
         id: 'p_handmade_bad_gtin',
         title: 'Handmade Bowl',
         category: 'Home & Kitchen / Tableware',
-        attributes: { microwaveSafe: 'True' },
+        attributes: { microwaveSafe: 'True', gtinExemptionVerified: 'true', gtinExemptionEvidenceRef: 'EXEMPT-001' },
         variants: [{ id: 'v1', sku: 'BOWL-BAD', title: 'Default', barcode: '036000291459', price: 40, inventoryCount: 3, attributes: {} }],
       });
 
-      const res = executeCatalogAudit([handmadePlanter, customExempt, handmadeInvalidBarcode], baseStore, []);
+      // Classification assertions
+      assert.equal(classifyProductDomain(handmadeNoEvidence).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(handmadeNoEvidence).isGtinExempt, false);
+      assert.equal(classifyProductDomain(vintageNoEvidence).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(digitalNoEvidence).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(missingBarcodeStandard).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(declaredAbsenceOnly).gtinEligibilityStatus, 'declared_identifier_absence');
+      assert.equal(classifyProductDomain(declaredAbsenceOnly).isGtinExempt, false);
+      assert.equal(classifyProductDomain(verifiedExemptionDoc).gtinEligibilityStatus, 'verified_exempt');
+      assert.equal(classifyProductDomain(verifiedExemptionDoc).isGtinExempt, true);
+      assert.equal(classifyProductDomain(verifiedShopifyGiftCard).gtinEligibilityStatus, 'verified_exempt');
+      assert.equal(classifyProductDomain(verifiedShopifyGiftCard).isGtinExempt, true);
+
+      const res = executeCatalogAudit(
+        [
+          handmadeNoEvidence,
+          vintageNoEvidence,
+          digitalNoEvidence,
+          missingBarcodeStandard,
+          declaredAbsenceOnly,
+          verifiedExemptionDoc,
+          verifiedShopifyGiftCard,
+          handmadeInvalidBarcode,
+        ],
+        baseStore,
+        []
+      );
+
+      // Handmade, Vintage, Digital without evidence & missing barcode => NEEDS_REVIEW insufficient_evidence findings (NOT auto-exempt)
+      for (const pid of ['p_handmade_no_ev', 'p_vintage_no_ev', 'p_digital_no_ev', 'p_missing_barcode_std']) {
+        const f = res.findings.find(x => x.productId === pid && x.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
+        assert.ok(f, `Expected NEEDS_REVIEW GTIN finding for ${pid}`);
+        assert.equal(f?.reviewStatus, 'NEEDS_REVIEW');
+        assert.equal(f?.gtinEligibilityStatus, 'insufficient_evidence');
+      }
+
+      // Declared identifier absence => distinct review finding (NOT verified_exempt, NOT silent skip)
+      const declFinding = res.findings.find(f => f.productId === 'p_declared_absence' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
+      assert.ok(declFinding, 'Declared identifier absence without evidence must emit a review finding');
+      assert.equal(declFinding?.reviewStatus, 'NEEDS_REVIEW');
+      assert.equal(declFinding?.gtinEligibilityStatus, 'declared_identifier_absence');
+      assert.equal(declFinding?.severity, 'medium');
+
+      // Verified exemption evidence => genuinely exempt (no missing GTIN finding)
       assert.equal(
-        res.findings.some(f => f.productId === 'p_handmade_planter' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
+        res.findings.some(f => f.productId === 'p_verified_exempt_doc' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
         false
       );
       assert.equal(
-        res.findings.some(f => f.productId === 'p_custom_exempt' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
+        res.findings.some(f => f.productId === 'p_verified_gift_card' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
         false
       );
-      assert.equal(
-        res.findings.some(f => f.productId === 'p_handmade_bad_gtin' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
-        true,
-        'Explicitly supplied invalid GTIN check digit must still be flagged even if product is handmade'
-      );
+
+      // Supplied invalid GTIN check digit => ALWAYS rejected even if product has exemption evidence
+      const badGtinFinding = res.findings.find(f => f.productId === 'p_handmade_bad_gtin' && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
+      assert.ok(badGtinFinding, 'Explicitly supplied invalid GTIN check digit must still be flagged');
+      assert.equal(badGtinFinding?.severity, 'critical');
+      assert.equal(badGtinFinding?.gtinEligibilityStatus, 'gtin_present');
     });
 
     it('enforces Product-Category Applicability Matrix to eliminate cross-category false positives and Solstice leakage', () => {

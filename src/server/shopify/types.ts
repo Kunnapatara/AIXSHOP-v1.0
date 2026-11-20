@@ -197,6 +197,7 @@ export interface ShopifyGraphQLProductNode {
   productType?: string | null;
   handle?: string | null;
   status?: string | null;
+  isGiftCard?: boolean | null;
   tags?: string[];
   createdAt?: string;
   updatedAt?: string;

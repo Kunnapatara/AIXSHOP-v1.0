@@ -79,7 +79,7 @@ export const HomePage: React.FC = () => {
             onClick={() => navigateTo('actions')}
             className="px-3.5 py-2 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-700 rounded-lg transition-colors flex items-center gap-1.5 shadow-xs min-h-[38px]"
           >
-            <span>Action Queue ({pendingActions.length})</span>
+            <span>{isReportLocked ? 'Action Queue (Locked)' : `Action Queue (${pendingActions.length})`}</span>
             <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>
@@ -108,9 +108,9 @@ export const HomePage: React.FC = () => {
               </div>
               <div className="mt-3 flex items-baseline gap-2">
                 <span className="text-3xl sm:text-4xl font-extrabold font-mono text-stone-950 tabular-nums">
-                  {storeProfile.catalogCompletenessAvg}%
+                  {isReportLocked ? 'Locked' : `${storeProfile.catalogCompletenessAvg}%`}
                 </span>
-                <span className="text-xs text-stone-500 font-mono">/ 100</span>
+                {!isReportLocked && <span className="text-xs text-stone-500 font-mono">/ 100</span>}
               </div>
               <p className="text-xs text-stone-600 mt-2 leading-relaxed">
                 Measures field population, attribute granularity (materials, dimensions, allergens), and structured schema.org data.
@@ -133,9 +133,9 @@ export const HomePage: React.FC = () => {
               </div>
               <div className="mt-3 flex items-baseline gap-2">
                 <span className="text-3xl sm:text-4xl font-extrabold font-mono text-stone-950 tabular-nums">
-                  {storeProfile.evidenceCoverageAvg}%
+                  {isReportLocked ? 'Locked' : `${storeProfile.evidenceCoverageAvg}%`}
                 </span>
-                <span className="text-xs text-stone-500 font-mono">/ 100</span>
+                {!isReportLocked && <span className="text-xs text-stone-500 font-mono">/ 100</span>}
               </div>
               <p className="text-xs text-stone-600 mt-2 leading-relaxed">
                 Measures specifications substantiated by verifiable documents (lab cupping sheets, OEKO-TEX licenses, GTIN barcodes).
@@ -143,7 +143,7 @@ export const HomePage: React.FC = () => {
             </div>
             <div className="mt-4 pt-3 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500 font-mono">
               <span>Strict Truth Policy</span>
-              <span className="text-amber-700">1 Unverified Claim</span>
+              <span className="text-amber-700">{isReportLocked ? 'Upgrade Required' : 'Evidence Verification'}</span>
             </div>
           </div>
 
@@ -158,16 +158,15 @@ export const HomePage: React.FC = () => {
               </div>
               <div className="mt-3 flex items-baseline gap-2">
                 <span className="text-3xl sm:text-4xl font-extrabold font-mono text-stone-950 tabular-nums">
-                  75%
+                  {isReportLocked ? 'Locked' : 'Observation Probe'}
                 </span>
-                <span className="text-xs text-stone-500 font-mono">observed in probe</span>
               </div>
               <p className="text-xs text-stone-600 mt-2 leading-relaxed">
                 Sample queries where products were observed in search grounding. Clearly labeled as sample observation, not guaranteed ranking.
               </p>
             </div>
             <div className="mt-4 pt-3 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500">
-              <span className="text-stone-400 font-mono">Sample Size: 24 queries</span>
+              <span className="text-stone-400 font-mono">{isReportLocked ? 'Paid plan required' : 'Sample Observation'}</span>
               <span className="text-stone-500">No ranking guarantee</span>
             </div>
           </div>
@@ -205,75 +204,85 @@ export const HomePage: React.FC = () => {
                 Priority Catalog Findings
               </h2>
               <p className="text-xs text-stone-500">
-                {criticalFindings.length} critical issues limiting discovery
+                {isReportLocked ? 'Paid plan required to inspect catalog audit findings' : `${criticalFindings.length} critical issues limiting discovery`}
               </p>
             </div>
             <button
-              onClick={() => navigateTo('audit')}
+              onClick={() => navigateTo(isReportLocked ? 'settings' : 'audit', isReportLocked ? 'subscription' : undefined)}
               className="text-xs font-semibold text-orange-600 hover:text-orange-700 flex items-center gap-1"
             >
-              <span>View All ({findings.length})</span>
+              <span>{isReportLocked ? 'Upgrade Plan' : `View All (${findings.length})`}</span>
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </div>
 
-          <div className="space-y-3">
-            {recentFindings.map(finding => {
-              const severityStyles = {
-                critical: 'text-rose-700 bg-rose-50 border-rose-200',
-                high: 'text-amber-700 bg-amber-50 border-amber-200',
-                medium: 'text-stone-700 bg-stone-100 border-stone-200',
-                low: 'text-stone-600 bg-stone-50 border-stone-200',
-              };
+          {isReportLocked ? (
+            <div className="p-6 bg-stone-50 border border-stone-200 rounded-xl text-center space-y-2">
+              <ShieldCheck className="w-8 h-8 text-amber-500 mx-auto" />
+              <p className="text-xs font-semibold text-stone-900">Audit Results Locked on Free Audit</p>
+              <p className="text-xs text-stone-500">
+                Audit findings, severity breakdowns, and product-level diagnostics require an active paid subscription.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {recentFindings.map(finding => {
+                const severityStyles = {
+                  critical: 'text-rose-700 bg-rose-50 border-rose-200',
+                  high: 'text-amber-700 bg-amber-50 border-amber-200',
+                  medium: 'text-stone-700 bg-stone-100 border-stone-200',
+                  low: 'text-stone-600 bg-stone-50 border-stone-200',
+                };
 
-              return (
-                <div
-                  key={finding.id}
-                  className="p-3.5 rounded-xl border border-stone-200/90 hover:border-stone-300 transition-colors bg-stone-50/40"
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className={`text-[11px] font-semibold font-mono uppercase px-2 py-0.5 rounded border ${severityStyles[finding.severity]}`}>
-                        {finding.severity}
-                      </span>
-                      <span className="text-xs text-stone-500 font-mono capitalize">
-                        {finding.scope} scope
-                      </span>
+                return (
+                  <div
+                    key={finding.id}
+                    className="p-3.5 rounded-xl border border-stone-200/90 hover:border-stone-300 transition-colors bg-stone-50/40"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-[11px] font-semibold font-mono uppercase px-2 py-0.5 rounded border ${severityStyles[finding.severity]}`}>
+                          {finding.severity}
+                        </span>
+                        <span className="text-xs text-stone-500 font-mono capitalize">
+                          {finding.scope} scope
+                        </span>
+                      </div>
+                      {finding.productId && (
+                        <button
+                          onClick={() => viewProductDetail(finding.productId!, 'home')}
+                          className="text-xs text-stone-500 hover:text-stone-900 font-medium underline flex items-center gap-1"
+                        >
+                          <span>Product</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </button>
+                      )}
                     </div>
-                    {finding.productId && (
+
+                    <h3 className="text-sm font-bold text-stone-900 mt-2 leading-snug">
+                      {finding.title}
+                    </h3>
+
+                    <p className="text-xs text-stone-600 mt-1 line-clamp-2 leading-relaxed">
+                      {finding.description}
+                    </p>
+
+                    <div className="mt-2.5 pt-2 border-t border-stone-200/60 flex items-center justify-between text-xs">
+                      <span className="text-stone-500 italic">
+                        Why it matters: {finding.whyItMatters.substring(0, 70)}...
+                      </span>
                       <button
-                        onClick={() => viewProductDetail(finding.productId!, 'home')}
-                        className="text-xs text-stone-500 hover:text-stone-900 font-medium underline flex items-center gap-1"
+                        onClick={() => navigateTo('actions', finding.actionItemId)}
+                        className="text-xs font-semibold text-orange-600 hover:text-orange-700 shrink-0 ml-2"
                       >
-                        <span>Product</span>
-                        <ExternalLink className="w-3 h-3" />
+                        Remediate →
                       </button>
-                    )}
+                    </div>
                   </div>
-
-                  <h3 className="text-sm font-bold text-stone-900 mt-2 leading-snug">
-                    {finding.title}
-                  </h3>
-
-                  <p className="text-xs text-stone-600 mt-1 line-clamp-2 leading-relaxed">
-                    {finding.description}
-                  </p>
-
-                  <div className="mt-2.5 pt-2 border-t border-stone-200/60 flex items-center justify-between text-xs">
-                    <span className="text-stone-500 italic">
-                      Why it matters: {finding.whyItMatters.substring(0, 70)}...
-                    </span>
-                    <button
-                      onClick={() => navigateTo('actions', finding.actionItemId)}
-                      className="text-xs font-semibold text-orange-600 hover:text-orange-700 shrink-0 ml-2"
-                    >
-                      Remediate →
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Right Column: Recommended Next Actions Queue (5 Cols) */}
@@ -285,46 +294,56 @@ export const HomePage: React.FC = () => {
                   Recommended Next Actions
                 </h2>
                 <p className="text-xs text-stone-500">
-                  {pendingActions.length} items awaiting review
+                  {isReportLocked ? 'Paid plan required for remediation workflow' : `${pendingActions.length} items awaiting review`}
                 </p>
               </div>
               <button
-                onClick={() => navigateTo('actions')}
+                onClick={() => navigateTo(isReportLocked ? 'settings' : 'actions', isReportLocked ? 'subscription' : undefined)}
                 className="text-xs font-semibold text-orange-600 hover:text-orange-700 flex items-center gap-1"
               >
-                <span>Action Center</span>
+                <span>{isReportLocked ? 'Upgrade Plan' : 'Action Center'}</span>
                 <ChevronRight className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="mt-3 space-y-3">
-              {pendingActions.slice(0, 3).map(action => (
-                <div key={action.id} className="p-3 bg-stone-50 rounded-xl border border-stone-200">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-stone-900 leading-snug">
-                      {action.title}
-                    </span>
-                    <span className="text-[10px] font-mono font-medium text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
-                      {action.severity}
-                    </span>
+            {isReportLocked ? (
+              <div className="mt-3 p-6 bg-stone-50 border border-stone-200 rounded-xl text-center space-y-2">
+                <CheckSquare className="w-8 h-8 text-amber-500 mx-auto" />
+                <p className="text-xs font-semibold text-stone-900">Action Queue Locked</p>
+                <p className="text-xs text-stone-500">
+                  Activate Starter, Growth, or Enterprise to generate and review remediation actions.
+                </p>
+              </div>
+            ) : (
+              <div className="mt-3 space-y-3">
+                {pendingActions.slice(0, 3).map(action => (
+                  <div key={action.id} className="p-3 bg-stone-50 rounded-xl border border-stone-200">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-stone-900 leading-snug">
+                        {action.title}
+                      </span>
+                      <span className="text-[10px] font-mono font-medium text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                        {action.severity}
+                      </span>
+                    </div>
+                    <p className="text-xs font-mono text-stone-500 mt-1">
+                      {action.proposedChange.field}: {action.proposedChange.to}
+                    </p>
+                    <div className="mt-2 flex items-center justify-between pt-2 border-t border-stone-200/60">
+                      <span className="text-[11px] text-stone-500">
+                        {action.evidenceRequired ? 'Evidence required' : 'Self-certifiable'}
+                      </span>
+                      <button
+                        onClick={() => navigateTo('actions', action.id)}
+                        className="text-xs font-semibold text-stone-900 hover:text-orange-600"
+                      >
+                        Review & Approve
+                      </button>
+                    </div>
                   </div>
-                  <p className="text-xs font-mono text-stone-500 mt-1">
-                    {action.proposedChange.field}: {action.proposedChange.to}
-                  </p>
-                  <div className="mt-2 flex items-center justify-between pt-2 border-t border-stone-200/60">
-                    <span className="text-[11px] text-stone-500">
-                      {action.evidenceRequired ? 'Evidence required' : 'Self-certifiable'}
-                    </span>
-                    <button
-                      onClick={() => navigateTo('actions', action.id)}
-                      className="text-xs font-semibold text-stone-900 hover:text-orange-600"
-                    >
-                      Review & Approve
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Quick Shortcuts to Primary Destinations */}

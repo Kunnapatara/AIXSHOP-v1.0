@@ -25,8 +25,11 @@ export const ProductsPage: React.FC = () => {
     addToast, 
     lastIngestionResult, 
     importDiscoveredProducts, 
-    isReadOnlyMode 
+    isReadOnlyMode,
+    isCloudWorkspace,
+    reportEntitlement,
   } = useApp();
+  const isReportLocked = Boolean(isCloudWorkspace && reportEntitlement && !reportEntitlement.hasFullReportAccess);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
@@ -309,12 +312,12 @@ export const ProductsPage: React.FC = () => {
                       </td>
                       <td className="p-4 text-center">
                         <span className="font-mono font-bold text-stone-900 tabular-nums">
-                          {product.completenessScore}%
+                          {isReportLocked ? 'Locked' : `${product.completenessScore}%`}
                         </span>
                       </td>
                       <td className="p-4 text-center">
                         <span className="font-mono font-medium text-stone-700 tabular-nums">
-                          {product.evidenceCoverageScore}%
+                          {isReportLocked ? 'Locked' : `${product.evidenceCoverageScore}%`}
                         </span>
                       </td>
                       <td className="p-4 text-right">
@@ -352,7 +355,7 @@ export const ProductsPage: React.FC = () => {
                     {product.brand}
                   </div>
                   <div className="absolute top-3 right-3 bg-white/90 backdrop-blur px-2 py-0.5 rounded text-[11px] font-mono font-bold text-stone-900 border border-stone-200 tabular-nums">
-                    Score: {product.completenessScore}%
+                    {isReportLocked ? 'Score: Locked' : `Score: ${product.completenessScore}%`}
                   </div>
                 </div>
 

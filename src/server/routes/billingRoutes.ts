@@ -14,12 +14,17 @@ export function createBillingRoutes(
   billingLeaseConfig?: BillingLeaseConfig
 ): Router {
   const router = Router();
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
   const requireAuth = createAuthMiddleware(repo);
   const getProvider = () => customProvider || getBillingProvider();
   const getBillingService = () => new BillingService(repo, getProvider(), billingLeaseConfig);
 
   // GET /api/billing/plans — Returns authoritative server-defined plans and capacities
   router.get('/plans', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     return res.json({
       plans: Object.values(AUTHORITATIVE_PLANS),
       commercialSummary: getCommercialPlanSummary(),
@@ -29,21 +34,41 @@ export function createBillingRoutes(
 
   // GET /api/billing/subscription — Returns active workspace subscription, capacity status, and report entitlement
   router.get('/subscription', requireAuth, async (req: AuthRequest, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
     try {
       const workspaceId = req.workspace!.id;
       const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
       const store = await repo.getStoreByWorkspace(workspaceId);
       const reportEntitlement = resolveReportEntitlement(store, subscription);
+      const safeStoreProfile = store && !reportEntitlement.hasFullReportAccess
+        ? {
+            ...store,
+            catalogCompletenessAvg: 0,
+            evidenceCoverageAvg: undefined,
+            lastAuditDate: undefined,
+          }
+        : store;
+
+      const isFreeTier = !subscription || subscription.tier === 'Free Audit';
+      const normalizedSubscription = isFreeTier
+        ? {
+            tier: 'Free Audit',
+            status: 'active',
+            provider: 'none',
+            billingInterval: 'none' as const,
+            isRecurring: false,
+            cancelAtPeriodEnd: false,
+          }
+        : {
+            ...subscription,
+            billingInterval: 'month' as const,
+            isRecurring: true,
+          };
 
       return res.json({
         workspaceId,
-        subscription: subscription || {
-          tier: store?.tier || 'Free Audit',
-          status: 'active',
-          provider: 'none',
-          cancelAtPeriodEnd: false,
-        },
-        storeProfile: store,
+        subscription: normalizedSubscription,
+        storeProfile: safeStoreProfile,
         reportEntitlement,
       });
     } catch (err: any) {
