@@ -43,6 +43,9 @@ jobs:
       - name: Run test suite
         run: bun run test
 
+      - name: Secret-safe config check
+        run: bun run config:check
+
       - name: Production build
         run: bun run build
 
@@ -83,7 +86,7 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Apply PostgreSQL migrations 001-014
+      - name: Apply PostgreSQL migrations 001-015
         run: bun run db:migrate
 
       - name: Verify migration checksums and readiness

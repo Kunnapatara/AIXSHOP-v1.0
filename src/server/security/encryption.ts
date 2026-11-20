@@ -145,3 +145,10 @@ export function verifyShopifyWebhookHmac(
     return false;
   }
 }
+
+/**
+ * Signs a raw Shopify webhook payload using Base64 HMAC-SHA256 (for test helpers / verification).
+ */
+export function signShopifyWebhookHmac(rawBody: string | Buffer, secret: string): string {
+  return crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+}

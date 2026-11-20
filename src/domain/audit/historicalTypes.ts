@@ -45,7 +45,7 @@ export interface HistoricalEvidenceRecord {
   issuer: string;
   dateVerified: string;
   url?: string | null;
-  status: 'verified' | 'unverified' | 'expired';
+  status: import('../../types').EvidenceStatus;
   sourceType: string;
   metadata: Record<string, any>;
   snapshotCreatedAt: string;

@@ -43,8 +43,16 @@ import {
   ActionItem, 
   StoreProfile,
   CatalogImportResult,
-  ProductCandidate
+  ProductCandidate,
+  EvidencePurpose,
+  EvidenceReviewAuditEntry,
+  ShopifyProductProvenanceRecord
 } from '../../types';
+import {
+  buildTrustedGtinVerificationContext,
+  computeEvidenceIntegrityHash,
+  sanitizeAndValidateImportCandidates,
+} from '../security/catalogSanitizer';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
@@ -237,6 +245,8 @@ export class PostgresRepository implements DatabaseRepository {
       'auth_rate_limits',
       'password_reset_tokens',
       'workspace_operation_leases',
+      'evidence_review_audit_log',
+      'shopify_product_provenance',
     ];
 
     try {
@@ -453,7 +463,7 @@ export class PostgresRepository implements DatabaseRepository {
           };
         }
 
-        // Verify applied migrations (001 through 012 are all required for current version)
+        // Verify applied migrations (001 through 015 are all required for current version)
         const migRes = await client.query<{ id: string }>(
           'SELECT id FROM schema_migrations ORDER BY id ASC'
         );
@@ -474,6 +484,7 @@ export class PostgresRepository implements DatabaseRepository {
           '012_production_blockers_integrity.sql',
           '013_billing_webhook_recovery.sql',
           '014_auth_recovery_and_operation_leases.sql',
+          '015_gtin_evidence_trust.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -1152,7 +1163,24 @@ export class PostgresRepository implements DatabaseRepository {
     );
 
     const eviRes = await queryable.query(
-      `SELECT id, product_id AS "productId", title, type, issuer, date_verified AS "dateVerified", url, status
+      `SELECT
+        id,
+        product_id AS "productId",
+        title,
+        type,
+        issuer,
+        date_verified AS "dateVerified",
+        url,
+        status,
+        evidence_purpose AS "evidencePurpose",
+        verification_source AS "verificationSource",
+        submitted_by_user_id AS "submittedByUserId",
+        reviewed_by AS "verifiedBy",
+        reviewed_at AS "reviewedAt",
+        decision,
+        decision_reason AS "decisionReason",
+        integrity_hash AS "integrityHash",
+        created_at AS "createdAt"
        FROM evidence_documents
        WHERE workspace_id = $1`,
       [workspaceId]
@@ -1212,8 +1240,17 @@ export class PostgresRepository implements DatabaseRepository {
         type: r.type,
         issuer: r.issuer,
         dateVerified: r.dateVerified,
-        url: r.url,
+        url: r.url || undefined,
         status: r.status,
+        evidencePurpose: r.evidencePurpose || 'general',
+        verificationSource: r.verificationSource || 'client_submission',
+        ...(r.submittedByUserId ? { submittedByUserId: r.submittedByUserId } : {}),
+        ...(r.verifiedBy ? { verifiedBy: r.verifiedBy } : {}),
+        ...(r.reviewedAt ? { reviewedAt: new Date(r.reviewedAt).toISOString() } : {}),
+        ...(r.decision ? { decision: r.decision } : {}),
+        ...(r.decisionReason ? { decisionReason: r.decisionReason } : {}),
+        ...(r.integrityHash ? { integrityHash: r.integrityHash } : {}),
+        ...(r.createdAt ? { createdAt: new Date(r.createdAt).toISOString() } : {}),
       };
       if (!evidenceByProduct.has(r.productId)) evidenceByProduct.set(r.productId, []);
       evidenceByProduct.get(r.productId)!.push(e);
@@ -1328,6 +1365,17 @@ export class PostgresRepository implements DatabaseRepository {
     const nextVersion = Number(storeUpsertRes.rows[0]?.catalog_version ?? 1);
     payload.catalogVersion = nextVersion;
 
+    // Prune Shopify provenance rows only for products explicitly removed from the catalog
+    const activeProductIds = (payload.products || []).map(p => p.id);
+    if (activeProductIds.length === 0) {
+      await client.query('DELETE FROM shopify_product_provenance WHERE workspace_id = $1', [workspaceId]);
+    } else {
+      await client.query(
+        'DELETE FROM shopify_product_provenance WHERE workspace_id = $1 AND NOT (product_id = ANY($2::text[]))',
+        [workspaceId, activeProductIds]
+      );
+    }
+
     // Clean old child records for this workspace in transaction
     await client.query('DELETE FROM action_items WHERE workspace_id = $1', [workspaceId]);
     await client.query('DELETE FROM findings WHERE workspace_id = $1', [workspaceId]);
@@ -1400,11 +1448,14 @@ export class PostgresRepository implements DatabaseRepository {
         );
       }
 
-      // Insert evidence
+      // Insert evidence with full server provenance columns
       for (const e of p.evidenceDocuments || []) {
         await client.query(
-          `INSERT INTO evidence_documents (id, workspace_id, product_id, title, type, issuer, date_verified, url, status, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+          `INSERT INTO evidence_documents (
+             id, workspace_id, product_id, title, type, issuer, date_verified, url, status,
+             evidence_purpose, verification_source, submitted_by_user_id, reviewed_by, reviewed_at,
+             decision, decision_reason, integrity_hash, created_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, COALESCE($18::timestamptz, NOW()))`,
           [
             e.id,
             workspaceId,
@@ -1415,6 +1466,15 @@ export class PostgresRepository implements DatabaseRepository {
             e.dateVerified,
             e.url || null,
             e.status,
+            e.evidencePurpose || 'general',
+            e.verificationSource || 'client_submission',
+            e.submittedByUserId || null,
+            e.verifiedBy || null,
+            e.reviewedAt || null,
+            e.decision || 'pending',
+            e.decisionReason || null,
+            e.integrityHash || null,
+            e.createdAt || null,
           ]
         );
       }
@@ -1997,6 +2057,10 @@ export class PostgresRepository implements DatabaseRepository {
     workspaceId: string,
     candidates: any[]
   ): Promise<CatalogImportResult> {
+    const safeCandidates = sanitizeAndValidateImportCandidates(workspaceId, candidates, {
+      rejectOnTampering: true,
+    });
+
     return this.withTransaction(async (client) => {
       const storeId = `store_${workspaceId}`;
 
@@ -2064,7 +2128,7 @@ export class PostgresRepository implements DatabaseRepository {
       const existingCatalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
 
       // 3. Deduplicate and calculate additional usage under the lock
-      const { additionalSkus } = calculateImportUsage(candidates, existingCatalog.products);
+      const { additionalSkus } = calculateImportUsage(safeCandidates, existingCatalog.products);
 
       // 4. Authoritative server-side quota validation under the lock
       const quotaCheck = checkPlanQuota(authoritativeStore, existingCatalog.products, additionalSkus);
@@ -2073,7 +2137,7 @@ export class PostgresRepository implements DatabaseRepository {
       }
 
       // 5. Ingest domain candidates
-      const importRes = executeCatalogImport(candidates, {
+      const importRes = executeCatalogImport(safeCandidates, {
         products: existingCatalog.products,
         findings: existingCatalog.findings,
         actionItems: existingCatalog.actions,
@@ -2865,8 +2929,25 @@ export class PostgresRepository implements DatabaseRepository {
 
       const catalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
 
-      // Execute domain rules on real catalog data
-      const auditResult = executeCatalogAudit(catalog.products, catalog.storeProfile || authoritativeStore, catalog.actions);
+      // Load server-owned Shopify connection & product provenance inside transaction
+      const [shopifyConnection, shopifyProvenance] = await Promise.all([
+        this.getShopifyConnectionWithClient(client, workspaceId),
+        this.getShopifyProductProvenanceWithClient(client, workspaceId),
+      ]);
+      const trustedGtinContext = buildTrustedGtinVerificationContext(
+        workspaceId,
+        catalog.products,
+        shopifyConnection,
+        shopifyProvenance
+      );
+
+      // Execute domain rules on real catalog data with TrustedGtinVerificationContext
+      const auditResult = executeCatalogAudit(
+        catalog.products,
+        catalog.storeProfile || authoritativeStore,
+        catalog.actions,
+        trustedGtinContext
+      );
 
       // Construct next catalog state
       const nextCatalog: StoragePayloadV1 = {
@@ -2874,6 +2955,7 @@ export class PostgresRepository implements DatabaseRepository {
         products: auditResult.updatedProducts,
         findings: auditResult.findings,
         actions: auditResult.actionItems,
+        evidence: auditResult.updatedProducts.flatMap(p => p.evidenceDocuments || []),
         storeProfile: auditResult.updatedStoreProfile,
       };
 
@@ -2960,7 +3042,15 @@ export class PostgresRepository implements DatabaseRepository {
             e.url || null,
             e.status || 'unverified',
             'catalog_evidence',
-            JSON.stringify({}),
+            JSON.stringify({
+              evidencePurpose: e.evidencePurpose || 'general',
+              verificationSource: e.verificationSource || 'client_submission',
+              verifiedBy: e.verifiedBy || null,
+              reviewedAt: e.reviewedAt || null,
+              decision: e.decision || null,
+              decisionReason: e.decisionReason || null,
+              integrityHash: e.integrityHash || null,
+            }),
           ]
         );
       }
@@ -4559,6 +4649,447 @@ export class PostgresRepository implements DatabaseRepository {
       `DELETE FROM workspace_operation_leases
        WHERE workspace_id = $1 AND operation_key = $2 AND lease_owner = $3`,
       [workspaceId, operationKey, leaseOwner]
+    );
+  }
+
+  // ==========================================
+  // GTIN Evidence Verification & Shopify Provenance (Migration 015)
+  // ==========================================
+
+  private async getShopifyConnectionWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    workspaceId: string
+  ): Promise<import('../shopify/types').ShopifyConnectionRecord | null> {
+    const res = await queryable.query(
+      `SELECT 
+        id, workspace_id AS "workspaceId", shop_domain AS "shopDomain",
+        access_token_encrypted AS "accessTokenEncrypted", refresh_token_encrypted AS "refreshTokenEncrypted",
+        token_expires_at AS "tokenExpiresAt", refresh_token_expires_at AS "refreshTokenExpiresAt",
+        last_refreshed_at AS "lastRefreshedAt", webhook_subscriptions_json AS "webhookSubscriptions",
+        webhook_last_verified_at AS "webhookLastVerifiedAt",
+        webhook_verification_status AS "webhookVerificationStatus",
+        webhook_verification_details AS "webhookVerificationDetails",
+        granted_scopes AS "grantedScopes", key_version AS "keyVersion", status, installed_at AS "installedAt",
+        last_verified_at AS "lastVerifiedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM shopify_connections
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+    if (res.rows.length === 0) return null;
+    return this.mapShopifyConnectionRow(res.rows[0]);
+  }
+
+  private async getShopifyProductProvenanceWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    workspaceId: string
+  ): Promise<ShopifyProductProvenanceRecord[]> {
+    const res = await queryable.query(
+      `SELECT
+        workspace_id AS "workspaceId",
+        product_id AS "productId",
+        shop_domain AS "shopDomain",
+        shopify_product_id AS "shopifyProductId",
+        shopify_gid AS "shopifyGid",
+        is_gift_card AS "isGiftCard",
+        source_type AS "sourceType",
+        shopify_updated_at AS "shopifyUpdatedAt",
+        verified_at AS "verifiedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+       FROM shopify_product_provenance
+       WHERE workspace_id = $1`,
+      [workspaceId]
+    );
+    return res.rows.map((r: any) => ({
+      workspaceId: r.workspaceId,
+      productId: r.productId,
+      shopDomain: r.shopDomain,
+      shopifyProductId: r.shopifyProductId,
+      shopifyGid: r.shopifyGid,
+      isGiftCard: Boolean(r.isGiftCard),
+      sourceType: r.sourceType,
+      shopifyUpdatedAt: r.shopifyUpdatedAt || undefined,
+      verifiedAt: r.verifiedAt ? new Date(r.verifiedAt).toISOString() : new Date().toISOString(),
+      createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : undefined,
+      updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : undefined,
+    }));
+  }
+
+  async submitEvidenceDocument(params: {
+    workspaceId: string;
+    productId: string;
+    title: string;
+    type: EvidenceDocument['type'];
+    issuer: string;
+    dateVerified?: string;
+    url?: string;
+    evidencePurpose?: EvidencePurpose;
+    submittedByUserId: string;
+    id?: string;
+  }): Promise<{ evidence: EvidenceDocument; catalogVersion?: number }> {
+    return this.withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [params.workspaceId]);
+
+      const storeRes = await client.query<{ id: string }>(
+        `SELECT id FROM stores WHERE workspace_id = $1 FOR UPDATE`,
+        [params.workspaceId]
+      );
+      if (storeRes.rows.length === 0) {
+        const err: any = new Error(`Workspace ${params.workspaceId} catalog not found`);
+        err.statusCode = 404;
+        err.code = 'CATALOG_NOT_FOUND';
+        throw err;
+      }
+
+      const prodRes = await client.query<{ id: string }>(
+        `SELECT id FROM products WHERE workspace_id = $1 AND id = $2`,
+        [params.workspaceId, params.productId]
+      );
+      if (prodRes.rows.length === 0) {
+        const err: any = new Error(`Product "${params.productId}" not found in workspace ${params.workspaceId}`);
+        err.statusCode = 404;
+        err.code = 'PRODUCT_NOT_FOUND';
+        throw err;
+      }
+
+      const nowIso = new Date().toISOString();
+      const id =
+        params.id?.trim() ||
+        `ev_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const purpose: EvidencePurpose =
+        params.evidencePurpose === 'gtin_exemption' ||
+        params.evidencePurpose === 'product_claim' ||
+        params.evidencePurpose === 'general'
+          ? params.evidencePurpose
+          : 'general';
+
+      const newDoc: EvidenceDocument = {
+        id,
+        title: String(params.title || '').trim(),
+        type: params.type,
+        issuer: String(params.issuer || '').trim(),
+        dateVerified: String(params.dateVerified || '').trim(),
+        url: params.url ? String(params.url).trim() : undefined,
+        status: 'pending',
+        evidencePurpose: purpose,
+        verificationSource: 'client_submission',
+        submittedByUserId: params.submittedByUserId,
+        decision: 'pending',
+        createdAt: nowIso,
+      };
+      newDoc.integrityHash = computeEvidenceIntegrityHash(params.workspaceId, params.productId, newDoc);
+
+      await client.query(
+        `DELETE FROM evidence_documents WHERE workspace_id = $1 AND id = $2`,
+        [params.workspaceId, id]
+      );
+      await client.query(
+        `INSERT INTO evidence_documents (
+           id, workspace_id, product_id, title, type, issuer, date_verified, url, status,
+           evidence_purpose, verification_source, submitted_by_user_id, reviewed_by, reviewed_at,
+           decision, decision_reason, integrity_hash, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 'client_submission', $10, NULL, NULL, 'pending', NULL, $11, $12::timestamptz)`,
+        [
+          id,
+          params.workspaceId,
+          params.productId,
+          newDoc.title,
+          newDoc.type,
+          newDoc.issuer,
+          newDoc.dateVerified,
+          newDoc.url || null,
+          purpose,
+          params.submittedByUserId,
+          newDoc.integrityHash,
+          nowIso,
+        ]
+      );
+
+      const verRes = await client.query<{ catalog_version: number }>(
+        `UPDATE stores SET catalog_version = COALESCE(catalog_version, 1) + 1, updated_at = NOW() WHERE workspace_id = $1 RETURNING catalog_version`,
+        [params.workspaceId]
+      );
+
+      await client.query(
+        `INSERT INTO evidence_review_audit_log (
+           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, reason, integrity_hash, metadata_json, created_at
+         ) VALUES ($1, $2, $3, $4, 'submitted', 'pending', $5, 'merchant_submitter', NULL, $6, $7::jsonb, $8::timestamptz)`,
+        [
+          `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          params.workspaceId,
+          id,
+          params.productId,
+          params.submittedByUserId,
+          newDoc.integrityHash,
+          JSON.stringify({
+            evidencePurpose: purpose,
+            verificationSource: 'client_submission',
+          }),
+          nowIso,
+        ]
+      );
+
+      return {
+        evidence: newDoc,
+        catalogVersion: Number(verRes.rows[0]?.catalog_version ?? 1),
+      };
+    });
+  }
+
+  async reviewEvidenceDocument(params: {
+    workspaceId: string;
+    evidenceId: string;
+    decision: 'approved' | 'rejected';
+    reviewerId: string;
+    reviewerRole: string;
+    reason?: string;
+    verificationSource?: 'server_reviewer' | 'external_registry';
+  }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }> {
+    return this.withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [params.workspaceId]);
+
+      await client.query(
+        `SELECT id FROM stores WHERE workspace_id = $1 FOR UPDATE`,
+        [params.workspaceId]
+      );
+
+      const eviRes = await client.query<any>(
+        `SELECT
+          id,
+          product_id AS "productId",
+          title,
+          type,
+          issuer,
+          date_verified AS "dateVerified",
+          url,
+          status,
+          evidence_purpose AS "evidencePurpose",
+          verification_source AS "verificationSource",
+          submitted_by_user_id AS "submittedByUserId",
+          reviewed_by AS "verifiedBy",
+          reviewed_at AS "reviewedAt",
+          decision,
+          decision_reason AS "decisionReason",
+          integrity_hash AS "integrityHash",
+          created_at AS "createdAt"
+         FROM evidence_documents
+         WHERE workspace_id = $1 AND id = $2
+         FOR UPDATE`,
+        [params.workspaceId, params.evidenceId]
+      );
+
+      if (eviRes.rows.length === 0) {
+        const err: any = new Error(`Evidence document "${params.evidenceId}" not found in workspace ${params.workspaceId}`);
+        err.statusCode = 404;
+        err.code = 'EVIDENCE_NOT_FOUND';
+        throw err;
+      }
+
+      const row = eviRes.rows[0];
+      const existingDoc: EvidenceDocument = {
+        id: row.id,
+        title: row.title,
+        type: row.type,
+        issuer: row.issuer,
+        dateVerified: row.dateVerified,
+        url: row.url || undefined,
+        status: row.status,
+        evidencePurpose: row.evidencePurpose || 'general',
+        verificationSource: row.verificationSource || 'client_submission',
+        submittedByUserId: row.submittedByUserId || undefined,
+        verifiedBy: row.verifiedBy || undefined,
+        reviewedAt: row.reviewedAt ? new Date(row.reviewedAt).toISOString() : undefined,
+        decision: row.decision || undefined,
+        decisionReason: row.decisionReason || undefined,
+        integrityHash: row.integrityHash || undefined,
+        createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : undefined,
+      };
+
+      const expectedHash = computeEvidenceIntegrityHash(params.workspaceId, row.productId, existingDoc);
+      if (existingDoc.integrityHash && existingDoc.integrityHash !== expectedHash) {
+        const err: any = new Error(
+          `Evidence document "${params.evidenceId}" integrity hash mismatch: content may have been altered.`
+        );
+        err.statusCode = 409;
+        err.code = 'EVIDENCE_INTEGRITY_MISMATCH';
+        throw err;
+      }
+
+      const nowIso = new Date().toISOString();
+      const source = params.verificationSource || 'server_reviewer';
+      const nextStatus = params.decision === 'approved' ? 'verified' : 'rejected';
+      const effectiveDateVerified = existingDoc.dateVerified || nowIso;
+      const updatedIntegrityHash = computeEvidenceIntegrityHash(params.workspaceId, row.productId, {
+        ...existingDoc,
+        dateVerified: effectiveDateVerified,
+      });
+
+      await client.query(
+        `UPDATE evidence_documents
+         SET status = $3,
+             decision = $4,
+             decision_reason = $5,
+             verification_source = $6,
+             reviewed_by = $7,
+             reviewed_at = $8::timestamptz,
+             date_verified = $9,
+             integrity_hash = $10
+         WHERE workspace_id = $1 AND id = $2`,
+        [
+          params.workspaceId,
+          params.evidenceId,
+          nextStatus,
+          params.decision,
+          params.reason || null,
+          source,
+          params.reviewerId,
+          nowIso,
+          effectiveDateVerified,
+          updatedIntegrityHash,
+        ]
+      );
+
+      const verRes = await client.query<{ catalog_version: number }>(
+        `UPDATE stores SET catalog_version = COALESCE(catalog_version, 1) + 1, updated_at = NOW() WHERE workspace_id = $1 RETURNING catalog_version`,
+        [params.workspaceId]
+      );
+
+      const updatedDoc: EvidenceDocument = {
+        ...existingDoc,
+        status: nextStatus,
+        decision: params.decision,
+        decisionReason: params.reason,
+        verificationSource: source,
+        verifiedBy: params.reviewerId,
+        reviewedAt: nowIso,
+        dateVerified: effectiveDateVerified,
+        integrityHash: updatedIntegrityHash,
+      };
+
+      const auditEntry: EvidenceReviewAuditEntry = {
+        id: `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        workspaceId: params.workspaceId,
+        evidenceId: existingDoc.id,
+        productId: row.productId,
+        action: params.decision === 'approved' ? 'approved' : 'rejected',
+        decision: params.decision,
+        reviewerId: params.reviewerId,
+        reviewerRole: params.reviewerRole,
+        reason: params.reason,
+        integrityHash: updatedIntegrityHash,
+        metadata: {
+          evidencePurpose: updatedDoc.evidencePurpose || 'general',
+          verificationSource: source,
+          previousStatus: existingDoc.status,
+        },
+        createdAt: nowIso,
+      };
+
+      await client.query(
+        `INSERT INTO evidence_review_audit_log (
+           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, reason, integrity_hash, metadata_json, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::timestamptz)`,
+        [
+          auditEntry.id,
+          auditEntry.workspaceId,
+          auditEntry.evidenceId,
+          auditEntry.productId,
+          auditEntry.action,
+          auditEntry.decision,
+          auditEntry.reviewerId || null,
+          auditEntry.reviewerRole || null,
+          auditEntry.reason || null,
+          auditEntry.integrityHash,
+          JSON.stringify(auditEntry.metadata || {}),
+          nowIso,
+        ]
+      );
+
+      return {
+        evidence: updatedDoc,
+        auditEntry,
+        catalogVersion: Number(verRes.rows[0]?.catalog_version ?? 1),
+      };
+    });
+  }
+
+  async getEvidenceReviewAuditLog(workspaceId: string, evidenceId?: string): Promise<EvidenceReviewAuditEntry[]> {
+    const res = evidenceId
+      ? await this.query<any>(
+          `SELECT id, workspace_id AS "workspaceId", evidence_id AS "evidenceId", product_id AS "productId",
+                  action, decision, reviewer_id AS "reviewerId", reviewer_role AS "reviewerRole",
+                  reason, integrity_hash AS "integrityHash", metadata_json AS "metadata", created_at AS "createdAt"
+           FROM evidence_review_audit_log
+           WHERE workspace_id = $1 AND evidence_id = $2
+           ORDER BY created_at DESC`,
+          [workspaceId, evidenceId]
+        )
+      : await this.query<any>(
+          `SELECT id, workspace_id AS "workspaceId", evidence_id AS "evidenceId", product_id AS "productId",
+                  action, decision, reviewer_id AS "reviewerId", reviewer_role AS "reviewerRole",
+                  reason, integrity_hash AS "integrityHash", metadata_json AS "metadata", created_at AS "createdAt"
+           FROM evidence_review_audit_log
+           WHERE workspace_id = $1
+           ORDER BY created_at DESC`,
+          [workspaceId]
+        );
+
+    return res.rows.map((r: any) => ({
+      id: r.id,
+      workspaceId: r.workspaceId,
+      evidenceId: r.evidenceId,
+      productId: r.productId,
+      action: r.action,
+      decision: r.decision,
+      reviewerId: r.reviewerId || undefined,
+      reviewerRole: r.reviewerRole || undefined,
+      reason: r.reason || undefined,
+      integrityHash: r.integrityHash,
+      metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata || {},
+      createdAt: new Date(r.createdAt).toISOString(),
+    }));
+  }
+
+  async upsertShopifyProductProvenance(record: ShopifyProductProvenanceRecord): Promise<void> {
+    await this.query(
+      `INSERT INTO shopify_product_provenance (
+         workspace_id, product_id, shop_domain, shopify_product_id, shopify_gid,
+         is_gift_card, source_type, shopify_updated_at, verified_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::timestamptz, NOW()), NOW(), NOW())
+       ON CONFLICT (workspace_id, product_id) DO UPDATE SET
+         shop_domain = EXCLUDED.shop_domain,
+         shopify_product_id = EXCLUDED.shopify_product_id,
+         shopify_gid = EXCLUDED.shopify_gid,
+         is_gift_card = EXCLUDED.is_gift_card,
+         source_type = EXCLUDED.source_type,
+         shopify_updated_at = EXCLUDED.shopify_updated_at,
+         verified_at = EXCLUDED.verified_at,
+         updated_at = NOW()`,
+      [
+        record.workspaceId,
+        record.productId,
+        record.shopDomain,
+        record.shopifyProductId,
+        record.shopifyGid,
+        record.isGiftCard,
+        record.sourceType,
+        record.shopifyUpdatedAt || null,
+        record.verifiedAt || null,
+      ]
+    );
+  }
+
+  async getShopifyProductProvenance(workspaceId: string): Promise<ShopifyProductProvenanceRecord[]> {
+    return this.getShopifyProductProvenanceWithClient(
+      { query: (text: string, params?: any[]) => this.query(text, params) },
+      workspaceId
+    );
+  }
+
+  async deleteShopifyProductProvenance(workspaceId: string, productId: string): Promise<void> {
+    await this.query(
+      `DELETE FROM shopify_product_provenance WHERE workspace_id = $1 AND product_id = $2`,
+      [workspaceId, productId]
     );
   }
 }

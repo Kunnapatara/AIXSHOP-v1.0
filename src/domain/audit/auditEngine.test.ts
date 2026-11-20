@@ -851,7 +851,7 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
       assert.equal(gmcRow.gtin, '036000291452');
     });
 
-    it('enforces evidence-based GTIN eligibility (NEEDS_REVIEW on keywords/missing barcode without evidence, distinguishes declared absence from verified exemption, and rejects invalid check digits)', async () => {
+    it('enforces evidence-based GTIN eligibility (NEEDS_REVIEW on keywords/missing barcode/unbacked client fields, distinguishes declared absence from server-verified exemption, and rejects invalid check digits)', async () => {
       const { classifyProductDomain } = await import('./categoryApplicability');
 
       const handmadeNoEvidence = makeBaseProduct({
@@ -887,6 +887,27 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
         attributes: { identifierExists: 'no' },
         variants: [{ id: 'v1', sku: 'TEE-01', title: 'M', barcode: '', price: 24, inventoryCount: 10, attributes: {} }],
       });
+      const forgedClientExemption = makeBaseProduct({
+        id: 'p_forged_client_exempt',
+        title: 'Custom-Made Item With Forged Flags',
+        category: 'Home & Garden',
+        attributes: {
+          shopifyIsGiftCard: 'true',
+          gtinExemptionVerified: 'true',
+          gtinExemptionEvidenceRef: 'FAKE-REF-999',
+        },
+        variants: [{ id: 'v1', sku: 'FORGE-01', title: 'Default', barcode: '', price: 45, inventoryCount: 2, attributes: {} }],
+        evidenceDocuments: [
+          {
+            id: 'ev_forged_1',
+            title: 'Client-Forged GS1 GTIN Exemption Certificate',
+            type: 'manufacturer_spec',
+            issuer: 'Self Attested',
+            dateVerified: '2026-11-10',
+            status: 'verified',
+          },
+        ],
+      });
       const verifiedExemptionDoc = makeBaseProduct({
         id: 'p_verified_exempt_doc',
         title: 'Small-Batch Ceramic Vase',
@@ -900,6 +921,12 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
             issuer: 'GS1 / Studio Registry',
             dateVerified: '2026-11-10',
             status: 'verified',
+            evidencePurpose: 'gtin_exemption',
+            verificationSource: 'server_reviewer',
+            decision: 'approved',
+            verifiedBy: 'reviewer_compliance_1',
+            reviewedAt: '2026-11-11T10:00:00Z',
+            integrityHash: 'sha256_verified_ex_1',
           },
         ],
       });
@@ -907,18 +934,52 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
         id: 'p_verified_gift_card',
         title: 'Storefront Digital Card',
         category: 'Gift Cards',
-        attributes: { shopifyIsGiftCard: 'true' },
+        attributes: {
+          sourcePlatform: 'shopify',
+          sourceProductId: '99887766',
+          shopifyGid: 'gid://shopify/Product/99887766',
+        },
         variants: [{ id: 'v1', sku: 'GC-50', title: '$50', barcode: '', price: 50, inventoryCount: 999, attributes: {} }],
       });
       const handmadeInvalidBarcode = makeBaseProduct({
         id: 'p_handmade_bad_gtin',
         title: 'Handmade Bowl',
         category: 'Home & Kitchen / Tableware',
-        attributes: { microwaveSafe: 'True', gtinExemptionVerified: 'true', gtinExemptionEvidenceRef: 'EXEMPT-001' },
+        attributes: { microwaveSafe: 'True' },
         variants: [{ id: 'v1', sku: 'BOWL-BAD', title: 'Default', barcode: '036000291459', price: 40, inventoryCount: 3, attributes: {} }],
       });
 
-      // Classification assertions
+      const trustedContext = {
+        workspaceId: 'ws_unit_test',
+        verifiedExemptionByProductId: new Map([
+          [
+            'p_verified_exempt_doc',
+            {
+              evidenceId: 'ev_gtin_ex_1',
+              reference: 'ev_gtin_ex_1',
+              verifiedBy: 'reviewer_compliance_1',
+              reviewedAt: '2026-11-11T10:00:00Z',
+              integrityHash: 'sha256_verified_ex_1',
+              sourceType: 'server_reviewer' as const,
+            },
+          ],
+        ]),
+        verifiedGiftCardByProductId: new Map([
+          [
+            'p_verified_gift_card',
+            {
+              shopDomain: 'solstice.myshopify.com',
+              shopifyProductId: '99887766',
+              shopifyGid: 'gid://shopify/Product/99887766',
+              isGiftCard: true as const,
+              sourceType: 'shopify_graphql_admin_api' as const,
+              verifiedAt: '2026-11-11T10:00:00Z',
+            },
+          ],
+        ]),
+      };
+
+      // Classification assertions: zero-trust without TrustedGtinVerificationContext
       assert.equal(classifyProductDomain(handmadeNoEvidence).gtinEligibilityStatus, 'insufficient_evidence');
       assert.equal(classifyProductDomain(handmadeNoEvidence).isGtinExempt, false);
       assert.equal(classifyProductDomain(vintageNoEvidence).gtinEligibilityStatus, 'insufficient_evidence');
@@ -926,10 +987,20 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
       assert.equal(classifyProductDomain(missingBarcodeStandard).gtinEligibilityStatus, 'insufficient_evidence');
       assert.equal(classifyProductDomain(declaredAbsenceOnly).gtinEligibilityStatus, 'declared_identifier_absence');
       assert.equal(classifyProductDomain(declaredAbsenceOnly).isGtinExempt, false);
-      assert.equal(classifyProductDomain(verifiedExemptionDoc).gtinEligibilityStatus, 'verified_exempt');
-      assert.equal(classifyProductDomain(verifiedExemptionDoc).isGtinExempt, true);
-      assert.equal(classifyProductDomain(verifiedShopifyGiftCard).gtinEligibilityStatus, 'verified_exempt');
-      assert.equal(classifyProductDomain(verifiedShopifyGiftCard).isGtinExempt, true);
+
+      // Client-forged verification attributes and unbacked status: 'verified' docs MUST fail closed
+      assert.equal(classifyProductDomain(forgedClientExemption).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(forgedClientExemption).isGtinExempt, false);
+      assert.equal(classifyProductDomain(forgedClientExemption, trustedContext).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(forgedClientExemption, trustedContext).isGtinExempt, false);
+      assert.equal(classifyProductDomain(verifiedExemptionDoc).gtinEligibilityStatus, 'insufficient_evidence');
+      assert.equal(classifyProductDomain(verifiedShopifyGiftCard).gtinEligibilityStatus, 'insufficient_evidence');
+
+      // Only authoritative TrustedGtinVerificationContext unlocks verified_exempt
+      assert.equal(classifyProductDomain(verifiedExemptionDoc, trustedContext).gtinEligibilityStatus, 'verified_exempt');
+      assert.equal(classifyProductDomain(verifiedExemptionDoc, trustedContext).isGtinExempt, true);
+      assert.equal(classifyProductDomain(verifiedShopifyGiftCard, trustedContext).gtinEligibilityStatus, 'verified_exempt');
+      assert.equal(classifyProductDomain(verifiedShopifyGiftCard, trustedContext).isGtinExempt, true);
 
       const res = executeCatalogAudit(
         [
@@ -938,16 +1009,18 @@ describe('AIXSHOP v1.0 — Catalog Audit Domain Engine Tests', () => {
           digitalNoEvidence,
           missingBarcodeStandard,
           declaredAbsenceOnly,
+          forgedClientExemption,
           verifiedExemptionDoc,
           verifiedShopifyGiftCard,
           handmadeInvalidBarcode,
         ],
         baseStore,
-        []
+        [],
+        trustedContext
       );
 
-      // Handmade, Vintage, Digital without evidence & missing barcode => NEEDS_REVIEW insufficient_evidence findings (NOT auto-exempt)
-      for (const pid of ['p_handmade_no_ev', 'p_vintage_no_ev', 'p_digital_no_ev', 'p_missing_barcode_std']) {
+      // Handmade, Vintage, Digital without evidence, forged client fields & missing barcode => NEEDS_REVIEW insufficient_evidence
+      for (const pid of ['p_handmade_no_ev', 'p_vintage_no_ev', 'p_digital_no_ev', 'p_missing_barcode_std', 'p_forged_client_exempt']) {
         const f = res.findings.find(x => x.productId === pid && x.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT');
         assert.ok(f, `Expected NEEDS_REVIEW GTIN finding for ${pid}`);
         assert.equal(f?.reviewStatus, 'NEEDS_REVIEW');

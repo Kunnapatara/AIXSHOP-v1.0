@@ -1,6 +1,7 @@
 import { Product, Finding, ActionItem, StoreProfile } from '../../types';
 import { validateGtin } from '../validation/gtin';
-import { classifyProductDomain } from './categoryApplicability';
+import { classifyProductDomain, TrustedGtinVerificationContext } from './categoryApplicability';
+export type { TrustedGtinVerificationContext } from './categoryApplicability';
 import { calculateProductCompleteness, calculateStoreCompletenessAvg } from '../catalog/completeness';
 
 export type AuditRunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
@@ -217,7 +218,8 @@ export function buildAuditEntityIds(params: AuditEntityIdParams): { findingId: s
 export function executeCatalogAudit(
   products: Product[],
   storeProfile: StoreProfile,
-  existingActions: ActionItem[] = []
+  existingActions: ActionItem[] = [],
+  trustedGtinContext?: TrustedGtinVerificationContext
 ): AuditExecutionResult {
   const timestamp = new Date().toISOString();
   const findings: Finding[] = [];
@@ -328,7 +330,7 @@ export function executeCatalogAudit(
     let productFindingsCount = 0;
     const variants = p.variants || [];
     totalVariants += variants.length;
-    const domainClass = classifyProductDomain(p);
+    const domainClass = classifyProductDomain(p, trustedGtinContext);
 
     // Rule: Barcode / GTIN integrity (GTIN-8, GTIN-12/UPC-A, GTIN-13/EAN-13, GTIN-14) with evidence-based exemption eligibility
     recordRule('RULE_VARIANT_GTIN_CHECK_DIGIT');

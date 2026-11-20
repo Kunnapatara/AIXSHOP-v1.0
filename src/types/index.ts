@@ -43,14 +43,57 @@ export interface Offer {
   lastSync: string;
 }
 
+export type EvidenceStatus = 'pending' | 'unverified' | 'verified' | 'rejected' | 'expired';
+export type EvidencePurpose = 'gtin_exemption' | 'product_claim' | 'general';
+export type EvidenceVerificationSource = 'client_submission' | 'server_reviewer' | 'external_registry';
+export type EvidenceReviewDecision = 'pending' | 'approved' | 'rejected';
+
 export interface EvidenceDocument {
   id: string;
   title: string;
-  type: 'lab_report' | 'manufacturer_spec' | 'organic_certificate' | 'fair_trade_doc' | 'fda_label';
+  type: 'lab_report' | 'manufacturer_spec' | 'organic_certificate' | 'fair_trade_doc' | 'fda_label' | 'gtin_exemption_proof';
   issuer: string;
   dateVerified: string;
   url?: string;
-  status: 'verified' | 'unverified' | 'expired';
+  status: EvidenceStatus;
+  evidencePurpose?: EvidencePurpose;
+  verificationSource?: EvidenceVerificationSource;
+  verifiedBy?: string;
+  reviewedAt?: string;
+  decision?: EvidenceReviewDecision;
+  decisionReason?: string;
+  integrityHash?: string;
+  submittedByUserId?: string;
+  createdAt?: string;
+}
+
+export interface EvidenceReviewAuditEntry {
+  id: string;
+  workspaceId: string;
+  evidenceId: string;
+  productId: string;
+  action: 'submitted' | 'approved' | 'rejected';
+  decision: EvidenceReviewDecision;
+  reviewerId?: string | null;
+  reviewerRole?: string | null;
+  reason?: string | null;
+  integrityHash: string;
+  metadata?: Record<string, any>;
+  createdAt: string;
+}
+
+export interface ShopifyProductProvenanceRecord {
+  workspaceId: string;
+  productId: string;
+  shopDomain: string;
+  shopifyProductId: string;
+  shopifyGid: string;
+  isGiftCard: boolean;
+  sourceType: 'shopify_graphql_admin_api' | 'shopify_webhook';
+  shopifyUpdatedAt?: string | null;
+  verifiedAt: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface Product {

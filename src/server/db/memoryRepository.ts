@@ -38,8 +38,16 @@ import {
   ActionItem, 
   StoreProfile,
   CatalogImportResult,
-  ProductCandidate
+  ProductCandidate,
+  EvidencePurpose,
+  EvidenceReviewAuditEntry,
+  ShopifyProductProvenanceRecord
 } from '../../types';
+import {
+  buildTrustedGtinVerificationContext,
+  computeEvidenceIntegrityHash,
+  sanitizeAndValidateImportCandidates,
+} from '../security/catalogSanitizer';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
 import { 
@@ -83,6 +91,8 @@ export class MemoryRepository implements DatabaseRepository {
   private shopifyWebhookEvents: Map<string, import('../shopify/types').ShopifyWebhookEventRecord> = new Map(); // deliveryKey -> event
   private passwordResetTokens: Map<string, { id: string; userId: string; tokenHash: string; expiresAt: string; usedAt: string | null; requestedIp?: string; createdAt: string }> = new Map();
   private workspaceOperationLeases: Map<string, { workspaceId: string; operationKey: string; leaseOwner: string; leaseExpiresAt: number }> = new Map();
+  private evidenceReviewAuditLog: Map<string, EvidenceReviewAuditEntry[]> = new Map(); // workspaceId -> entries
+  private shopifyProductProvenance: Map<string, Map<string, ShopifyProductProvenanceRecord>> = new Map(); // workspaceId -> productId -> record
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -188,8 +198,10 @@ export class MemoryRepository implements DatabaseRepository {
           'findings',
           'action_items',
           'schema_migrations',
+          'evidence_review_audit_log',
+          'shopify_product_provenance',
         ],
-        appliedMigrations: ['001_initial_schema.sql'],
+        appliedMigrations: ['001_initial_schema.sql', '015_gtin_evidence_trust.sql'],
       },
     };
   }
@@ -673,6 +685,17 @@ export class MemoryRepository implements DatabaseRepository {
     this.catalogs.set(workspaceId, payloadToStore);
     this.stores.set(workspaceId, updatedStoreProfile);
     this.catalogVersions.set(workspaceId, nextVersion);
+
+    // Prune Shopify provenance rows for products deleted from the catalog
+    const activeProductIds = new Set((payloadToStore.products || []).map(p => p.id));
+    const wsProv = this.shopifyProductProvenance.get(workspaceId);
+    if (wsProv) {
+      for (const pid of wsProv.keys()) {
+        if (!activeProductIds.has(pid)) {
+          wsProv.delete(pid);
+        }
+      }
+    }
   }
 
   async saveWorkspaceCatalog(
@@ -786,18 +809,22 @@ export class MemoryRepository implements DatabaseRepository {
     workspaceId: string,
     candidates: any[]
   ): Promise<CatalogImportResult> {
+    const safeCandidates = sanitizeAndValidateImportCandidates(workspaceId, candidates, {
+      rejectOnTampering: true,
+    });
+
     return this.withWorkspaceLock(workspaceId, async () => {
       const catalog = await this.loadWorkspaceCatalog(workspaceId);
       if (!catalog) throw new Error(`Workspace ${workspaceId} catalog not found`);
 
       const store = await this.getStoreByWorkspace(workspaceId);
-      const { additionalSkus } = calculateImportUsage(candidates, catalog.products);
+      const { additionalSkus } = calculateImportUsage(safeCandidates, catalog.products);
       const quotaCheck = checkPlanQuota(store, catalog.products, additionalSkus);
       if (!quotaCheck.allowed) {
         throw new PlanQuotaExceededError(quotaCheck);
       }
 
-      const importRes = executeCatalogImport(candidates, {
+      const importRes = executeCatalogImport(safeCandidates, {
         products: catalog.products,
         findings: catalog.findings,
         actionItems: catalog.actions,
@@ -809,6 +836,7 @@ export class MemoryRepository implements DatabaseRepository {
         await this.saveWorkspaceCatalogInternal(workspaceId, {
           ...catalog,
           products: importRes.nextProducts,
+          evidence: importRes.nextProducts.flatMap(p => p.evidenceDocuments || []),
           storeProfile: importRes.nextStoreProfile,
         });
       }
@@ -1333,8 +1361,24 @@ export class MemoryRepository implements DatabaseRepository {
           };
         }
 
-        // Execute domain rules on actual persisted catalog
-        const auditResult = executeCatalogAudit(catalog.products, catalog.storeProfile || store, catalog.actions);
+        // Execute domain rules with server-owned GTIN verification & Shopify provenance context
+        const [shopifyConnection, shopifyProvenance] = await Promise.all([
+          this.getShopifyConnection(workspaceId),
+          this.getShopifyProductProvenance(workspaceId),
+        ]);
+        const trustedGtinContext = buildTrustedGtinVerificationContext(
+          workspaceId,
+          catalog.products,
+          shopifyConnection,
+          shopifyProvenance
+        );
+
+        const auditResult = executeCatalogAudit(
+          catalog.products,
+          catalog.storeProfile || store,
+          catalog.actions,
+          trustedGtinContext
+        );
 
         // Update catalog with real evaluation results
         const updatedCatalog: StoragePayloadV1 = {
@@ -1342,6 +1386,7 @@ export class MemoryRepository implements DatabaseRepository {
           products: auditResult.updatedProducts,
           findings: auditResult.findings,
           actions: auditResult.actionItems,
+          evidence: auditResult.updatedProducts.flatMap(p => p.evidenceDocuments || []),
           storeProfile: auditResult.updatedStoreProfile,
         };
 
@@ -1416,7 +1461,15 @@ export class MemoryRepository implements DatabaseRepository {
           url: e.url || null,
           status: e.status || 'unverified',
           sourceType: 'catalog_evidence',
-          metadata: {},
+          metadata: {
+            evidencePurpose: e.evidencePurpose || 'general',
+            verificationSource: e.verificationSource || 'client_submission',
+            verifiedBy: e.verifiedBy || null,
+            reviewedAt: e.reviewedAt || null,
+            decision: e.decision || null,
+            decisionReason: e.decisionReason || null,
+            integrityHash: e.integrityHash || null,
+          },
           snapshotCreatedAt: snapshotTime,
         }));
 
@@ -2237,6 +2290,260 @@ export class MemoryRepository implements DatabaseRepository {
     const existing = this.workspaceOperationLeases.get(key);
     if (existing && existing.leaseOwner === leaseOwner) {
       this.workspaceOperationLeases.delete(key);
+    }
+  }
+
+  // ==========================================
+  // GTIN Evidence Verification & Shopify Provenance (Migration 015)
+  // ==========================================
+
+  async submitEvidenceDocument(params: {
+    workspaceId: string;
+    productId: string;
+    title: string;
+    type: EvidenceDocument['type'];
+    issuer: string;
+    dateVerified?: string;
+    url?: string;
+    evidencePurpose?: EvidencePurpose;
+    submittedByUserId: string;
+    id?: string;
+  }): Promise<{ evidence: EvidenceDocument; catalogVersion?: number }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
+      if (!catalog) {
+        const err: any = new Error(`Workspace ${params.workspaceId} catalog not found`);
+        err.statusCode = 404;
+        err.code = 'CATALOG_NOT_FOUND';
+        throw err;
+      }
+
+      const targetProduct = catalog.products.find(p => p.id === params.productId);
+      if (!targetProduct) {
+        const err: any = new Error(`Product "${params.productId}" not found in workspace ${params.workspaceId}`);
+        err.statusCode = 404;
+        err.code = 'PRODUCT_NOT_FOUND';
+        throw err;
+      }
+
+      const nowIso = new Date().toISOString();
+      const id =
+        params.id?.trim() ||
+        `ev_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const purpose: EvidencePurpose =
+        params.evidencePurpose === 'gtin_exemption' ||
+        params.evidencePurpose === 'product_claim' ||
+        params.evidencePurpose === 'general'
+          ? params.evidencePurpose
+          : 'general';
+
+      // Enforce client submissions strictly start as pending/unverified
+      const newDoc: EvidenceDocument = {
+        id,
+        title: String(params.title || '').trim(),
+        type: params.type,
+        issuer: String(params.issuer || '').trim(),
+        dateVerified: String(params.dateVerified || '').trim(),
+        url: params.url ? String(params.url).trim() : undefined,
+        status: 'pending',
+        evidencePurpose: purpose,
+        verificationSource: 'client_submission',
+        submittedByUserId: params.submittedByUserId,
+        decision: 'pending',
+        createdAt: nowIso,
+      };
+      newDoc.integrityHash = computeEvidenceIntegrityHash(params.workspaceId, params.productId, newDoc);
+
+      const nextProducts = catalog.products.map(p => {
+        if (p.id !== params.productId) return p;
+        const filtered = (p.evidenceDocuments || []).filter(d => d.id !== id);
+        return {
+          ...p,
+          evidenceDocuments: [...filtered, newDoc],
+        };
+      });
+
+      const updatedCatalog: StoragePayloadV1 = {
+        ...catalog,
+        products: nextProducts,
+        evidence: nextProducts.flatMap(p => p.evidenceDocuments || []),
+      };
+      await this.saveWorkspaceCatalogInternal(params.workspaceId, updatedCatalog);
+
+      const logList = this.evidenceReviewAuditLog.get(params.workspaceId) || [];
+      logList.push({
+        id: `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        workspaceId: params.workspaceId,
+        evidenceId: id,
+        productId: params.productId,
+        action: 'submitted',
+        decision: 'pending',
+        reviewerId: params.submittedByUserId,
+        reviewerRole: 'merchant_submitter',
+        integrityHash: newDoc.integrityHash,
+        metadata: {
+          evidencePurpose: purpose,
+          verificationSource: 'client_submission',
+        },
+        createdAt: nowIso,
+      });
+      this.evidenceReviewAuditLog.set(params.workspaceId, logList);
+
+      return {
+        evidence: JSON.parse(JSON.stringify(newDoc)),
+        catalogVersion: this.catalogVersions.get(params.workspaceId),
+      };
+    });
+  }
+
+  async reviewEvidenceDocument(params: {
+    workspaceId: string;
+    evidenceId: string;
+    decision: 'approved' | 'rejected';
+    reviewerId: string;
+    reviewerRole: string;
+    reason?: string;
+    verificationSource?: 'server_reviewer' | 'external_registry';
+  }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
+      if (!catalog) {
+        const err: any = new Error(`Workspace ${params.workspaceId} catalog not found`);
+        err.statusCode = 404;
+        err.code = 'CATALOG_NOT_FOUND';
+        throw err;
+      }
+
+      let foundProduct: Product | undefined;
+      let foundDoc: EvidenceDocument | undefined;
+      for (const p of catalog.products) {
+        const match = (p.evidenceDocuments || []).find(d => d.id === params.evidenceId);
+        if (match) {
+          foundProduct = p;
+          foundDoc = match;
+          break;
+        }
+      }
+
+      if (!foundProduct || !foundDoc) {
+        const err: any = new Error(`Evidence document "${params.evidenceId}" not found in workspace ${params.workspaceId}`);
+        err.statusCode = 404;
+        err.code = 'EVIDENCE_NOT_FOUND';
+        throw err;
+      }
+
+      const expectedHash = computeEvidenceIntegrityHash(params.workspaceId, foundProduct.id, foundDoc);
+      if (foundDoc.integrityHash && foundDoc.integrityHash !== expectedHash) {
+        const err: any = new Error(
+          `Evidence document "${params.evidenceId}" integrity hash mismatch: content may have been altered.`
+        );
+        err.statusCode = 409;
+        err.code = 'EVIDENCE_INTEGRITY_MISMATCH';
+        throw err;
+      }
+
+      const nowIso = new Date().toISOString();
+      const source = params.verificationSource || 'server_reviewer';
+      const effectiveDateVerified = foundDoc.dateVerified || nowIso;
+      const updatedIntegrityHash = computeEvidenceIntegrityHash(params.workspaceId, foundProduct.id, {
+        ...foundDoc,
+        dateVerified: effectiveDateVerified,
+      });
+      const updatedDoc: EvidenceDocument = {
+        ...foundDoc,
+        status: params.decision === 'approved' ? 'verified' : 'rejected',
+        decision: params.decision,
+        decisionReason: params.reason,
+        verificationSource: source,
+        verifiedBy: params.reviewerId,
+        reviewedAt: nowIso,
+        dateVerified: effectiveDateVerified,
+        integrityHash: updatedIntegrityHash,
+      };
+
+      const nextProducts = catalog.products.map(p => {
+        if (p.id !== foundProduct!.id) return p;
+        return {
+          ...p,
+          evidenceDocuments: (p.evidenceDocuments || []).map(d =>
+            d.id === params.evidenceId ? updatedDoc : d
+          ),
+        };
+      });
+
+      const updatedCatalog: StoragePayloadV1 = {
+        ...catalog,
+        products: nextProducts,
+        evidence: nextProducts.flatMap(p => p.evidenceDocuments || []),
+      };
+      await this.saveWorkspaceCatalogInternal(params.workspaceId, updatedCatalog);
+
+      const auditEntry: EvidenceReviewAuditEntry = {
+        id: `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        workspaceId: params.workspaceId,
+        evidenceId: foundDoc.id,
+        productId: foundProduct.id,
+        action: params.decision === 'approved' ? 'approved' : 'rejected',
+        decision: params.decision,
+        reviewerId: params.reviewerId,
+        reviewerRole: params.reviewerRole,
+        reason: params.reason,
+        integrityHash: expectedHash,
+        metadata: {
+          evidencePurpose: updatedDoc.evidencePurpose || 'general',
+          verificationSource: source,
+          previousStatus: foundDoc.status,
+        },
+        createdAt: nowIso,
+      };
+
+      const logList = this.evidenceReviewAuditLog.get(params.workspaceId) || [];
+      logList.push(auditEntry);
+      this.evidenceReviewAuditLog.set(params.workspaceId, logList);
+
+      return {
+        evidence: JSON.parse(JSON.stringify(updatedDoc)),
+        auditEntry: JSON.parse(JSON.stringify(auditEntry)),
+        catalogVersion: this.catalogVersions.get(params.workspaceId),
+      };
+    });
+  }
+
+  async getEvidenceReviewAuditLog(workspaceId: string, evidenceId?: string): Promise<EvidenceReviewAuditEntry[]> {
+    const entries = this.evidenceReviewAuditLog.get(workspaceId) || [];
+    const filtered = evidenceId ? entries.filter(e => e.evidenceId === evidenceId) : entries;
+    const sorted = [...filtered].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    return JSON.parse(JSON.stringify(sorted));
+  }
+
+  async upsertShopifyProductProvenance(record: ShopifyProductProvenanceRecord): Promise<void> {
+    let wsMap = this.shopifyProductProvenance.get(record.workspaceId);
+    if (!wsMap) {
+      wsMap = new Map();
+      this.shopifyProductProvenance.set(record.workspaceId, wsMap);
+    }
+    const nowIso = new Date().toISOString();
+    const existing = wsMap.get(record.productId);
+    const saved: ShopifyProductProvenanceRecord = {
+      ...JSON.parse(JSON.stringify(record)),
+      createdAt: existing?.createdAt || record.createdAt || nowIso,
+      updatedAt: nowIso,
+    };
+    wsMap.set(record.productId, saved);
+  }
+
+  async getShopifyProductProvenance(workspaceId: string): Promise<ShopifyProductProvenanceRecord[]> {
+    const wsMap = this.shopifyProductProvenance.get(workspaceId);
+    if (!wsMap) return [];
+    return JSON.parse(JSON.stringify(Array.from(wsMap.values())));
+  }
+
+  async deleteShopifyProductProvenance(workspaceId: string, productId: string): Promise<void> {
+    const wsMap = this.shopifyProductProvenance.get(workspaceId);
+    if (wsMap) {
+      wsMap.delete(productId);
     }
   }
 }

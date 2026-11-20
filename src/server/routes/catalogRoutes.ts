@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Router } from 'express';
 import {
   CatalogVersionConflictError,
@@ -8,10 +9,17 @@ import {
   createAuthMiddleware,
   createWorkspaceRateLimiter,
   OperationInProgressError,
+  requireRole,
   withWorkspaceOperationLease,
 } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
+import {
+  ProtectedVerificationFieldError,
+  computeEvidenceIntegrityHash,
+  inspectAndSanitizeClientCatalogPut,
+  sanitizeAndValidateImportCandidates,
+} from '../security/catalogSanitizer';
 import { 
   initialProducts, 
   initialFindings, 
@@ -163,17 +171,30 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           });
         }
 
+        // Inspect & sanitize client-submitted catalog to reject forged GTIN verification/Shopify gift-card provenance
+        const [existingCatalog, provenanceList] = await Promise.all([
+          repo.loadWorkspaceCatalog(workspaceId),
+          repo.getShopifyProductProvenance(workspaceId),
+        ]);
+        const sanitizedPayload = inspectAndSanitizeClientCatalogPut(
+          workspaceId,
+          payload,
+          existingCatalog,
+          provenanceList,
+          { rejectOnTampering: true }
+        );
+
         // Never trust client-supplied tier or skuLimit in payload.storeProfile
-        if (store && payload.storeProfile) {
-          payload.storeProfile = {
-            ...payload.storeProfile,
+        if (store && sanitizedPayload.storeProfile) {
+          sanitizedPayload.storeProfile = {
+            ...sanitizedPayload.storeProfile,
             tier: store.tier,
             skuLimit: store.skuLimit,
           };
         }
 
         // Never trust user-supplied storeId or workspaceId in body; derive from server session
-        await repo.saveWorkspaceCatalog(workspaceId, payload, { expectedVersion });
+        await repo.saveWorkspaceCatalog(workspaceId, sanitizedPayload, { expectedVersion });
         const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
 
         return res.json({
@@ -185,6 +206,12 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       });
     } catch (err: any) {
+      if (err instanceof ProtectedVerificationFieldError || err.code === 'PROTECTED_VERIFICATION_FIELD') {
+        return res.status(403).json({
+          error: err.message,
+          code: 'PROTECTED_VERIFICATION_FIELD',
+        });
+      }
       if (err instanceof CatalogVersionValidationError || err.code === 'INVALID_CATALOG_VERSION') {
         return res.status(400).json({
           error: err.message,
@@ -347,6 +374,10 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       }
 
+      const safeCandidates = sanitizeAndValidateImportCandidates(workspaceId, candidates, {
+        rejectOnTampering: true,
+      });
+
       // Serialize concurrent import requests per workspace via distributed repository lock
       return await repo.withWorkspaceLock(workspaceId, async () => {
         const store = await repo.getStoreByWorkspace(workspaceId);
@@ -354,7 +385,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         const catalog = await repo.loadWorkspaceCatalog(workspaceId);
         const existingProducts = catalog?.products || [];
 
-        const { additionalSkus } = calculateImportUsage(candidates, existingProducts);
+        const { additionalSkus } = calculateImportUsage(safeCandidates, existingProducts);
 
         const quotaCheck = checkPlanQuota(store, existingProducts, additionalSkus, subscription);
         if (!quotaCheck.allowed) {
@@ -369,7 +400,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           });
         }
 
-        const result = await repo.importCatalog(workspaceId, candidates);
+        const result = await repo.importCatalog(workspaceId, safeCandidates);
         const savedCatalog = await repo.loadWorkspaceCatalog(workspaceId);
 
         return res.json({
@@ -379,6 +410,12 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       });
     } catch (err: any) {
+      if (err instanceof ProtectedVerificationFieldError || err.code === 'PROTECTED_VERIFICATION_FIELD') {
+        return res.status(403).json({
+          error: err.message,
+          code: 'PROTECTED_VERIFICATION_FIELD',
+        });
+      }
       if (err.code === 'PLAN_QUOTA_EXCEEDED' || err.name === 'PlanQuotaExceededError') {
         return res.status(403).json({
           error: err.message,
@@ -447,13 +484,40 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
             });
           }
 
+          const nowIso = new Date().toISOString();
+          const demoProducts = JSON.parse(JSON.stringify(initialProducts)).map((p: any) => ({
+            ...p,
+            evidenceDocuments: (p.evidenceDocuments || []).map((doc: any) => {
+              const isVerifiedDemoDoc = doc.status === 'verified';
+              const withServerMeta = isVerifiedDemoDoc
+                ? {
+                    ...doc,
+                    evidencePurpose: 'product_claim' as const,
+                    verificationSource: 'external_registry' as const,
+                    decision: 'approved' as const,
+                    verifiedBy: 'demo_seed',
+                    reviewedAt: nowIso,
+                    createdAt: nowIso,
+                  }
+                : {
+                    ...doc,
+                    evidencePurpose: 'product_claim' as const,
+                    verificationSource: 'client_submission' as const,
+                    decision: 'pending' as const,
+                    createdAt: nowIso,
+                  };
+              withServerMeta.integrityHash = computeEvidenceIntegrityHash(workspaceId, p.id, withServerMeta);
+              return withServerMeta;
+            }),
+          }));
+
           const demoPayload: StoragePayloadV1 = {
-            products: JSON.parse(JSON.stringify(initialProducts)),
-            variants: initialProducts.flatMap(p => p.variants || []),
-            offers: initialProducts.flatMap(p => p.offers || []),
+            products: demoProducts,
+            variants: demoProducts.flatMap((p: any) => p.variants || []),
+            offers: demoProducts.flatMap((p: any) => p.offers || []),
             findings: JSON.parse(JSON.stringify(initialFindings)),
             actions: JSON.parse(JSON.stringify(initialActionItems)),
-            evidence: initialProducts.flatMap(p => p.evidenceDocuments || []),
+            evidence: demoProducts.flatMap((p: any) => p.evidenceDocuments || []),
             storeProfile: {
               ...storeProfile,
               skuCount: demoSkus,
@@ -507,6 +571,162 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       }
       console.error('[AIXSHOP Catalog] Demo migration error:', err);
       return res.status(500).json({ error: 'Failed to migrate demo data to workspace' });
+    }
+  });
+
+  // POST /api/catalog/evidence — Merchant evidence upload (always starts pending/unverified)
+  router.post(
+    '/evidence',
+    requireAuth,
+    requireRole(['owner', 'admin', 'member']),
+    catalogWriteLimiter,
+    async (req: AuthRequest, res) => {
+      try {
+        const workspaceId = req.workspace!.id;
+        const body = req.body || {};
+
+        if (
+          body.status === 'verified' ||
+          body.decision === 'approved' ||
+          Boolean(body.verifiedBy) ||
+          Boolean(body.reviewedAt) ||
+          Boolean(body.integrityHash) ||
+          (body.verificationSource && body.verificationSource !== 'client_submission')
+        ) {
+          return res.status(403).json({
+            error:
+              'Forbidden: verification status, decision, reviewer metadata, and integrityHash are server-controlled and cannot be set by client submissions.',
+            code: 'PROTECTED_VERIFICATION_FIELD',
+          });
+        }
+
+        const productId = typeof body.productId === 'string' ? body.productId.trim() : '';
+        const title = typeof body.title === 'string' ? body.title.trim() : '';
+        const type = typeof body.type === 'string' ? body.type.trim() : '';
+        const issuer = typeof body.issuer === 'string' ? body.issuer.trim() : '';
+
+        if (!productId || !title || !type || !issuer) {
+          return res.status(400).json({
+            error: 'productId, title, type, and issuer are required.',
+            code: 'INVALID_EVIDENCE_PAYLOAD',
+          });
+        }
+
+        const result = await repo.submitEvidenceDocument({
+          workspaceId,
+          productId,
+          title,
+          type: type as any,
+          issuer,
+          dateVerified: typeof body.dateVerified === 'string' ? body.dateVerified.trim() : undefined,
+          url: typeof body.url === 'string' ? body.url.trim() : undefined,
+          evidencePurpose: body.evidencePurpose,
+          submittedByUserId: req.user!.id,
+          id: typeof body.id === 'string' ? body.id.trim() : undefined,
+        });
+
+        return res.status(201).json({
+          success: true,
+          workspaceId,
+          evidence: result.evidence,
+          catalogVersion: result.catalogVersion,
+        });
+      } catch (err: any) {
+        if (err.code === 'PRODUCT_NOT_FOUND' || err.code === 'CATALOG_NOT_FOUND') {
+          return res.status(404).json({
+            error: err.message,
+            code: err.code,
+          });
+        }
+        console.error('[AIXSHOP Catalog] Evidence submission error:', err);
+        return res.status(500).json({ error: err.message || 'Failed to submit evidence document' });
+      }
+    }
+  );
+
+  // POST /api/catalog/evidence/:evidenceId/review — Server-owned reviewer verification (workspace users forbidden)
+  router.post('/evidence/:evidenceId/review', requireAuth, catalogWriteLimiter, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const evidenceId = req.params.evidenceId;
+
+      const configuredSecret = process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET?.trim() || '';
+      const providedToken = String(req.headers['x-aixshop-reviewer-token'] || '');
+      const reviewerIdHeader = String(req.headers['x-aixshop-reviewer-id'] || '').trim();
+
+      let authorizedReviewer = false;
+      if (configuredSecret.length >= 32 && providedToken.length > 0 && reviewerIdHeader.length > 0) {
+        const expectedDigest = crypto.createHash('sha256').update(configuredSecret, 'utf8').digest();
+        const providedDigest = crypto.createHash('sha256').update(providedToken, 'utf8').digest();
+        authorizedReviewer = crypto.timingSafeEqual(expectedDigest, providedDigest);
+      }
+
+      if (!authorizedReviewer) {
+        return res.status(403).json({
+          error:
+            'Forbidden: workspace users cannot self-approve or modify evidence verification status. A server-authorized platform reviewer credential is required.',
+          code: 'FORBIDDEN_REVIEWER_REQUIRED',
+        });
+      }
+
+      const { decision, reason, verificationSource } = req.body || {};
+      if (decision !== 'approved' && decision !== 'rejected') {
+        return res.status(400).json({
+          error: 'decision must be "approved" or "rejected".',
+          code: 'INVALID_REVIEW_DECISION',
+        });
+      }
+
+      const result = await repo.reviewEvidenceDocument({
+        workspaceId,
+        evidenceId,
+        decision,
+        reviewerId: reviewerIdHeader,
+        reviewerRole: 'platform_reviewer',
+        reason: typeof reason === 'string' ? reason.trim() : undefined,
+        verificationSource: verificationSource === 'external_registry' ? 'external_registry' : 'server_reviewer',
+      });
+
+      return res.status(200).json({
+        success: true,
+        workspaceId,
+        evidence: result.evidence,
+        auditEntry: result.auditEntry,
+        catalogVersion: result.catalogVersion,
+      });
+    } catch (err: any) {
+      if (err.code === 'EVIDENCE_NOT_FOUND' || err.code === 'CATALOG_NOT_FOUND') {
+        return res.status(404).json({
+          error: err.message,
+          code: err.code,
+        });
+      }
+      if (err.code === 'EVIDENCE_INTEGRITY_MISMATCH') {
+        return res.status(409).json({
+          error: err.message,
+          code: err.code,
+        });
+      }
+      console.error('[AIXSHOP Catalog] Evidence review error:', err);
+      return res.status(500).json({ error: err.message || 'Failed to review evidence document' });
+    }
+  });
+
+  // GET /api/catalog/evidence/:evidenceId/audit-log — Read immutable server review log for an evidence record
+  router.get('/evidence/:evidenceId/audit-log', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const evidenceId = req.params.evidenceId;
+      const entries = await repo.getEvidenceReviewAuditLog(workspaceId, evidenceId);
+      return res.status(200).json({
+        success: true,
+        workspaceId,
+        evidenceId,
+        entries,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Catalog] Evidence audit log read error:', err);
+      return res.status(500).json({ error: 'Failed to retrieve evidence review audit log' });
     }
   });
 

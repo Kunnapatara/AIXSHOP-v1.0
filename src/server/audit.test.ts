@@ -371,7 +371,8 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
             issuer: 'Fair Trade USA',
             dateVerified: '2026-05-15',
             url: 'https://fairtradecertified.org/registry/10492',
-            status: 'verified',
+            status: 'unverified',
+            evidencePurpose: 'product_claim',
           },
         ],
         findingsCount: 0,
@@ -390,7 +391,7 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
       };
 
       // Save catalog
-      await fetch(`${baseUrl}/api/catalog`, {
+      const putRes = await fetch(`${baseUrl}/api/catalog`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -408,6 +409,17 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
             storeProfile: store,
           },
         }),
+      });
+      assert.equal(putRes.status, 200);
+
+      // Server-side verification by trusted platform reviewer
+      await repo.reviewEvidenceDocument({
+        workspaceId: tenant.workspace.id,
+        evidenceId: 'evid_fair_trade_01',
+        decision: 'approved',
+        reviewerId: 'reviewer_compliance_01',
+        reviewerRole: 'platform_reviewer',
+        reason: 'Verified Fair Trade USA registry #10492',
       });
 
       // Execute audit
@@ -926,14 +938,15 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
             issuer: 'USDA National Organic Program',
             dateVerified: '2026-05-01T00:00:00.000Z',
             url: 'https://example.com/cert/usda-456.pdf',
-            status: 'verified',
+            status: 'unverified',
+            evidencePurpose: 'product_claim',
           },
         ],
         findingsCount: 0,
         lastAudited: '',
       };
 
-      await fetch(`${baseUrl}/api/catalog`, {
+      const putRes = await fetch(`${baseUrl}/api/catalog`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -951,6 +964,16 @@ describe('AIXSHOP v1.0 — Phase 1: Real Audit Execution Integration Suite', () 
             storeProfile: store,
           },
         }),
+      });
+      assert.equal(putRes.status, 200);
+
+      await repo.reviewEvidenceDocument({
+        workspaceId: evidenceTenant.workspace.id,
+        evidenceId: 'ev_usda_cert_456',
+        decision: 'approved',
+        reviewerId: 'reviewer_compliance_02',
+        reviewerRole: 'platform_reviewer',
+        reason: 'Verified USDA NOP registry document',
       });
 
       // Execute audit

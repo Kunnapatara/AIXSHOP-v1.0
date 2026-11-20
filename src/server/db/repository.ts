@@ -15,7 +15,10 @@ import {
   ActionItem, 
   StoreProfile,
   CatalogImportResult,
-  ProductCandidate
+  ProductCandidate,
+  EvidencePurpose,
+  EvidenceReviewAuditEntry,
+  ShopifyProductProvenanceRecord
 } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
@@ -226,6 +229,36 @@ export interface DatabaseRepository {
     workspaceId: string,
     candidates: ProductCandidate[]
   ): Promise<CatalogImportResult>;
+
+  // GTIN Evidence Verification & Shopify Provenance (Migration 015)
+  submitEvidenceDocument(params: {
+    workspaceId: string;
+    productId: string;
+    title: string;
+    type: EvidenceDocument['type'];
+    issuer: string;
+    dateVerified?: string;
+    url?: string;
+    evidencePurpose?: EvidencePurpose;
+    submittedByUserId: string;
+    id?: string;
+  }): Promise<{ evidence: EvidenceDocument; catalogVersion?: number }>;
+
+  reviewEvidenceDocument(params: {
+    workspaceId: string;
+    evidenceId: string;
+    decision: 'approved' | 'rejected';
+    reviewerId: string;
+    reviewerRole: string;
+    reason?: string;
+    verificationSource?: 'server_reviewer' | 'external_registry';
+  }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }>;
+
+  getEvidenceReviewAuditLog(workspaceId: string, evidenceId?: string): Promise<EvidenceReviewAuditEntry[]>;
+
+  upsertShopifyProductProvenance(record: ShopifyProductProvenanceRecord): Promise<void>;
+  getShopifyProductProvenance(workspaceId: string): Promise<ShopifyProductProvenanceRecord[]>;
+  deleteShopifyProductProvenance(workspaceId: string, productId: string): Promise<void>;
 
   // Billing & Subscriptions
   getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null>;

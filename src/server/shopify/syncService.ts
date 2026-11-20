@@ -1,5 +1,5 @@
 import { DatabaseRepository } from '../db/repository';
-import { Product, Variant, Offer } from '../../types';
+import { Product, Variant, Offer, ShopifyProductProvenanceRecord } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import {
   PaginationCompletenessStatus,
@@ -254,6 +254,8 @@ async function executeSyncShopifyCatalog(
     let planLimitHit = false;
 
     const mergedProducts: Product[] = [];
+    const provenanceRecords: ShopifyProductProvenanceRecord[] = [];
+    const syncVerifiedAt = new Date().toISOString();
     const allVariantCompleteness: Record<string, import('./types').ProductVariantCompleteness> = {};
     let isEarlyCursorBreak = false;
 
@@ -318,6 +320,18 @@ async function executeSyncShopifyCatalog(
 
         importedProductsCount++;
         importedVariantsCount += variantCount;
+
+        provenanceRecords.push({
+          workspaceId,
+          productId: mappedProduct.id,
+          shopDomain: shop,
+          shopifyProductId: mappedProduct.attributes.sourceProductId,
+          shopifyGid: mappedProduct.attributes.shopifyGid,
+          isGiftCard: rawNode.isGiftCard === true,
+          sourceType: 'shopify_graphql_admin_api',
+          shopifyUpdatedAt: rawNode.updatedAt || undefined,
+          verifiedAt: syncVerifiedAt,
+        });
       }
 
       if (pageResult.hasNextPage && !pageResult.endCursor) {
@@ -457,6 +471,11 @@ async function executeSyncShopifyCatalog(
         result: undefined,
       };
     });
+
+    // Persist authoritative server-owned Shopify provenance (gift-card eligibility, shop domain & GID)
+    for (const provRecord of provenanceRecords) {
+      await repo.upsertShopifyProductProvenance(provRecord);
+    }
 
     // Update sync run in database with strict workspace scoping
     syncRun = await repo.updateShopifySyncRun(syncRunId, workspaceId, {

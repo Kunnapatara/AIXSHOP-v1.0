@@ -620,6 +620,7 @@ export function mapWebhookPayloadToDomainProduct(
       shopifyHandle: payload.handle || '',
       shopifyStatus: payload.status || 'active',
       shopifyUpdatedAt: payload.updated_at || new Date().toISOString(),
+      ...(payload.gift_card === true ? { shopifyIsGiftCard: 'true' } : {}),
       provenance: 'shopify_webhook',
       canonicalProductUrl: productUrl,
       urlProvenance: canonicalDomain ? 'verified_shopify_store_domain' : 'unavailable_store_domain',
@@ -878,6 +879,26 @@ export async function processShopifyWebhook(
 
       outcomeStatus = mutationOutcome.status;
       ignoredReason = mutationOutcome.reason;
+
+      if (outcomeStatus === 'processed') {
+        const numericId = String(payload.id || '');
+        const productId = `p_shopify_${numericId}`;
+        if (topic === 'products/create' || topic === 'products/update') {
+          await repo.upsertShopifyProductProvenance({
+            workspaceId,
+            productId,
+            shopDomain: shop,
+            shopifyProductId: numericId,
+            shopifyGid: `gid://shopify/Product/${numericId}`,
+            isGiftCard: payload.gift_card === true,
+            sourceType: 'shopify_webhook',
+            shopifyUpdatedAt: payload.updated_at || undefined,
+            verifiedAt: new Date().toISOString(),
+          });
+        } else if (topic === 'products/delete') {
+          await repo.deleteShopifyProductProvenance(workspaceId, productId);
+        }
+      }
     }
 
     await repo.updateShopifyWebhookEventStatus(
