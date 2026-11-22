@@ -49,13 +49,24 @@ export function createStoreRoutes(repo: DatabaseRepository): Router {
       const workspaceId = req.workspace!.id;
       const rawUpdates = req.body || {};
       const updates = { ...rawUpdates };
-      // Authoritative security boundary: never allow client requests to mutate plan tier, SKU limits, or identities
+      // Authoritative security boundary: never allow client requests to mutate plan tier, SKU limits, Shopify OAuth state, or server-managed provenance
       delete updates.id;
       delete updates.workspaceId;
       delete updates.tier;
       delete updates.skuLimit;
       delete updates.skuCount;
       delete updates.role;
+      delete updates.shopifyConnected;
+      delete updates.shopifyShopDomain;
+      delete updates.shopify_connected;
+      delete updates.shopify_shop_domain;
+      delete updates.sourceClassification;
+      delete updates.source_classification;
+      delete updates.sourceMetadata;
+      delete updates.source_metadata_json;
+      delete updates.platform;
+      delete updates.lastAuditDate;
+      delete updates.evidenceCoverageAvg;
 
       const currentStore = await repo.getStoreByWorkspace(workspaceId);
       if (!currentStore) {

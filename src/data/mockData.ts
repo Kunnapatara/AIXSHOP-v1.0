@@ -3,7 +3,16 @@ import { Product, Finding, ActionItem, StoreProfile } from '../types';
 export const initialStoreProfile: StoreProfile = {
   name: 'Solstice Craft Goods & Coffee',
   domain: 'https://solsticecraftgoods.store',
-  platform: 'Shopify Storefront API v2025-01',
+  websiteUrl: 'https://solsticecraftgoods.store',
+  platform: 'Solstice Demo Catalog Fixture',
+  sourceClassification: 'demo',
+  sourceMetadata: {
+    classification: 'demo',
+    origin: 'https://solsticecraftgoods.store',
+    acquisitionMethod: 'demo_fixture',
+    isPartialSample: false,
+  },
+  shopifyConnected: false,
   skuCount: 184,
   skuLimit: 2500,
   tier: 'Growth Tier',
@@ -70,6 +79,9 @@ export const initialProducts: Product[] = [
     completenessScore: 92,
     evidenceCoverageScore: 88,
     externalDiscoveryStatus: 'observed_in_sample',
+    sourceClassification: 'demo',
+    sourceOrigin: 'https://solsticecraftgoods.store',
+    acquisitionMethod: 'demo_fixture',
     lastAudited: '2026-10-11T04:15:00Z',
     findingsCount: 1,
     attributes: {
@@ -165,6 +177,9 @@ export const initialProducts: Product[] = [
     completenessScore: 78,
     evidenceCoverageScore: 62,
     externalDiscoveryStatus: 'observed_in_sample',
+    sourceClassification: 'demo',
+    sourceOrigin: 'https://solsticecraftgoods.store',
+    acquisitionMethod: 'demo_fixture',
     lastAudited: '2026-10-11T04:15:00Z',
     findingsCount: 2,
     attributes: {
@@ -242,6 +257,9 @@ export const initialProducts: Product[] = [
     completenessScore: 81,
     evidenceCoverageScore: 70,
     externalDiscoveryStatus: 'observed_in_sample',
+    sourceClassification: 'demo',
+    sourceOrigin: 'https://solsticecraftgoods.store',
+    acquisitionMethod: 'demo_fixture',
     lastAudited: '2026-10-11T04:15:00Z',
     findingsCount: 2,
     attributes: {
@@ -307,6 +325,9 @@ export const initialProducts: Product[] = [
     completenessScore: 71,
     evidenceCoverageScore: 45,
     externalDiscoveryStatus: 'insufficient_evidence',
+    sourceClassification: 'demo',
+    sourceOrigin: 'https://solsticecraftgoods.store',
+    acquisitionMethod: 'demo_fixture',
     lastAudited: '2026-10-11T04:15:00Z',
     findingsCount: 3,
     attributes: {

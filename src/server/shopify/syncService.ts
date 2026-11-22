@@ -115,6 +115,9 @@ export function mapShopifyProductNodeToDomain(
     completenessScore: 0,
     evidenceCoverageScore: 0,
     externalDiscoveryStatus: 'observed_in_sample',
+    sourceClassification: 'shopify_oauth',
+    sourceOrigin: canonicalDomain || undefined,
+    acquisitionMethod: 'shopify_admin_graphql',
     attributes: {
       sourcePlatform: 'shopify',
       sourceProductId: numericId,
@@ -441,14 +444,18 @@ async function executeSyncShopifyCatalog(
 
       const effectiveStore = latestCatalog.storeProfile || authoritativeStore || storeProfile;
       const connectors = effectiveStore?.connectors || [];
-      const shopifyConnectorIdx = connectors.findIndex((c) => c.id === 'shopify');
+      const shopifyConnectorIdx = connectors.findIndex(
+        (c) => c.id === 'shopify' || c.id === 'shopify_primary' || c.type === 'shopify'
+      );
+      const existingConnectorId = shopifyConnectorIdx >= 0 ? connectors[shopifyConnectorIdx].id : 'shopify';
+      const nowSyncIso = new Date().toISOString();
       const updatedConnector = {
-        id: 'shopify',
+        id: existingConnectorId,
         name: `Shopify (${shop})`,
         type: 'shopify' as const,
         status: 'connected' as const,
         productCountSynced: importedVariantsCount,
-        lastSync: new Date().toISOString(),
+        lastSync: nowSyncIso,
         writeBackAuthorized: false,
       };
       const nextConnectors = [...connectors];
@@ -464,6 +471,19 @@ async function executeSyncShopifyCatalog(
           products: mergedCatalogProducts,
           storeProfile: {
             ...effectiveStore,
+            domain: effectiveStore?.domain || shop,
+            websiteUrl: effectiveStore?.websiteUrl || effectiveStore?.domain || shop,
+            platform: 'Shopify Admin GraphQL API (2026-10)',
+            sourceClassification: 'shopify_oauth',
+            sourceMetadata: {
+              classification: 'shopify_oauth',
+              origin: shop,
+              shopDomain: shop,
+              acquisitionMethod: 'shopify_admin_graphql',
+              importedAt: nowSyncIso,
+            },
+            shopifyConnected: true,
+            shopifyShopDomain: shop,
             connectors: nextConnectors,
             skuCount: countCatalogSkus(mergedCatalogProducts),
           },

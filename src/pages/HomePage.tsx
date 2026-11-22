@@ -55,14 +55,35 @@ export const HomePage: React.FC = () => {
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-stone-950">
-                {storeProfile.name}
+                {storeProfile.name || 'Merchant Workspace'}
               </h1>
-              <span className="text-xs font-mono font-medium text-emerald-800 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md">
-                Connector Active
-              </span>
+              {(() => {
+                const isShopifyOAuth = Boolean(storeProfile.shopifyConnected || storeProfile.sourceClassification === 'shopify_oauth');
+                const cls = storeProfile.sourceClassification;
+                const badgeConfig = isShopifyOAuth
+                  ? { label: 'Shopify Connected Store', clsName: 'text-emerald-800 bg-emerald-50 border-emerald-200' }
+                  : cls === 'public_feed'
+                  ? { label: 'Public Feed Sample', clsName: 'text-blue-800 bg-blue-50 border-blue-200' }
+                  : cls === 'manual_import'
+                  ? { label: 'Manual Import', clsName: 'text-stone-700 bg-stone-100 border-stone-200' }
+                  : cls === 'demo'
+                  ? { label: 'Demo Data', clsName: 'text-amber-800 bg-amber-50 border-amber-200' }
+                  : storeProfile.domain || storeProfile.websiteUrl
+                  ? { label: 'General Website', clsName: 'text-stone-700 bg-stone-100 border-stone-200' }
+                  : { label: 'Website Not Configured', clsName: 'text-stone-500 bg-stone-50 border-stone-200' };
+                return (
+                  <span className={`text-xs font-mono font-medium border px-2 py-0.5 rounded-md ${badgeConfig.clsName}`}>
+                    {badgeConfig.label}
+                  </span>
+                );
+              })()}
             </div>
             <p className="text-xs text-stone-500 font-mono mt-0.5">
-              {storeProfile.platform} · {storeProfile.domain}
+              {storeProfile.platform || (storeProfile.shopifyConnected ? 'Shopify Admin GraphQL API' : 'No catalog feed connected')}
+              {' · '}
+              {storeProfile.shopifyConnected && storeProfile.shopifyShopDomain
+                ? `Shopify OAuth: ${storeProfile.shopifyShopDomain}`
+                : storeProfile.domain || storeProfile.websiteUrl || 'No website URL configured'}
             </p>
           </div>
         </div>
@@ -108,7 +129,7 @@ export const HomePage: React.FC = () => {
               </div>
               <div className="mt-3 flex items-baseline gap-2">
                 <span className="text-3xl sm:text-4xl font-extrabold font-mono text-stone-950 tabular-nums">
-                  {isReportLocked ? 'Locked' : `${storeProfile.catalogCompletenessAvg}%`}
+                  {isReportLocked ? 'Locked' : `${storeProfile.catalogCompletenessAvg ?? 0}%`}
                 </span>
                 {!isReportLocked && <span className="text-xs text-stone-500 font-mono">/ 100</span>}
               </div>
@@ -133,9 +154,15 @@ export const HomePage: React.FC = () => {
               </div>
               <div className="mt-3 flex items-baseline gap-2">
                 <span className="text-3xl sm:text-4xl font-extrabold font-mono text-stone-950 tabular-nums">
-                  {isReportLocked ? 'Locked' : `${storeProfile.evidenceCoverageAvg}%`}
+                  {isReportLocked
+                    ? 'Locked'
+                    : storeProfile.evidenceCoverageAvg != null
+                    ? `${storeProfile.evidenceCoverageAvg}%`
+                    : '—'}
                 </span>
-                {!isReportLocked && <span className="text-xs text-stone-500 font-mono">/ 100</span>}
+                {!isReportLocked && storeProfile.evidenceCoverageAvg != null && (
+                  <span className="text-xs text-stone-500 font-mono">/ 100</span>
+                )}
               </div>
               <p className="text-xs text-stone-600 mt-2 leading-relaxed">
                 Measures specifications substantiated by verifiable documents (lab cupping sheets, OEKO-TEX licenses, GTIN barcodes).

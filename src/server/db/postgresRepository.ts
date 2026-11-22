@@ -485,6 +485,7 @@ export class PostgresRepository implements DatabaseRepository {
           '013_billing_webhook_recovery.sql',
           '014_auth_recovery_and_operation_leases.sql',
           '015_gtin_evidence_trust.sql',
+          '016_source_classification_and_domain_cleanup.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -876,19 +877,22 @@ export class PostgresRepository implements DatabaseRepository {
         },
       ];
       await client.query(
-        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())`,
+        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, NOW(), NOW())`,
         [
           storeId,
           workspace.id,
           `${workspace.name} Store`,
-          `${workspace.slug}.myshopify.com`,
+          '',
           'USD',
           0,
           0,
           'standard',
           'Free Audit',
           JSON.stringify(defaultConnectors),
+          '',
+          'unconfigured',
+          false,
         ]
       );
 
@@ -970,11 +974,11 @@ export class PostgresRepository implements DatabaseRepository {
       // Also create default store record for the workspace
       const storeId = `store_${workspace.id}`;
       const storeQuery = `
-        INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, 'USD', 0, 0, 'balanced', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+        INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, 'USD', 0, 0, 'balanced', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
         ON CONFLICT (id) DO NOTHING
       `;
-      await client.query(storeQuery, [storeId, workspace.id, `${workspace.name} Store`, `${workspace.slug}.myshopify.com`]);
+      await client.query(storeQuery, [storeId, workspace.id, `${workspace.name} Store`, '']);
 
       return { workspace, membership };
     });
@@ -1060,7 +1064,7 @@ export class PostgresRepository implements DatabaseRepository {
 
   async getStoreByWorkspace(workspaceId: string): Promise<StoreProfile | null> {
     const query = `
-      SELECT id, name, domain, currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
+      SELECT id, name, domain, website_url AS "websiteUrl", platform, source_classification AS "sourceClassification", source_metadata_json AS "sourceMetadataJson", evidence_coverage_avg AS "evidenceCoverageAvg", last_audit_date AS "lastAuditDate", shopify_connected AS "shopifyConnected", shopify_shop_domain AS "shopifyShopDomain", currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
       FROM stores
       WHERE workspace_id = $1
       LIMIT 1
@@ -1069,18 +1073,29 @@ export class PostgresRepository implements DatabaseRepository {
     if (!res.rows[0]) return null;
     const r = res.rows[0];
     const parsedLimit = (typeof r.skuLimit === 'number' && !isNaN(r.skuLimit)) ? r.skuLimit : undefined;
+    const parsedEvidenceAvg = (typeof r.evidenceCoverageAvg === 'number' && !isNaN(r.evidenceCoverageAvg)) ? r.evidenceCoverageAvg : undefined;
+    const parsedSourceMetadata = r.sourceMetadataJson
+      ? (typeof r.sourceMetadataJson === 'string' ? JSON.parse(r.sourceMetadataJson) : r.sourceMetadataJson)
+      : undefined;
+    const shopifyConnected = Boolean(r.shopifyConnected);
+    const domain = r.domain ?? '';
     return {
       name: r.name,
-      domain: r.domain,
-      platform: 'Shopify Storefront API v2025-01',
+      domain,
+      websiteUrl: r.websiteUrl ?? domain,
+      platform: r.platform || undefined,
+      sourceClassification: r.sourceClassification || (shopifyConnected ? 'shopify_oauth' : 'unconfigured'),
+      ...(parsedSourceMetadata && Object.keys(parsedSourceMetadata).length > 0 ? { sourceMetadata: parsedSourceMetadata } : {}),
+      shopifyConnected,
+      ...(r.shopifyShopDomain ? { shopifyShopDomain: r.shopifyShopDomain } : {}),
       skuCount: r.skuCount,
       skuLimit: parsedLimit,
       tier: r.tier,
-      lastAuditDate: new Date().toISOString(),
+      ...(r.lastAuditDate ? { lastAuditDate: r.lastAuditDate } : {}),
       currency: r.currency,
-      connectors: typeof r.connectorsJson === 'string' ? JSON.parse(r.connectorsJson) : r.connectorsJson,
+      connectors: typeof r.connectorsJson === 'string' ? JSON.parse(r.connectorsJson) : (r.connectorsJson || []),
       catalogCompletenessAvg: r.catalogCompletenessAvg,
-      evidenceCoverageAvg: 70,
+      ...(parsedEvidenceAvg !== undefined ? { evidenceCoverageAvg: parsedEvidenceAvg } : {}),
       truthBoundaryStrictness: r.truthBoundaryStrictness,
     };
   }
@@ -1090,9 +1105,16 @@ export class PostgresRepository implements DatabaseRepository {
     const cleanSkuLimit = (typeof profile.skuLimit === 'number' && Number.isInteger(profile.skuLimit) && profile.skuLimit >= 0)
       ? profile.skuLimit
       : null;
+    const cleanEvidenceAvg = (typeof profile.evidenceCoverageAvg === 'number' && !isNaN(profile.evidenceCoverageAvg))
+      ? Math.round(profile.evidenceCoverageAvg)
+      : null;
+    const cleanDomain = profile.domain ?? '';
+    const cleanWebsiteUrl = profile.websiteUrl ?? cleanDomain;
+    const cleanShopifyConnected = Boolean(profile.shopifyConnected);
+    const cleanClassification = profile.sourceClassification || (cleanShopifyConnected ? 'shopify_oauth' : 'unconfigured');
     const query = `
-      INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, sku_limit, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW(), NOW())
+      INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, sku_limit, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb, $16, $17, $18, $19, NOW(), NOW())
       ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
         domain = EXCLUDED.domain,
@@ -1103,14 +1125,22 @@ export class PostgresRepository implements DatabaseRepository {
         truth_boundary_strictness = EXCLUDED.truth_boundary_strictness,
         tier = EXCLUDED.tier,
         connectors_json = EXCLUDED.connectors_json,
+        website_url = EXCLUDED.website_url,
+        platform = EXCLUDED.platform,
+        source_classification = EXCLUDED.source_classification,
+        source_metadata_json = EXCLUDED.source_metadata_json,
+        evidence_coverage_avg = EXCLUDED.evidence_coverage_avg,
+        last_audit_date = EXCLUDED.last_audit_date,
+        shopify_connected = EXCLUDED.shopify_connected,
+        shopify_shop_domain = EXCLUDED.shopify_shop_domain,
         updated_at = NOW()
-      RETURNING name, domain, currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
+      RETURNING name, domain, website_url AS "websiteUrl", platform, source_classification AS "sourceClassification", source_metadata_json AS "sourceMetadataJson", evidence_coverage_avg AS "evidenceCoverageAvg", last_audit_date AS "lastAuditDate", shopify_connected AS "shopifyConnected", shopify_shop_domain AS "shopifyShopDomain", currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
     `;
     const res = await this.query(query, [
       storeId,
       workspaceId,
       profile.name,
-      profile.domain,
+      cleanDomain,
       profile.currency,
       profile.skuCount,
       cleanSkuLimit,
@@ -1118,20 +1148,41 @@ export class PostgresRepository implements DatabaseRepository {
       profile.truthBoundaryStrictness,
       profile.tier,
       JSON.stringify(profile.connectors || []),
+      cleanWebsiteUrl,
+      profile.platform ?? null,
+      cleanClassification,
+      JSON.stringify(profile.sourceMetadata || {}),
+      cleanEvidenceAvg,
+      profile.lastAuditDate ?? null,
+      cleanShopifyConnected,
+      profile.shopifyShopDomain ?? null,
     ]);
     const r = res.rows[0];
+    const parsedEvidenceAvg = (typeof r.evidenceCoverageAvg === 'number' && !isNaN(r.evidenceCoverageAvg))
+      ? r.evidenceCoverageAvg
+      : profile.evidenceCoverageAvg;
+    const parsedMeta = r.sourceMetadataJson
+      ? (typeof r.sourceMetadataJson === 'string' ? JSON.parse(r.sourceMetadataJson) : r.sourceMetadataJson)
+      : profile.sourceMetadata;
+    const returnedShopifyConnected = r.shopifyConnected !== undefined ? Boolean(r.shopifyConnected) : cleanShopifyConnected;
+    const returnedDomain = r.domain ?? cleanDomain;
     return {
       name: r.name,
-      domain: r.domain,
-      platform: profile.platform || 'Shopify Storefront API v2025-01',
+      domain: returnedDomain,
+      websiteUrl: r.websiteUrl ?? cleanWebsiteUrl,
+      platform: r.platform ?? profile.platform ?? undefined,
+      sourceClassification: r.sourceClassification ?? cleanClassification,
+      ...(parsedMeta && Object.keys(parsedMeta).length > 0 ? { sourceMetadata: parsedMeta } : {}),
+      shopifyConnected: returnedShopifyConnected,
+      ...(r.shopifyShopDomain ?? profile.shopifyShopDomain ? { shopifyShopDomain: r.shopifyShopDomain ?? profile.shopifyShopDomain } : {}),
       skuCount: r.skuCount,
       skuLimit: (typeof r.skuLimit === 'number' && !isNaN(r.skuLimit)) ? r.skuLimit : undefined,
       tier: r.tier,
-      lastAuditDate: profile.lastAuditDate || new Date().toISOString(),
+      ...((r.lastAuditDate ?? profile.lastAuditDate) ? { lastAuditDate: r.lastAuditDate ?? profile.lastAuditDate } : {}),
       currency: r.currency,
-      connectors: typeof r.connectorsJson === 'string' ? JSON.parse(r.connectorsJson) : r.connectorsJson,
+      connectors: typeof r.connectorsJson === 'string' ? JSON.parse(r.connectorsJson) : (r.connectorsJson || []),
       catalogCompletenessAvg: r.catalogCompletenessAvg,
-      evidenceCoverageAvg: profile.evidenceCoverageAvg || 70,
+      ...(parsedEvidenceAvg !== undefined ? { evidenceCoverageAvg: parsedEvidenceAvg } : {}),
       truthBoundaryStrictness: r.truthBoundaryStrictness,
     };
   }
@@ -1142,7 +1193,7 @@ export class PostgresRepository implements DatabaseRepository {
     store: StoreProfile
   ): Promise<StoragePayloadV1> {
     const prodRes = await queryable.query(
-      `SELECT id, title, brand, category, description, image, status, completeness_score AS "completenessScore", evidence_coverage_score AS "evidenceCoverageScore", external_discovery_status AS "externalDiscoveryStatus", attributes_json AS "attributesJson", findings_count AS "findingsCount", last_audited AS "lastAudited"
+      `SELECT id, title, brand, category, description, image, status, completeness_score AS "completenessScore", evidence_coverage_score AS "evidenceCoverageScore", external_discovery_status AS "externalDiscoveryStatus", source_classification AS "sourceClassification", source_origin AS "sourceOrigin", acquisition_method AS "acquisitionMethod", attributes_json AS "attributesJson", findings_count AS "findingsCount", last_audited AS "lastAudited"
        FROM products
        WHERE workspace_id = $1`,
       [workspaceId]
@@ -1267,6 +1318,9 @@ export class PostgresRepository implements DatabaseRepository {
       completenessScore: r.completenessScore,
       evidenceCoverageScore: r.evidenceCoverageScore,
       externalDiscoveryStatus: r.externalDiscoveryStatus,
+      ...(r.sourceClassification ? { sourceClassification: r.sourceClassification } : {}),
+      ...(r.sourceOrigin ? { sourceOrigin: r.sourceOrigin } : {}),
+      ...(r.acquisitionMethod ? { acquisitionMethod: r.acquisitionMethod } : {}),
       attributes: typeof r.attributesJson === 'string' ? JSON.parse(r.attributesJson) : r.attributesJson,
       variants: variantsByProduct.get(r.id) || [],
       offers: offersByProduct.get(r.id) || [],
@@ -1331,10 +1385,25 @@ export class PostgresRepository implements DatabaseRepository {
       payload.storeProfile.skuCount = authoritativeSkuCount;
     }
 
+    const resolvedDomain = payload.storeProfile?.domain !== undefined ? payload.storeProfile.domain : authoritativeStore.domain;
+    const resolvedWebsiteUrl = payload.storeProfile?.websiteUrl !== undefined ? payload.storeProfile.websiteUrl : (authoritativeStore.websiteUrl ?? resolvedDomain);
+    const resolvedShopifyConnected = payload.storeProfile?.shopifyConnected !== undefined ? Boolean(payload.storeProfile.shopifyConnected) : Boolean(authoritativeStore.shopifyConnected);
+    const resolvedShopifyShopDomain = payload.storeProfile?.shopifyShopDomain ?? authoritativeStore.shopifyShopDomain ?? null;
+    const resolvedPlatform = payload.storeProfile?.platform ?? authoritativeStore.platform ?? null;
+    const resolvedSourceClass = payload.storeProfile?.sourceClassification ?? authoritativeStore.sourceClassification ?? (resolvedShopifyConnected ? 'shopify_oauth' : 'unconfigured');
+    const resolvedSourceMeta = payload.storeProfile?.sourceMetadata ?? authoritativeStore.sourceMetadata ?? {};
+    const resolvedEvidenceAvg = payload.storeProfile?.evidenceCoverageAvg !== undefined
+      ? payload.storeProfile.evidenceCoverageAvg
+      : authoritativeStore.evidenceCoverageAvg;
+    const cleanEvidenceAvg = (typeof resolvedEvidenceAvg === 'number' && !isNaN(resolvedEvidenceAvg))
+      ? Math.round(resolvedEvidenceAvg)
+      : null;
+    const resolvedLastAudit = payload.storeProfile?.lastAuditDate ?? authoritativeStore.lastAuditDate ?? null;
+
     // Update store profile, preserving server-managed tier and sku_limit, and advance catalog_version
     const storeUpsertRes = await client.query<{ catalog_version?: number }>(
-      `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, catalog_version, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 1, NOW(), NOW())
+      `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, sku_limit, connectors_json, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, catalog_version, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15::jsonb, $16, $17, $18, $19, 1, NOW(), NOW())
        ON CONFLICT (id) DO UPDATE SET
          name = EXCLUDED.name,
          domain = EXCLUDED.domain,
@@ -1345,6 +1414,14 @@ export class PostgresRepository implements DatabaseRepository {
          tier = EXCLUDED.tier,
          sku_limit = EXCLUDED.sku_limit,
          connectors_json = EXCLUDED.connectors_json,
+         website_url = EXCLUDED.website_url,
+         platform = EXCLUDED.platform,
+         source_classification = EXCLUDED.source_classification,
+         source_metadata_json = EXCLUDED.source_metadata_json,
+         evidence_coverage_avg = EXCLUDED.evidence_coverage_avg,
+         last_audit_date = EXCLUDED.last_audit_date,
+         shopify_connected = EXCLUDED.shopify_connected,
+         shopify_shop_domain = EXCLUDED.shopify_shop_domain,
          catalog_version = COALESCE(stores.catalog_version, 1) + 1,
          updated_at = NOW()
        RETURNING catalog_version`,
@@ -1352,7 +1429,7 @@ export class PostgresRepository implements DatabaseRepository {
         storeId,
         workspaceId,
         payload.storeProfile?.name || authoritativeStore.name,
-        payload.storeProfile?.domain || authoritativeStore.domain,
+        resolvedDomain ?? '',
         payload.storeProfile?.currency || authoritativeStore.currency,
         authoritativeSkuCount,
         payload.storeProfile?.catalogCompletenessAvg ?? authoritativeStore.catalogCompletenessAvg ?? 0,
@@ -1360,6 +1437,14 @@ export class PostgresRepository implements DatabaseRepository {
         authoritativeStore.tier,
         authoritativeStore.skuLimit !== undefined ? authoritativeStore.skuLimit : null,
         JSON.stringify(payload.storeProfile?.connectors || authoritativeStore.connectors || []),
+        resolvedWebsiteUrl ?? '',
+        resolvedPlatform,
+        resolvedSourceClass,
+        JSON.stringify(resolvedSourceMeta),
+        cleanEvidenceAvg,
+        resolvedLastAudit,
+        resolvedShopifyConnected,
+        resolvedShopifyShopDomain,
       ]
     );
     const nextVersion = Number(storeUpsertRes.rows[0]?.catalog_version ?? 1);
@@ -1387,8 +1472,8 @@ export class PostgresRepository implements DatabaseRepository {
     // Insert products
     for (const p of payload.products) {
       await client.query(
-        `INSERT INTO products (id, workspace_id, store_id, title, brand, category, description, image, status, completeness_score, evidence_coverage_score, external_discovery_status, attributes_json, findings_count, last_audited, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, NOW(), NOW())`,
+        `INSERT INTO products (id, workspace_id, store_id, title, brand, category, description, image, status, completeness_score, evidence_coverage_score, external_discovery_status, attributes_json, findings_count, last_audited, source_classification, source_origin, acquisition_method, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, NOW(), NOW())`,
         [
           p.id,
           workspaceId,
@@ -1405,6 +1490,9 @@ export class PostgresRepository implements DatabaseRepository {
           JSON.stringify(p.attributes || {}),
           p.findingsCount,
           p.lastAudited,
+          p.sourceClassification ?? null,
+          p.sourceOrigin ?? null,
+          p.acquisitionMethod ?? null,
         ]
       );
 
@@ -1739,6 +1827,14 @@ export class PostgresRepository implements DatabaseRepository {
         sku_limit: number | null;
         name: string;
         domain: string;
+        website_url?: string;
+        platform?: string | null;
+        source_classification?: any;
+        source_metadata_json?: any;
+        evidence_coverage_avg?: number | null;
+        last_audit_date?: string | null;
+        shopify_connected?: boolean;
+        shopify_shop_domain?: string | null;
         currency: string;
         sku_count: number;
         catalog_completeness_avg: number;
@@ -1746,7 +1842,7 @@ export class PostgresRepository implements DatabaseRepository {
         connectors_json: any;
         catalog_version?: number;
       }>(
-        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+        `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
          FROM stores
          WHERE workspace_id = $1
          FOR UPDATE`,
@@ -1755,13 +1851,13 @@ export class PostgresRepository implements DatabaseRepository {
 
       if (storeRes.rows.length === 0) {
         await client.query(
-          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
            ON CONFLICT (id) DO NOTHING`,
-          [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
+          [storeId, workspaceId, payload.storeProfile?.name || `${workspaceId} Store`, '']
         );
         storeRes = await client.query(
-          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+          `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
            FROM stores
            WHERE workspace_id = $1
            FOR UPDATE`,
@@ -1774,7 +1870,15 @@ export class PostgresRepository implements DatabaseRepository {
         tier: 'Free Audit',
         sku_limit: null,
         name: payload.storeProfile?.name || 'Store',
-        domain: payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
+        domain: payload.storeProfile?.domain ?? '',
+        website_url: payload.storeProfile?.websiteUrl ?? payload.storeProfile?.domain ?? '',
+        platform: payload.storeProfile?.platform ?? null,
+        source_classification: 'unconfigured',
+        source_metadata_json: '{}',
+        evidence_coverage_avg: null,
+        last_audit_date: null,
+        shopify_connected: false,
+        shopify_shop_domain: null,
         currency: payload.storeProfile?.currency || 'USD',
         sku_count: 0,
         catalog_completeness_avg: 0,
@@ -1821,12 +1925,26 @@ export class PostgresRepository implements DatabaseRepository {
         }
       }
 
+      const lockedDomain = lockedRow.domain ?? payload.storeProfile?.domain ?? '';
+      const lockedMeta = lockedRow.source_metadata_json
+        ? (typeof lockedRow.source_metadata_json === 'string' ? JSON.parse(lockedRow.source_metadata_json) : lockedRow.source_metadata_json)
+        : undefined;
       const authoritativeStore: StoreProfile = {
         name: lockedRow.name || payload.storeProfile?.name || 'Store',
-        domain: lockedRow.domain || payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
+        domain: lockedDomain,
+        websiteUrl: lockedRow.website_url ?? lockedDomain,
+        ...(lockedRow.platform ? { platform: lockedRow.platform } : {}),
+        sourceClassification: lockedRow.source_classification || (lockedRow.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
+        ...(lockedMeta && Object.keys(lockedMeta).length > 0 ? { sourceMetadata: lockedMeta } : {}),
+        shopifyConnected: Boolean(lockedRow.shopify_connected),
+        ...(lockedRow.shopify_shop_domain ? { shopifyShopDomain: lockedRow.shopify_shop_domain } : {}),
         currency: lockedRow.currency || payload.storeProfile?.currency || 'USD',
         skuCount: lockedRow.sku_count || 0,
         catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+        ...(typeof lockedRow.evidence_coverage_avg === 'number' && !isNaN(lockedRow.evidence_coverage_avg)
+          ? { evidenceCoverageAvg: lockedRow.evidence_coverage_avg }
+          : {}),
+        ...(lockedRow.last_audit_date ? { lastAuditDate: lockedRow.last_audit_date } : {}),
         truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
         tier: (lockedRow.tier || 'Free Audit') as any,
         skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
@@ -1864,6 +1982,14 @@ export class PostgresRepository implements DatabaseRepository {
         sku_limit: number | null;
         name: string;
         domain: string;
+        website_url?: string;
+        platform?: string | null;
+        source_classification?: any;
+        source_metadata_json?: any;
+        evidence_coverage_avg?: number | null;
+        last_audit_date?: string | null;
+        shopify_connected?: boolean;
+        shopify_shop_domain?: string | null;
         currency: string;
         sku_count: number;
         catalog_completeness_avg: number;
@@ -1871,7 +1997,7 @@ export class PostgresRepository implements DatabaseRepository {
         connectors_json: any;
         catalog_version?: number;
       }>(
-        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+        `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
          FROM stores
          WHERE workspace_id = $1
          FOR UPDATE`,
@@ -1880,13 +2006,13 @@ export class PostgresRepository implements DatabaseRepository {
 
       if (storeRes.rows.length === 0 && options.createStoreIfMissing) {
         await client.query(
-          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
            ON CONFLICT (id) DO NOTHING`,
-          [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
+          [storeId, workspaceId, `${workspaceId} Store`, '', 'USD']
         );
         storeRes = await client.query(
-          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+          `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
            FROM stores
            WHERE workspace_id = $1
            FOR UPDATE`,
@@ -1899,12 +2025,26 @@ export class PostgresRepository implements DatabaseRepository {
       }
 
       const lockedRow = storeRes.rows[0];
+      const lockedDomain = lockedRow.domain ?? '';
+      const lockedMeta = lockedRow.source_metadata_json
+        ? (typeof lockedRow.source_metadata_json === 'string' ? JSON.parse(lockedRow.source_metadata_json) : lockedRow.source_metadata_json)
+        : undefined;
       const authoritativeStore: StoreProfile = {
         name: lockedRow.name || 'Store',
-        domain: lockedRow.domain || `${workspaceId}.myshopify.com`,
+        domain: lockedDomain,
+        websiteUrl: lockedRow.website_url ?? lockedDomain,
+        ...(lockedRow.platform ? { platform: lockedRow.platform } : {}),
+        sourceClassification: lockedRow.source_classification || (lockedRow.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
+        ...(lockedMeta && Object.keys(lockedMeta).length > 0 ? { sourceMetadata: lockedMeta } : {}),
+        shopifyConnected: Boolean(lockedRow.shopify_connected),
+        ...(lockedRow.shopify_shop_domain ? { shopifyShopDomain: lockedRow.shopify_shop_domain } : {}),
         currency: lockedRow.currency || 'USD',
         skuCount: lockedRow.sku_count || 0,
         catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+        ...(typeof lockedRow.evidence_coverage_avg === 'number' && !isNaN(lockedRow.evidence_coverage_avg)
+          ? { evidenceCoverageAvg: lockedRow.evidence_coverage_avg }
+          : {}),
+        ...(lockedRow.last_audit_date ? { lastAuditDate: lockedRow.last_audit_date } : {}),
         truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
         tier: (lockedRow.tier || 'Free Audit') as any,
         skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
@@ -2071,13 +2211,21 @@ export class PostgresRepository implements DatabaseRepository {
         sku_limit: number | null;
         name: string;
         domain: string;
+        website_url?: string;
+        platform?: string | null;
+        source_classification?: any;
+        source_metadata_json?: any;
+        evidence_coverage_avg?: number | null;
+        last_audit_date?: string | null;
+        shopify_connected?: boolean;
+        shopify_shop_domain?: string | null;
         currency: string;
         sku_count: number;
         catalog_completeness_avg: number;
         truth_boundary_strictness: string;
         connectors_json: any;
       }>(
-        `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+        `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
          FROM stores
          WHERE workspace_id = $1
          FOR UPDATE`,
@@ -2086,13 +2234,13 @@ export class PostgresRepository implements DatabaseRepository {
 
       if (storeRes.rows.length === 0) {
         await client.query(
-          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, NOW(), NOW())
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
            ON CONFLICT (id) DO NOTHING`,
-          [storeId, workspaceId, `${workspaceId} Store`, `${workspaceId}.myshopify.com`, 'USD']
+          [storeId, workspaceId, `${workspaceId} Store`, '', 'USD']
         );
         storeRes = await client.query(
-          `SELECT id, tier, sku_limit, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
+          `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json
            FROM stores
            WHERE workspace_id = $1
            FOR UPDATE`,
@@ -2105,19 +2253,41 @@ export class PostgresRepository implements DatabaseRepository {
         tier: 'Free Audit',
         sku_limit: null,
         name: 'Store',
-        domain: `${workspaceId}.myshopify.com`,
+        domain: '',
+        website_url: '',
+        platform: null,
+        source_classification: 'unconfigured',
+        source_metadata_json: '{}',
+        evidence_coverage_avg: null,
+        last_audit_date: null,
+        shopify_connected: false,
+        shopify_shop_domain: null,
         currency: 'USD',
         sku_count: 0,
         catalog_completeness_avg: 0,
         truth_boundary_strictness: 'standard',
         connectors_json: '[]',
       };
+      const lockedDomain = lockedRow.domain ?? '';
+      const lockedMeta = lockedRow.source_metadata_json
+        ? (typeof lockedRow.source_metadata_json === 'string' ? JSON.parse(lockedRow.source_metadata_json) : lockedRow.source_metadata_json)
+        : undefined;
       const authoritativeStore: StoreProfile = {
         name: lockedRow.name || 'Store',
-        domain: lockedRow.domain || `${workspaceId}.myshopify.com`,
+        domain: lockedDomain,
+        websiteUrl: lockedRow.website_url ?? lockedDomain,
+        ...(lockedRow.platform ? { platform: lockedRow.platform } : {}),
+        sourceClassification: lockedRow.source_classification || (lockedRow.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
+        ...(lockedMeta && Object.keys(lockedMeta).length > 0 ? { sourceMetadata: lockedMeta } : {}),
+        shopifyConnected: Boolean(lockedRow.shopify_connected),
+        ...(lockedRow.shopify_shop_domain ? { shopifyShopDomain: lockedRow.shopify_shop_domain } : {}),
         currency: lockedRow.currency || 'USD',
         skuCount: lockedRow.sku_count || 0,
         catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+        ...(typeof lockedRow.evidence_coverage_avg === 'number' && !isNaN(lockedRow.evidence_coverage_avg)
+          ? { evidenceCoverageAvg: lockedRow.evidence_coverage_avg }
+          : {}),
+        ...(lockedRow.last_audit_date ? { lastAuditDate: lockedRow.last_audit_date } : {}),
         truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
         tier: (lockedRow.tier || 'Free Audit') as any,
         skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
@@ -2895,6 +3065,14 @@ export class PostgresRepository implements DatabaseRepository {
         id: string;
         name: string;
         domain: string;
+        website_url?: string;
+        platform?: string | null;
+        source_classification?: any;
+        source_metadata_json?: any;
+        evidence_coverage_avg?: number | null;
+        last_audit_date?: string | null;
+        shopify_connected?: boolean;
+        shopify_shop_domain?: string | null;
         currency: string;
         sku_count: number;
         sku_limit: number | null;
@@ -2903,7 +3081,7 @@ export class PostgresRepository implements DatabaseRepository {
         tier: string;
         connectors_json: any;
       }>(
-        `SELECT id, name, domain, currency, sku_count, sku_limit, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json
+        `SELECT id, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, sku_limit, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json
          FROM stores
          WHERE workspace_id = $1
          FOR UPDATE`,
@@ -2915,15 +3093,29 @@ export class PostgresRepository implements DatabaseRepository {
       }
 
       const rawStore = storeRes.rows[0];
+      const rawDomain = rawStore.domain ?? '';
+      const rawMeta = rawStore.source_metadata_json
+        ? (typeof rawStore.source_metadata_json === 'string' ? JSON.parse(rawStore.source_metadata_json) : rawStore.source_metadata_json)
+        : undefined;
       const authoritativeStore: StoreProfile = {
         name: rawStore.name,
-        domain: rawStore.domain,
+        domain: rawDomain,
+        websiteUrl: rawStore.website_url ?? rawDomain,
+        ...(rawStore.platform ? { platform: rawStore.platform } : {}),
+        sourceClassification: rawStore.source_classification || (rawStore.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
+        ...(rawMeta && Object.keys(rawMeta).length > 0 ? { sourceMetadata: rawMeta } : {}),
+        shopifyConnected: Boolean(rawStore.shopify_connected),
+        ...(rawStore.shopify_shop_domain ? { shopifyShopDomain: rawStore.shopify_shop_domain } : {}),
         currency: rawStore.currency,
         skuCount: rawStore.sku_count,
         skuLimit: (typeof rawStore.sku_limit === 'number' && !isNaN(rawStore.sku_limit)) ? rawStore.sku_limit : undefined,
         tier: rawStore.tier,
-        connectors: typeof rawStore.connectors_json === 'string' ? JSON.parse(rawStore.connectors_json) : rawStore.connectors_json,
+        connectors: typeof rawStore.connectors_json === 'string' ? JSON.parse(rawStore.connectors_json) : (rawStore.connectors_json || []),
         catalogCompletenessAvg: rawStore.catalog_completeness_avg,
+        ...(typeof rawStore.evidence_coverage_avg === 'number' && !isNaN(rawStore.evidence_coverage_avg)
+          ? { evidenceCoverageAvg: rawStore.evidence_coverage_avg }
+          : {}),
+        ...(rawStore.last_audit_date ? { lastAuditDate: rawStore.last_audit_date } : {}),
         truthBoundaryStrictness: rawStore.truth_boundary_strictness,
       };
 

@@ -261,13 +261,16 @@ export async function handleShopifyCallback(
 
   const savedConnection = await repo.saveShopifyConnection(connection);
 
-  // Update store profile connector status
+  // Update store profile connector status & truthful Shopify OAuth identity
   const storeProfile = await repo.getStoreByWorkspace(workspaceId);
   if (storeProfile) {
     const connectors = storeProfile.connectors || [];
-    const shopifyIdx = connectors.findIndex(c => c.id === 'shopify');
+    const shopifyIdx = connectors.findIndex(
+      c => c.id === 'shopify' || c.id === 'shopify_primary' || c.type === 'shopify'
+    );
+    const existingConnectorId = shopifyIdx >= 0 ? connectors[shopifyIdx].id : 'shopify';
     const updatedConnector = {
-      id: 'shopify',
+      id: existingConnectorId,
       name: `Shopify (${verifyResult.shopName || shop})`,
       type: 'shopify' as const,
       status: 'connected' as const,
@@ -276,7 +279,7 @@ export async function handleShopifyCallback(
       writeBackAuthorized: false,
     };
 
-    let nextConnectors = [...connectors];
+    const nextConnectors = [...connectors];
     if (shopifyIdx >= 0) {
       nextConnectors[shopifyIdx] = updatedConnector;
     } else {
@@ -285,7 +288,19 @@ export async function handleShopifyCallback(
 
     await repo.saveStoreProfile(workspaceId, {
       ...storeProfile,
-      domain: shop,
+      domain: storeProfile.domain || shop,
+      websiteUrl: storeProfile.websiteUrl || storeProfile.domain || shop,
+      platform: 'Shopify Admin GraphQL API (2026-10)',
+      sourceClassification: 'shopify_oauth',
+      sourceMetadata: {
+        classification: 'shopify_oauth',
+        origin: shop,
+        shopDomain: shop,
+        acquisitionMethod: 'shopify_admin_graphql',
+        importedAt: nowIso,
+      },
+      shopifyConnected: true,
+      shopifyShopDomain: shop,
       connectors: nextConnectors,
     });
   }
@@ -479,14 +494,24 @@ export async function disconnectShopify(
 
   await repo.deleteShopifyConnection(workspaceId);
 
-  // Update store profile connector
+  // Update store profile connector & disconnect Shopify OAuth flag honestly while preserving domain & catalog
   const storeProfile = await repo.getStoreByWorkspace(workspaceId);
   if (storeProfile) {
     const connectors = (storeProfile.connectors || []).map(c =>
-      c.id === 'shopify' ? { ...c, status: 'disconnected' as const } : c
+      c.id === 'shopify' || c.id === 'shopify_primary' || c.type === 'shopify'
+        ? { ...c, status: 'disconnected' as const }
+        : c
     );
+    const hasRemainingProducts = (storeProfile.skuCount || 0) > 0;
+    const nextClassification =
+      storeProfile.sourceClassification === 'shopify_oauth'
+        ? (hasRemainingProducts ? 'manual_import' : 'unconfigured')
+        : storeProfile.sourceClassification;
     await repo.saveStoreProfile(workspaceId, {
       ...storeProfile,
+      shopifyConnected: false,
+      shopifyShopDomain: undefined,
+      sourceClassification: nextClassification,
       connectors,
     });
   }

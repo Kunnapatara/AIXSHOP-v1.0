@@ -172,7 +172,47 @@ export function inspectAndSanitizeClientCatalogPut(
       }
     }
 
-    // Re-attach authentic server-owned Shopify gift-card metadata only if backed by server provenance
+    // 2b. Prevent spoofing server-controlled Shopify OAuth product sourceClassification / acquisitionMethod
+    const rawSourceClass = (p as any).sourceClassification;
+    const rawAcquisition = (p as any).acquisitionMethod;
+    const isClaimingShopifyOAuth =
+      rawSourceClass === 'shopify_oauth' ||
+      rawAcquisition === 'shopify_admin_graphql' ||
+      rawAcquisition === 'shopify_webhook';
+
+    if (isClaimingShopifyOAuth) {
+      const backedByServerProvenance = Boolean(serverProvenance);
+      const backedByExistingOAuth =
+        Boolean(existingProduct) &&
+        (existingProduct!.sourceClassification === 'shopify_oauth' ||
+          SERVER_SHOPIFY_PROVENANCE_VALUES.has(String(existingAttrs.provenance || '')));
+      if (!backedByServerProvenance && !backedByExistingOAuth) {
+        if (reject) {
+          throw new ProtectedVerificationFieldError(
+            'Forbidden: "shopify_oauth" source classification and Shopify Admin acquisition methods cannot be forged by clients.'
+          );
+        }
+        (p as any).sourceClassification = 'manual_import';
+        delete (p as any).acquisitionMethod;
+      }
+    }
+
+    // Re-attach authentic server-owned Shopify provenance & gift-card metadata
+    if (serverProvenance) {
+      (p as any).sourceClassification = 'shopify_oauth';
+      if (!p.sourceOrigin) {
+        (p as any).sourceOrigin = serverProvenance.shopDomain;
+      }
+      if (!p.acquisitionMethod) {
+        (p as any).acquisitionMethod =
+          serverProvenance.sourceType === 'shopify_webhook'
+            ? 'shopify_webhook'
+            : 'shopify_admin_graphql';
+      }
+    } else if (!p.sourceClassification) {
+      (p as any).sourceClassification = existingProduct?.sourceClassification || 'manual_import';
+    }
+
     if (
       serverProvenance?.isGiftCard &&
       String(rawAttrs.sourceProductId || serverProvenance.shopifyProductId) === serverProvenance.shopifyProductId &&
@@ -327,6 +367,20 @@ export function sanitizeAndValidateImportCandidates(
       rawAttrs.provenance = 'merchant_import';
     }
 
+    const candSourceClass = (candidate as any).sourceClassification;
+    const candAcq = (candidate as any).acquisitionMethod;
+    if (
+      candSourceClass === 'shopify_oauth' ||
+      candAcq === 'shopify_admin_graphql' ||
+      candAcq === 'shopify_webhook'
+    ) {
+      if (reject) {
+        throw new ProtectedVerificationFieldError(
+          'Forbidden: candidate import cannot forge "shopify_oauth" source classification or Shopify Admin acquisition methods.'
+        );
+      }
+    }
+
     const nextDocs: EvidenceDocument[] = [];
     for (const rawDoc of candidate.evidenceDocuments || []) {
       if (!rawDoc || typeof rawDoc !== 'object' || !rawDoc.id) continue;
@@ -368,6 +422,10 @@ export function sanitizeAndValidateImportCandidates(
 
     sanitized.push({
       ...candidate,
+      sourceClassification:
+        candidate.sourceClassification === 'public_feed' || candidate.sourceClassification === 'demo'
+          ? candidate.sourceClassification
+          : 'manual_import',
       attributes: rawAttrs,
       evidenceDocuments: nextDocs,
     });

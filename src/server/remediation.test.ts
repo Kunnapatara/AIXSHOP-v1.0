@@ -896,6 +896,7 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         '013_billing_webhook_recovery.sql',
         '014_auth_recovery_and_operation_leases.sql',
         '015_gtin_evidence_trust.sql',
+        '016_source_classification_and_domain_cleanup.sql',
       ];
       const baseConstraints = [
         { source_schema: 'tenant_prod', source_table: 'stores', target_schema: '', target_table: '', constraint_name: 'uq_stores_ws_id', constraint_type: 'u', source_columns: 'workspace_id,id', target_columns: '', is_partial_index: false },

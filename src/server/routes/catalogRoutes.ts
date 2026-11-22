@@ -88,7 +88,10 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           evidence: [],
           storeProfile: store || {
             name: `${req.workspace!.name} Store`,
-            domain: `${req.workspace!.slug}.myshopify.com`,
+            domain: '',
+            websiteUrl: '',
+            sourceClassification: 'unconfigured',
+            shopifyConnected: false,
             currency: 'USD',
             skuCount: 0,
             catalogCompletenessAvg: 0,
@@ -184,12 +187,33 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           { rejectOnTampering: true }
         );
 
-        // Never trust client-supplied tier or skuLimit in payload.storeProfile
+        // Never trust client-supplied tier, skuLimit, or Shopify OAuth identity in payload.storeProfile
         if (store && sanitizedPayload.storeProfile) {
+          const clientClass = sanitizedPayload.storeProfile.sourceClassification;
+          const safeClientClass =
+            clientClass === 'public_feed' ||
+            clientClass === 'manual_import' ||
+            clientClass === 'demo' ||
+            clientClass === 'unconfigured'
+              ? clientClass
+              : store.sourceClassification;
+
           sanitizedPayload.storeProfile = {
             ...sanitizedPayload.storeProfile,
             tier: store.tier,
             skuLimit: store.skuLimit,
+            shopifyConnected: Boolean(store.shopifyConnected),
+            shopifyShopDomain: store.shopifyShopDomain,
+            sourceClassification: store.shopifyConnected
+              ? 'shopify_oauth'
+              : safeClientClass || store.sourceClassification || 'unconfigured',
+            platform: store.shopifyConnected
+              ? store.platform
+              : sanitizedPayload.storeProfile.platform || store.platform,
+            websiteUrl:
+              sanitizedPayload.storeProfile.websiteUrl ??
+              sanitizedPayload.storeProfile.domain ??
+              store.websiteUrl,
           };
         }
 
@@ -462,7 +486,11 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           const demoSkus = countCatalogSkus(initialProducts);
           const storeProfile = currentStore || {
             name: `${req.workspace!.name} Store`,
-            domain: `${req.workspace!.slug}.myshopify.com`,
+            domain: '',
+            websiteUrl: '',
+            platform: 'Solstice Demo Catalog Fixture',
+            sourceClassification: 'demo' as const,
+            shopifyConnected: false,
             currency: 'USD',
             skuCount: demoSkus,
             catalogCompletenessAvg: 88,
@@ -487,6 +515,9 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           const nowIso = new Date().toISOString();
           const demoProducts = JSON.parse(JSON.stringify(initialProducts)).map((p: any) => ({
             ...p,
+            sourceClassification: 'demo' as const,
+            sourceOrigin: 'https://solsticecraftgoods.store',
+            acquisitionMethod: 'demo_fixture' as const,
             evidenceDocuments: (p.evidenceDocuments || []).map((doc: any) => {
               const isVerifiedDemoDoc = doc.status === 'verified';
               const withServerMeta = isVerifiedDemoDoc
@@ -521,6 +552,17 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
             storeProfile: {
               ...storeProfile,
               skuCount: demoSkus,
+              platform: currentStore?.platform || 'Solstice Demo Catalog Fixture',
+              sourceClassification: currentStore?.shopifyConnected ? 'shopify_oauth' : 'demo',
+              sourceMetadata: currentStore?.shopifyConnected
+                ? currentStore.sourceMetadata
+                : {
+                    classification: 'demo',
+                    origin: currentStore?.domain || 'https://solsticecraftgoods.store',
+                    acquisitionMethod: 'demo_fixture',
+                    importedAt: nowIso,
+                  },
+              shopifyConnected: Boolean(currentStore?.shopifyConnected),
             },
           };
 

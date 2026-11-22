@@ -444,6 +444,8 @@ export async function ingestAndAnalyzeStore(
       candidateProducts: [],
       evaluationDetails: [],
       source: {
+        classification: 'unconfigured',
+        acquisitionMethod: 'none',
         platform: 'Unknown (Runtime Fetch Unavailable)',
         origin,
         endpoint,
@@ -482,13 +484,13 @@ export async function ingestAndAnalyzeStore(
         gtinPresentRatio: 0,
         conflictingClaimsCount: 0,
         missingAttributesCount: 0,
-        detectedPlatform: 'Restricted / Non-Public Storefront',
+        detectedPlatform: 'Unsupported or Restricted Public Feed',
         sampleIssues: [
-          `Public product feed returned HTTP ${response.status} ${response.statusText}.`,
-          'Direct public catalog access is disabled or restricted by the merchant store.',
+          `Public /products.json endpoint returned HTTP ${response.status} ${response.statusText}.`,
+          'This website either does not expose a Shopify-compatible public feed or restricts public access.',
         ],
         scanStatus: 'unsupported_store',
-        notice: 'Store does not expose an open public /products.json feed. Live ingestion requires an authorized Store Connector in Settings.',
+        notice: 'No open public /products.json feed was accessible. Non-Shopify websites and private storefronts cannot be crawled here; connect Shopify OAuth in Settings or import products manually.',
       };
 
       const ingestionResult: StoreIngestionResult = {
@@ -496,7 +498,9 @@ export async function ingestAndAnalyzeStore(
         candidateProducts: [],
         evaluationDetails: [],
         source: {
-          platform: 'Restricted / Non-Public Storefront',
+          classification: 'unconfigured',
+          acquisitionMethod: 'none',
+          platform: 'Unsupported or Restricted Public Feed',
           origin,
           endpoint,
           timestamp,
@@ -505,7 +509,7 @@ export async function ingestAndAnalyzeStore(
           discoveredCount: 0,
           parsedCount: 0,
         },
-        warnings: [`Storefront feed returned HTTP ${response.status}. Public catalog access restricted.`],
+        warnings: [`Public /products.json feed returned HTTP ${response.status}. Website does not expose a supported open feed.`],
       };
 
       return { ...healthCheck, ingestionResult };
@@ -521,10 +525,10 @@ export async function ingestAndAnalyzeStore(
         gtinPresentRatio: 0,
         conflictingClaimsCount: 0,
         missingAttributesCount: 0,
-        detectedPlatform: 'Non-Shopify / Custom Platform',
-        sampleIssues: ['Endpoint returned valid JSON but lacked standard Shopify product arrays.'],
+        detectedPlatform: 'Non-Shopify / Unsupported Website Format',
+        sampleIssues: ['Endpoint returned JSON without a standard Shopify public products array.'],
         scanStatus: 'unsupported_store',
-        notice: 'Platform catalog schema not recognized for automatic public scan.',
+        notice: 'Website does not expose a supported Shopify-compatible public /products.json feed. AIXSHOP does not crawl arbitrary non-feed HTML storefronts.',
       };
 
       const ingestionResult: StoreIngestionResult = {
@@ -532,7 +536,9 @@ export async function ingestAndAnalyzeStore(
         candidateProducts: [],
         evaluationDetails: [],
         source: {
-          platform: 'Non-Shopify / Custom Platform',
+          classification: 'unconfigured',
+          acquisitionMethod: 'none',
+          platform: 'Non-Shopify / Unsupported Website Format',
           origin,
           endpoint,
           timestamp,
@@ -541,7 +547,7 @@ export async function ingestAndAnalyzeStore(
           discoveredCount: 0,
           parsedCount: 0,
         },
-        warnings: ['Catalog schema does not match standard public Shopify feed format.'],
+        warnings: ['Catalog schema does not match standard public /products.json feed format.'],
       };
 
       return { ...healthCheck, ingestionResult };
@@ -557,8 +563,8 @@ export async function ingestAndAnalyzeStore(
         gtinPresentRatio: 0,
         conflictingClaimsCount: 0,
         missingAttributesCount: 0,
-        detectedPlatform: 'Shopify Storefront (Empty Catalog)',
-        sampleIssues: ['Store catalog endpoint contains 0 active public products.'],
+        detectedPlatform: 'Public Product Feed (Empty)',
+        sampleIssues: ['Public /products.json feed contains 0 active public products.'],
         scanStatus: 'real_scan',
         notice: '0 products found in public feed. Empty catalog cannot be evaluated.',
       };
@@ -568,7 +574,9 @@ export async function ingestAndAnalyzeStore(
         candidateProducts: [],
         evaluationDetails: [],
         source: {
-          platform: 'Shopify Storefront (Empty Catalog)',
+          classification: 'public_feed',
+          acquisitionMethod: 'public_products_json_sample',
+          platform: 'Public Product Feed (Empty)',
           origin,
           endpoint,
           timestamp,
@@ -629,11 +637,15 @@ export async function ingestAndAnalyzeStore(
         completenessScore: 0,
         evidenceCoverageScore: 0, // Public storefront feeds do not provide lab evidence documents
         externalDiscoveryStatus: 'observed_in_sample',
+        sourceClassification: 'public_feed',
+        sourceOrigin: origin,
+        acquisitionMethod: 'public_products_json_sample',
         attributes: {
-          sourcePlatform: 'shopify',
+          sourcePlatform: 'public_products_json',
           sourceProductId: sourceId,
           sourceHandle: p.handle || '',
           provenance: 'observed_in_sample',
+          acquisitionMethod: 'public_products_json_sample',
         },
         variants,
         offers: [],
@@ -649,7 +661,7 @@ export async function ingestAndAnalyzeStore(
     return evaluateProductsCatalog(
       domainProducts, 
       origin, 
-      `Shopify Public Storefront Sample (${domainProducts.length} Products Sampled)`, 
+      `Public Product Feed Sample (${domainProducts.length} of up to 25 sampled)`, 
       'real_scan',
       existingCatalog
     );
@@ -665,14 +677,14 @@ export async function ingestAndAnalyzeStore(
       gtinPresentRatio: 0,
       conflictingClaimsCount: 0,
       missingAttributesCount: 0,
-      detectedPlatform: 'External Storefront (CORS Restricted)',
+      detectedPlatform: 'External Website (Browser Fetch Blocked / CORS)',
       sampleIssues: [
-        `Direct browser fetch was blocked: ${errorMsg}`,
-        'Most modern storefronts restrict browser-origin cross-domain fetch via CORS headers.',
-        'Use authorized Store Connectors in Settings or a server-side proxy for full live data sync.',
+        `Direct browser fetch was blocked for ${endpoint}: ${errorMsg}`,
+        'Third-party storefronts commonly restrict cross-origin browser requests via CORS headers.',
+        'For Shopify stores, connect via Shopify OAuth in Settings for full catalog synchronization.',
       ],
       scanStatus: isCorsOrFetch ? 'network_failure' : 'unsupported_store',
-      notice: 'Direct browser access was blocked by CORS policy. This is expected security behavior for third-party storefront domains.',
+      notice: 'Direct browser access to the public /products.json feed was blocked by CORS or network policy. This is not a full site crawl.',
     };
 
     const ingestionResult: StoreIngestionResult = {
@@ -680,7 +692,9 @@ export async function ingestAndAnalyzeStore(
       candidateProducts: [],
       evaluationDetails: [],
       source: {
-        platform: 'External Storefront (CORS Restricted)',
+        classification: 'unconfigured',
+        acquisitionMethod: 'none',
+        platform: 'External Website (Browser Fetch Blocked / CORS)',
         origin,
         endpoint,
         timestamp,
@@ -776,8 +790,17 @@ export function evaluateProductsCatalog(
     issues.push('All sampled products satisfy baseline GTIN and attribute criteria.');
   }
 
-  const { candidateDetails, eligibleProducts } = evaluateCandidateProducts(products, existingCatalog);
+  const { candidateDetails } = evaluateCandidateProducts(products, existingCatalog);
   const isPartial = scanStatus === 'real_scan' || scanStatus === 'partial_scan';
+  const classification = scanStatus === 'demo_fixture' ? 'demo' : 'public_feed';
+  const acquisitionMethod = scanStatus === 'demo_fixture' ? 'demo_fixture' : 'public_products_json_sample';
+
+  const taggedProducts = products.map(p => ({
+    ...p,
+    sourceClassification: p.sourceClassification || classification,
+    sourceOrigin: p.sourceOrigin || url,
+    acquisitionMethod: p.acquisitionMethod || acquisitionMethod,
+  }));
 
   const healthCheck: QuickHealthCheckResult = {
     url,
@@ -791,15 +814,17 @@ export function evaluateProductsCatalog(
     sampleIssues: issues,
     scanStatus,
     notice: scanStatus === 'demo_fixture'
-      ? 'Evaluated Solstice Mercantile demo catalog fixtures using deterministic rules.'
-      : `Sample evaluation scanned ${products.length} products and ${totalVariants} variants from public feed. Full inventory requires authorized Store Connector.`,
+      ? 'Evaluated Solstice Mercantile demo catalog fixtures using deterministic rules (not a live store).'
+      : `Sample evaluation scanned ${products.length} product(s) and ${totalVariants} variant(s) via public /products.json feed (max 25). This is not a full website crawl; connect Shopify OAuth in Settings for full catalog synchronization.`,
   };
 
   const ingestionResult: StoreIngestionResult = {
     healthCheck,
-    candidateProducts: products,
+    candidateProducts: taggedProducts,
     evaluationDetails: candidateDetails,
     source: {
+      classification,
+      acquisitionMethod,
       platform: platformName,
       origin: url,
       endpoint: isPartial ? `${url}/products.json?limit=25` : url,
@@ -810,7 +835,7 @@ export function evaluateProductsCatalog(
       parsedCount: products.length,
     },
     warnings: isPartial
-      ? ['Public feed is limited to a 25-product sample. Complete catalog requires authorized Store Connector in Settings.']
+      ? ['Public feed import is capped at a 25-product sample (/products.json) and is not a full website crawl. Connect Shopify OAuth in Settings for full catalog sync.']
       : [],
   };
 

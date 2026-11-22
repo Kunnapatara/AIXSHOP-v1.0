@@ -157,7 +157,7 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
             <div className="pt-2 border-t border-stone-200/60 flex items-center justify-between text-[11px]">
               {isCloudWorkspace ? (
                 <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200/60">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                   Cloud · PostgreSQL
                 </span>
               ) : (
@@ -336,7 +336,7 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
               aria-label="Store configuration and account settings"
             >
               <Store className="w-3.5 h-3.5 text-orange-600" />
-              <span className="hidden sm:inline font-medium">{storeProfile.name.split(' ')[0]}</span>
+              <span className="hidden sm:inline font-medium">{(storeProfile.name || 'Store').split(' ')[0]}</span>
               <Settings className="w-3.5 h-3.5 text-stone-500" />
             </button>
 

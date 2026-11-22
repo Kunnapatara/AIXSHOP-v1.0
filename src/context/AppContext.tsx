@@ -106,7 +106,11 @@ export const AppContext = createContext<AppContextType | undefined>(undefined);
 function buildEmptyCloudStoreProfile(workspace?: { name?: string; slug?: string } | null): StoreProfile {
   return {
     name: workspace?.name ? `${workspace.name} Store` : '',
-    domain: workspace?.slug ? `${workspace.slug}.myshopify.com` : '',
+    domain: '',
+    websiteUrl: '',
+    platform: '',
+    sourceClassification: 'unconfigured',
+    shopifyConnected: false,
     currency: 'USD',
     skuCount: 0,
     skuLimit: 2500,

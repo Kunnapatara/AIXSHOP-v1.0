@@ -1158,9 +1158,16 @@ export function executeCatalogAudit(
     ruleBreakdown: ruleCounts,
   };
 
+  const evidenceCoverageAvg = updatedProducts.length > 0
+    ? Math.round(
+        updatedProducts.reduce((acc, p) => acc + (p.evidenceCoverageScore ?? 0), 0) / updatedProducts.length
+      )
+    : storeProfile.evidenceCoverageAvg;
+
   const updatedStoreProfile: StoreProfile = {
     ...storeProfile,
     catalogCompletenessAvg: completenessAvg,
+    ...(evidenceCoverageAvg !== undefined ? { evidenceCoverageAvg } : {}),
     lastAuditDate: timestamp,
   };
 

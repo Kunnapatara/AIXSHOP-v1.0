@@ -445,7 +445,7 @@ export const LandingPage: React.FC = () => {
 
             <div className="mt-4 pt-3 border-t border-stone-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-stone-500">
               <span>Evaluates: Variant GTIN/UPC completeness · Attribute &amp; schema gaps · Claim conflicts</span>
-              <span className="font-mono text-stone-400">Solstice demo fixture or public 25-product sample scan</span>
+              <span className="font-mono text-stone-400">Checks 25-product /products.json public feed sample (not a full site crawl) or demo fixture</span>
             </div>
           </form>
 
@@ -454,12 +454,17 @@ export const LandingPage: React.FC = () => {
             <div className="mt-8 bg-white border border-stone-200 rounded-2xl p-6 shadow-sm space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-stone-100 gap-3">
                 <div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="text-xs font-semibold px-2 py-0.5 rounded bg-stone-100 text-stone-700">
-                      {canViewQuickCheckMetrics ? 'Quick Health Check Result' : 'Storefront Catalog Discovered'}
+                      {canViewQuickCheckMetrics ? 'Quick Health Check Result' : 'Catalog Source Inspected'}
                     </span>
                     <span className="text-xs text-stone-500 font-mono">
                       {quickCheckResult.detectedPlatform}
+                      {quickCheckResult.ingestionResult?.source?.classification === 'public_feed'
+                        ? ' · Public Feed (25-product sample)'
+                        : quickCheckResult.ingestionResult?.source?.classification === 'demo'
+                        ? ' · Demo Fixture'
+                        : ''}
                     </span>
                   </div>
                   <h3 className="text-lg font-bold text-stone-950 mt-1 font-mono truncate">
@@ -736,7 +741,7 @@ export const LandingPage: React.FC = () => {
                   onClick={() => navigateTo('home')}
                   className="px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors shrink-0 whitespace-nowrap"
                 >
-                  Enter Solstice Workspace
+                  Open Merchant Workspace
                 </button>
               </div>
             </div>

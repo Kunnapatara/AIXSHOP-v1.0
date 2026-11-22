@@ -43,19 +43,40 @@ export function validateAndApplyProfileUpdate(
     };
   }
 
-  if (updates.domain !== undefined && updates.domain.trim() === '') {
-    return {
-      success: false,
-      errorCode: 'VALIDATION_FAILED',
-      message: 'Store domain cannot be empty.',
-    };
+  let nextDomain = currentProfile.domain;
+  if (updates.domain !== undefined) {
+    const rawDomain = updates.domain.trim();
+    if (rawDomain === '') {
+      nextDomain = '';
+    } else {
+      const withScheme = /^https?:\/\//i.test(rawDomain) ? rawDomain : `https://${rawDomain}`;
+      try {
+        const parsed = new URL(withScheme);
+        const host = parsed.hostname.toLowerCase();
+        if (!host || (!host.includes('.') && host !== 'localhost')) {
+          return {
+            success: false,
+            errorCode: 'VALIDATION_FAILED',
+            message: 'Please enter a valid website domain (e.g., store.com or https://store.com).',
+          };
+        }
+        nextDomain = rawDomain;
+      } catch {
+        return {
+          success: false,
+          errorCode: 'VALIDATION_FAILED',
+          message: 'Please enter a valid website domain (e.g., store.com or https://store.com).',
+        };
+      }
+    }
   }
 
   const nextProfile: StoreProfile = {
     ...currentProfile,
     ...updates,
     name: updates.name !== undefined ? updates.name.trim() : currentProfile.name,
-    domain: updates.domain !== undefined ? updates.domain.trim() : currentProfile.domain,
+    domain: nextDomain,
+    websiteUrl: updates.websiteUrl !== undefined ? updates.websiteUrl.trim() : nextDomain,
   };
 
   return {

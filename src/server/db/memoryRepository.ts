@@ -201,7 +201,7 @@ export class MemoryRepository implements DatabaseRepository {
           'evidence_review_audit_log',
           'shopify_product_provenance',
         ],
-        appliedMigrations: ['001_initial_schema.sql', '015_gtin_evidence_trust.sql'],
+        appliedMigrations: ['001_initial_schema.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql'],
       },
     };
   }
@@ -244,7 +244,10 @@ export class MemoryRepository implements DatabaseRepository {
 
     const store: StoreProfile = {
       name: `${workspace.name} Store`,
-      domain: `${workspace.slug}.myshopify.com`,
+      domain: '',
+      websiteUrl: '',
+      sourceClassification: 'unconfigured',
+      shopifyConnected: false,
       currency: 'USD',
       skuCount: 0,
       skuLimit: 2500,
@@ -397,7 +400,10 @@ export class MemoryRepository implements DatabaseRepository {
     // Create default store
     const store: StoreProfile = {
       name: `${workspace.name} Store`,
-      domain: `${workspace.slug}.myshopify.com`,
+      domain: '',
+      websiteUrl: '',
+      sourceClassification: 'unconfigured',
+      shopifyConnected: false,
       currency: 'USD',
       skuCount: 0,
       skuLimit: 2500,
@@ -654,7 +660,10 @@ export class MemoryRepository implements DatabaseRepository {
     const store = this.stores.get(workspaceId);
     const authoritativeStore: StoreProfile = store || {
       name: payload.storeProfile?.name || `${workspaceId} Store`,
-      domain: payload.storeProfile?.domain || `${workspaceId}.myshopify.com`,
+      domain: payload.storeProfile?.domain ?? '',
+      websiteUrl: payload.storeProfile?.websiteUrl ?? payload.storeProfile?.domain ?? '',
+      sourceClassification: payload.storeProfile?.sourceClassification || 'unconfigured',
+      shopifyConnected: false,
       currency: payload.storeProfile?.currency || 'USD',
       skuCount: 0,
       catalogCompletenessAvg: 0,
@@ -1340,7 +1349,10 @@ export class MemoryRepository implements DatabaseRepository {
         let catalog = await this.loadWorkspaceCatalog(workspaceId);
         const store = (await this.getStoreByWorkspace(workspaceId)) || {
           name: 'Store',
-          domain: 'store.myshopify.com',
+          domain: '',
+          websiteUrl: '',
+          sourceClassification: 'unconfigured' as const,
+          shopifyConnected: false,
           currency: 'USD',
           skuCount: 0,
           catalogCompletenessAvg: 0,

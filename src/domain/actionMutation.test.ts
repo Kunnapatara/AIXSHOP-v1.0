@@ -1203,8 +1203,8 @@ describe('Phase 2 Remediation & Production Domain Integrity Suite', () => {
       assert.equal(result.schemaFound, true);
       // 1 out of 2 variants has valid GTIN = 50%
       assert.equal(result.gtinPresentRatio, 50);
-      // Sample label correctly documents sample scope
-      assert.ok(result.detectedPlatform.includes('Shopify Public Storefront Sample'));
+      // Sample label correctly documents sample scope without assuming Shopify connection
+      assert.ok(result.detectedPlatform.includes('Public Product Feed Sample'));
       // Identified genuine missing fields
       assert.ok(result.sampleIssues.some(i => i.includes('Missing GTIN/UPC')));
       assert.ok(result.sampleIssues.some(i => i.includes('description')));

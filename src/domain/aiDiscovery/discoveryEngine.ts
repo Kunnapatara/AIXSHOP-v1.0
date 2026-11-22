@@ -464,7 +464,7 @@ export function evaluateDiscoveryReadiness(
         observedValue: offerUrl || '(none)',
         expectedCondition: 'Explicit HTTPS storefront URL pointing to verified merchant store domain',
         evidence: `Product offer URL "${offerUrl || '(empty)'}" rejected: ${urlCheck.reason || 'invalid URL'} (provenance: ${urlProvenance || 'unknown'}).`,
-        recommendation: 'Ensure catalog sync uses verified Shopify storefront domain and valid product handle.',
+        recommendation: 'Ensure catalog records include a valid canonical HTTPS product URL matching your verified storefront domain.',
         needsMerchantInput: false,
         recheckStatus: 'unverified',
       });

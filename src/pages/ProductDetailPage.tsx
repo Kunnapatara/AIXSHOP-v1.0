@@ -110,6 +110,22 @@ export const ProductDetailPage: React.FC = () => {
               <span className="text-stone-500">{selectedProduct.category}</span>
               <span className="text-stone-300">·</span>
               <span className="font-mono text-stone-400">Canonical ID: {selectedProduct.id}</span>
+              {selectedProduct.sourceClassification && (
+                <>
+                  <span className="text-stone-300">·</span>
+                  <span className="font-mono text-stone-600">
+                    Source:{' '}
+                    {selectedProduct.sourceClassification === 'shopify_oauth'
+                      ? 'Shopify Connected Store'
+                      : selectedProduct.sourceClassification === 'public_feed'
+                      ? 'Public Feed'
+                      : selectedProduct.sourceClassification === 'demo'
+                      ? 'Demo Data'
+                      : 'Manual Import'}
+                    {selectedProduct.sourceOrigin ? ` (${selectedProduct.sourceOrigin})` : ''}
+                  </span>
+                </>
+              )}
             </div>
 
             <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-stone-950">

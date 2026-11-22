@@ -96,6 +96,36 @@ export interface ShopifyProductProvenanceRecord {
   updatedAt?: string;
 }
 
+export type StoreSourceClassification =
+  | 'shopify_oauth'
+  | 'public_feed'
+  | 'manual_import'
+  | 'demo'
+  | 'unconfigured';
+
+export type ProductSourceClassification =
+  | 'shopify_oauth'
+  | 'public_feed'
+  | 'manual_import'
+  | 'demo';
+
+export type CatalogAcquisitionMethod =
+  | 'shopify_admin_graphql'
+  | 'shopify_webhook'
+  | 'public_products_json_sample'
+  | 'manual_import'
+  | 'demo_fixture';
+
+export interface CatalogSourceMetadata {
+  classification: StoreSourceClassification;
+  origin?: string;
+  acquisitionMethod?: CatalogAcquisitionMethod | 'none';
+  shopDomain?: string;
+  importedAt?: string;
+  isPartialSample?: boolean;
+  sampleLimit?: number;
+}
+
 export interface Product {
   id: string;
   title: string;
@@ -107,6 +137,9 @@ export interface Product {
   completenessScore: number; // 0-100 catalog completeness
   evidenceCoverageScore: number; // 0-100 evidence-backed specifications
   externalDiscoveryStatus: 'observed_in_sample' | 'unindexed' | 'insufficient_evidence';
+  sourceClassification?: ProductSourceClassification;
+  sourceOrigin?: string;
+  acquisitionMethod?: CatalogAcquisitionMethod;
   attributes: Record<string, string>;
   variants: Variant[];
   offers: Offer[];
@@ -188,7 +221,12 @@ export interface StoreConnector {
 export interface StoreProfile {
   name: string;
   domain: string;
+  websiteUrl?: string;
   platform?: string;
+  sourceClassification?: StoreSourceClassification;
+  sourceMetadata?: CatalogSourceMetadata;
+  shopifyConnected?: boolean;
+  shopifyShopDomain?: string;
   skuCount: number;
   skuLimit?: number;
   tier: string;
@@ -238,6 +276,8 @@ export interface StoreIngestionResult {
   candidateProducts: Product[];
   evaluationDetails: CandidateProductStatus[];
   source: {
+    classification?: StoreSourceClassification;
+    acquisitionMethod?: CatalogAcquisitionMethod | 'none';
     platform: string;
     origin: string;
     endpoint: string;

@@ -729,10 +729,10 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   };
 
   React.useEffect(() => {
-    setStoreName(storeProfile.name);
-    setStoreDomain(storeProfile.domain);
-    setCurrency(storeProfile.currency);
-    setStrictness(storeProfile.truthBoundaryStrictness);
+    setStoreName(storeProfile.name || '');
+    setStoreDomain(storeProfile.domain || storeProfile.websiteUrl || '');
+    setCurrency(storeProfile.currency || 'USD');
+    setStrictness(storeProfile.truthBoundaryStrictness || 'standard');
   }, [storeProfile]);
 
   const handleSaveProfile = (e: React.FormEvent) => {
@@ -741,13 +741,11 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
       addToast('Validation Error', 'Store name cannot be empty.', 'warning');
       return;
     }
-    if (!storeDomain.trim()) {
-      addToast('Validation Error', 'Store domain cannot be empty.', 'warning');
-      return;
-    }
+    const cleanDomain = storeDomain.trim();
     updateStoreProfile({
       name: storeName.trim(),
-      domain: storeDomain.trim(),
+      domain: cleanDomain,
+      websiteUrl: cleanDomain,
       currency: currency,
       truthBoundaryStrictness: strictness,
     });
@@ -859,14 +857,18 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
 
             <div>
               <label className="text-xs font-bold text-stone-900 block mb-1">
-                Store Primary Domain
+                Store Website URL / Domain (Optional)
               </label>
               <input
                 type="text"
                 value={storeDomain}
+                placeholder="e.g. yourstore.com"
                 onChange={e => setStoreDomain(e.target.value)}
-                className="w-full px-3.5 py-2.5 bg-stone-50 border border-stone-300 rounded-xl text-xs font-mono text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                className="w-full px-3.5 py-2.5 bg-stone-50 border border-stone-300 rounded-xl text-xs font-mono text-stone-900 placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
+              <p className="text-[11px] text-stone-500 mt-1">
+                Used for general website and public feed identification. Independent from Shopify OAuth integration.
+              </p>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
@@ -888,12 +890,23 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
 
               <div>
                 <label className="text-xs font-bold text-stone-900 block mb-1">
-                  Primary Source of Truth
+                  Catalog Acquisition Source
                 </label>
                 <input
                   type="text"
                   disabled
-                  value={storeProfile.platform}
+                  value={
+                    storeProfile.platform ||
+                    (storeProfile.shopifyConnected || storeProfile.sourceClassification === 'shopify_oauth'
+                      ? 'Shopify Admin GraphQL API (2026-10)'
+                      : storeProfile.sourceClassification === 'public_feed'
+                      ? 'Public Product Feed (/products.json)'
+                      : storeProfile.sourceClassification === 'manual_import'
+                      ? 'Manual Catalog Import'
+                      : storeProfile.sourceClassification === 'demo'
+                      ? 'Solstice Demo Catalog Fixture'
+                      : 'Not yet configured')
+                  }
                   className="w-full px-3.5 py-2.5 bg-stone-100 border border-stone-200 rounded-xl text-xs font-mono text-stone-600 cursor-not-allowed"
                 />
               </div>
@@ -934,7 +947,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
             </div>
             {isCloudWorkspace ? (
               <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                <span className="w-2 h-2 rounded-full bg-emerald-500" />
                 PostgreSQL Connected
               </span>
             ) : (
@@ -1085,7 +1098,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                   </span>
                 ) : shopifyStatus?.connected ? (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="w-2 h-2 rounded-full bg-emerald-500" />
                     <span>Connected & Active</span>
                   </span>
                 ) : (
@@ -1439,7 +1452,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                       </p>
                     )}
                     <p className="text-[11px] text-stone-500 mt-1.5">
-                      Enter your <code className="font-mono text-stone-700">myshopify.com</code> store handle or canonical hostname. You will be redirected to the secure Shopify authorization screen to grant read permissions.
+                      Optional: only required if syncing a Shopify store via OAuth. Enter your <code className="font-mono text-stone-700">myshopify.com</code> store handle or canonical hostname to authorize read-only permissions. Non-Shopify websites can use Public Feed checks or Manual Import.
                     </p>
                   </div>
                 </form>

@@ -290,6 +290,20 @@ export const ProductsPage: React.FC = () => {
                             </button>
                             <p className="text-[11px] text-stone-500 font-mono mt-0.5 truncate">
                               ID: {product.id} · {product.brand}
+                              {product.sourceClassification && (
+                                <>
+                                  {' · '}
+                                  <span className="text-stone-600">
+                                    {product.sourceClassification === 'shopify_oauth'
+                                      ? 'Shopify OAuth'
+                                      : product.sourceClassification === 'public_feed'
+                                      ? 'Public Feed'
+                                      : product.sourceClassification === 'demo'
+                                      ? 'Demo Data'
+                                      : 'Manual Import'}
+                                  </span>
+                                </>
+                              )}
                             </p>
                           </div>
                         </div>
@@ -363,6 +377,18 @@ export const ProductsPage: React.FC = () => {
                   <h3 className="text-sm font-bold text-stone-950 leading-snug line-clamp-2">
                     {product.title}
                   </h3>
+                  {product.sourceClassification && (
+                    <p className="text-[11px] font-mono text-stone-500 truncate">
+                      {product.sourceClassification === 'shopify_oauth'
+                        ? 'Shopify Connected Store'
+                        : product.sourceClassification === 'public_feed'
+                        ? 'Public Feed'
+                        : product.sourceClassification === 'demo'
+                        ? 'Demo Data'
+                        : 'Manual Import'}
+                      {product.sourceOrigin ? ` · ${product.sourceOrigin}` : ''}
+                    </p>
+                  )}
 
                   <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-stone-100 font-mono text-stone-600">
                     <div>

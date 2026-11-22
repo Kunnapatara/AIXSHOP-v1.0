@@ -40,7 +40,11 @@ export function createDiscoveryRoutes(repo: DatabaseRepository): Router {
         });
       }
 
-      const storeDomain = shopifyConn?.shopDomain || store?.domain || 'myshopify.com';
+      const storeDomain =
+        (shopifyConn?.status === 'connected' ? shopifyConn.shopDomain : '') ||
+        store?.domain ||
+        store?.websiteUrl ||
+        '';
       const products = catalog?.products || [];
 
       const readinessResult = evaluateDiscoveryReadiness(products, storeDomain);

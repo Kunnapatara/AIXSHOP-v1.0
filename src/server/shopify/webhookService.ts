@@ -613,6 +613,9 @@ export function mapWebhookPayloadToDomainProduct(
     completenessScore: 0,
     evidenceCoverageScore: 0,
     externalDiscoveryStatus: 'observed_in_sample',
+    sourceClassification: 'shopify_oauth',
+    sourceOrigin: canonicalDomain || undefined,
+    acquisitionMethod: 'shopify_webhook',
     attributes: {
       sourcePlatform: 'shopify',
       sourceProductId: numericId,

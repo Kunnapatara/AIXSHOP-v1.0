@@ -799,16 +799,51 @@ export function executeCatalogImport(
   // Ensure each newly imported product has valid completeness score calculated
   const newProductsWithScores = eligibleProducts.map(p => ({
     ...p,
+    sourceClassification: p.sourceClassification || 'manual_import',
     completenessScore: calculateProductCompleteness(p),
   }));
 
   const nextProducts = [...ctx.products, ...newProductsWithScores];
   const addedVariantCount = newProductsWithScores.reduce((sum, p) => sum + (p.variants?.length || 0), 0);
+  const firstImported = newProductsWithScores[0];
+  const inferredClass =
+    firstImported?.sourceClassification === 'public_feed' || firstImported?.sourceClassification === 'demo'
+      ? firstImported.sourceClassification
+      : 'manual_import';
+  const inferredPlatform =
+    inferredClass === 'public_feed'
+      ? 'Public Product Feed (/products.json Sample)'
+      : inferredClass === 'demo'
+      ? 'Solstice Demo Catalog Fixture'
+      : 'Manual Catalog Import';
+  const shouldUpdateClassification =
+    !ctx.storeProfile.shopifyConnected &&
+    ctx.storeProfile.sourceClassification !== 'shopify_oauth' &&
+    (!ctx.storeProfile.sourceClassification || ctx.storeProfile.sourceClassification === 'unconfigured');
+  const resolvedOrigin = firstImported?.sourceOrigin || ctx.storeProfile.domain || ctx.storeProfile.websiteUrl || '';
+  const nowIso = new Date().toISOString();
+
   const nextStoreProfile: StoreProfile = {
     ...ctx.storeProfile,
+    domain: ctx.storeProfile.domain || firstImported?.sourceOrigin || '',
+    websiteUrl: ctx.storeProfile.websiteUrl || ctx.storeProfile.domain || firstImported?.sourceOrigin || '',
+    platform: shouldUpdateClassification ? (ctx.storeProfile.platform || inferredPlatform) : ctx.storeProfile.platform,
+    sourceClassification: shouldUpdateClassification
+      ? inferredClass
+      : (ctx.storeProfile.sourceClassification || inferredClass),
+    sourceMetadata: shouldUpdateClassification
+      ? {
+          classification: inferredClass,
+          origin: resolvedOrigin || inferredClass,
+          acquisitionMethod: firstImported?.acquisitionMethod || 'manual_import',
+          isPartialSample: inferredClass === 'public_feed',
+          sampleLimit: inferredClass === 'public_feed' ? 25 : undefined,
+          importedAt: nowIso,
+        }
+      : ctx.storeProfile.sourceMetadata,
     skuCount: ctx.storeProfile.skuCount + addedVariantCount,
     catalogCompletenessAvg: calculateStoreCompletenessAvg(nextProducts),
-    lastAuditDate: new Date().toISOString(),
+    lastAuditDate: nowIso,
   };
 
   return {
