@@ -290,6 +290,7 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   const [isVerifyingWebhooks, setIsVerifyingWebhooks] = useState(false);
   const [isRegisteringWebhooks, setIsRegisteringWebhooks] = useState(false);
   const [isDisconnectingShopify, setIsDisconnectingShopify] = useState(false);
+  const [confirmingShopifyDisconnect, setConfirmingShopifyDisconnect] = useState(false);
   const [shopifyShopInput, setShopifyShopInput] = useState('');
   const [connectError, setConnectError] = useState<string | null>(null);
   const connectingShopifyRef = useRef<boolean>(false);
@@ -712,12 +713,10 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   };
 
   const handleDisconnectShopify = async () => {
-    if (!confirm('Are you sure you want to disconnect Shopify? Webhooks and automated sync will be disabled.')) {
-      return;
-    }
     setIsDisconnectingShopify(true);
     try {
       await apiClient.disconnectShopify();
+      setConfirmingShopifyDisconnect(false);
       addToast('Shopify Disconnected', 'Shopify connection revoked.', 'info');
       await fetchShopifyStatus();
       await reloadWorkspaceCatalog();
@@ -1213,14 +1212,34 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                         <span>{isSyncingShopify ? 'Syncing...' : 'Sync Full Catalog'}</span>
                       </button>
 
-                      <button
-                        disabled={isDisconnectingShopify}
-                        onClick={handleDisconnectShopify}
-                        className="px-3.5 py-1.5 bg-white border border-red-200 hover:bg-red-50 text-red-700 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
-                      >
-                        <Unlink className="w-3.5 h-3.5" />
-                        <span>{isDisconnectingShopify ? 'Revoking...' : 'Disconnect'}</span>
-                      </button>
+                      {confirmingShopifyDisconnect ? (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            disabled={isDisconnectingShopify}
+                            onClick={handleDisconnectShopify}
+                            className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                          >
+                            <Unlink className="w-3.5 h-3.5" />
+                            <span>{isDisconnectingShopify ? 'Revoking...' : 'Confirm Disconnect'}</span>
+                          </button>
+                          <button
+                            disabled={isDisconnectingShopify}
+                            onClick={() => setConfirmingShopifyDisconnect(false)}
+                            className="px-2.5 py-1.5 bg-white border border-stone-300 hover:bg-stone-50 text-stone-700 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          disabled={isDisconnectingShopify}
+                          onClick={() => setConfirmingShopifyDisconnect(true)}
+                          className="px-3.5 py-1.5 bg-white border border-red-200 hover:bg-red-50 text-red-700 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                        >
+                          <Unlink className="w-3.5 h-3.5" />
+                          <span>Disconnect</span>
+                        </button>
+                      )}
                     </div>
                   </div>
 

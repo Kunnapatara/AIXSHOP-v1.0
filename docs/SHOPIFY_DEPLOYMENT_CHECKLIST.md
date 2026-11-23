@@ -114,6 +114,7 @@ Expected schema elements:
 - `password_reset_tokens`: Single-use SHA-256 hashed password-recovery tokens with expiration and `consumed_at` timestamps (Migration `014`).
 - `workspace_operation_leases`: DB-backed workspace concurrency leases (`shopify_sync`, `demo_migrate`, etc.) enforcing `409 OPERATION_IN_PROGRESS` across multi-instance pods (Migration `014`).
 - `evidence_documents`, `evidence_review_audit_log`, & `shopify_product_provenance`: Server-controlled verification defaults (`status = 'pending'`, `verification_source`, `integrity_hash`), immutable review audit history, and synced Shopify `isGiftCard` provenance (Migration `015`).
+- `stores` & `products`: Traceable `source_classification`, `source_origin`, `acquisition_method`, `website_url`, `shopify_connected`, and `shopify_shop_domain` fields separating general merchant websites from authenticated Shopify OAuth connections and removing unbacked synthetic `.myshopify.com` defaults (Migration `016`).
 
 ### Authentication, Commercial Model & SKU Quota Semantics
 
@@ -176,7 +177,7 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 |:---|:---|:---|:---|
 | **TypeScript Build** | Zero type errors | `npm run lint` / `tsc --noEmit` | **PASS** |
 | **Vite Bundle Build** | Zero bundling errors | `npm run build` | **PASS** |
-| **Unit & Integration Suite** | All unit & integration tests passing | `npm test` | **PASS** (556 passed, 0 failed, 4 external Postgres skipped) |
+| **Unit & Integration Suite** | All unit & integration tests passing | `npm test` | **PASS** (564 passed, 0 failed, 4 external Postgres skipped) |
 | **Composite Snapshot Integrity** | Foreign key on (audit_run_id, workspace_id) | Migration 006 / 008 checks | **PASS** |
 | **AES-256-GCM Encryption** | No plaintext tokens stored | `src/server/security/encryption.ts` | **PASS** |
 | **Multi-Instance Refresh Lock** | Transaction-scoped `saveConnection` inside `withShopifyRefreshLock` | `oauthService.ts` / `postgresRepository.ts` / `shopify.test.ts` | **PASS** |
@@ -188,7 +189,7 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 | **AI Visibility Monitoring** | `DATA_SOURCE_NOT_CONNECTED` empty state & CSV ingestion deduplication | `visibilityRoutes.ts` / `AiVisibilityPage.tsx` / `workstreams.test.ts` | **PASS** |
 | **Billing & Stale Event Recovery** | Stripe webhook idempotency & >5m `processing` lock reclaim | `billingService.ts` / `postgresRepository.ts` / `workstreams.test.ts` | **PASS** |
 | **Real Shopify Store Live OAuth** | Live Admin GraphQL exchange with Shopify | Live merchant install flow | **BLOCKED — AWAITING CREDENTIALS** (Requires live Shopify store & partner app secrets) |
-| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–015) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |
+| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–016) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |
 
 ---
 
@@ -196,7 +197,7 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 
 ### Pre-Deployment Preflight Gate
 1. Run `npm run config:check -- --strict` in the target Staging/Production environment to verify without logging secret values that `DATABASE_URL`, `APP_URL`, `SHOPIFY_TOKEN_ENCRYPTION_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SHOPIFY_*` URLs, `TRUST_PROXY`, and `AUTH_RATE_LIMIT_FAILURE_MODE` are valid.
-2. Execute forward-only PostgreSQL migrations (`001..015`) before shifting traffic:
+2. Execute forward-only PostgreSQL migrations (`001..016`) before shifting traffic:
    ```bash
    npm run db:migrate
    npm run db:status
@@ -211,10 +212,10 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 
 ### Health & Readiness Probes
 - **Liveness**: `GET /api/health/live` -> `200 OK` (Node event loop responsive).
-- **Readiness**: `GET /api/health/ready` -> `200 OK` only when PostgreSQL connectivity passes, migrations `001..015` schema checks pass, and `validateProductionConfig().valid` is `true` in production (`503` otherwise).
+- **Readiness**: `GET /api/health/ready` -> `200 OK` only when PostgreSQL connectivity passes, migrations `001..016` schema checks pass, and `validateProductionConfig().valid` is `true` in production (`503` otherwise).
 
 ### Safe Rollback Procedure
-1. Migrations `001..015` are strictly **forward-only** (additive columns/tables and constraint hardening). Never drop tables, delete `schema_migrations` entries, or reset databases on rollback.
+1. Migrations `001..016` are strictly **forward-only** (additive columns/tables and constraint hardening). Never drop tables, delete `schema_migrations` entries, or reset databases on rollback.
 2. To roll back an application release cleanly:
    - Shift load balancer / Cloud Run revision traffic back to the prior known-good container digest while preserving the forward-migrated database schema.
    - Do **not** replay modified SQL migration files; `npm run db:status` verifies SHA-256 checksums and fails closed on drift.
