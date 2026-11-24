@@ -1,0 +1,844 @@
+# AIXSHOP v1.0 — Production Readiness Remediation
+
+## Mission
+
+Repository: https://github.com/Kunnapatara/AIXSHOP-v1.0
+
+Work exclusively in the existing AIXSHOP v1.0 project.
+
+Complete the outstanding production-readiness remediation in the exact sequence defined below.
+
+The objective is to reach a verifiable state where the application can be prepared for production environment configuration without compromising existing functionality, customer data, security, or development progress.
+
+This is an implementation task, not a documentation-only task.
+
+You must inspect the actual repository, understand the existing architecture, implement the required changes, and execute the relevant tests.
+
+Do not report an item as complete merely because code was written. Completion requires appropriate verification evidence.
+
+---
+
+# 1. Mandatory Development Rules
+
+## 1.1 Zero Loss of Development Progress
+
+Preserve all existing working functionality and development progress.
+
+Do not:
+
+- Rewrite the application from scratch.
+- Replace existing architecture without a demonstrated technical necessity.
+- Delete or reset existing database migrations.
+- Drop, truncate, or recreate production-related tables.
+- Delete existing customer, workspace, catalog, billing, audit, or evidence data.
+- Remove existing features to make tests pass.
+- Replace real integrations with mock implementations.
+- Weaken security controls or tests to obtain passing results.
+- Introduce fake success responses or hardcoded production readiness.
+- Change the existing business model, pricing, subscription limits, or entitlement rules.
+- Commit, push, publish, or deploy changes without explicit authorization.
+
+Use incremental, backward-compatible changes wherever possible.
+
+If a database migration is necessary, add a new forward-only migration. Never rewrite historical migrations.
+
+## 1.2 Preserve Existing Product Scope
+
+Preserve all existing plans:
+
+- Free Audit: $0 one-time, 2,500 SKU
+- Starter: $49/month, 250 SKU
+- Growth: $149/month, 2,500 SKU
+- Enterprise: $499/month, unlimited SKU
+
+Preserve existing functionality, including:
+
+- Shopify OAuth and Admin GraphQL integration.
+- Shopify pagination and synchronization.
+- Shopify webhooks, HMAC verification, and idempotency.
+- Shopify uninstall and disconnect handling.
+- Public Feed import and its existing 25-product sample limitation.
+- Manual import.
+- Source classification:
+  - shopify_oauth
+  - public_feed
+  - manual_import
+  - demo
+  - unconfigured
+- Merchant website domain handling, separate from Shopify shop identity.
+- Workspace ownership and RBAC.
+- Billing, subscription lifecycle, and entitlements.
+- GTIN validation and review.
+- Evidence records, audit history, and catalog operations.
+
+Do not turn Public Feed into a claimed full website crawler.
+
+Do not claim that GTIN checksum validation proves registry allocation or that an external registry has been consulted unless an actual external provider has verified it.
+
+## 1.3 Work Method
+
+Before modifying any workstream:
+
+1. Inspect the current branch and latest commit.
+2. Inspect the relevant source files, tests, migrations, and CI workflows.
+3. Identify the existing implementation and its dependencies.
+4. Write down the exact changes required.
+5. Implement the smallest safe incremental changes.
+6. Add or update regression tests.
+7. Run the relevant tests before proceeding to the next workstream.
+
+Do not assume previous audit findings are still identical to the current source. Verify them.
+
+Do not fabricate test output, CI results, credentials, or external verification.
+
+If a required integration test cannot run because credentials or an external service are unavailable, report it as BLOCKED, not PASS.
+
+---
+
+# 2. Execution Sequence
+
+Complete these workstreams in order. Do not skip ahead when an earlier workstream has failed its acceptance criteria.
+
+## STEP 1 — Fix RF1 / RF3 First: AI Studio Archive Exposure
+
+### Problem
+
+The repository currently contains an AI Studio artifact under:
+
+`public/assets/aistudio/`
+
+The existing production blocker tests RF1 and RF3 require AI Studio artifacts to be archived outside the public production assets.
+
+### Required changes
+
+1. Locate:
+   `public/assets/aistudio/Paste_November_23__2026_-_9_45AM_8ade02fa`
+
+2. Move the artifact to:
+   `docs/archive/aistudio/`
+
+3. Preserve its complete original contents.
+
+4. Do not simply delete the artifact.
+
+5. Inspect the entire repository for any other AI Studio artifacts incorrectly stored under public production assets.
+
+6. Ensure no AI Studio archive artifacts are served as public production assets.
+
+7. Preserve legitimate application assets unrelated to AI Studio.
+
+### Tests
+
+Inspect and run the actual tests in:
+
+`src/server/productionBlockers.test.ts`
+
+Verify:
+
+- RF1: `public/assets/aistudio` does not exist.
+- RF2: Existing route and traversal protections remain intact.
+- RF3: Production build output contains no AI Studio archive artifacts.
+
+Run the relevant test suite and production build.
+
+### Acceptance criteria
+
+- Original artifact exists in `docs/archive/aistudio/`.
+- Artifact contents are preserved.
+- No AI Studio archive artifacts remain under public production assets.
+- RF1 passes.
+- RF2 passes.
+- RF3 passes.
+- Production build succeeds.
+
+Do not proceed until this step passes.
+
+---
+
+## STEP 2 — Workstreams 1–2: Reviewer Identity and Verification Integrity
+
+### Workstream 1: Server-authoritative Reviewer Identity
+
+Inspect:
+
+`src/server/routes/catalogRoutes.ts`
+
+Current security concern:
+
+The reviewer identity is accepted from the caller through:
+
+`X-AIXSHOP-Reviewer-Id`
+
+A shared secret proves possession of a credential. It does not independently establish the identity of a human reviewer.
+
+### Required implementation
+
+Implement a server-authoritative reviewer identity model.
+
+Requirements:
+
+1. Do not trust caller-provided reviewer IDs as authoritative identity.
+2. Establish reviewer or service identity on the server through an authenticated and authorized principal.
+3. Validate the principal's authorization for the requested review operation.
+4. Derive audit attribution from the authenticated server-side principal.
+5. Prevent arbitrary clients from impersonating another reviewer by changing request headers.
+6. Keep service-to-service authentication distinct from human reviewer identity.
+7. Preserve existing legitimate reviewer workflows where possible.
+8. If the current architecture uses a shared secret, retain it only as an authentication credential where appropriate. Do not treat it as proof of a human identity.
+9. Use secure comparison and existing authentication conventions.
+10. Return appropriate authorization errors without leaking sensitive information.
+
+If there is no verified human reviewer identity, record the operation as a service or system action rather than inventing a human reviewer.
+
+### Tests
+
+Add regression tests covering:
+
+- Caller attempts to spoof another reviewer ID.
+- Missing authenticated principal.
+- Invalid service credential.
+- Authenticated but unauthorized principal.
+- Authorized reviewer.
+- Valid service principal.
+- Audit records use the server-established identity.
+- Existing legitimate workflows remain functional.
+
+### Workstream 2: Separate Reviewer Verification from External Registry Verification
+
+Current security concern:
+
+The request can provide `verificationSource`, potentially claiming `external_registry` without an actual external registry provider response.
+
+### Required implementation
+
+Separate verification provenance into distinct, explicit states.
+
+At minimum, support these meanings:
+
+- `not_externally_verified`
+- `reviewer_verified`
+- `external_registry_verified`
+
+The exact internal schema may follow existing project conventions, but the meanings must remain unambiguous.
+
+Requirements:
+
+1. Reviewer verification must be attributable to an authenticated and authorized reviewer.
+2. A client-supplied `verificationSource` must never independently establish external registry verification.
+3. Only a genuine server-side external registry provider integration and its validated response may establish `external_registry_verified`.
+4. If no real external registry provider is configured or integrated, the system must remain `not_externally_verified` unless an authorized reviewer has explicitly performed a separate review.
+5. Preserve the distinction between a reviewer confirming supplied evidence and an external registry independently confirming a record.
+6. Store verification provenance and relevant timestamps.
+7. Preserve audit history.
+8. Do not create fake registry responses or mock external verification in production code.
+9. Do not claim that an external registry provider exists unless the code actually integrates with one.
+
+If the existing database schema requires modification, use a new forward-only migration and preserve existing records.
+
+### Tests
+
+Cover:
+
+- Caller attempts to submit `external_registry` manually.
+- Reviewer verification without external verification.
+- External verification without a genuine provider response.
+- Valid provider response through an actual server-side integration, if one exists.
+- Missing provider configuration.
+- Audit attribution.
+- Backward compatibility with existing verification records.
+
+### Acceptance criteria
+
+- Reviewer identity is server-authoritative.
+- Unauthorized reviewer impersonation is prevented.
+- Verification provenance cannot be spoofed by request parameters.
+- External registry verification cannot be claimed without actual provider evidence.
+- Existing audit records and workflows remain intact.
+
+Do not proceed until both workstreams pass their tests.
+
+---
+
+## STEP 3 — Workstreams 3–4: Stripe Production Configuration and SMTP Readiness
+
+### Workstream 3: Enforce Stripe Price IDs in Production
+
+Inspect:
+
+- `src/server/config/productionConfig.ts`
+- `src/server/config/checkConfig.ts`
+- Existing Stripe billing and checkout services.
+- Subscription lifecycle and entitlement mapping.
+
+Current concern:
+
+Production configuration checks Stripe secrets but may not strictly require all recurring Price IDs.
+
+### Required implementation
+
+Production must require all three Price IDs:
+
+- `STRIPE_PRICE_STARTER`
+- `STRIPE_PRICE_GROWTH`
+- `STRIPE_PRICE_ENTERPRISE`
+
+Requirements:
+
+1. All required Price IDs must be present in production.
+2. Empty or placeholder values must fail production validation.
+3. Verify that each configured Price ID maps to the correct existing plan.
+4. Verify recurring billing configuration and expected intervals where the Stripe API or available metadata allows it.
+5. Prevent one plan's Price ID from silently mapping to another plan.
+6. Do not silently fall back to test, demo, or hardcoded prices.
+7. Do not change existing plan prices or SKU limits.
+8. Preserve Stripe Checkout and subscription lifecycle behavior.
+9. Keep development and test configuration usable without weakening production checks.
+10. Never expose Stripe secrets in logs or API responses.
+
+The production readiness checker must clearly report missing or invalid Stripe configuration.
+
+### Tests
+
+Cover:
+
+- Missing Starter Price ID.
+- Missing Growth Price ID.
+- Missing Enterprise Price ID.
+- All Price IDs configured.
+- Placeholder values.
+- Invalid or conflicting mappings.
+- Incorrect recurring interval where verifiable.
+- Existing checkout and entitlement mapping.
+- Development/test mode compatibility.
+
+### Workstream 4: SMTP Configuration and Connection Readiness
+
+Inspect:
+
+- `src/server/services/emailService.ts`
+- `src/server/config/productionConfig.ts`
+- `src/server/config/checkConfig.ts`
+- `src/server/routes/authRoutes.ts`
+
+Important:
+
+The existing SMTP password environment variable is:
+
+`SMTP_PASS`
+
+Do not accidentally replace it with `SMTP_PASSWORD` unless the application deliberately supports a backward-compatible alias.
+
+### Required implementation
+
+Add explicit SMTP production readiness checks.
+
+Validate the configuration fields used by the existing implementation, including:
+
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_FROM`
+
+Requirements:
+
+1. Validate required SMTP configuration in production.
+2. Validate port and transport configuration.
+3. Add an explicit SMTP connection verification mechanism using the existing mail library.
+4. Apply a reasonable connection timeout.
+5. Handle authentication, TLS, DNS, timeout, and connection failures safely.
+6. Avoid logging SMTP credentials or sensitive connection details.
+7. Expose distinct readiness states instead of treating configuration presence as proof of successful email delivery.
+
+The system must distinguish:
+
+- Configuration valid.
+- SMTP connection verified.
+- SMTP server accepted the message.
+- Actual recipient inbox delivery confirmed.
+
+Do not claim inbox delivery merely because the SMTP server accepted a message.
+
+### Password Reset Failure Handling
+
+Inspect the current password reset flow in `authRoutes.ts`.
+
+Current concern:
+
+A reset token may be created before the email send operation, and the result of `sendPasswordResetEmail()` may not be checked adequately.
+
+Implement safe failure handling.
+
+Requirements:
+
+1. A failed SMTP connection or failed send operation must not leave the user with an unusable or misleading reset flow.
+2. Handle token creation and delivery consistently.
+3. Where practical, use a transactional or compensating approach so an undelivered reset token is invalidated.
+4. Do not expose whether an email address has an account.
+5. Preserve generic password-reset responses to prevent account enumeration.
+6. Preserve token expiration, one-time-use, and existing password security rules.
+7. Do not log reset tokens or sensitive email content.
+8. Ensure retry behavior does not accidentally create multiple valid reset tokens.
+
+### Tests
+
+Cover:
+
+- Missing SMTP configuration.
+- Invalid SMTP configuration.
+- Successful connection verification.
+- SMTP connection failure.
+- Authentication failure.
+- SMTP send rejection.
+- Password reset email delivery failure.
+- Token invalidation or safe recovery after failure.
+- Generic response consistency.
+- Successful password reset flow.
+- No sensitive values in logs.
+
+### Acceptance criteria
+
+- Production cannot pass readiness checks without all required Stripe Price IDs.
+- Existing plan mapping is correct.
+- SMTP configuration is validated.
+- SMTP connection readiness is independently verified.
+- Password reset handles email failures safely.
+- No account enumeration or sensitive logging is introduced.
+
+Do not proceed until both workstreams pass.
+
+---
+
+## STEP 4 — Workstream 5: Secure and Recoverable Guest-to-Cloud Transfer
+
+Inspect:
+
+`src/context/AppContext.tsx`
+
+Also inspect the relevant authentication, workspace, catalog persistence, API routes, and database services.
+
+Current concern:
+
+Guest/demo data may be cleared when an authenticated cloud workspace is loaded, without a secure and recoverable guest-to-cloud transfer.
+
+### Required implementation
+
+Implement a secure guest-to-cloud transfer process.
+
+Requirements:
+
+1. Guest data must remain available locally until cloud persistence has been positively confirmed.
+2. Transfer must be bound to the authenticated user and the correct workspace.
+3. A guest must not be able to transfer data into another user's workspace.
+4. Use a short-lived, single-use transfer authorization or an equivalent secure mechanism.
+5. Make the transfer idempotent.
+6. Support safe retry after network interruptions.
+7. Support recovery when the server commits data but the client does not receive the confirmation response.
+8. Never overwrite existing cloud catalog data unintentionally.
+9. Detect and resolve conflicts explicitly.
+10. Preserve source classification and original provenance.
+11. Never misclassify demo or manual-import records as Shopify OAuth records.
+12. Preserve relevant catalog evidence and metadata.
+13. Ensure a partial transfer does not result in silent data loss.
+14. Clear local guest data only after verified successful cloud persistence and reconciliation.
+15. Prevent duplicate records when the same transfer is retried.
+16. Record appropriate transfer audit events.
+
+Design the transfer so that a browser refresh, temporary disconnection, or repeated request cannot cause data loss or unauthorized duplication.
+
+### Data and migration considerations
+
+- Reuse existing data models and persistence patterns where possible.
+- Add a new forward-only migration only if required.
+- Preserve existing workspace and tenant isolation.
+- Do not weaken authentication or authorization for transfer convenience.
+
+### Tests
+
+Cover:
+
+- Successful guest-to-cloud transfer.
+- Guest data remains available before confirmation.
+- Unauthorized user attempts transfer.
+- Workspace ownership mismatch.
+- Expired transfer authorization.
+- Reuse of a single-use authorization.
+- Repeated idempotent requests.
+- Network failure before server commit.
+- Network failure after server commit but before client confirmation.
+- Partial persistence failure.
+- Existing cloud data conflict.
+- Recovery and retry.
+- Source classification preservation.
+- No cross-tenant data leakage.
+
+### Acceptance criteria
+
+A guest-to-cloud transfer must be demonstrably secure, idempotent, recoverable, and resistant to data loss.
+
+Do not proceed until the relevant integration and regression tests pass.
+
+---
+
+## STEP 5 — Workstream 6: Atomic Shopify Catalog and Provenance Persistence
+
+Inspect:
+
+- `src/server/shopify/syncService.ts`
+- `src/server/shopify/webhookService.ts`
+- Related catalog repositories and database services.
+- Existing transaction helpers and outbox patterns.
+
+Current concern:
+
+Shopify catalog changes and product provenance may be persisted in separate operations.
+
+A provenance write failure after a successful catalog mutation can leave inconsistent catalog state.
+
+### Required implementation
+
+Implement one of these approaches:
+
+**Preferred approach: Single database transaction**
+
+Persist catalog mutations and their corresponding provenance records atomically in the same transaction.
+
+OR
+
+**Alternative: Durable outbox and recovery**
+
+If a single transaction is not technically feasible:
+
+- Persist the catalog mutation and durable outbox event atomically.
+- Process provenance creation through a reliable worker or recovery mechanism.
+- Track pending, processed, and failed states.
+- Retry safely.
+- Make processing idempotent.
+- Provide a way to detect and recover permanently failed events.
+- Ensure the application does not report a fully synchronized state while required provenance remains incomplete.
+
+Do not implement a superficial retry loop without durable recovery state.
+
+### Apply consistently
+
+Review both:
+
+- Normal Shopify synchronization.
+- Shopify webhook processing.
+
+Ensure both paths use the same integrity guarantees where appropriate.
+
+### Failure handling
+
+Handle:
+
+- Catalog persistence succeeds but provenance persistence fails.
+- Database transaction rollback.
+- Duplicate webhook delivery.
+- Concurrent synchronization.
+- Retry after temporary database failure.
+- Worker interruption.
+- Repeated outbox processing.
+- Permanent processing failure and manual recovery.
+- Disconnect or uninstall during synchronization.
+
+### Data integrity requirements
+
+1. Preserve existing Shopify product data.
+2. Preserve product provenance and source classification.
+3. Do not create duplicate provenance records.
+4. Do not mark an incomplete synchronization as fully successful.
+5. Maintain tenant and workspace isolation.
+6. Preserve webhook HMAC validation and idempotency.
+7. Ensure existing catalog audit history remains valid.
+
+If a schema change is required, add a new forward-only migration.
+
+### Tests
+
+Use actual PostgreSQL integration tests where available.
+
+Add failure-injection tests to demonstrate the atomicity or recovery guarantees.
+
+At minimum verify:
+
+- Transaction rollback when provenance creation fails.
+- Catalog and provenance consistency after successful sync.
+- Duplicate webhook idempotency.
+- Concurrent sync behavior.
+- Outbox recovery if using the outbox approach.
+- No cross-tenant provenance writes.
+- Accurate synchronization status.
+- Existing Shopify workflows remain functional.
+
+### Acceptance criteria
+
+There must be reproducible evidence that catalog and provenance cannot silently diverge without a detectable and recoverable state.
+
+Do not proceed until these guarantees pass integration tests.
+
+---
+
+# 3. STEP 6 — Final CI and Integration Verification
+
+After all previous workstreams have passed their acceptance criteria, run the complete final verification process.
+
+Inspect the actual GitHub Actions workflow and local test scripts before execution.
+
+Do not rely on an earlier CI run.
+
+## 3.1 Required checks
+
+All of the following must pass:
+
+1. TypeScript type checking.
+2. Lint and static checks.
+3. Full test suite.
+4. Production configuration validation.
+5. Production build.
+6. PostgreSQL migration tests.
+7. PostgreSQL integration tests.
+8. Multi-connection and transaction tests.
+9. RF1, RF2, and RF3 production blocker tests.
+10. Regression tests for all six workstreams.
+
+A successful TypeScript check alone is not sufficient.
+
+A successful unit test run alone is not sufficient.
+
+A successful build alone is not sufficient.
+
+## 3.2 PostgreSQL migration verification
+
+Inspect all existing migration files.
+
+The repository previously contained migrations 001–016.
+
+Verify the actual migration runner behavior and confirm that every migration present in the repository is applied in the intended order.
+
+Do not assume the workflow's displayed migration range accurately represents the migrations executed.
+
+If the GitHub Actions workflow label is outdated, correct the label to reflect the actual migration range. Do not alter migration history just to make the label match.
+
+Run against a real PostgreSQL service, not SQLite substitutes.
+
+Verify:
+
+- Fresh database migration.
+- Migration status.
+- Existing schema compatibility.
+- New migration application, if any.
+- Multi-connection behavior.
+- Transaction integrity.
+- Tenant isolation.
+- Existing data preservation.
+
+## 3.3 External integration verification
+
+Where test credentials and external services are available, verify:
+
+- Stripe Test Mode checkout and subscription lifecycle.
+- Shopify Development Store OAuth and synchronization.
+- Shopify webhook handling.
+- SMTP connection and message acceptance.
+
+Do not use production credentials for testing.
+
+Do not invent successful external integration results.
+
+If credentials are unavailable, clearly identify the exact test as BLOCKED and explain what remains unverified.
+
+Do not expose secrets in reports or logs.
+
+## 3.4 Final CI requirement
+
+The final CI must demonstrate successful completion of:
+
+- TypeScript.
+- Full test suite.
+- Production configuration check.
+- Production build.
+- PostgreSQL migrations.
+- PostgreSQL integration tests.
+
+A failed test must not be bypassed, skipped, or downgraded merely to produce a green pipeline.
+
+If any check fails:
+
+1. Identify the root cause.
+2. Fix the underlying problem.
+3. Add regression coverage where appropriate.
+4. Re-run the affected tests.
+5. Re-run the full final CI.
+
+Do not declare final completion until the required checks pass.
+
+---
+
+# 4. Environment Variable Readiness
+
+Prepare the application so that environment configuration can be performed safely after code remediation.
+
+Inspect the actual code and generate an accurate environment variable checklist.
+
+At minimum, verify the requirements for:
+
+### Core application
+
+- `NODE_ENV`
+- `APP_URL`
+- `TRUST_PROXY`
+- `DATABASE_URL`
+
+### Shopify
+
+- `SHOPIFY_API_KEY`
+- `SHOPIFY_API_SECRET`
+- `SHOPIFY_APP_URL`
+- `SHOPIFY_REDIRECT_URI`
+- Required webhook configuration
+- `SHOPIFY_TOKEN_ENCRYPTION_KEY`
+
+Use the actual variable names expected by the repository. Do not invent or rename variables without updating all references and tests.
+
+### Stripe
+
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+- `STRIPE_PRICE_STARTER`
+- `STRIPE_PRICE_GROWTH`
+- `STRIPE_PRICE_ENTERPRISE`
+
+### SMTP
+
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_FROM`
+
+### Reviewer / service authentication
+
+Include the actual environment variables required by the final server-authoritative reviewer authentication implementation.
+
+For every variable, report:
+
+- Exact name.
+- Required or optional.
+- Production requirement.
+- Purpose.
+- Validation performed.
+- Whether a real connection or external verification is required.
+
+Do not ask the user to paste secrets into chat, source code, or the final report.
+
+Do not create fake values or silently accept placeholders as production credentials.
+
+The final report must distinguish:
+
+- Code readiness.
+- Configuration readiness.
+- Connection readiness.
+- External integration verification.
+
+Passing code tests does not mean production credentials have been configured or verified.
+
+---
+
+# 5. Final Deliverables
+
+When implementation is finished, provide a precise final report.
+
+## A. Execution Summary
+
+List the six workstreams in execution order.
+
+For each one, report:
+
+- Implemented: PASS / FAIL / BLOCKED.
+- Tests: PASS / FAIL / BLOCKED.
+- Evidence: exact test names, files, and relevant commit or change references.
+
+## B. RF1 / RF2 / RF3 Results
+
+Report each production blocker test separately.
+
+Confirm the archive artifact's new location and whether its contents were preserved.
+
+## C. Security and Data Integrity
+
+Explain the actual guarantees achieved for:
+
+- Reviewer identity.
+- Verification provenance.
+- Password reset failure handling.
+- Guest-to-cloud transfer.
+- Shopify catalog and provenance consistency.
+- Tenant isolation.
+
+Avoid vague statements such as "secure" without describing the tested behavior.
+
+## D. Test and CI Results
+
+Provide actual results, including:
+
+- TypeScript.
+- Lint.
+- Full test suite.
+- Production config check.
+- Production build.
+- PostgreSQL migrations.
+- PostgreSQL integration tests.
+- External integration tests.
+
+Include exact pass/fail counts where available.
+
+## E. Environment Variable Checklist
+
+Provide the accurate final list of required and optional variables.
+
+Identify which values still need to be entered into the secure deployment environment.
+
+Do not include actual secrets.
+
+## F. Final Readiness Decision
+
+Choose exactly one:
+
+**READY FOR PRODUCTION ENV CONFIGURATION**
+
+Only if all six workstreams and all mandatory code/CI/PostgreSQL acceptance criteria pass.
+
+This means the codebase is ready for secure production environment configuration. It does not mean production credentials, live external services, or actual inbox delivery have automatically been verified.
+
+**NOT READY**
+
+If any required code, test, build, migration, or CI criterion remains failed or incomplete.
+
+**BLOCKED — EXTERNAL VERIFICATION REQUIRED**
+
+If code and internal tests pass but an essential external integration cannot be verified because credentials or services are unavailable.
+
+Clearly list what is blocked and what evidence is still needed.
+
+Never report READY if a required internal test is failing.
+
+---
+
+# 6. Final Restrictions
+
+- Do not commit.
+- Do not push.
+- Do not deploy.
+- Do not modify production secrets.
+- Do not perform destructive database operations.
+- Do not remove existing features.
+- Do not change plan prices or entitlements.
+- Do not bypass failing tests.
+- Do not claim external verification without real evidence.
+- Do not claim inbox delivery based solely on SMTP acceptance.
+- Do not mark workstreams complete based only on code inspection.
+
+Work incrementally and preserve the existing project.
+
+**Start with STEP 1. Complete and verify it before moving to STEP 2. Continue strictly in the specified order.**

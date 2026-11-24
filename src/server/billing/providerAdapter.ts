@@ -11,15 +11,54 @@ import {
   PlanTier 
 } from './types';
 
+const STRIPE_PRICE_ID_REGEX = /^price_[A-Za-z0-9_]{8,}$/;
+const STRIPE_PRICE_PLACEHOLDER_RE =
+  /(placeholder|your_price|replace_me|changeme|my_stripe_price|example|sample|todo|^price_(?:test_)?x+$|^price_0+$|<|>)/i;
+
+export interface StripePriceIdValidationResult {
+  valid: boolean;
+  value?: string;
+  reason?: string;
+}
+
 /**
- * Resolves configured Stripe Price ID for a given plan tier.
- * Price IDs are external Stripe resources and must be explicitly configured via
- * environment variables (e.g. STRIPE_PRICE_STARTER or STRIPE_PRICE_ID_STARTER)
- * or injected via priceMap for testing.
+ * Validates that a configured Stripe Price ID has valid format and is not a placeholder.
  */
-export function getPlanPriceId(tier: PlanTier, priceMap?: Record<string, string>): string | undefined {
+export function validateStripePriceIdFormat(raw: string | undefined): StripePriceIdValidationResult {
+  if (typeof raw !== 'string' || !raw.trim()) {
+    return { valid: false, reason: 'missing' };
+  }
+  const trimmed = raw.trim();
+  if (STRIPE_PRICE_PLACEHOLDER_RE.test(trimmed)) {
+    return { valid: false, value: trimmed, reason: 'placeholder_value' };
+  }
+  if (!STRIPE_PRICE_ID_REGEX.test(trimmed)) {
+    return { valid: false, value: trimmed, reason: 'invalid_format' };
+  }
+  return { valid: true, value: trimmed };
+}
+
+export const PAID_STRIPE_PRICE_TIERS: ReadonlyArray<{
+  tier: 'Starter' | 'Growth' | 'Enterprise';
+  envVar: 'STRIPE_PRICE_STARTER' | 'STRIPE_PRICE_GROWTH' | 'STRIPE_PRICE_ENTERPRISE';
+  aliasEnvVar: 'STRIPE_PRICE_ID_STARTER' | 'STRIPE_PRICE_ID_GROWTH' | 'STRIPE_PRICE_ID_ENTERPRISE';
+  expectedCents: number;
+}> = [
+  { tier: 'Starter', envVar: 'STRIPE_PRICE_STARTER', aliasEnvVar: 'STRIPE_PRICE_ID_STARTER', expectedCents: 4900 },
+  { tier: 'Growth', envVar: 'STRIPE_PRICE_GROWTH', aliasEnvVar: 'STRIPE_PRICE_ID_GROWTH', expectedCents: 14900 },
+  { tier: 'Enterprise', envVar: 'STRIPE_PRICE_ENTERPRISE', aliasEnvVar: 'STRIPE_PRICE_ID_ENTERPRISE', expectedCents: 49900 },
+];
+
+export interface StripePriceConfigurationValidation {
+  valid: boolean;
+  missingOrInvalid: string[];
+  errors: string[];
+  priceIds: Partial<Record<'Starter' | 'Growth' | 'Enterprise', string>>;
+}
+
+function getRawPlanPriceId(tier: PlanTier, priceMap?: Record<string, string>): string | undefined {
   if (priceMap) {
-    if (priceMap[tier]) return priceMap[tier];
+    if (priceMap[tier] !== undefined) return priceMap[tier];
     const lowerTier = tier.toLowerCase();
     for (const [k, v] of Object.entries(priceMap)) {
       if (k.toLowerCase() === lowerTier) return v;
@@ -39,19 +78,226 @@ export function getPlanPriceId(tier: PlanTier, priceMap?: Record<string, string>
 }
 
 /**
+ * Validates all required paid-tier Stripe Price IDs:
+ * - Every paid tier (Starter, Growth, Enterprise) has a non-empty, non-placeholder, well-formed price_... ID.
+ * - No two paid tiers share the same Stripe Price ID (prevents cross-tier misbilling).
+ */
+export function validateStripePriceConfiguration(
+  priceMap?: Record<string, string>
+): StripePriceConfigurationValidation {
+  const missingOrInvalid: string[] = [];
+  const errors: string[] = [];
+  const priceIds: Partial<Record<'Starter' | 'Growth' | 'Enterprise', string>> = {};
+  const seenOwners = new Map<string, { tier: string; envVar: string }>();
+
+  for (const cfg of PAID_STRIPE_PRICE_TIERS) {
+    const raw = getRawPlanPriceId(cfg.tier, priceMap);
+    const check = validateStripePriceIdFormat(raw);
+    if (!check.valid || !check.value) {
+      const detail =
+        check.reason === 'placeholder_value'
+          ? 'placeholder value rejected'
+          : check.reason === 'invalid_format'
+          ? 'must match price_...'
+          : 'missing';
+      missingOrInvalid.push(`${cfg.envVar} (${detail})`);
+      errors.push(`${cfg.envVar} for tier "${cfg.tier}" is ${detail}.`);
+      continue;
+    }
+
+    const existingOwner = seenOwners.get(check.value);
+    if (existingOwner) {
+      missingOrInvalid.push(`${cfg.envVar} (conflicts with ${existingOwner.envVar})`);
+      errors.push(
+        `${cfg.envVar} for tier "${cfg.tier}" duplicates ${existingOwner.envVar} for tier "${existingOwner.tier}".`
+      );
+      continue;
+    }
+
+    seenOwners.set(check.value, { tier: cfg.tier, envVar: cfg.envVar });
+    priceIds[cfg.tier] = check.value;
+  }
+
+  return {
+    valid: missingOrInvalid.length === 0,
+    missingOrInvalid,
+    errors,
+    priceIds,
+  };
+}
+
+export interface StripeLivePriceCheckItem {
+  tier: 'Starter' | 'Growth' | 'Enterprise';
+  envVar: string;
+  priceId?: string;
+  valid: boolean;
+  active?: boolean;
+  currency?: string;
+  unitAmount?: number | null;
+  interval?: string | null;
+  intervalCount?: number | null;
+  errors: string[];
+}
+
+export interface StripeLivePriceVerificationResult {
+  verified: boolean;
+  missingOrInvalid: string[];
+  plans: StripeLivePriceCheckItem[];
+  error?: string;
+}
+
+/**
+ * Verifies configured Stripe Price IDs against the Stripe Prices API:
+ * ensures each price exists, is active, uses USD recurring monthly billing,
+ * matches the authoritative tier amount, and is distinct across plans.
+ * Never logs or returns Stripe secrets.
+ */
+export async function verifyStripeConfiguredPrices(
+  stripeClient?: Stripe | null,
+  priceMap?: Record<string, string>
+): Promise<StripeLivePriceVerificationResult> {
+  const staticCheck = validateStripePriceConfiguration(priceMap);
+  const plans: StripeLivePriceCheckItem[] = [];
+  const missingOrInvalid = [...staticCheck.missingOrInvalid];
+
+  if (!staticCheck.valid) {
+    for (const cfg of PAID_STRIPE_PRICE_TIERS) {
+      const priceId = staticCheck.priceIds[cfg.tier];
+      const tierErrors = staticCheck.errors.filter((e) => e.includes(cfg.envVar));
+      plans.push({
+        tier: cfg.tier,
+        envVar: cfg.envVar,
+        priceId,
+        valid: Boolean(priceId) && tierErrors.length === 0,
+        errors: tierErrors.length > 0 ? tierErrors : priceId ? [] : [`${cfg.envVar} is not configured.`],
+      });
+    }
+    return {
+      verified: false,
+      missingOrInvalid,
+      plans,
+      error: staticCheck.errors[0] || 'Stripe Price ID configuration is incomplete or invalid.',
+    };
+  }
+
+  const client =
+    stripeClient ||
+    (process.env.STRIPE_SECRET_KEY?.trim() ? new Stripe(process.env.STRIPE_SECRET_KEY.trim()) : null);
+  if (!client || typeof client.prices?.retrieve !== 'function') {
+    return {
+      verified: false,
+      missingOrInvalid: ['STRIPE_SECRET_KEY (required for live Stripe price verification)'],
+      plans: PAID_STRIPE_PRICE_TIERS.map((cfg) => ({
+        tier: cfg.tier,
+        envVar: cfg.envVar,
+        priceId: staticCheck.priceIds[cfg.tier],
+        valid: false,
+        errors: ['Stripe client is unavailable because STRIPE_SECRET_KEY is not configured.'],
+      })),
+      error: 'Stripe client is unavailable because STRIPE_SECRET_KEY is not configured.',
+    };
+  }
+
+  for (const cfg of PAID_STRIPE_PRICE_TIERS) {
+    const priceId = staticCheck.priceIds[cfg.tier]!;
+    const itemErrors: string[] = [];
+    try {
+      const price = await client.prices.retrieve(priceId);
+      const active = Boolean(price?.active);
+      const currency = typeof price?.currency === 'string' ? price.currency.toLowerCase() : '';
+      const interval = price?.recurring?.interval ?? null;
+      const intervalCount = price?.recurring?.interval_count ?? null;
+      const unitAmount = typeof price?.unit_amount === 'number' ? price.unit_amount : null;
+
+      if (!active) {
+        itemErrors.push(`${cfg.envVar} (${priceId}) is inactive in Stripe.`);
+      }
+      if (price?.type !== 'recurring' || !price?.recurring) {
+        itemErrors.push(`${cfg.envVar} (${priceId}) must be a recurring Stripe price.`);
+      }
+      if (interval !== 'month' || (intervalCount !== null && intervalCount !== 1)) {
+        itemErrors.push(
+          `${cfg.envVar} (${priceId}) must have monthly recurring interval (got ${interval || 'none'}/${intervalCount ?? 'none'}).`
+        );
+      }
+      if (currency !== 'usd') {
+        itemErrors.push(`${cfg.envVar} (${priceId}) must use USD currency (got ${currency || 'none'}).`);
+      }
+      if (unitAmount !== cfg.expectedCents) {
+        itemErrors.push(
+          `${cfg.envVar} (${priceId}) unit_amount mismatch: expected ${cfg.expectedCents} cents for ${cfg.tier}, got ${unitAmount}.`
+        );
+      }
+
+      if (itemErrors.length > 0) {
+        missingOrInvalid.push(`${cfg.envVar} (${itemErrors.join('; ')})`);
+      }
+
+      plans.push({
+        tier: cfg.tier,
+        envVar: cfg.envVar,
+        priceId,
+        valid: itemErrors.length === 0,
+        active,
+        currency,
+        unitAmount,
+        interval,
+        intervalCount,
+        errors: itemErrors,
+      });
+    } catch (err: any) {
+      const safeErr =
+        typeof err?.message === 'string'
+          ? err.message.replace(/\b(sk|rk)_(live|test)_[A-Za-z0-9_]+\b/g, '[REDACTED_STRIPE_KEY]')
+          : 'Unknown Stripe API error';
+      const msg = `Failed to retrieve ${cfg.envVar} (${priceId}) from Stripe: ${safeErr}`;
+      missingOrInvalid.push(`${cfg.envVar} (Stripe lookup failed)`);
+      plans.push({
+        tier: cfg.tier,
+        envVar: cfg.envVar,
+        priceId,
+        valid: false,
+        errors: [msg],
+      });
+    }
+  }
+
+  return {
+    verified: missingOrInvalid.length === 0 && plans.every((p) => p.valid),
+    missingOrInvalid,
+    plans,
+    ...(missingOrInvalid.length > 0 ? { error: 'One or more configured Stripe Price IDs failed verification.' } : {}),
+  };
+}
+
+/**
+ * Resolves configured Stripe Price ID for a given plan tier.
+ * Price IDs are external Stripe resources and must be explicitly configured via
+ * environment variables (e.g. STRIPE_PRICE_STARTER or STRIPE_PRICE_ID_STARTER)
+ * or injected via priceMap for testing. Never falls back to hardcoded or placeholder IDs.
+ */
+export function getPlanPriceId(tier: PlanTier, priceMap?: Record<string, string>): string | undefined {
+  const raw = getRawPlanPriceId(tier, priceMap);
+  const check = validateStripePriceIdFormat(raw);
+  return check.valid ? check.value : undefined;
+}
+
+/**
  * Looks up authoritative plan matching a given Stripe Price ID.
- * Rejects unmapped Price IDs to prevent unauthorized tier elevation.
+ * Rejects unmapped or duplicate/conflicting Price IDs to prevent unauthorized tier elevation.
  */
 export function findPlanByPriceId(priceId: string, priceMap?: Record<string, string>): BillingPlanDefinition | null {
   if (!priceId) return null;
+  const trimmed = priceId.trim();
+  const matches: BillingPlanDefinition[] = [];
   for (const plan of Object.values(AUTHORITATIVE_PLANS)) {
     if (plan.priceCents <= 0) continue;
     const configuredId = getPlanPriceId(plan.tier, priceMap);
-    if (configuredId && configuredId === priceId) {
-      return plan;
+    if (configuredId && configuredId === trimmed) {
+      matches.push(plan);
     }
   }
-  return null;
+  return matches.length === 1 ? matches[0] : null;
 }
 
 /**
@@ -94,6 +340,10 @@ export class StripeBillingProvider implements IBillingProvider {
     return this.priceMap;
   }
 
+  async verifyConfiguredPrices(): Promise<StripeLivePriceVerificationResult> {
+    return verifyStripeConfiguredPrices(this.stripe, this.priceMap);
+  }
+
   async retrieveCheckoutSession(sessionId: string): Promise<Stripe.Checkout.Session | null> {
     if (!this.stripe || !sessionId) return null;
     return await this.stripe.checkout.sessions.retrieve(sessionId, {
@@ -120,10 +370,31 @@ export class StripeBillingProvider implements IBillingProvider {
       throw new Error(`[Billing] Cannot create paid checkout session for plan "${options.tier}".`);
     }
 
-    const priceId = getPlanPriceId(options.tier, this.priceMap);
-    if (!priceId) {
-      const envKey = `STRIPE_PRICE_${options.tier.toUpperCase().replace(/\s+/g, '_')}`;
-      throw new Error(`[Billing] Stripe Price ID is not configured for plan tier "${options.tier}". Please configure ${envKey}.`);
+    const rawPriceId = getRawPlanPriceId(options.tier, this.priceMap);
+    const priceCheck = validateStripePriceIdFormat(rawPriceId);
+    const envKey = `STRIPE_PRICE_${options.tier.toUpperCase().replace(/\s+/g, '_')}`;
+    if (!priceCheck.valid || !priceCheck.value) {
+      if (priceCheck.reason === 'placeholder_value' || priceCheck.reason === 'invalid_format') {
+        throw new Error(
+          `[Billing] Stripe Price ID for plan tier "${options.tier}" (${envKey}) is invalid or uses a placeholder value.`
+        );
+      }
+      throw new Error(
+        `[Billing] Stripe Price ID is not configured for plan tier "${options.tier}". Please configure ${envKey}.`
+      );
+    }
+    const priceId = priceCheck.value;
+
+    // Prevent one plan's Price ID from silently mapping to another plan
+    for (const cfg of PAID_STRIPE_PRICE_TIERS) {
+      if (cfg.tier === options.tier) continue;
+      const otherRaw = getRawPlanPriceId(cfg.tier, this.priceMap);
+      const otherCheck = validateStripePriceIdFormat(otherRaw);
+      if (otherCheck.valid && otherCheck.value === priceId) {
+        throw new Error(
+          `[Billing] Stripe Price ID for plan tier "${options.tier}" (${envKey}) conflicts with ${cfg.envVar} (${cfg.tier}).`
+        );
+      }
     }
 
     const sessionParams: Stripe.Checkout.SessionCreateParams = {

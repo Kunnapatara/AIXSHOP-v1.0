@@ -20,6 +20,12 @@ import {
   inspectAndSanitizeClientCatalogPut,
   sanitizeAndValidateImportCandidates,
 } from '../security/catalogSanitizer';
+import { authenticateReviewerPrincipal } from '../security/reviewerAuth';
+import {
+  ExternalRegistryProviderAdapter,
+  evaluateExternalRegistryResponse,
+  getConfiguredExternalRegistryProvider,
+} from '../services/externalRegistryService';
 import { 
   initialProducts, 
   initialFindings, 
@@ -32,11 +38,24 @@ import {
   redactCatalogForPreliminaryAccess,
   resolveReportEntitlement,
 } from '../services/entitlementService';
+import {
+  GuestTransferError,
+  authorizeGuestTransfer,
+  commitGuestTransfer,
+  getGuestTransferStatus,
+} from '../services/guestTransferService';
 
 const MAX_CATALOG_PUT_PRODUCTS = 5000;
 const MAX_IMPORT_CANDIDATES = 1000;
 
-export function createCatalogRoutes(repo: DatabaseRepository): Router {
+export interface CatalogRoutesOptions {
+  externalRegistryProvider?: ExternalRegistryProviderAdapter;
+}
+
+export function createCatalogRoutes(
+  repo: DatabaseRepository,
+  options: CatalogRoutesOptions = {}
+): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(repo);
   const catalogWriteLimiter = createWorkspaceRateLimiter(
@@ -524,7 +543,10 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
                 ? {
                     ...doc,
                     evidencePurpose: 'product_claim' as const,
-                    verificationSource: 'external_registry' as const,
+                    verificationSource: 'server_reviewer' as const,
+                    externalVerificationStatus: 'reviewer_verified' as const,
+                    reviewerPrincipalType: 'service_principal' as const,
+                    reviewerAuthMethod: 'demo_seed',
                     decision: 'approved' as const,
                     verifiedBy: 'demo_seed',
                     reviewedAt: nowIso,
@@ -534,6 +556,7 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
                     ...doc,
                     evidencePurpose: 'product_claim' as const,
                     verificationSource: 'client_submission' as const,
+                    externalVerificationStatus: 'not_externally_verified' as const,
                     decision: 'pending' as const,
                     createdAt: nowIso,
                   };
@@ -616,6 +639,166 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
     }
   });
 
+  // POST /api/catalog/guest-transfer/authorize — Issue short-lived, single-use user+workspace bound transfer authorization
+  router.post(
+    '/guest-transfer/authorize',
+    requireAuth,
+    requireRole(['owner', 'admin', 'member']),
+    catalogImportLimiter,
+    async (req: AuthRequest, res) => {
+      try {
+        const workspaceId = req.workspace!.id;
+        const userId = req.user!.id;
+        const body = req.body || {};
+
+        if (
+          (body.targetWorkspaceId && body.targetWorkspaceId !== workspaceId) ||
+          (body.workspaceId && body.workspaceId !== workspaceId) ||
+          (body.targetUserId && body.targetUserId !== userId)
+        ) {
+          return res.status(403).json({
+            error: 'Forbidden: guest transfer cannot target another user or workspace.',
+            code: 'TRANSFER_TENANT_MISMATCH',
+          });
+        }
+
+        const authRes = await authorizeGuestTransfer(repo, {
+          userId,
+          workspaceId,
+          idempotencyKey: body.idempotencyKey,
+          conflictStrategy: body.conflictStrategy,
+          payload: body.payload,
+          ttlMs: typeof body.ttlMs === 'number' ? body.ttlMs : undefined,
+        });
+
+        return res.status(200).json(authRes);
+      } catch (err: any) {
+        if (err instanceof ProtectedVerificationFieldError || err.code === 'PROTECTED_VERIFICATION_FIELD') {
+          return res.status(403).json({
+            error: err.message,
+            code: 'PROTECTED_VERIFICATION_FIELD',
+          });
+        }
+        if (err instanceof GuestTransferError) {
+          return res.status(err.statusCode).json({
+            error: err.message,
+            code: err.code,
+            ...(err.conflicts ? { conflicts: err.conflicts } : {}),
+          });
+        }
+        console.error('[AIXSHOP Catalog] Guest transfer authorize error:', err);
+        return res.status(500).json({ error: 'Failed to authorize guest catalog transfer' });
+      }
+    }
+  );
+
+  // POST /api/catalog/guest-transfer/commit — Atomically and idempotently commit guest catalog transfer
+  router.post(
+    '/guest-transfer/commit',
+    requireAuth,
+    requireRole(['owner', 'admin', 'member']),
+    catalogImportLimiter,
+    async (req: AuthRequest, res) => {
+      try {
+        const workspaceId = req.workspace!.id;
+        const userId = req.user!.id;
+        const body = req.body || {};
+
+        if (
+          (body.targetWorkspaceId && body.targetWorkspaceId !== workspaceId) ||
+          (body.workspaceId && body.workspaceId !== workspaceId) ||
+          (body.targetUserId && body.targetUserId !== userId)
+        ) {
+          return res.status(403).json({
+            error: 'Forbidden: guest transfer cannot commit into another user or workspace.',
+            code: 'TRANSFER_TENANT_MISMATCH',
+          });
+        }
+
+        const result = await withWorkspaceOperationLease(
+          repo,
+          workspaceId,
+          'catalog_guest_transfer',
+          120_000,
+          () =>
+            commitGuestTransfer(repo, {
+              userId,
+              workspaceId,
+              transferToken: body.transferToken,
+              idempotencyKey: body.idempotencyKey,
+              conflictStrategy: body.conflictStrategy,
+              payload: body.payload,
+            })
+        );
+
+        return res.status(200).json(result);
+      } catch (err: any) {
+        if (err instanceof OperationInProgressError || err.code === 'OPERATION_IN_PROGRESS') {
+          return res.status(409).json({
+            error: err.message,
+            code: 'OPERATION_IN_PROGRESS',
+            operationKey: err.operationKey,
+          });
+        }
+        if (err instanceof ProtectedVerificationFieldError || err.code === 'PROTECTED_VERIFICATION_FIELD') {
+          return res.status(403).json({
+            error: err.message,
+            code: 'PROTECTED_VERIFICATION_FIELD',
+          });
+        }
+        if (err instanceof GuestTransferError) {
+          return res.status(err.statusCode).json({
+            error: err.message,
+            code: err.code,
+            ...(err.conflicts ? { conflicts: err.conflicts } : {}),
+          });
+        }
+        console.error('[AIXSHOP Catalog] Guest transfer commit error:', err);
+        return res.status(500).json({ error: 'Failed to commit guest catalog transfer' });
+      }
+    }
+  );
+
+  // GET /api/catalog/guest-transfer/status — Recover status/receipt of a transfer by idempotencyKey
+  router.get('/guest-transfer/status', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const userId = req.user!.id;
+      const idempotencyKey = typeof req.query.idempotencyKey === 'string' ? req.query.idempotencyKey : '';
+      const status = await getGuestTransferStatus(repo, {
+        userId,
+        workspaceId,
+        idempotencyKey,
+      });
+      return res.status(200).json(status);
+    } catch (err: any) {
+      if (err instanceof GuestTransferError) {
+        return res.status(err.statusCode).json({
+          error: err.message,
+          code: err.code,
+        });
+      }
+      console.error('[AIXSHOP Catalog] Guest transfer status error:', err);
+      return res.status(500).json({ error: 'Failed to check guest transfer status' });
+    }
+  });
+
+  // GET /api/catalog/guest-transfer/audit-log — Read guest-to-cloud transfer audit trail
+  router.get('/guest-transfer/audit-log', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const entries = await repo.getGuestTransferAuditLog(workspaceId);
+      return res.status(200).json({
+        success: true,
+        workspaceId,
+        entries,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Catalog] Guest transfer audit log error:', err);
+      return res.status(500).json({ error: 'Failed to load guest transfer audit log' });
+    }
+  });
+
   // POST /api/catalog/evidence — Merchant evidence upload (always starts pending/unverified)
   router.post(
     '/evidence',
@@ -633,11 +816,20 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
           Boolean(body.verifiedBy) ||
           Boolean(body.reviewedAt) ||
           Boolean(body.integrityHash) ||
+          Boolean(body.reviewerPrincipalType) ||
+          Boolean(body.reviewerAuthMethod) ||
+          Boolean(body.externalProviderName) ||
+          Boolean(body.externalProviderRef) ||
+          Boolean(body.externalRequestAt) ||
+          Boolean(body.externalResponseAt) ||
+          Boolean(body.externalVerificationResult) ||
+          Boolean(body.externalVerificationEvidence) ||
+          (body.externalVerificationStatus && body.externalVerificationStatus !== 'not_externally_verified') ||
           (body.verificationSource && body.verificationSource !== 'client_submission')
         ) {
           return res.status(403).json({
             error:
-              'Forbidden: verification status, decision, reviewer metadata, and integrityHash are server-controlled and cannot be set by client submissions.',
+              'Forbidden: verification status, decision, reviewer metadata, external verification fields, and integrityHash are server-controlled and cannot be set by client submissions.',
             code: 'PROTECTED_VERIFICATION_FIELD',
           });
         }
@@ -692,26 +884,34 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       const workspaceId = req.workspace!.id;
       const evidenceId = req.params.evidenceId;
 
-      const configuredSecret = process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET?.trim() || '';
-      const providedToken = String(req.headers['x-aixshop-reviewer-token'] || '');
-      const reviewerIdHeader = String(req.headers['x-aixshop-reviewer-id'] || '').trim();
-
-      let authorizedReviewer = false;
-      if (configuredSecret.length >= 32 && providedToken.length > 0 && reviewerIdHeader.length > 0) {
-        const expectedDigest = crypto.createHash('sha256').update(configuredSecret, 'utf8').digest();
-        const providedDigest = crypto.createHash('sha256').update(providedToken, 'utf8').digest();
-        authorizedReviewer = crypto.timingSafeEqual(expectedDigest, providedDigest);
-      }
-
-      if (!authorizedReviewer) {
+      const authResult = await authenticateReviewerPrincipal(repo, req, {
+        requiredScope: 'evidence:review',
+      });
+      if (!authResult.authorized || !authResult.principal) {
         return res.status(403).json({
           error:
-            'Forbidden: workspace users cannot self-approve or modify evidence verification status. A server-authorized platform reviewer credential is required.',
-          code: 'FORBIDDEN_REVIEWER_REQUIRED',
+            authResult.errorMessage ||
+            'Forbidden: workspace users cannot self-approve or modify evidence verification status.',
+          code: authResult.errorCode || 'FORBIDDEN_REVIEWER_REQUIRED',
         });
       }
 
-      const { decision, reason, verificationSource } = req.body || {};
+      const body = req.body || {};
+      const { decision, reason, verificationSource, externalVerificationStatus } = body;
+
+      if (
+        verificationSource === 'external_registry' ||
+        externalVerificationStatus === 'external_registry_verified' ||
+        Boolean(body.externalProviderName) ||
+        Boolean(body.externalProviderRef)
+      ) {
+        return res.status(403).json({
+          error:
+            'Forbidden: reviewer review actions cannot grant or spoof external_registry verification status. External registry verification requires the dedicated configured external provider flow.',
+          code: 'FORBIDDEN_EXTERNAL_VERIFICATION_SPOOF',
+        });
+      }
+
       if (decision !== 'approved' && decision !== 'rejected') {
         return res.status(400).json({
           error: 'decision must be "approved" or "rejected".',
@@ -719,14 +919,36 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
         });
       }
 
+      const existing = await repo.getEvidenceDocumentById(workspaceId, evidenceId);
+      if (!existing) {
+        return res.status(404).json({
+          error: `Evidence document "${evidenceId}" not found in workspace ${workspaceId}`,
+          code: 'EVIDENCE_NOT_FOUND',
+        });
+      }
+
+      if (
+        authResult.principal.humanUserId &&
+        existing.evidence.submittedByUserId &&
+        existing.evidence.submittedByUserId === authResult.principal.humanUserId
+      ) {
+        return res.status(403).json({
+          error: 'Forbidden: a reviewer cannot approve or reject evidence they submitted.',
+          code: 'FORBIDDEN_SELF_REVIEW',
+        });
+      }
+
       const result = await repo.reviewEvidenceDocument({
         workspaceId,
         evidenceId,
         decision,
-        reviewerId: reviewerIdHeader,
-        reviewerRole: 'platform_reviewer',
+        reviewerId: authResult.principal.reviewerId,
+        reviewerRole: authResult.principal.reviewerRole,
+        principalType: authResult.principal.principalType,
+        authMethod: authResult.principal.authMethod,
+        claimedReviewerId: authResult.principal.claimedReviewerId,
         reason: typeof reason === 'string' ? reason.trim() : undefined,
-        verificationSource: verificationSource === 'external_registry' ? 'external_registry' : 'server_reviewer',
+        verificationSource: 'server_reviewer',
       });
 
       return res.status(200).json({
@@ -751,6 +973,154 @@ export function createCatalogRoutes(repo: DatabaseRepository): Router {
       }
       console.error('[AIXSHOP Catalog] Evidence review error:', err);
       return res.status(500).json({ error: err.message || 'Failed to review evidence document' });
+    }
+  });
+
+  // POST /api/catalog/evidence/:evidenceId/verify-external — Authoritative external registry verification via server-configured adapter
+  router.post('/evidence/:evidenceId/verify-external', requireAuth, catalogWriteLimiter, async (req: AuthRequest, res) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const evidenceId = req.params.evidenceId;
+
+      const authResult = await authenticateReviewerPrincipal(repo, req, {
+        requiredScope: 'evidence:external_verify',
+      });
+      if (!authResult.authorized || !authResult.principal) {
+        return res.status(403).json({
+          error:
+            authResult.errorMessage ||
+            'Forbidden: a server-authorized platform reviewer credential is required for external registry verification.',
+          code: authResult.errorCode || 'FORBIDDEN_REVIEWER_REQUIRED',
+        });
+      }
+
+      const body = req.body || {};
+      if (
+        Boolean(body.providerUrl) ||
+        Boolean(body.providerEndpoint) ||
+        Boolean(body.apiKey) ||
+        Boolean(body.mockResponse) ||
+        body.externalVerificationStatus === 'external_registry_verified'
+      ) {
+        return res.status(403).json({
+          error:
+            'Forbidden: external registry endpoint, credentials, and verification outcomes cannot be supplied by client requests.',
+          code: 'FORBIDDEN_EXTERNAL_VERIFICATION_SPOOF',
+        });
+      }
+
+      const existing = await repo.getEvidenceDocumentById(workspaceId, evidenceId);
+      if (!existing) {
+        return res.status(404).json({
+          error: `Evidence document "${evidenceId}" not found in workspace ${workspaceId}`,
+          code: 'EVIDENCE_NOT_FOUND',
+        });
+      }
+
+      if (
+        authResult.principal.humanUserId &&
+        existing.evidence.submittedByUserId &&
+        existing.evidence.submittedByUserId === authResult.principal.humanUserId
+      ) {
+        return res.status(403).json({
+          error: 'Forbidden: a reviewer cannot initiate external verification for evidence they submitted.',
+          code: 'FORBIDDEN_SELF_REVIEW',
+        });
+      }
+
+      const provider = options.externalRegistryProvider ?? getConfiguredExternalRegistryProvider();
+      if (!provider) {
+        return res.status(503).json({
+          success: false,
+          verified: false,
+          outcome: 'unconfigured',
+          code: 'EXTERNAL_REGISTRY_UNCONFIGURED',
+          error:
+            'External registry verification provider is not configured on this server. Evidence remains unverified by external registries.',
+          externalVerificationStatus:
+            existing.evidence.externalVerificationStatus === 'reviewer_verified'
+              ? 'reviewer_verified'
+              : 'not_externally_verified',
+        });
+      }
+
+      const barcodes = (existing.product?.variants || [])
+        .map((v) => String(v.barcode || '').trim())
+        .filter(Boolean);
+      const queryInput = {
+        workspaceId,
+        productId: existing.productId,
+        evidenceId,
+        title: existing.evidence.title,
+        type: existing.evidence.type,
+        issuer: existing.evidence.issuer,
+        url: existing.evidence.url,
+        barcodes,
+        brand: existing.product?.brand,
+        requestedReference:
+          typeof body.requestedReference === 'string' ? body.requestedReference.trim() : undefined,
+      };
+
+      const rawResponse = await provider.verifyRecord(queryInput, { timeoutMs: 5000 });
+      const evaluation = evaluateExternalRegistryResponse(queryInput, rawResponse);
+
+      const recorded = await repo.recordExternalRegistryVerification({
+        workspaceId,
+        evidenceId,
+        initiatedByReviewerId: authResult.principal.reviewerId,
+        initiatedByPrincipalType: authResult.principal.principalType,
+        initiatedByAuthMethod: authResult.principal.authMethod,
+        claimedReviewerId: authResult.principal.claimedReviewerId,
+        evaluation,
+      });
+
+      if (evaluation.verified) {
+        return res.status(200).json({
+          success: true,
+          verified: true,
+          outcome: evaluation.outcome,
+          workspaceId,
+          evidence: recorded.evidence,
+          auditEntry: recorded.auditEntry,
+          catalogVersion: recorded.catalogVersion,
+        });
+      }
+
+      const statusCode =
+        evaluation.outcome === 'timeout'
+          ? 504
+          : evaluation.outcome === 'unavailable' || evaluation.outcome === 'unconfigured'
+          ? 503
+          : evaluation.outcome === 'malformed'
+          ? 502
+          : 422;
+
+      return res.status(statusCode).json({
+        success: false,
+        verified: false,
+        outcome: evaluation.outcome,
+        code: 'EXTERNAL_REGISTRY_VERIFICATION_FAILED',
+        error: evaluation.reason,
+        workspaceId,
+        evidence: recorded.evidence,
+        auditEntry: recorded.auditEntry,
+        catalogVersion: recorded.catalogVersion,
+      });
+    } catch (err: any) {
+      if (err.code === 'EVIDENCE_NOT_FOUND' || err.code === 'CATALOG_NOT_FOUND') {
+        return res.status(404).json({
+          error: err.message,
+          code: err.code,
+        });
+      }
+      if (err.code === 'EVIDENCE_INTEGRITY_MISMATCH') {
+        return res.status(409).json({
+          error: err.message,
+          code: err.code,
+        });
+      }
+      console.error('[AIXSHOP Catalog] External registry verification error:', err);
+      return res.status(500).json({ error: 'Failed to execute external registry verification' });
     }
   });
 

@@ -233,10 +233,24 @@ export function inspectAndSanitizeClientCatalogPut(
         existingEntry!.productId === p.id &&
         evidenceContentMatches(rawDoc, existingEntry!.doc);
 
-      const clientClaimsVerified = rawDoc.status === 'verified' || rawDoc.decision === 'approved';
+      const clientClaimsVerified =
+        rawDoc.status === 'verified' ||
+        rawDoc.decision === 'approved' ||
+        rawDoc.externalVerificationStatus === 'reviewer_verified' ||
+        rawDoc.externalVerificationStatus === 'external_registry_verified';
       const clientSuppliesServerReviewer =
         Boolean(rawDoc.verifiedBy && rawDoc.verifiedBy !== existingEntry?.doc.verifiedBy) ||
         Boolean(rawDoc.reviewedAt && rawDoc.reviewedAt !== existingEntry?.doc.reviewedAt) ||
+        Boolean(rawDoc.reviewerPrincipalType && rawDoc.reviewerPrincipalType !== existingEntry?.doc.reviewerPrincipalType) ||
+        Boolean(rawDoc.reviewerAuthMethod && rawDoc.reviewerAuthMethod !== existingEntry?.doc.reviewerAuthMethod) ||
+        Boolean(rawDoc.externalProviderName && rawDoc.externalProviderName !== existingEntry?.doc.externalProviderName) ||
+        Boolean(rawDoc.externalProviderRef && rawDoc.externalProviderRef !== existingEntry?.doc.externalProviderRef) ||
+        Boolean(rawDoc.externalRequestAt && rawDoc.externalRequestAt !== existingEntry?.doc.externalRequestAt) ||
+        Boolean(rawDoc.externalResponseAt && rawDoc.externalResponseAt !== existingEntry?.doc.externalResponseAt) ||
+        Boolean(rawDoc.externalVerificationResult && rawDoc.externalVerificationResult !== existingEntry?.doc.externalVerificationResult) ||
+        (rawDoc.externalVerificationStatus !== undefined &&
+          rawDoc.externalVerificationStatus !== 'not_externally_verified' &&
+          rawDoc.externalVerificationStatus !== existingEntry?.doc.externalVerificationStatus) ||
         (rawDoc.verificationSource !== undefined &&
           rawDoc.verificationSource !== 'client_submission' &&
           rawDoc.verificationSource !== existingEntry?.doc.verificationSource) ||
@@ -246,7 +260,7 @@ export function inspectAndSanitizeClientCatalogPut(
         if (clientSuppliesServerReviewer) {
           if (reject) {
             throw new ProtectedVerificationFieldError(
-              'Forbidden: evidence reviewer metadata and integrityHash are server-controlled fields.'
+              'Forbidden: evidence reviewer metadata, external verification state, and integrityHash are server-controlled fields.'
             );
           }
         }
@@ -258,7 +272,7 @@ export function inspectAndSanitizeClientCatalogPut(
       if (clientClaimsVerified || clientSuppliesServerReviewer) {
         if (reject) {
           throw new ProtectedVerificationFieldError(
-            `Forbidden: evidence document "${rawDoc.id}" cannot be marked verified or assigned reviewer metadata by a client.`
+            `Forbidden: evidence document "${rawDoc.id}" cannot be marked verified or assigned reviewer/external-registry metadata by a client.`
           );
         }
       }
@@ -283,6 +297,7 @@ export function inspectAndSanitizeClientCatalogPut(
         status: sanitizedStatus,
         evidencePurpose: purpose,
         verificationSource: 'client_submission',
+        externalVerificationStatus: 'not_externally_verified',
         decision: 'pending',
         createdAt: existingEntry?.doc.createdAt || new Date().toISOString(),
       };
@@ -389,11 +404,15 @@ export function sanitizeAndValidateImportCandidates(
         rawDoc.decision === 'approved' ||
         Boolean(rawDoc.verifiedBy) ||
         Boolean(rawDoc.reviewedAt) ||
+        Boolean(rawDoc.reviewerPrincipalType) ||
+        Boolean(rawDoc.externalProviderName) ||
+        Boolean(rawDoc.externalProviderRef) ||
+        (rawDoc.externalVerificationStatus && rawDoc.externalVerificationStatus !== 'not_externally_verified') ||
         (rawDoc.verificationSource && rawDoc.verificationSource !== 'client_submission')
       ) {
         if (reject) {
           throw new ProtectedVerificationFieldError(
-            `Forbidden: imported evidence "${rawDoc.id}" cannot claim verified or reviewer-approved status.`
+            `Forbidden: imported evidence "${rawDoc.id}" cannot claim verified, reviewer-approved, or externally verified status.`
           );
         }
       }
@@ -413,6 +432,7 @@ export function sanitizeAndValidateImportCandidates(
         status: rawDoc.status === 'unverified' || rawDoc.status === 'expired' ? rawDoc.status : 'pending',
         evidencePurpose: purpose,
         verificationSource: 'client_submission',
+        externalVerificationStatus: 'not_externally_verified',
         decision: 'pending',
         createdAt: new Date().toISOString(),
       };
@@ -455,12 +475,24 @@ export function buildTrustedGtinVerificationContext(
     productById.set(p.id, p);
 
     for (const doc of p.evidenceDocuments || []) {
+      const hasExternalRegistryProof =
+        doc.verificationSource === 'external_registry' &&
+        doc.externalVerificationStatus === 'external_registry_verified' &&
+        Boolean(doc.externalProviderName?.trim()) &&
+        Boolean(doc.externalProviderRef?.trim()) &&
+        Boolean(doc.externalResponseAt?.trim());
+      const hasServerReviewerProof =
+        doc.verificationSource === 'server_reviewer' &&
+        (!doc.externalVerificationStatus ||
+          doc.externalVerificationStatus === 'reviewer_verified' ||
+          doc.externalVerificationStatus === 'not_externally_verified');
+
       if (
         !doc ||
         doc.status !== 'verified' ||
         doc.decision !== 'approved' ||
         doc.evidencePurpose !== 'gtin_exemption' ||
-        (doc.verificationSource !== 'server_reviewer' && doc.verificationSource !== 'external_registry') ||
+        (!hasExternalRegistryProof && !hasServerReviewerProof) ||
         !doc.verifiedBy?.trim() ||
         !doc.reviewedAt?.trim() ||
         !doc.integrityHash?.trim()
@@ -479,7 +511,7 @@ export function buildTrustedGtinVerificationContext(
         verifiedBy: doc.verifiedBy,
         reviewedAt: doc.reviewedAt,
         integrityHash: doc.integrityHash,
-        sourceType: doc.verificationSource,
+        sourceType: hasExternalRegistryProof ? 'external_registry' : 'server_reviewer',
       });
       break;
     }

@@ -46,6 +46,15 @@ export interface Offer {
 export type EvidenceStatus = 'pending' | 'unverified' | 'verified' | 'rejected' | 'expired';
 export type EvidencePurpose = 'gtin_exemption' | 'product_claim' | 'general';
 export type EvidenceVerificationSource = 'client_submission' | 'server_reviewer' | 'external_registry';
+export type ExternalVerificationStatus =
+  | 'not_externally_verified'
+  | 'reviewer_verified'
+  | 'external_registry_verified';
+export type ReviewerPrincipalType =
+  | 'human_reviewer'
+  | 'service_principal'
+  | 'external_registry_provider'
+  | 'merchant_submitter';
 export type EvidenceReviewDecision = 'pending' | 'approved' | 'rejected';
 
 export interface EvidenceDocument {
@@ -58,12 +67,29 @@ export interface EvidenceDocument {
   status: EvidenceStatus;
   evidencePurpose?: EvidencePurpose;
   verificationSource?: EvidenceVerificationSource;
+  externalVerificationStatus?: ExternalVerificationStatus;
   verifiedBy?: string;
+  reviewerPrincipalType?: ReviewerPrincipalType;
+  reviewerAuthMethod?: string;
   reviewedAt?: string;
   decision?: EvidenceReviewDecision;
   decisionReason?: string;
   integrityHash?: string;
   submittedByUserId?: string;
+  externalProviderName?: string;
+  externalProviderRef?: string;
+  externalRequestAt?: string;
+  externalResponseAt?: string;
+  externalVerificationResult?:
+    | 'verified'
+    | 'mismatched'
+    | 'ambiguous'
+    | 'timeout'
+    | 'unavailable'
+    | 'malformed'
+    | 'unconfigured'
+    | 'rejected';
+  externalVerificationEvidence?: Record<string, any>;
   createdAt?: string;
 }
 
@@ -72,10 +98,12 @@ export interface EvidenceReviewAuditEntry {
   workspaceId: string;
   evidenceId: string;
   productId: string;
-  action: 'submitted' | 'approved' | 'rejected';
+  action: 'submitted' | 'approved' | 'rejected' | 'external_verified' | 'external_verification_failed';
   decision: EvidenceReviewDecision;
   reviewerId?: string | null;
   reviewerRole?: string | null;
+  principalType?: ReviewerPrincipalType | null;
+  authMethod?: string | null;
   reason?: string | null;
   integrityHash: string;
   metadata?: Record<string, any>;

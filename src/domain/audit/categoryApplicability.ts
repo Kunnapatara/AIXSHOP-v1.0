@@ -104,14 +104,26 @@ function hasAuthoritativeVerifiedGtinExemption(
     (exemptionProof.sourceType === 'server_reviewer' || exemptionProof.sourceType === 'external_registry')
   ) {
     const matchingDoc = (product.evidenceDocuments || []).find(
-      (doc) =>
-        doc &&
-        doc.id === exemptionProof.evidenceId &&
-        doc.status === 'verified' &&
-        doc.decision === 'approved' &&
-        (doc.verificationSource === 'server_reviewer' || doc.verificationSource === 'external_registry') &&
-        doc.evidencePurpose === 'gtin_exemption' &&
-        doc.integrityHash === exemptionProof.integrityHash
+      (doc) => {
+        if (
+          !doc ||
+          doc.id !== exemptionProof.evidenceId ||
+          doc.status !== 'verified' ||
+          doc.decision !== 'approved' ||
+          doc.evidencePurpose !== 'gtin_exemption' ||
+          doc.integrityHash !== exemptionProof.integrityHash
+        ) {
+          return false;
+        }
+        if (doc.verificationSource === 'external_registry') {
+          return (
+            doc.externalVerificationStatus === 'external_registry_verified' &&
+            Boolean(doc.externalProviderName?.trim()) &&
+            Boolean(doc.externalProviderRef?.trim())
+          );
+        }
+        return doc.verificationSource === 'server_reviewer';
+      }
     );
 
     if (matchingDoc) {

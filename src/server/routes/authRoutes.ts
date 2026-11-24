@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Router, Request, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
 import { hashPassword, verifyPassword } from '../security/passwords';
@@ -5,7 +6,12 @@ import { generateSessionToken, hashSessionToken } from '../security/tokens';
 import { createAuthMiddleware, authRateLimiter } from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { getTrustedBaseUrl } from '../config/productionConfig';
-import { sendPasswordResetEmail } from '../services/emailService';
+import {
+  checkEmailTransportAvailability,
+  sanitizeSmtpErrorMessage,
+  sendPasswordResetEmail,
+  verifySmtpConnection,
+} from '../services/emailService';
 
 function validatePasswordInput(password: unknown): { valid: boolean; error?: string } {
   if (typeof password !== 'string') {
@@ -236,6 +242,15 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
           return res.status(400).json({ error: 'Valid email address is required' });
         }
 
+        const transport = checkEmailTransportAvailability();
+        if (!transport.available) {
+          console.warn('[AIXSHOP Auth] Password reset unavailable:', sanitizeSmtpErrorMessage(transport.reason));
+          return res.status(503).json({
+            error: 'Password recovery email service is temporarily unavailable. Please try again later.',
+            code: 'EMAIL_SERVICE_UNAVAILABLE',
+          });
+        }
+
         const normalizedEmail = rawEmail.trim().toLowerCase();
         const user = await repo.getUserByEmail(normalizedEmail);
 
@@ -244,24 +259,62 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
           const ttlMinutes = Number.isFinite(ttlMinutesRaw) && ttlMinutesRaw > 0 ? Math.min(120, ttlMinutesRaw) : 30;
           const rawResetToken = generateSessionToken();
           const tokenHash = hashSessionToken(rawResetToken);
+          const tokenId = `pwr_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
           const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString();
+          const baseUrl = getTrustedBaseUrl(req);
+          const resetUrl = `${baseUrl}/#reset_token=${encodeURIComponent(rawResetToken)}`;
 
           await repo.createPasswordResetToken({
-            id: `pwr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+            id: tokenId,
             userId: user.id,
             tokenHash,
             expiresAt,
             requestedIp: req.ip,
           });
 
-          const baseUrl = getTrustedBaseUrl(req);
-          const resetUrl = `${baseUrl}/#reset_token=${encodeURIComponent(rawResetToken)}`;
-          await sendPasswordResetEmail({
-            to: user.email,
-            fullName: user.fullName,
-            resetUrl,
-            ttlMinutes,
-          });
+          let delivery;
+          try {
+            delivery = await sendPasswordResetEmail({
+              to: user.email,
+              fullName: user.fullName,
+              resetUrl,
+              ttlMinutes,
+            });
+          } catch (sendErr: any) {
+            delivery = {
+              delivered: false,
+              mode: 'smtp' as const,
+              error: sanitizeSmtpErrorMessage(sendErr),
+            };
+          }
+
+          if (!delivery.delivered) {
+            await repo.invalidatePasswordResetToken(tokenId).catch((invErr) => {
+              console.error(
+                '[AIXSHOP Auth] Failed to invalidate undelivered password reset token:',
+                sanitizeSmtpErrorMessage(invErr)
+              );
+            });
+            console.warn('[AIXSHOP Auth] Password reset email delivery failed; token invalidated', {
+              mode: delivery.mode,
+              error: sanitizeSmtpErrorMessage(delivery.error),
+            });
+            return res.status(503).json({
+              error: 'Unable to send password reset instructions right now. Please try again later.',
+              code: 'EMAIL_DELIVERY_FAILED',
+            });
+          }
+        } else if (transport.usesSmtpSocket) {
+          const probe = await verifySmtpConnection({ timeoutMs: 4000 });
+          if (!probe.smtp_connection_verified) {
+            console.warn('[AIXSHOP Auth] Password reset SMTP connection probe failed', {
+              error: sanitizeSmtpErrorMessage(probe.connectionError),
+            });
+            return res.status(503).json({
+              error: 'Unable to send password reset instructions right now. Please try again later.',
+              code: 'EMAIL_DELIVERY_FAILED',
+            });
+          }
         }
 
         // Strict non-enumeration response: identical regardless of whether email matched an account
@@ -270,7 +323,7 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
           message: 'If an account matches that email address, password reset instructions have been sent.',
         });
       } catch (err: any) {
-        console.error('[AIXSHOP Auth] Forgot password error:', err);
+        console.error('[AIXSHOP Auth] Forgot password error:', sanitizeSmtpErrorMessage(err));
         return res.status(500).json({ error: 'Unable to process password reset request' });
       }
     }

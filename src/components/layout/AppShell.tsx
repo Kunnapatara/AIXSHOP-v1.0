@@ -43,7 +43,14 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
     actionItems,
     isReadOnlyMode,
     readOnlyReason,
-    isCloudWorkspace
+    isCloudWorkspace,
+    guestTransferEligibility,
+    guestTransferConflicts,
+    guestTransferPendingCheckpoint,
+    guestTransferInFlight,
+    guestTransferDismissed,
+    transferGuestCatalogToCloud,
+    dismissGuestTransferPrompt,
   } = useApp();
 
   const {
@@ -524,6 +531,102 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
               </div>
             </div>
           )}
+          {isCloudWorkspace &&
+            !guestTransferDismissed &&
+            transferGuestCatalogToCloud &&
+            (Boolean(guestTransferPendingCheckpoint) || Boolean(guestTransferEligibility?.hasCustomizedGuestWork)) && (
+              <div
+                className="mb-5 p-4 bg-white border border-orange-200 rounded-xl text-xs text-stone-800 shadow-xs space-y-2.5"
+                role="region"
+                aria-label="Guest catalog cloud transfer"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-semibold text-stone-900">
+                      {guestTransferPendingCheckpoint
+                        ? 'Resume Interrupted Guest Catalog Transfer'
+                        : 'Local Guest Catalog Ready to Transfer'}
+                    </p>
+                    <p className="text-stone-600 mt-0.5 leading-relaxed">
+                      {guestTransferEligibility
+                        ? `${guestTransferEligibility.productsCount} product(s) from "${guestTransferEligibility.storeName}" are saved locally in this browser. Your local copy remains untouched until cloud persistence is positively verified.`
+                        : 'An interrupted guest catalog transfer checkpoint was found in this browser. You can resume safely without duplicating records.'}
+                    </p>
+                  </div>
+                  {dismissGuestTransferPrompt && (
+                    <button
+                      type="button"
+                      onClick={dismissGuestTransferPrompt}
+                      className="text-stone-400 hover:text-stone-700 p-1 cursor-pointer"
+                      aria-label="Keep guest catalog local for now"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+
+                {guestTransferConflicts && guestTransferConflicts.length > 0 && (
+                  <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 space-y-1">
+                    <p className="font-semibold">
+                      {guestTransferConflicts.length} conflict(s) detected with existing cloud products (no cloud data was overwritten):
+                    </p>
+                    <ul className="list-disc pl-4 space-y-0.5">
+                      {guestTransferConflicts.slice(0, 4).map((c) => (
+                        <li key={c.productId}>
+                          {c.incomingTitle} matched existing "{c.existingTitle}" ({c.matchedBy})
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {guestTransferConflicts && guestTransferConflicts.length > 0 ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={guestTransferInFlight}
+                        onClick={() => transferGuestCatalogToCloud('skip_existing')}
+                        className="px-3 py-1.5 bg-stone-900 hover:bg-stone-800 text-white font-semibold rounded-lg disabled:opacity-50 cursor-pointer"
+                      >
+                        {guestTransferInFlight ? 'Transferring...' : 'Skip Conflicting & Import New'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={guestTransferInFlight}
+                        onClick={() => transferGuestCatalogToCloud('rename_import')}
+                        className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white font-semibold rounded-lg disabled:opacity-50 cursor-pointer"
+                      >
+                        Import Conflicts as Separate Copies
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={guestTransferInFlight}
+                      onClick={() => transferGuestCatalogToCloud('abort_on_conflict')}
+                      className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white font-semibold rounded-lg disabled:opacity-50 cursor-pointer"
+                    >
+                      {guestTransferInFlight
+                        ? 'Transferring & Verifying...'
+                        : guestTransferPendingCheckpoint
+                        ? 'Resume Transfer'
+                        : 'Transfer Guest Catalog to Workspace'}
+                    </button>
+                  )}
+                  {dismissGuestTransferPrompt && (
+                    <button
+                      type="button"
+                      disabled={guestTransferInFlight}
+                      onClick={dismissGuestTransferPrompt}
+                      className="px-3 py-1.5 bg-stone-100 hover:bg-stone-200 text-stone-700 font-medium rounded-lg disabled:opacity-50 cursor-pointer"
+                    >
+                      Keep Local Only
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           {children}
         </main>
 

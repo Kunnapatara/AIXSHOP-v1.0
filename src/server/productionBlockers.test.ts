@@ -3552,6 +3552,8 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
       const archivedFiles = fs.readdirSync(archiveDir);
       assert.ok(archivedFiles.includes('Paste_November_14__2026_-_8_30PM_b6c0943e'));
       assert.ok(archivedFiles.includes('Paste_November_15__2026_-_4_18PM_bccda2c6'));
+      assert.ok(archivedFiles.includes('Paste_November_23__2026_-_9_45AM_8ade02fa'));
+      assert.ok(archivedFiles.includes('Paste_November_23__2026_-_10_56AM_99241227'));
       assert.ok(archivedFiles.includes('Allbirds_Shopify_products_fdd9af86.txt'));
 
       const repo = new MemoryRepository();
@@ -3565,6 +3567,8 @@ describe('Workstreams A-I & M — Production Blockers & Integrity Regression Sui
           '/assets/%61istudio/Paste_November_12__2026_-_6_20PM_bdc47db1',
           '/assets/foo/../aistudio/Allbirds_Shopify_products_fdd9af86.txt',
           '/assets/aistudio/Paste_November_15__2026_-_4_18PM_bccda2c6',
+          '/assets/aistudio/Paste_November_23__2026_-_9_45AM_8ade02fa',
+          '/assets/aistudio/Paste_November_23__2026_-_10_56AM_99241227',
         ];
         for (const p of probePaths) {
           const r = await fetch(`${baseUrl}${p}`);

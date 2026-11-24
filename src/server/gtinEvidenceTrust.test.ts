@@ -2,6 +2,8 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { Pool } from 'pg';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
@@ -9,7 +11,9 @@ import { PostgresRepository } from './db/postgresRepository';
 import { encryptCredential, signShopifyWebhookHmac } from './security/encryption';
 import { syncShopifyCatalog } from './shopify/syncService';
 import { processShopifyWebhook } from './shopify/webhookService';
-import { computeEvidenceIntegrityHash } from './security/catalogSanitizer';
+import { buildTrustedGtinVerificationContext, computeEvidenceIntegrityHash } from './security/catalogSanitizer';
+import { hashReviewerServiceSecret } from './security/reviewerAuth';
+import { ExternalRegistryProviderAdapter } from './services/externalRegistryService';
 import { Product, StoreProfile } from '../types';
 
 function makeStore(domain = 'trust-test.myshopify.com'): StoreProfile {
@@ -438,7 +442,7 @@ describe('AIXSHOP v1.0 — Server-Owned GTIN Evidence Trust & Security Regressio
       });
       assert.equal(wrongTokenRes.status, 403);
 
-      // Trusted server reviewer approves evidence
+      // Trusted server reviewer approves evidence; spoofed X-AIXSHOP-Reviewer-Id is NOT trusted as identity
       const reviewRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_gtin_lifecycle_1/review`, {
         method: 'POST',
         headers: {
@@ -457,9 +461,15 @@ describe('AIXSHOP v1.0 — Server-Owned GTIN Evidence Trust & Security Regressio
       const reviewData = await reviewRes.json();
       assert.equal(reviewData.evidence.status, 'verified');
       assert.equal(reviewData.evidence.decision, 'approved');
-      assert.equal(reviewData.evidence.verifiedBy, 'compliance_reviewer_alice');
+      assert.equal(reviewData.evidence.verifiedBy, 'service:platform-compliance-reviewer');
+      assert.equal(reviewData.evidence.reviewerPrincipalType, 'service_principal');
+      assert.equal(reviewData.evidence.reviewerAuthMethod, 'platform_service_secret');
       assert.equal(reviewData.evidence.verificationSource, 'server_reviewer');
+      assert.equal(reviewData.evidence.externalVerificationStatus, 'reviewer_verified');
       assert.equal(reviewData.auditEntry.action, 'approved');
+      assert.equal(reviewData.auditEntry.reviewerId, 'service:platform-compliance-reviewer');
+      assert.equal(reviewData.auditEntry.principalType, 'service_principal');
+      assert.equal(reviewData.auditEntry.metadata.claimedReviewerId, 'compliance_reviewer_alice');
     } finally {
       if (prevSecret === undefined) delete process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET;
       else process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET = prevSecret;
@@ -494,7 +504,14 @@ describe('AIXSHOP v1.0 — Server-Owned GTIN Evidence Trust & Security Regressio
     assert.equal(logRes.status, 200);
     const logData = await logRes.json();
     assert.ok(logData.entries.some((e: any) => e.action === 'submitted'));
-    assert.ok(logData.entries.some((e: any) => e.action === 'approved' && e.reviewerId === 'compliance_reviewer_alice'));
+    assert.ok(
+      logData.entries.some(
+        (e: any) =>
+          e.action === 'approved' &&
+          e.reviewerId === 'service:platform-compliance-reviewer' &&
+          e.metadata?.claimedReviewerId === 'compliance_reviewer_alice'
+      )
+    );
 
     const snapRes = await fetch(`${baseUrl}/api/audit/${runId}`, {
       headers: {
@@ -509,7 +526,9 @@ describe('AIXSHOP v1.0 — Server-Owned GTIN Evidence Trust & Security Regressio
     assert.equal(snapEv.status, 'verified');
     assert.equal(snapEv.metadata.evidencePurpose, 'gtin_exemption');
     assert.equal(snapEv.metadata.verificationSource, 'server_reviewer');
-    assert.equal(snapEv.metadata.verifiedBy, 'compliance_reviewer_alice');
+    assert.equal(snapEv.metadata.externalVerificationStatus, 'reviewer_verified');
+    assert.equal(snapEv.metadata.verifiedBy, 'service:platform-compliance-reviewer');
+    assert.equal(snapEv.metadata.reviewerPrincipalType, 'service_principal');
     assert.ok(snapEv.metadata.integrityHash);
   });
 
@@ -1211,6 +1230,566 @@ describe('AIXSHOP v1.0 — Server-Owned GTIN Evidence Trust & Security Regressio
         await pool.query('DELETE FROM users WHERE id = $1', [userId]).catch(() => {});
         await pool.end();
       }
+    });
+  });
+
+  // 9. Workstream 1: Server-Authoritative Reviewer Identity (Human Sessions, Self-Review Prevention, Rotation & Revocation)
+  describe('Workstream 1: Server-Authoritative Reviewer Identity & Service Principal Lifecycle', () => {
+    test('9a. Authorized human reviewer session derives user:<id> from server, blocks self-review & insufficient scopes & revoked grants', async () => {
+      const merchant = await registerPaidTenant('ws1_merchant@example.com', 'WS1 Merchant Store');
+      const reviewerAccount = await registerPaidTenant('ws1_human_rev@example.com', 'WS1 Reviewer Personal');
+
+      const prod = makeUnbarcodedProduct('p_ws1_1', 'Artisan Pottery');
+      await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            products: [prod],
+            variants: prod.variants,
+            offers: prod.offers,
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: makeStore(),
+          },
+        }),
+      });
+
+      await repo.submitEvidenceDocument({
+        workspaceId: merchant.workspace.id,
+        productId: prod.id,
+        id: 'ev_ws1_human',
+        title: 'Pottery Exemption',
+        type: 'gtin_exemption_proof',
+        issuer: 'GS1',
+        evidencePurpose: 'gtin_exemption',
+        submittedByUserId: merchant.user.id,
+      });
+
+      // Grant merchant user platform_reviewer temporarily -> self-review on own submitted evidence MUST fail with 403 FORBIDDEN_SELF_REVIEW
+      await repo.setPlatformReviewerGrant({
+        userId: merchant.user.id,
+        platformRole: 'platform_reviewer',
+        scopes: ['evidence:review'],
+      });
+      const selfReviewRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_human/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({ decision: 'approved' }),
+      });
+      assert.equal(selfReviewRes.status, 403);
+      const selfReviewBody = await selfReviewRes.json();
+      assert.equal(selfReviewBody.code, 'FORBIDDEN_SELF_REVIEW');
+      await repo.setPlatformReviewerGrant({ userId: merchant.user.id, platformRole: 'none', scopes: [] });
+
+      // Reviewer with read-only scope -> 403 FORBIDDEN_INSUFFICIENT_REVIEWER_SCOPE
+      await repo.setPlatformReviewerGrant({
+        userId: reviewerAccount.user.id,
+        platformRole: 'platform_reviewer',
+        scopes: ['evidence:read'],
+      });
+      const insufficientScopeRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_human/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-AIXSHOP-Reviewer-Session': reviewerAccount.token,
+          'X-AIXSHOP-Reviewer-Id': 'impersonated_admin',
+        },
+        body: JSON.stringify({ decision: 'approved' }),
+      });
+      assert.equal(insufficientScopeRes.status, 403);
+      assert.equal((await insufficientScopeRes.json()).code, 'FORBIDDEN_INSUFFICIENT_REVIEWER_SCOPE');
+
+      // Grant evidence:review scope -> authorized human review succeeds with server-derived user:<id>
+      await repo.setPlatformReviewerGrant({
+        userId: reviewerAccount.user.id,
+        platformRole: 'platform_reviewer',
+        scopes: ['evidence:review'],
+      });
+      const okHumanRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_human/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-AIXSHOP-Reviewer-Session': reviewerAccount.token,
+          'X-AIXSHOP-Reviewer-Id': 'spoofed_other_human',
+        },
+        body: JSON.stringify({ decision: 'approved', reason: 'Verified via human reviewer session' }),
+      });
+      assert.equal(okHumanRes.status, 200);
+      const okHumanBody = await okHumanRes.json();
+      assert.equal(okHumanBody.evidence.verifiedBy, `user:${reviewerAccount.user.id}`);
+      assert.equal(okHumanBody.evidence.reviewerPrincipalType, 'human_reviewer');
+      assert.equal(okHumanBody.evidence.reviewerAuthMethod, 'reviewer_session');
+      assert.equal(okHumanBody.evidence.externalVerificationStatus, 'reviewer_verified');
+      assert.equal(okHumanBody.auditEntry.metadata.claimedReviewerId, 'spoofed_other_human');
+
+      // Revoked grant -> 403 FORBIDDEN_REVIEWER_REVOKED
+      await repo.setPlatformReviewerGrant({
+        userId: reviewerAccount.user.id,
+        platformRole: 'platform_reviewer',
+        scopes: ['evidence:review'],
+        revokedAt: new Date().toISOString(),
+      });
+      const revokedHumanRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_human/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-AIXSHOP-Reviewer-Session': reviewerAccount.token,
+        },
+        body: JSON.stringify({ decision: 'rejected' }),
+      });
+      assert.equal(revokedHumanRes.status, 403);
+      assert.equal((await revokedHumanRes.json()).code, 'FORBIDDEN_REVIEWER_REVOKED');
+    });
+
+    test('9b. DB-registered service principals support rotation, expiration, and revocation without trusting X-AIXSHOP-Reviewer-Id', async () => {
+      const merchant = await registerPaidTenant('ws1_svc_merchant@example.com', 'WS1 Svc Merchant');
+      const prod = makeUnbarcodedProduct('p_ws1_svc', 'Handmade Rug');
+      await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            products: [prod],
+            variants: prod.variants,
+            offers: prod.offers,
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: makeStore(),
+          },
+        }),
+      });
+      await repo.submitEvidenceDocument({
+        workspaceId: merchant.workspace.id,
+        productId: prod.id,
+        id: 'ev_ws1_svc',
+        title: 'Rug GS1 Filing',
+        type: 'gtin_exemption_proof',
+        issuer: 'GS1',
+        evidencePurpose: 'gtin_exemption',
+        submittedByUserId: merchant.user.id,
+      });
+
+      const activeSecret = 'svc_key_v1_secret_32_characters_minimum_length_ok';
+      await repo.saveReviewerServicePrincipal({
+        id: 'sp_row_1',
+        principalId: 'compliance-bot-eu',
+        displayName: 'EU Compliance Bot',
+        secretHash: hashReviewerServiceSecret(activeSecret),
+        keyId: 'key_v1',
+        scopes: ['evidence:review'],
+        status: 'active',
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      });
+
+      const svcOkRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_svc/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-AIXSHOP-Reviewer-Token': activeSecret,
+          'X-AIXSHOP-Reviewer-Id': 'spoofed_alice',
+        },
+        body: JSON.stringify({ decision: 'approved' }),
+      });
+      assert.equal(svcOkRes.status, 200);
+      const svcOkData = await svcOkRes.json();
+      assert.equal(svcOkData.evidence.verifiedBy, 'service:compliance-bot-eu');
+      assert.equal(svcOkData.evidence.reviewerPrincipalType, 'service_principal');
+      assert.equal(svcOkData.evidence.reviewerAuthMethod, 'service_token_registry');
+
+      // Revoke service principal -> fails with 403 FORBIDDEN_REVIEWER_REVOKED
+      await repo.revokeReviewerServicePrincipal('compliance-bot-eu');
+      const svcRevokedRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_svc/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-AIXSHOP-Reviewer-Token': activeSecret,
+        },
+        body: JSON.stringify({ decision: 'rejected' }),
+      });
+      assert.equal(svcRevokedRes.status, 403);
+      assert.equal((await svcRevokedRes.json()).code, 'FORBIDDEN_REVIEWER_REVOKED');
+
+      // Expired service principal -> fails with 403 FORBIDDEN_REVIEWER_EXPIRED
+      const expiredSecret = 'svc_expired_secret_32_characters_minimum_length_ok';
+      await repo.saveReviewerServicePrincipal({
+        id: 'sp_row_2',
+        principalId: 'compliance-bot-expired',
+        displayName: 'Expired Bot',
+        secretHash: hashReviewerServiceSecret(expiredSecret),
+        keyId: 'key_old',
+        scopes: ['evidence:review'],
+        status: 'active',
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+      const svcExpRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws1_svc/review`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${merchant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-AIXSHOP-Reviewer-Token': expiredSecret,
+        },
+        body: JSON.stringify({ decision: 'approved' }),
+      });
+      assert.equal(svcExpRes.status, 403);
+      assert.equal((await svcExpRes.json()).code, 'FORBIDDEN_REVIEWER_EXPIRED');
+    });
+  });
+
+  // 10. Workstream 2: Separate Reviewer Verification from External Registry Verification
+  describe('Workstream 2: External Registry Verification Separation & Conservative Backfill', () => {
+    test('10a. Rejects external_registry spoofing on /review and /verify-external, and fails closed when external provider unconfigured', async () => {
+      const tenant = await registerPaidTenant('ws2_spoof@example.com', 'WS2 Spoof Store');
+      const prod = makeUnbarcodedProduct('p_ws2_spoof', 'Artisan Vase');
+      await fetch(`${baseUrl}/api/catalog`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tenant.token}`,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          payload: {
+            products: [prod],
+            variants: prod.variants,
+            offers: prod.offers,
+            findings: [],
+            actions: [],
+            evidence: [],
+            storeProfile: makeStore(),
+          },
+        }),
+      });
+      await repo.submitEvidenceDocument({
+        workspaceId: tenant.workspace.id,
+        productId: prod.id,
+        id: 'ev_ws2_spoof',
+        title: 'GS1 Proof',
+        type: 'gtin_exemption_proof',
+        issuer: 'GS1',
+        evidencePurpose: 'gtin_exemption',
+        submittedByUserId: tenant.user.id,
+      });
+
+      const prevSecret = process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET;
+      const prevExtUrl = process.env.AIXSHOP_EXTERNAL_REGISTRY_PROVIDER_URL;
+      const prevExtKey = process.env.AIXSHOP_EXTERNAL_REGISTRY_API_KEY;
+      process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET = 'reviewer_super_secret_token_32chars_minimum_ok';
+      delete process.env.AIXSHOP_EXTERNAL_REGISTRY_PROVIDER_URL;
+      delete process.env.AIXSHOP_EXTERNAL_REGISTRY_API_KEY;
+
+      try {
+        // Attempt to pass verificationSource: 'external_registry' on /review -> 403 FORBIDDEN_EXTERNAL_VERIFICATION_SPOOF
+        const spoofSourceRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws2_spoof/review`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tenant.token}`,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-AIXSHOP-Reviewer-Token': process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET,
+          },
+          body: JSON.stringify({ decision: 'approved', verificationSource: 'external_registry' }),
+        });
+        assert.equal(spoofSourceRes.status, 403);
+        assert.equal((await spoofSourceRes.json()).code, 'FORBIDDEN_EXTERNAL_VERIFICATION_SPOOF');
+
+        // Attempt to pass externalVerificationStatus: 'external_registry_verified' on /review -> 403
+        const spoofExtStatusRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws2_spoof/review`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tenant.token}`,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-AIXSHOP-Reviewer-Token': process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET,
+          },
+          body: JSON.stringify({
+            decision: 'approved',
+            externalVerificationStatus: 'external_registry_verified',
+          }),
+        });
+        assert.equal(spoofExtStatusRes.status, 403);
+        assert.equal((await spoofExtStatusRes.json()).code, 'FORBIDDEN_EXTERNAL_VERIFICATION_SPOOF');
+
+        // Normal reviewer approval sets reviewer_verified ONLY (never external_registry_verified)
+        const normalReviewRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws2_spoof/review`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tenant.token}`,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-AIXSHOP-Reviewer-Token': process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET,
+          },
+          body: JSON.stringify({ decision: 'approved' }),
+        });
+        assert.equal(normalReviewRes.status, 200);
+        const normalBody = await normalReviewRes.json();
+        assert.equal(normalBody.evidence.verificationSource, 'server_reviewer');
+        assert.equal(normalBody.evidence.externalVerificationStatus, 'reviewer_verified');
+
+        // Attempt verify-external when unconfigured -> 503 EXTERNAL_REGISTRY_UNCONFIGURED (never fakes success)
+        const unconfiguredRes = await fetch(`${baseUrl}/api/catalog/evidence/ev_ws2_spoof/verify-external`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tenant.token}`,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-AIXSHOP-Reviewer-Token': process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET,
+          },
+          body: JSON.stringify({}),
+        });
+        assert.equal(unconfiguredRes.status, 503);
+        const unconfBody = await unconfiguredRes.json();
+        assert.equal(unconfBody.code, 'EXTERNAL_REGISTRY_UNCONFIGURED');
+        assert.equal(unconfBody.verified, false);
+        assert.equal(unconfBody.externalVerificationStatus, 'reviewer_verified');
+      } finally {
+        if (prevSecret === undefined) delete process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET;
+        else process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET = prevSecret;
+        if (prevExtUrl !== undefined) process.env.AIXSHOP_EXTERNAL_REGISTRY_PROVIDER_URL = prevExtUrl;
+        if (prevExtKey !== undefined) process.env.AIXSHOP_EXTERNAL_REGISTRY_API_KEY = prevExtKey;
+      }
+    });
+
+    test('10b. Configured external registry adapter verifies matched records cleanly and refuses to elevate on mismatch, ambiguity, timeout, or malformed payloads', async () => {
+      let currentMode: 'verified' | 'mismatched' | 'ambiguous' | 'timeout' | 'malformed' = 'verified';
+      const testAdapter: ExternalRegistryProviderAdapter = {
+        providerName: 'gs1_verified_by_gs1_v1',
+        async verifyRecord(input) {
+          const reqAt = '2026-11-23T12:00:00.000Z';
+          const resAt = '2026-11-23T12:00:01.000Z';
+          if (currentMode === 'verified') {
+            return {
+              outcome: 'verified',
+              providerName: 'gs1_verified_by_gs1_v1',
+              providerRef: 'GS1-REF-998811',
+              requestAt: reqAt,
+              responseAt: resAt,
+              matchedIdentifier: input.evidenceId,
+              matchedRecordSummary: { issuer: 'GS1', brand: input.brand, status: 'verified', registryCode: 'EXEMPT-GTIN' },
+              reason: 'Confirmed active GS1 exemption filing',
+            };
+          }
+          if (currentMode === 'mismatched') {
+            return {
+              outcome: 'verified',
+              providerName: 'gs1_verified_by_gs1_v1',
+              providerRef: 'GS1-REF-WRONG',
+              requestAt: reqAt,
+              responseAt: resAt,
+              matchedIdentifier: 'COMPLETELY_DIFFERENT_COMPANY_ID',
+              reason: 'Returned unrelated record',
+            };
+          }
+          if (currentMode === 'ambiguous') {
+            return {
+              outcome: 'ambiguous',
+              providerName: 'gs1_verified_by_gs1_v1',
+              providerRef: 'GS1-REF-AMB',
+              requestAt: reqAt,
+              responseAt: resAt,
+              reason: 'Multiple conflicting registry entries found',
+            };
+          }
+          if (currentMode === 'timeout') {
+            return {
+              outcome: 'timeout',
+              providerName: 'gs1_verified_by_gs1_v1',
+              requestAt: reqAt,
+              responseAt: resAt,
+              reason: 'External registry request timed out after 5000ms.',
+            };
+          }
+          return {
+            outcome: 'malformed',
+            providerName: 'gs1_verified_by_gs1_v1',
+            requestAt: reqAt,
+            responseAt: resAt,
+            reason: 'Malformed JSON from registry',
+          };
+        },
+      };
+
+      const extRepo = new MemoryRepository(false);
+      const extApp = createApp(extRepo, { externalRegistryProvider: testAdapter });
+      const extServer = http.createServer(extApp);
+      await new Promise<void>((resolve) => extServer.listen(0, '127.0.0.1', () => resolve()));
+      const extUrl = `http://127.0.0.1:${(extServer.address() as any).port}`;
+
+      const prevSecret = process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET;
+      process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET = 'reviewer_super_secret_token_32chars_minimum_ok';
+
+      try {
+        const regRes = await fetch(`${extUrl}/api/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: 'ws2_ext_adapter@example.com',
+            password: 'StrongPassword123!',
+            fullName: 'Ext Owner',
+            workspaceName: 'WS2 Adapter Store',
+          }),
+        });
+        assert.equal(regRes.status, 201);
+        const regBody = await regRes.json();
+        const token = extractSessionCookie(regRes);
+        await extRepo.saveStoreProfile(regBody.workspace.id, {
+          ...(await extRepo.getStoreByWorkspace(regBody.workspace.id))!,
+          tier: 'Growth',
+          skuLimit: 2500,
+        });
+
+        const prod = makeUnbarcodedProduct('p_ext_1', 'Artisan Blanket');
+        await fetch(`${extUrl}/api/catalog`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          body: JSON.stringify({
+            payload: {
+              products: [prod],
+              variants: prod.variants,
+              offers: prod.offers,
+              findings: [],
+              actions: [],
+              evidence: [],
+              storeProfile: makeStore(),
+            },
+          }),
+        });
+
+        await extRepo.submitEvidenceDocument({
+          workspaceId: regBody.workspace.id,
+          productId: prod.id,
+          id: 'ev_ext_negative',
+          title: 'Pending Exemption',
+          type: 'gtin_exemption_proof',
+          issuer: 'GS1',
+          evidencePurpose: 'gtin_exemption',
+          submittedByUserId: regBody.user.id,
+        });
+
+        // Negative outcomes must fail without elevating status
+        for (const [mode, expectedHttp] of [
+          ['mismatched', 422],
+          ['ambiguous', 422],
+          ['timeout', 504],
+          ['malformed', 502],
+        ] as const) {
+          currentMode = mode;
+          const failRes: Response = await fetch(`${extUrl}/api/catalog/evidence/ev_ext_negative/verify-external`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+              'X-Requested-With': 'XMLHttpRequest',
+              'X-AIXSHOP-Reviewer-Token': process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET,
+            },
+            body: JSON.stringify({}),
+          });
+          assert.equal(failRes.status, expectedHttp, `Mode ${mode} expected HTTP ${expectedHttp}`);
+          const failBody = await failRes.json();
+          assert.equal(failBody.verified, false);
+          assert.equal(failBody.evidence.status, 'pending');
+          assert.equal(failBody.evidence.externalVerificationStatus, 'not_externally_verified');
+          assert.equal(failBody.auditEntry.action, 'external_verification_failed');
+        }
+
+        // Verified outcome sets external_registry_verified + provider metadata + audit log entry
+        currentMode = 'verified';
+        const okRes = await fetch(`${extUrl}/api/catalog/evidence/ev_ext_negative/verify-external`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-AIXSHOP-Reviewer-Token': process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET,
+          },
+          body: JSON.stringify({}),
+        });
+        assert.equal(okRes.status, 200);
+        const okBody = await okRes.json();
+        assert.equal(okBody.verified, true);
+        assert.equal(okBody.evidence.status, 'verified');
+        assert.equal(okBody.evidence.verificationSource, 'external_registry');
+        assert.equal(okBody.evidence.externalVerificationStatus, 'external_registry_verified');
+        assert.equal(okBody.evidence.externalProviderName, 'gs1_verified_by_gs1_v1');
+        assert.equal(okBody.evidence.externalProviderRef, 'GS1-REF-998811');
+        assert.equal(okBody.evidence.reviewerPrincipalType, 'external_registry_provider');
+        assert.equal(okBody.evidence.reviewerAuthMethod, 'external_registry_adapter');
+        assert.equal(okBody.auditEntry.action, 'external_verified');
+
+        // Re-audit accepts authentic external_registry_verified GTIN exemption
+        const auditRes = await extRepo.executeWorkspaceAudit(regBody.workspace.id);
+        assert.equal(
+          auditRes.catalog.findings.some((f) => f.productId === prod.id && f.ruleCode === 'RULE_VARIANT_GTIN_CHECK_DIGIT'),
+          false
+        );
+      } finally {
+        if (prevSecret === undefined) delete process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET;
+        else process.env.AIXSHOP_PLATFORM_REVIEWER_SECRET = prevSecret;
+        await new Promise<void>((resolve) => extServer.close(() => resolve()));
+      }
+    });
+
+    test('10c. Forged historical external_registry without provider metadata fails closed in trusted GTIN context & Migration 017 SQL enforces conservative backfill', () => {
+      const sql017 = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/server/db/migrations/017_reviewer_identity_and_registry_trust.sql'),
+        'utf8'
+      );
+      assert.match(sql017, /CREATE TABLE IF NOT EXISTS reviewer_service_principals/i);
+      assert.match(sql017, /ADD COLUMN IF NOT EXISTS external_verification_status/i);
+      assert.match(sql017, /THEN 'reviewer_verified'/i);
+      assert.match(sql017, /WHEN verification_source = 'external_registry' AND external_provider_name IS NULL[\s\S]*THEN 'server_reviewer'/i);
+
+      // Even if a legacy DB row still had verificationSource = 'external_registry' without externalProviderName/externalVerificationStatus,
+      // buildTrustedGtinVerificationContext refuses to accept it as externally verified!
+      const legacyProduct = makeUnbarcodedProduct('p_legacy_unbacked', 'Legacy Item');
+      const legacyDoc = {
+        id: 'ev_legacy_fake_ext',
+        title: 'Legacy Doc',
+        type: 'gtin_exemption_proof' as const,
+        issuer: 'GS1',
+        dateVerified: '2026-10-01T00:00:00Z',
+        status: 'verified' as const,
+        evidencePurpose: 'gtin_exemption' as const,
+        verificationSource: 'external_registry' as const,
+        decision: 'approved' as const,
+        verifiedBy: 'legacy_reviewer',
+        reviewedAt: '2026-10-01T00:00:00Z',
+        integrityHash: '',
+      };
+      legacyDoc.integrityHash = computeEvidenceIntegrityHash('ws_legacy', legacyProduct.id, legacyDoc);
+      legacyProduct.evidenceDocuments = [legacyDoc];
+
+      const ctx = buildTrustedGtinVerificationContext('ws_legacy', [legacyProduct], null, []);
+      assert.equal(Boolean(ctx.verifiedExemptionByProductId?.has(legacyProduct.id)), false);
     });
   });
 });

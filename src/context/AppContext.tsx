@@ -39,6 +39,14 @@ import {
   CloudCatalogLoadStatus,
   DemoOverwriteProtectionEvaluation,
 } from '../domain/catalog/demoMigrationProtection';
+import {
+  GuestTransferCommitResult,
+  GuestTransferConflict,
+  GuestTransferConflictStrategy,
+  GuestTransferEligibility,
+  GuestTransferPendingCheckpoint,
+  evaluateGuestTransferEligibility,
+} from '../domain/catalog/guestTransfer';
 import { useAuth } from './AuthContext';
 import { apiClient, PreliminaryAuditSummary, ReportEntitlement } from '../api/client';
 
@@ -80,6 +88,11 @@ export interface AppContextType {
   preliminarySummary?: PreliminaryAuditSummary | null;
   selectedSettingsTab?: 'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics' | null;
   demoOverwriteProtection: DemoOverwriteProtectionEvaluation;
+  guestTransferEligibility?: GuestTransferEligibility | null;
+  guestTransferConflicts?: GuestTransferConflict[];
+  guestTransferPendingCheckpoint?: GuestTransferPendingCheckpoint | null;
+  guestTransferInFlight?: boolean;
+  guestTransferDismissed?: boolean;
   setMobileMenuOpen: (open: boolean) => void;
   setSelectedActionId: (id: string | null) => void;
   navigateTo: (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => void;
@@ -94,6 +107,8 @@ export interface AppContextType {
   updateStoreProfile: (updates: Partial<StoreProfile>) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
   toggleConnectorSync: (connectorId: string) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
   migrateDemoDataToCloud: () => Promise<boolean>;
+  transferGuestCatalogToCloud?: (conflictStrategy?: GuestTransferConflictStrategy) => Promise<GuestTransferCommitResult | null>;
+  dismissGuestTransferPrompt?: () => void;
   runAudit: () => Promise<any>;
   addToast: (title: string, message: string, type?: ToastMessage['type']) => void;
   removeToast: (id: string) => void;
@@ -195,6 +210,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
   const [selectedSettingsTab, setSelectedSettingsTab] = useState<
     'profile' | 'workspace' | 'connectors' | 'subscription' | 'policies' | 'diagnostics' | null
   >(null);
+  const [guestTransferEligibility, setGuestTransferEligibility] = useState<GuestTransferEligibility | null>(null);
+  const [guestTransferConflicts, setGuestTransferConflicts] = useState<GuestTransferConflict[]>([]);
+  const [guestTransferPendingCheckpoint, setGuestTransferPendingCheckpoint] = useState<GuestTransferPendingCheckpoint | null>(null);
+  const [guestTransferInFlight, setGuestTransferInFlight] = useState<boolean>(false);
+  const [guestTransferDismissed, setGuestTransferDismissed] = useState<boolean>(false);
 
   const isInitializedRef = useRef<boolean>(false);
   const wasCloudSessionRef = useRef<boolean>(false);
@@ -504,6 +524,80 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         setCloudCatalogStatus('loaded');
         setIsReadOnlyMode(false);
         setReadOnlyReason(null);
+
+        // Evaluate local guest storage & recover any interrupted transfer bound to this (userId, workspaceId)
+        try {
+          const localRes = storageAdapter.load();
+          const localPayload = localRes.type === 'valid' ? localRes.envelope.payload : null;
+          const checkpoint = storageAdapter.loadPendingGuestTransfer();
+
+          if (
+            checkpoint &&
+            checkpoint.targetWorkspaceId === targetWorkspaceId &&
+            checkpoint.targetUserId === (targetUserId || '')
+          ) {
+            if (typeof apiClient.getGuestTransferStatus === 'function') {
+              try {
+                const statusRes = await apiClient.getGuestTransferStatus(checkpoint.idempotencyKey);
+                if (isCancelled || !isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId)) {
+                  return;
+                }
+                if (statusRes.found && statusRes.status === 'committed' && statusRes.receipt) {
+                  // Positively verify latest workspace catalog before clearing local guest data
+                  const verifiedCat = await apiClient.getCatalog();
+                  if (
+                    !isCancelled &&
+                    isCurrentCloudRequest(reqGen, targetWorkspaceId, targetUserId, verifiedCat?.workspaceId, {
+                      requireResponseWorkspaceId: true,
+                    })
+                  ) {
+                    applyCatalogSnapshot(verifiedCat.catalog, targetWorkspaceId, targetUserId);
+                    setReportEntitlement(verifiedCat.reportEntitlement ?? null);
+                    setPreliminarySummary(verifiedCat.preliminarySummary ?? null);
+                    storageAdapter.clear();
+                    storageAdapter.clearPendingGuestTransfer();
+                    setGuestTransferPendingCheckpoint(null);
+                    setGuestTransferEligibility(null);
+                    setGuestTransferConflicts([]);
+                    addToast(
+                      'Guest Transfer Recovered',
+                      `Verified ${statusRes.receipt.importedCount} guest product(s) persisted in cloud workspace "${targetWorkspaceName}".`,
+                      'success'
+                    );
+                    return;
+                  }
+                } else if (
+                  statusRes.found &&
+                  statusRes.status === 'pending' &&
+                  new Date(checkpoint.expiresAt).getTime() > Date.now()
+                ) {
+                  setGuestTransferPendingCheckpoint(checkpoint);
+                } else {
+                  storageAdapter.clearPendingGuestTransfer();
+                  setGuestTransferPendingCheckpoint(null);
+                }
+              } catch {
+                // Keep checkpoint intact for manual retry if status lookup fails due to transient network error
+                setGuestTransferPendingCheckpoint(checkpoint);
+              }
+            } else {
+              setGuestTransferPendingCheckpoint(checkpoint);
+            }
+          } else {
+            setGuestTransferPendingCheckpoint(null);
+          }
+
+          if (localPayload) {
+            setGuestTransferEligibility(
+              evaluateGuestTransferEligibility(localPayload, initialProducts, initialStoreProfile.name)
+            );
+          } else {
+            setGuestTransferEligibility(null);
+          }
+        } catch {
+          // Never block cloud catalog load on local storage evaluation
+        }
+
         addToast(
           'Workspace Connected',
           `Loaded catalog for workspace "${targetWorkspaceName}". Data is durably persisted to PostgreSQL.`,
@@ -1213,6 +1307,216 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   };
 
+  const reconcileAndClearGuestAfterCommit = async (
+    receipt: GuestTransferCommitResult,
+    reqGen: number,
+    targetWsId: string,
+    targetUserId: string | undefined,
+    targetWsName: string
+  ): Promise<GuestTransferCommitResult | null> => {
+    const catRes = await apiClient.getCatalog();
+    if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+    if (
+      !isCurrentCloudRequest(reqGen, targetWsId, targetUserId, catRes?.workspaceId, {
+        requireResponseWorkspaceId: true,
+      })
+    ) {
+      throw new Error('Workspace catalog reconciliation failed (missing or mismatched workspaceId).');
+    }
+
+    // Positively verify server persistence before clearing local guest data
+    const confirmedCount = catRes.catalog.products?.length ?? 0;
+    if (receipt.importedCount > 0 && confirmedCount === 0) {
+      throw new Error('Server catalog reconciliation returned empty catalog; local guest data preserved.');
+    }
+
+    applyCatalogSnapshot(catRes.catalog, targetWsId, targetUserId);
+    setReportEntitlement(catRes.reportEntitlement ?? null);
+    setPreliminarySummary(catRes.preliminarySummary ?? null);
+    setCloudCatalogStatus('loaded');
+
+    storageAdapter.clear();
+    storageAdapter.clearPendingGuestTransfer();
+    setGuestTransferPendingCheckpoint(null);
+    setGuestTransferEligibility(null);
+    setGuestTransferConflicts([]);
+    setGuestTransferDismissed(false);
+
+    addToast(
+      receipt.idempotentReplay ? 'Guest Transfer Confirmed' : 'Guest Catalog Transferred',
+      `Imported ${receipt.importedCount} product(s) into "${targetWsName}" (skipped ${receipt.skippedCount}, renamed ${receipt.renamedCount}). Local guest buffer cleared after verification.`,
+      'success'
+    );
+    return receipt;
+  };
+
+  const transferGuestCatalogToCloud = async (
+    conflictStrategy: GuestTransferConflictStrategy = 'abort_on_conflict'
+  ): Promise<GuestTransferCommitResult | null> => {
+    if (!isCloudWorkspace || !activeWorkspaceId) {
+      authContext?.openAuthModal?.('register');
+      return null;
+    }
+
+    const localLoad = storageAdapter.load();
+    if (localLoad.type !== 'valid' || !localLoad.envelope.payload.products.length) {
+      addToast('No Guest Catalog Found', 'No local guest catalog items are available to transfer.', 'info');
+      return null;
+    }
+    const localPayload = localLoad.envelope.payload;
+
+    const reqGen = cloudRequestGenRef.current;
+    const targetWsId = activeWorkspaceId;
+    const targetUserId = activeUserId;
+    const targetWsName = authContext?.activeWorkspace?.name || 'Workspace';
+
+    setGuestTransferInFlight(true);
+    setGuestTransferConflicts([]);
+
+    let activeIdempotencyKey = '';
+    try {
+      const existingCheckpoint = storageAdapter.loadPendingGuestTransfer();
+      let transferToken = '';
+      let expiresAt = '';
+
+      const checkpointMatchesCurrent =
+        existingCheckpoint &&
+        existingCheckpoint.targetWorkspaceId === targetWsId &&
+        existingCheckpoint.targetUserId === (targetUserId || '') &&
+        new Date(existingCheckpoint.expiresAt).getTime() > Date.now();
+
+      if (checkpointMatchesCurrent) {
+        activeIdempotencyKey = existingCheckpoint.idempotencyKey;
+        transferToken = existingCheckpoint.transferToken;
+        expiresAt = existingCheckpoint.expiresAt;
+        if (typeof apiClient.getGuestTransferStatus === 'function') {
+          try {
+            const statusRes = await apiClient.getGuestTransferStatus(activeIdempotencyKey);
+            if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+            if (statusRes.found && statusRes.status === 'committed' && statusRes.receipt) {
+              return await reconcileAndClearGuestAfterCommit(
+                statusRes.receipt,
+                reqGen,
+                targetWsId,
+                targetUserId,
+                targetWsName
+              );
+            }
+          } catch {
+            // Fall through to commit/reauthorize
+          }
+        }
+      }
+
+      if (!transferToken) {
+        activeIdempotencyKey = `gt_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        const authRes = await apiClient.authorizeGuestTransfer({
+          idempotencyKey: activeIdempotencyKey,
+          conflictStrategy,
+          payload: localPayload,
+        });
+        if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+        if (authRes.alreadyCommitted && authRes.receipt) {
+          return await reconcileAndClearGuestAfterCommit(
+            authRes.receipt,
+            reqGen,
+            targetWsId,
+            targetUserId,
+            targetWsName
+          );
+        }
+        transferToken = authRes.transferToken;
+        expiresAt = authRes.expiresAt;
+
+        const checkpoint: GuestTransferPendingCheckpoint = {
+          transferId: authRes.transferId,
+          transferToken,
+          idempotencyKey: authRes.idempotencyKey,
+          payloadSha256: authRes.payloadSha256,
+          targetWorkspaceId: targetWsId,
+          targetUserId: targetUserId || '',
+          conflictStrategy,
+          expiresAt,
+          createdAt: new Date().toISOString(),
+          state: 'committing',
+        };
+        storageAdapter.savePendingGuestTransfer(checkpoint);
+        setGuestTransferPendingCheckpoint(checkpoint);
+      }
+
+      const commitRes = await apiClient.commitGuestTransfer({
+        transferToken,
+        idempotencyKey: activeIdempotencyKey,
+        conflictStrategy,
+        payload: localPayload,
+      });
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+
+      return await reconcileAndClearGuestAfterCommit(
+        commitRes,
+        reqGen,
+        targetWsId,
+        targetUserId,
+        targetWsName
+      );
+    } catch (err: any) {
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+
+      if (err?.code === 'GUEST_TRANSFER_CONFLICT' || err?.status === 409) {
+        if (Array.isArray(err?.conflicts)) {
+          setGuestTransferConflicts(err.conflicts);
+        }
+        addToast(
+          'Cloud Catalog Conflicts Detected',
+          err.message || 'Existing cloud products conflict with guest items. Choose Skip Duplicates or Import Renamed Copies; your local guest data remains safe.',
+          'warning'
+        );
+        return null;
+      }
+
+      // Recover if server committed data but client lost the HTTP confirmation response
+      if (
+        activeIdempotencyKey &&
+        (!err?.status || err.status >= 500) &&
+        typeof apiClient.getGuestTransferStatus === 'function'
+      ) {
+        try {
+          const recovered = await apiClient.getGuestTransferStatus(activeIdempotencyKey);
+          if (recovered.found && recovered.status === 'committed' && recovered.receipt) {
+            return await reconcileAndClearGuestAfterCommit(
+              recovered.receipt,
+              reqGen,
+              targetWsId,
+              targetUserId,
+              targetWsName
+            );
+          }
+        } catch {
+          // Leave checkpoint & guest catalog intact locally for safe retry
+        }
+      }
+
+      if (err?.code === 'TRANSFER_AUTHORIZATION_EXPIRED' || err?.status === 410) {
+        storageAdapter.clearPendingGuestTransfer();
+        setGuestTransferPendingCheckpoint(null);
+      }
+
+      addToast(
+        'Guest Transfer Paused',
+        `${err?.message || 'Transfer interrupted.'} Your local guest catalog was preserved safely and can be retried.`,
+        'error'
+      );
+      return null;
+    } finally {
+      setGuestTransferInFlight(false);
+    }
+  };
+
+  const dismissGuestTransferPrompt = () => {
+    setGuestTransferDismissed(true);
+    setGuestTransferConflicts([]);
+  };
+
   const runAudit = async (): Promise<any> => {
     if (isCloudWorkspace) {
       const reqGen = cloudRequestGenRef.current;
@@ -1443,6 +1747,11 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         preliminarySummary: isStateWorkspaceMismatch ? null : preliminarySummary,
         selectedSettingsTab,
         demoOverwriteProtection,
+        guestTransferEligibility: isStateWorkspaceMismatch ? null : guestTransferEligibility,
+        guestTransferConflicts: isStateWorkspaceMismatch ? [] : guestTransferConflicts,
+        guestTransferPendingCheckpoint: isStateWorkspaceMismatch ? null : guestTransferPendingCheckpoint,
+        guestTransferInFlight,
+        guestTransferDismissed,
         setMobileMenuOpen,
         setSelectedActionId,
         navigateTo,
@@ -1457,6 +1766,8 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         updateStoreProfile,
         toggleConnectorSync,
         migrateDemoDataToCloud,
+        transferGuestCatalogToCloud,
+        dismissGuestTransferPrompt,
         runAudit,
         addToast,
         removeToast,

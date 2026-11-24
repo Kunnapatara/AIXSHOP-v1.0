@@ -98,6 +98,7 @@ class ApiClient {
         if (body.code !== undefined) error.code = body.code;
         if (body.currentVersion !== undefined) error.currentVersion = body.currentVersion;
         if (body.expectedVersion !== undefined) error.expectedVersion = body.expectedVersion;
+        if (body.conflicts !== undefined) error.conflicts = body.conflicts;
         if (body.reportEntitlement !== undefined) error.reportEntitlement = body.reportEntitlement;
         if (body.preliminarySummary !== undefined) error.preliminarySummary = body.preliminarySummary;
       }
@@ -218,6 +219,37 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(expectedVersion !== undefined ? { expectedVersion } : {}),
     });
+  }
+
+  async authorizeGuestTransfer(params: {
+    idempotencyKey?: string;
+    conflictStrategy?: import('../domain/catalog/guestTransfer').GuestTransferConflictStrategy;
+    payload: StoragePayloadV1;
+  }): Promise<import('../domain/catalog/guestTransfer').GuestTransferAuthorizationResponse> {
+    return this.request('/api/catalog/guest-transfer/authorize', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async commitGuestTransfer(params: {
+    transferToken: string;
+    idempotencyKey?: string;
+    conflictStrategy?: import('../domain/catalog/guestTransfer').GuestTransferConflictStrategy;
+    payload: StoragePayloadV1;
+  }): Promise<import('../domain/catalog/guestTransfer').GuestTransferCommitResult> {
+    return this.request('/api/catalog/guest-transfer/commit', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async getGuestTransferStatus(
+    idempotencyKey: string
+  ): Promise<import('../domain/catalog/guestTransfer').GuestTransferStatusResponse> {
+    return this.request(
+      `/api/catalog/guest-transfer/status?idempotencyKey=${encodeURIComponent(idempotencyKey)}`
+    );
   }
 
   // Store Endpoints

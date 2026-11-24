@@ -15,6 +15,7 @@ import { createFeedRoutes } from './routes/feedRoutes';
 import { createVisibilityRoutes } from './routes/visibilityRoutes';
 import { csrfProtection, getAuthRateLimiterDiagnostics } from './middleware/auth';
 import { parseTrustProxySetting, validateProductionConfig } from './config/productionConfig';
+import { ExternalRegistryProviderAdapter } from './services/externalRegistryService';
 
 /**
  * Blocks public HTTP access to unreferenced internal AI Studio prompt/attachment artifacts
@@ -43,7 +44,14 @@ export function blockInternalPromptArtifactsMiddleware(req: any, res: any, next:
   return next();
 }
 
-export function createApp(customRepo?: DatabaseRepository): Express {
+export interface CreateAppOptions {
+  externalRegistryProvider?: ExternalRegistryProviderAdapter;
+}
+
+export function createApp(
+  customRepo?: DatabaseRepository,
+  options: CreateAppOptions = {}
+): Express {
   const app = express();
   const repo = customRepo || getDatabaseRepository();
 
@@ -224,7 +232,12 @@ export function createApp(customRepo?: DatabaseRepository): Express {
 
   // Mount API routers
   app.use('/api/auth', createAuthRoutes(repo));
-  app.use('/api/catalog', createCatalogRoutes(repo));
+  app.use(
+    '/api/catalog',
+    createCatalogRoutes(repo, {
+      externalRegistryProvider: options.externalRegistryProvider,
+    })
+  );
   app.use('/api/store', createStoreRoutes(repo));
   app.use('/api/billing', createBillingRoutes(repo));
   app.use('/api/audit', createAuditRoutes(repo));

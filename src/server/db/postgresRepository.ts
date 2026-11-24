@@ -46,8 +46,12 @@ import {
   ProductCandidate,
   EvidencePurpose,
   EvidenceReviewAuditEntry,
+  ExternalVerificationStatus,
+  ReviewerPrincipalType,
   ShopifyProductProvenanceRecord
 } from '../../types';
+import { ReviewerServicePrincipalRecord } from '../security/reviewerAuth';
+import { ExternalRegistryVerificationEvaluation } from '../services/externalRegistryService';
 import {
   buildTrustedGtinVerificationContext,
   computeEvidenceIntegrityHash,
@@ -55,6 +59,13 @@ import {
 } from '../security/catalogSanitizer';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
+import {
+  GuestTransferAuditRecord,
+  GuestTransferAuthorizationRecord,
+  GuestTransferCommitResult,
+  GuestTransferConflictStrategy,
+} from '../../domain/catalog/guestTransfer';
+import { GuestTransferError } from '../services/guestTransferService';
 import { executeActionApproval, executeActionDismissal, executeActionRecheck, executeCatalogImport } from '../../domain/catalog/catalogMutationService';
 import { 
   calculateImportUsage, 
@@ -247,6 +258,9 @@ export class PostgresRepository implements DatabaseRepository {
       'workspace_operation_leases',
       'evidence_review_audit_log',
       'shopify_product_provenance',
+      'reviewer_service_principals',
+      'guest_transfer_authorizations',
+      'guest_transfer_audit_log',
     ];
 
     try {
@@ -486,6 +500,8 @@ export class PostgresRepository implements DatabaseRepository {
           '014_auth_recovery_and_operation_leases.sql',
           '015_gtin_evidence_trust.sql',
           '016_source_classification_and_domain_cleanup.sql',
+          '017_reviewer_identity_and_registry_trust.sql',
+          '018_guest_transfer_authorizations.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -1225,11 +1241,20 @@ export class PostgresRepository implements DatabaseRepository {
         status,
         evidence_purpose AS "evidencePurpose",
         verification_source AS "verificationSource",
+        external_verification_status AS "externalVerificationStatus",
         submitted_by_user_id AS "submittedByUserId",
         reviewed_by AS "verifiedBy",
+        reviewer_principal_type AS "reviewerPrincipalType",
+        reviewer_auth_method AS "reviewerAuthMethod",
         reviewed_at AS "reviewedAt",
         decision,
         decision_reason AS "decisionReason",
+        external_provider_name AS "externalProviderName",
+        external_provider_ref AS "externalProviderRef",
+        external_request_at AS "externalRequestAt",
+        external_response_at AS "externalResponseAt",
+        external_verification_result AS "externalVerificationResult",
+        external_verification_evidence_json AS "externalVerificationEvidence",
         integrity_hash AS "integrityHash",
         created_at AS "createdAt"
        FROM evidence_documents
@@ -1295,11 +1320,27 @@ export class PostgresRepository implements DatabaseRepository {
         status: r.status,
         evidencePurpose: r.evidencePurpose || 'general',
         verificationSource: r.verificationSource || 'client_submission',
+        externalVerificationStatus: r.externalVerificationStatus || 'not_externally_verified',
         ...(r.submittedByUserId ? { submittedByUserId: r.submittedByUserId } : {}),
         ...(r.verifiedBy ? { verifiedBy: r.verifiedBy } : {}),
+        ...(r.reviewerPrincipalType ? { reviewerPrincipalType: r.reviewerPrincipalType } : {}),
+        ...(r.reviewerAuthMethod ? { reviewerAuthMethod: r.reviewerAuthMethod } : {}),
         ...(r.reviewedAt ? { reviewedAt: new Date(r.reviewedAt).toISOString() } : {}),
         ...(r.decision ? { decision: r.decision } : {}),
         ...(r.decisionReason ? { decisionReason: r.decisionReason } : {}),
+        ...(r.externalProviderName ? { externalProviderName: r.externalProviderName } : {}),
+        ...(r.externalProviderRef ? { externalProviderRef: r.externalProviderRef } : {}),
+        ...(r.externalRequestAt ? { externalRequestAt: new Date(r.externalRequestAt).toISOString() } : {}),
+        ...(r.externalResponseAt ? { externalResponseAt: new Date(r.externalResponseAt).toISOString() } : {}),
+        ...(r.externalVerificationResult ? { externalVerificationResult: r.externalVerificationResult } : {}),
+        ...(r.externalVerificationEvidence
+          ? {
+              externalVerificationEvidence:
+                typeof r.externalVerificationEvidence === 'string'
+                  ? JSON.parse(r.externalVerificationEvidence)
+                  : r.externalVerificationEvidence,
+            }
+          : {}),
         ...(r.integrityHash ? { integrityHash: r.integrityHash } : {}),
         ...(r.createdAt ? { createdAt: new Date(r.createdAt).toISOString() } : {}),
       };
@@ -1541,9 +1582,21 @@ export class PostgresRepository implements DatabaseRepository {
         await client.query(
           `INSERT INTO evidence_documents (
              id, workspace_id, product_id, title, type, issuer, date_verified, url, status,
-             evidence_purpose, verification_source, submitted_by_user_id, reviewed_by, reviewed_at,
-             decision, decision_reason, integrity_hash, created_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, COALESCE($18::timestamptz, NOW()))`,
+             evidence_purpose, verification_source, external_verification_status,
+             submitted_by_user_id, reviewed_by, reviewer_principal_type, reviewer_auth_method,
+             reviewed_at, decision, decision_reason,
+             external_provider_name, external_provider_ref, external_request_at, external_response_at,
+             external_verification_result, external_verification_evidence_json,
+             integrity_hash, created_at
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9,
+             $10, $11, $12,
+             $13, $14, $15, $16,
+             $17, $18, $19,
+             $20, $21, $22, $23,
+             $24, $25::jsonb,
+             $26, COALESCE($27::timestamptz, NOW())
+           )`,
           [
             e.id,
             workspaceId,
@@ -1556,11 +1609,20 @@ export class PostgresRepository implements DatabaseRepository {
             e.status,
             e.evidencePurpose || 'general',
             e.verificationSource || 'client_submission',
+            e.externalVerificationStatus || 'not_externally_verified',
             e.submittedByUserId || null,
             e.verifiedBy || null,
+            e.reviewerPrincipalType || null,
+            e.reviewerAuthMethod || null,
             e.reviewedAt || null,
             e.decision || 'pending',
             e.decisionReason || null,
+            e.externalProviderName || null,
+            e.externalProviderRef || null,
+            e.externalRequestAt || null,
+            e.externalResponseAt || null,
+            e.externalVerificationResult || null,
+            e.externalVerificationEvidence ? JSON.stringify(e.externalVerificationEvidence) : null,
             e.integrityHash || null,
             e.createdAt || null,
           ]
@@ -3237,10 +3299,18 @@ export class PostgresRepository implements DatabaseRepository {
             JSON.stringify({
               evidencePurpose: e.evidencePurpose || 'general',
               verificationSource: e.verificationSource || 'client_submission',
+              externalVerificationStatus: e.externalVerificationStatus || 'not_externally_verified',
               verifiedBy: e.verifiedBy || null,
+              reviewerPrincipalType: e.reviewerPrincipalType || null,
+              reviewerAuthMethod: e.reviewerAuthMethod || null,
               reviewedAt: e.reviewedAt || null,
               decision: e.decision || null,
               decisionReason: e.decisionReason || null,
+              externalProviderName: e.externalProviderName || null,
+              externalProviderRef: e.externalProviderRef || null,
+              externalRequestAt: e.externalRequestAt || null,
+              externalResponseAt: e.externalResponseAt || null,
+              externalVerificationResult: e.externalVerificationResult || null,
               integrityHash: e.integrityHash || null,
             }),
           ]
@@ -4736,6 +4806,7 @@ export class PostgresRepository implements DatabaseRepository {
     requestedIp?: string;
   }): Promise<void> {
     await this.withTransaction(async (client) => {
+      await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [data.userId]);
       await client.query(
         `UPDATE password_reset_tokens
          SET used_at = NOW()
@@ -4748,6 +4819,15 @@ export class PostgresRepository implements DatabaseRepository {
         [data.id, data.userId, data.tokenHash, data.expiresAt, data.requestedIp || null]
       );
     });
+  }
+
+  async invalidatePasswordResetToken(tokenId: string): Promise<void> {
+    await this.query(
+      `UPDATE password_reset_tokens
+       SET used_at = COALESCE(used_at, NOW())
+       WHERE id = $1`,
+      [tokenId]
+    );
   }
 
   async consumePasswordResetTokenAndUpdatePassword(
@@ -4965,6 +5045,7 @@ export class PostgresRepository implements DatabaseRepository {
         status: 'pending',
         evidencePurpose: purpose,
         verificationSource: 'client_submission',
+        externalVerificationStatus: 'not_externally_verified',
         submittedByUserId: params.submittedByUserId,
         decision: 'pending',
         createdAt: nowIso,
@@ -4978,9 +5059,10 @@ export class PostgresRepository implements DatabaseRepository {
       await client.query(
         `INSERT INTO evidence_documents (
            id, workspace_id, product_id, title, type, issuer, date_verified, url, status,
-           evidence_purpose, verification_source, submitted_by_user_id, reviewed_by, reviewed_at,
+           evidence_purpose, verification_source, external_verification_status,
+           submitted_by_user_id, reviewed_by, reviewed_at,
            decision, decision_reason, integrity_hash, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 'client_submission', $10, NULL, NULL, 'pending', NULL, $11, $12::timestamptz)`,
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, 'client_submission', 'not_externally_verified', $10, NULL, NULL, 'pending', NULL, $11, $12::timestamptz)`,
         [
           id,
           params.workspaceId,
@@ -5004,8 +5086,8 @@ export class PostgresRepository implements DatabaseRepository {
 
       await client.query(
         `INSERT INTO evidence_review_audit_log (
-           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, reason, integrity_hash, metadata_json, created_at
-         ) VALUES ($1, $2, $3, $4, 'submitted', 'pending', $5, 'merchant_submitter', NULL, $6, $7::jsonb, $8::timestamptz)`,
+           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, principal_type, auth_method, reason, integrity_hash, metadata_json, created_at
+         ) VALUES ($1, $2, $3, $4, 'submitted', 'pending', $5, 'merchant_submitter', 'merchant_submitter', 'workspace_session', NULL, $6, $7::jsonb, $8::timestamptz)`,
         [
           `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
           params.workspaceId,
@@ -5016,6 +5098,7 @@ export class PostgresRepository implements DatabaseRepository {
           JSON.stringify({
             evidencePurpose: purpose,
             verificationSource: 'client_submission',
+            externalVerificationStatus: 'not_externally_verified',
           }),
           nowIso,
         ]
@@ -5028,14 +5111,138 @@ export class PostgresRepository implements DatabaseRepository {
     });
   }
 
+  async getEvidenceDocumentById(
+    workspaceId: string,
+    evidenceId: string
+  ): Promise<{ evidence: EvidenceDocument; productId: string; product?: Product } | null> {
+    const eviRes = await this.query<any>(
+      `SELECT
+        id,
+        product_id AS "productId",
+        title,
+        type,
+        issuer,
+        date_verified AS "dateVerified",
+        url,
+        status,
+        evidence_purpose AS "evidencePurpose",
+        verification_source AS "verificationSource",
+        external_verification_status AS "externalVerificationStatus",
+        submitted_by_user_id AS "submittedByUserId",
+        reviewed_by AS "verifiedBy",
+        reviewer_principal_type AS "reviewerPrincipalType",
+        reviewer_auth_method AS "reviewerAuthMethod",
+        reviewed_at AS "reviewedAt",
+        decision,
+        decision_reason AS "decisionReason",
+        external_provider_name AS "externalProviderName",
+        external_provider_ref AS "externalProviderRef",
+        external_request_at AS "externalRequestAt",
+        external_response_at AS "externalResponseAt",
+        external_verification_result AS "externalVerificationResult",
+        external_verification_evidence_json AS "externalVerificationEvidence",
+        integrity_hash AS "integrityHash",
+        created_at AS "createdAt"
+       FROM evidence_documents
+       WHERE workspace_id = $1 AND id = $2`,
+      [workspaceId, evidenceId]
+    );
+    if (eviRes.rows.length === 0) return null;
+    const r = eviRes.rows[0];
+    const evidence: EvidenceDocument = {
+      id: r.id,
+      title: r.title,
+      type: r.type,
+      issuer: r.issuer,
+      dateVerified: r.dateVerified,
+      url: r.url || undefined,
+      status: r.status,
+      evidencePurpose: r.evidencePurpose || 'general',
+      verificationSource: r.verificationSource || 'client_submission',
+      externalVerificationStatus: r.externalVerificationStatus || 'not_externally_verified',
+      submittedByUserId: r.submittedByUserId || undefined,
+      verifiedBy: r.verifiedBy || undefined,
+      reviewerPrincipalType: r.reviewerPrincipalType || undefined,
+      reviewerAuthMethod: r.reviewerAuthMethod || undefined,
+      reviewedAt: r.reviewedAt ? new Date(r.reviewedAt).toISOString() : undefined,
+      decision: r.decision || undefined,
+      decisionReason: r.decisionReason || undefined,
+      externalProviderName: r.externalProviderName || undefined,
+      externalProviderRef: r.externalProviderRef || undefined,
+      externalRequestAt: r.externalRequestAt ? new Date(r.externalRequestAt).toISOString() : undefined,
+      externalResponseAt: r.externalResponseAt ? new Date(r.externalResponseAt).toISOString() : undefined,
+      externalVerificationResult: r.externalVerificationResult || undefined,
+      externalVerificationEvidence: r.externalVerificationEvidence
+        ? typeof r.externalVerificationEvidence === 'string'
+          ? JSON.parse(r.externalVerificationEvidence)
+          : r.externalVerificationEvidence
+        : undefined,
+      integrityHash: r.integrityHash || undefined,
+      createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : undefined,
+    };
+
+    let product: Product | undefined;
+    const prodRes = await this.query<any>(
+      `SELECT id, title, brand, category, description, image, status, completeness_score AS "completenessScore",
+              evidence_coverage_score AS "evidenceCoverageScore", external_discovery_status AS "externalDiscoveryStatus",
+              attributes_json AS "attributesJson", findings_count AS "findingsCount", last_audited AS "lastAudited"
+       FROM products
+       WHERE workspace_id = $1 AND id = $2`,
+      [workspaceId, r.productId]
+    );
+    if (prodRes.rows.length > 0) {
+      const pr = prodRes.rows[0];
+      const varRes = await this.query<any>(
+        `SELECT id, sku, title, barcode, price, inventory_count AS "inventoryCount", attributes_json AS "attributesJson"
+         FROM variants WHERE workspace_id = $1 AND product_id = $2`,
+        [workspaceId, pr.id]
+      );
+      product = {
+        id: pr.id,
+        title: pr.title,
+        brand: pr.brand,
+        category: pr.category,
+        description: pr.description,
+        image: pr.image,
+        status: pr.status,
+        completenessScore: pr.completenessScore,
+        evidenceCoverageScore: pr.evidenceCoverageScore,
+        externalDiscoveryStatus: pr.externalDiscoveryStatus,
+        attributes: typeof pr.attributesJson === 'string' ? JSON.parse(pr.attributesJson) : pr.attributesJson || {},
+        variants: varRes.rows.map((vr: any) => ({
+          id: vr.id,
+          sku: vr.sku,
+          title: vr.title,
+          barcode: vr.barcode,
+          price: vr.price !== null ? parseFloat(vr.price) : null,
+          inventoryCount: vr.inventoryCount,
+          attributes: typeof vr.attributesJson === 'string' ? JSON.parse(vr.attributesJson) : vr.attributesJson || {},
+        })),
+        offers: [],
+        evidenceDocuments: [evidence],
+        findingsCount: pr.findingsCount,
+        lastAudited: pr.lastAudited,
+      };
+    }
+
+    return {
+      evidence,
+      productId: r.productId,
+      product,
+    };
+  }
+
   async reviewEvidenceDocument(params: {
     workspaceId: string;
     evidenceId: string;
     decision: 'approved' | 'rejected';
     reviewerId: string;
     reviewerRole: string;
+    principalType?: ReviewerPrincipalType;
+    authMethod?: string;
+    claimedReviewerId?: string;
     reason?: string;
-    verificationSource?: 'server_reviewer' | 'external_registry';
+    verificationSource?: 'server_reviewer';
   }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }> {
     return this.withTransaction(async (client) => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [params.workspaceId]);
@@ -5057,8 +5264,11 @@ export class PostgresRepository implements DatabaseRepository {
           status,
           evidence_purpose AS "evidencePurpose",
           verification_source AS "verificationSource",
+          external_verification_status AS "externalVerificationStatus",
           submitted_by_user_id AS "submittedByUserId",
           reviewed_by AS "verifiedBy",
+          reviewer_principal_type AS "reviewerPrincipalType",
+          reviewer_auth_method AS "reviewerAuthMethod",
           reviewed_at AS "reviewedAt",
           decision,
           decision_reason AS "decisionReason",
@@ -5088,8 +5298,11 @@ export class PostgresRepository implements DatabaseRepository {
         status: row.status,
         evidencePurpose: row.evidencePurpose || 'general',
         verificationSource: row.verificationSource || 'client_submission',
+        externalVerificationStatus: row.externalVerificationStatus || 'not_externally_verified',
         submittedByUserId: row.submittedByUserId || undefined,
         verifiedBy: row.verifiedBy || undefined,
+        reviewerPrincipalType: row.reviewerPrincipalType || undefined,
+        reviewerAuthMethod: row.reviewerAuthMethod || undefined,
         reviewedAt: row.reviewedAt ? new Date(row.reviewedAt).toISOString() : undefined,
         decision: row.decision || undefined,
         decisionReason: row.decisionReason || undefined,
@@ -5108,7 +5321,11 @@ export class PostgresRepository implements DatabaseRepository {
       }
 
       const nowIso = new Date().toISOString();
-      const source = params.verificationSource || 'server_reviewer';
+      const source: 'server_reviewer' = 'server_reviewer';
+      const externalStatus: ExternalVerificationStatus =
+        params.decision === 'approved' ? 'reviewer_verified' : 'not_externally_verified';
+      const principalType: ReviewerPrincipalType = params.principalType || 'service_principal';
+      const authMethod = params.authMethod || 'platform_service_secret';
       const nextStatus = params.decision === 'approved' ? 'verified' : 'rejected';
       const effectiveDateVerified = existingDoc.dateVerified || nowIso;
       const updatedIntegrityHash = computeEvidenceIntegrityHash(params.workspaceId, row.productId, {
@@ -5122,10 +5339,13 @@ export class PostgresRepository implements DatabaseRepository {
              decision = $4,
              decision_reason = $5,
              verification_source = $6,
-             reviewed_by = $7,
-             reviewed_at = $8::timestamptz,
-             date_verified = $9,
-             integrity_hash = $10
+             external_verification_status = $7,
+             reviewed_by = $8,
+             reviewer_principal_type = $9,
+             reviewer_auth_method = $10,
+             reviewed_at = $11::timestamptz,
+             date_verified = $12,
+             integrity_hash = $13
          WHERE workspace_id = $1 AND id = $2`,
         [
           params.workspaceId,
@@ -5134,7 +5354,10 @@ export class PostgresRepository implements DatabaseRepository {
           params.decision,
           params.reason || null,
           source,
+          externalStatus,
           params.reviewerId,
+          principalType,
+          authMethod,
           nowIso,
           effectiveDateVerified,
           updatedIntegrityHash,
@@ -5152,7 +5375,10 @@ export class PostgresRepository implements DatabaseRepository {
         decision: params.decision,
         decisionReason: params.reason,
         verificationSource: source,
+        externalVerificationStatus: externalStatus,
         verifiedBy: params.reviewerId,
+        reviewerPrincipalType: principalType,
+        reviewerAuthMethod: authMethod,
         reviewedAt: nowIso,
         dateVerified: effectiveDateVerified,
         integrityHash: updatedIntegrityHash,
@@ -5167,20 +5393,24 @@ export class PostgresRepository implements DatabaseRepository {
         decision: params.decision,
         reviewerId: params.reviewerId,
         reviewerRole: params.reviewerRole,
+        principalType,
+        authMethod,
         reason: params.reason,
         integrityHash: updatedIntegrityHash,
         metadata: {
           evidencePurpose: updatedDoc.evidencePurpose || 'general',
           verificationSource: source,
+          externalVerificationStatus: externalStatus,
           previousStatus: existingDoc.status,
+          ...(params.claimedReviewerId ? { claimedReviewerId: params.claimedReviewerId } : {}),
         },
         createdAt: nowIso,
       };
 
       await client.query(
         `INSERT INTO evidence_review_audit_log (
-           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, reason, integrity_hash, metadata_json, created_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::timestamptz)`,
+           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, principal_type, auth_method, reason, integrity_hash, metadata_json, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::timestamptz)`,
         [
           auditEntry.id,
           auditEntry.workspaceId,
@@ -5190,6 +5420,8 @@ export class PostgresRepository implements DatabaseRepository {
           auditEntry.decision,
           auditEntry.reviewerId || null,
           auditEntry.reviewerRole || null,
+          principalType,
+          authMethod,
           auditEntry.reason || null,
           auditEntry.integrityHash,
           JSON.stringify(auditEntry.metadata || {}),
@@ -5205,11 +5437,406 @@ export class PostgresRepository implements DatabaseRepository {
     });
   }
 
+  async recordExternalRegistryVerification(params: {
+    workspaceId: string;
+    evidenceId: string;
+    initiatedByReviewerId: string;
+    initiatedByPrincipalType: ReviewerPrincipalType;
+    initiatedByAuthMethod: string;
+    claimedReviewerId?: string;
+    evaluation: ExternalRegistryVerificationEvaluation;
+  }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }> {
+    return this.withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [params.workspaceId]);
+
+      await client.query(
+        `SELECT id FROM stores WHERE workspace_id = $1 FOR UPDATE`,
+        [params.workspaceId]
+      );
+
+      const eviRes = await client.query<any>(
+        `SELECT
+          id,
+          product_id AS "productId",
+          title,
+          type,
+          issuer,
+          date_verified AS "dateVerified",
+          url,
+          status,
+          evidence_purpose AS "evidencePurpose",
+          verification_source AS "verificationSource",
+          external_verification_status AS "externalVerificationStatus",
+          submitted_by_user_id AS "submittedByUserId",
+          reviewed_by AS "verifiedBy",
+          reviewer_principal_type AS "reviewerPrincipalType",
+          reviewer_auth_method AS "reviewerAuthMethod",
+          reviewed_at AS "reviewedAt",
+          decision,
+          decision_reason AS "decisionReason",
+          external_provider_name AS "externalProviderName",
+          external_provider_ref AS "externalProviderRef",
+          external_request_at AS "externalRequestAt",
+          external_response_at AS "externalResponseAt",
+          external_verification_result AS "externalVerificationResult",
+          external_verification_evidence_json AS "externalVerificationEvidence",
+          integrity_hash AS "integrityHash",
+          created_at AS "createdAt"
+         FROM evidence_documents
+         WHERE workspace_id = $1 AND id = $2
+         FOR UPDATE`,
+        [params.workspaceId, params.evidenceId]
+      );
+
+      if (eviRes.rows.length === 0) {
+        const err: any = new Error(`Evidence document "${params.evidenceId}" not found in workspace ${params.workspaceId}`);
+        err.statusCode = 404;
+        err.code = 'EVIDENCE_NOT_FOUND';
+        throw err;
+      }
+
+      const row = eviRes.rows[0];
+      const existingDoc: EvidenceDocument = {
+        id: row.id,
+        title: row.title,
+        type: row.type,
+        issuer: row.issuer,
+        dateVerified: row.dateVerified,
+        url: row.url || undefined,
+        status: row.status,
+        evidencePurpose: row.evidencePurpose || 'general',
+        verificationSource: row.verificationSource || 'client_submission',
+        externalVerificationStatus: row.externalVerificationStatus || 'not_externally_verified',
+        submittedByUserId: row.submittedByUserId || undefined,
+        verifiedBy: row.verifiedBy || undefined,
+        reviewerPrincipalType: row.reviewerPrincipalType || undefined,
+        reviewerAuthMethod: row.reviewerAuthMethod || undefined,
+        reviewedAt: row.reviewedAt ? new Date(row.reviewedAt).toISOString() : undefined,
+        decision: row.decision || undefined,
+        decisionReason: row.decisionReason || undefined,
+        externalProviderName: row.externalProviderName || undefined,
+        externalProviderRef: row.externalProviderRef || undefined,
+        externalRequestAt: row.externalRequestAt ? new Date(row.externalRequestAt).toISOString() : undefined,
+        externalResponseAt: row.externalResponseAt ? new Date(row.externalResponseAt).toISOString() : undefined,
+        externalVerificationResult: row.externalVerificationResult || undefined,
+        externalVerificationEvidence: row.externalVerificationEvidence
+          ? typeof row.externalVerificationEvidence === 'string'
+            ? JSON.parse(row.externalVerificationEvidence)
+            : row.externalVerificationEvidence
+          : undefined,
+        integrityHash: row.integrityHash || undefined,
+        createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : undefined,
+      };
+
+      const expectedHash = computeEvidenceIntegrityHash(params.workspaceId, row.productId, existingDoc);
+      if (existingDoc.integrityHash && existingDoc.integrityHash !== expectedHash) {
+        const err: any = new Error(
+          `Evidence document "${params.evidenceId}" integrity hash mismatch: content may have been altered.`
+        );
+        err.statusCode = 409;
+        err.code = 'EVIDENCE_INTEGRITY_MISMATCH';
+        throw err;
+      }
+
+      const nowIso = new Date().toISOString();
+      const evalRes = params.evaluation;
+      let updatedDoc: EvidenceDocument;
+
+      if (evalRes.verified) {
+        const effectiveDateVerified = existingDoc.dateVerified || nowIso;
+        const updatedIntegrityHash = computeEvidenceIntegrityHash(params.workspaceId, row.productId, {
+          ...existingDoc,
+          dateVerified: effectiveDateVerified,
+        });
+        updatedDoc = {
+          ...existingDoc,
+          status: 'verified',
+          decision: 'approved',
+          decisionReason: evalRes.reason,
+          verificationSource: 'external_registry',
+          externalVerificationStatus: 'external_registry_verified',
+          verifiedBy: evalRes.providerName || params.initiatedByReviewerId,
+          reviewerPrincipalType: 'external_registry_provider',
+          reviewerAuthMethod: 'external_registry_adapter',
+          reviewedAt: evalRes.responseAt || nowIso,
+          dateVerified: effectiveDateVerified,
+          externalProviderName: evalRes.providerName,
+          externalProviderRef: evalRes.providerRef,
+          externalRequestAt: evalRes.requestAt,
+          externalResponseAt: evalRes.responseAt,
+          externalVerificationResult: evalRes.outcome,
+          externalVerificationEvidence: evalRes.sanitizedEvidence,
+          integrityHash: updatedIntegrityHash,
+        };
+
+        await client.query(
+          `UPDATE evidence_documents
+           SET status = 'verified',
+               decision = 'approved',
+               decision_reason = $3,
+               verification_source = 'external_registry',
+               external_verification_status = 'external_registry_verified',
+               reviewed_by = $4,
+               reviewer_principal_type = 'external_registry_provider',
+               reviewer_auth_method = 'external_registry_adapter',
+               reviewed_at = $5::timestamptz,
+               date_verified = $6,
+               external_provider_name = $7,
+               external_provider_ref = $8,
+               external_request_at = $9::timestamptz,
+               external_response_at = $10::timestamptz,
+               external_verification_result = $11,
+               external_verification_evidence_json = $12::jsonb,
+               integrity_hash = $13
+           WHERE workspace_id = $1 AND id = $2`,
+          [
+            params.workspaceId,
+            params.evidenceId,
+            evalRes.reason,
+            updatedDoc.verifiedBy,
+            updatedDoc.reviewedAt,
+            effectiveDateVerified,
+            evalRes.providerName || null,
+            evalRes.providerRef || null,
+            evalRes.requestAt || nowIso,
+            evalRes.responseAt || nowIso,
+            evalRes.outcome,
+            JSON.stringify(evalRes.sanitizedEvidence || {}),
+            updatedIntegrityHash,
+          ]
+        );
+      } else {
+        const nextExtStatus: ExternalVerificationStatus =
+          existingDoc.externalVerificationStatus === 'reviewer_verified'
+            ? 'reviewer_verified'
+            : 'not_externally_verified';
+        updatedDoc = {
+          ...existingDoc,
+          externalProviderName: evalRes.providerName || existingDoc.externalProviderName,
+          externalProviderRef: evalRes.providerRef || existingDoc.externalProviderRef,
+          externalRequestAt: evalRes.requestAt || nowIso,
+          externalResponseAt: evalRes.responseAt || nowIso,
+          externalVerificationResult: evalRes.outcome,
+          externalVerificationStatus: nextExtStatus,
+        };
+
+        await client.query(
+          `UPDATE evidence_documents
+           SET external_provider_name = COALESCE($3, external_provider_name),
+               external_provider_ref = COALESCE($4, external_provider_ref),
+               external_request_at = $5::timestamptz,
+               external_response_at = $6::timestamptz,
+               external_verification_result = $7,
+               external_verification_status = $8
+           WHERE workspace_id = $1 AND id = $2`,
+          [
+            params.workspaceId,
+            params.evidenceId,
+            evalRes.providerName || null,
+            evalRes.providerRef || null,
+            evalRes.requestAt || nowIso,
+            evalRes.responseAt || nowIso,
+            evalRes.outcome,
+            nextExtStatus,
+          ]
+        );
+      }
+
+      const verRes = await client.query<{ catalog_version: number }>(
+        `UPDATE stores SET catalog_version = COALESCE(catalog_version, 1) + 1, updated_at = NOW() WHERE workspace_id = $1 RETURNING catalog_version`,
+        [params.workspaceId]
+      );
+
+      const auditAction = evalRes.verified ? 'external_verified' : 'external_verification_failed';
+      const auditPrincipalType: ReviewerPrincipalType = evalRes.verified
+        ? 'external_registry_provider'
+        : params.initiatedByPrincipalType;
+      const auditAuthMethod = evalRes.verified ? 'external_registry_adapter' : params.initiatedByAuthMethod;
+
+      const auditEntry: EvidenceReviewAuditEntry = {
+        id: `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        workspaceId: params.workspaceId,
+        evidenceId: existingDoc.id,
+        productId: row.productId,
+        action: auditAction,
+        decision: updatedDoc.decision || 'pending',
+        reviewerId: params.initiatedByReviewerId,
+        reviewerRole: 'platform_reviewer',
+        principalType: auditPrincipalType,
+        authMethod: auditAuthMethod,
+        reason: evalRes.reason,
+        integrityHash: updatedDoc.integrityHash || expectedHash,
+        metadata: {
+          evidencePurpose: updatedDoc.evidencePurpose || 'general',
+          verificationSource: updatedDoc.verificationSource || 'client_submission',
+          externalVerificationStatus: updatedDoc.externalVerificationStatus,
+          externalOutcome: evalRes.outcome,
+          externalProviderName: evalRes.providerName || null,
+          externalProviderRef: evalRes.providerRef || null,
+          externalRequestAt: evalRes.requestAt || null,
+          externalResponseAt: evalRes.responseAt || null,
+          initiatedByReviewerId: params.initiatedByReviewerId,
+          ...(params.claimedReviewerId ? { claimedReviewerId: params.claimedReviewerId } : {}),
+        },
+        createdAt: nowIso,
+      };
+
+      await client.query(
+        `INSERT INTO evidence_review_audit_log (
+           id, workspace_id, evidence_id, product_id, action, decision, reviewer_id, reviewer_role, principal_type, auth_method, reason, integrity_hash, metadata_json, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::timestamptz)`,
+        [
+          auditEntry.id,
+          auditEntry.workspaceId,
+          auditEntry.evidenceId,
+          auditEntry.productId,
+          auditEntry.action,
+          auditEntry.decision,
+          auditEntry.reviewerId || null,
+          auditEntry.reviewerRole || null,
+          auditPrincipalType,
+          auditAuthMethod,
+          auditEntry.reason || null,
+          auditEntry.integrityHash,
+          JSON.stringify(auditEntry.metadata || {}),
+          nowIso,
+        ]
+      );
+
+      return {
+        evidence: updatedDoc,
+        auditEntry,
+        catalogVersion: Number(verRes.rows[0]?.catalog_version ?? 1),
+      };
+    });
+  }
+
+  async getPlatformReviewerGrant(userId: string): Promise<{
+    platformRole: 'none' | 'platform_reviewer';
+    scopes: string[];
+    revokedAt?: string | null;
+  } | null> {
+    const res = await this.query<any>(
+      `SELECT platform_role AS "platformRole", platform_reviewer_scopes_json AS "scopes", platform_reviewer_revoked_at AS "revokedAt"
+       FROM users
+       WHERE id = $1`,
+      [userId]
+    );
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    const scopesRaw = typeof r.scopes === 'string' ? JSON.parse(r.scopes) : r.scopes;
+    return {
+      platformRole: r.platformRole === 'platform_reviewer' ? 'platform_reviewer' : 'none',
+      scopes: Array.isArray(scopesRaw) ? scopesRaw : [],
+      revokedAt: r.revokedAt ? new Date(r.revokedAt).toISOString() : null,
+    };
+  }
+
+  async setPlatformReviewerGrant(params: {
+    userId: string;
+    platformRole: 'none' | 'platform_reviewer';
+    scopes?: string[];
+    revokedAt?: string | null;
+  }): Promise<void> {
+    await this.query(
+      `UPDATE users
+       SET platform_role = $2,
+           platform_reviewer_scopes_json = $3::jsonb,
+           platform_reviewer_revoked_at = $4::timestamptz,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [
+        params.userId,
+        params.platformRole,
+        JSON.stringify(params.scopes || []),
+        params.revokedAt ?? null,
+      ]
+    );
+  }
+
+  async listReviewerServicePrincipals(): Promise<ReviewerServicePrincipalRecord[]> {
+    const res = await this.query<any>(
+      `SELECT id, principal_id AS "principalId", display_name AS "displayName", secret_hash AS "secretHash",
+              key_id AS "keyId", scopes_json AS "scopes", status, expires_at AS "expiresAt",
+              revoked_at AS "revokedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+       FROM reviewer_service_principals
+       ORDER BY created_at DESC`
+    );
+    return res.rows.map((r: any) => ({
+      id: r.id,
+      principalId: r.principalId,
+      displayName: r.displayName,
+      secretHash: r.secretHash,
+      keyId: r.keyId,
+      scopes: typeof r.scopes === 'string' ? JSON.parse(r.scopes) : Array.isArray(r.scopes) ? r.scopes : [],
+      status: r.status === 'revoked' ? 'revoked' : 'active',
+      expiresAt: r.expiresAt ? new Date(r.expiresAt).toISOString() : null,
+      revokedAt: r.revokedAt ? new Date(r.revokedAt).toISOString() : null,
+      createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : undefined,
+      updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : undefined,
+    }));
+  }
+
+  async saveReviewerServicePrincipal(principal: ReviewerServicePrincipalRecord): Promise<ReviewerServicePrincipalRecord> {
+    const res = await this.query<any>(
+      `INSERT INTO reviewer_service_principals (
+         id, principal_id, display_name, secret_hash, key_id, scopes_json, status, expires_at, revoked_at, created_at, updated_at
+       ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::timestamptz, $9::timestamptz, NOW(), NOW())
+       ON CONFLICT (principal_id) DO UPDATE SET
+         display_name = EXCLUDED.display_name,
+         secret_hash = EXCLUDED.secret_hash,
+         key_id = EXCLUDED.key_id,
+         scopes_json = EXCLUDED.scopes_json,
+         status = EXCLUDED.status,
+         expires_at = EXCLUDED.expires_at,
+         revoked_at = EXCLUDED.revoked_at,
+         updated_at = NOW()
+       RETURNING id, principal_id AS "principalId", display_name AS "displayName", secret_hash AS "secretHash",
+                 key_id AS "keyId", scopes_json AS "scopes", status, expires_at AS "expiresAt",
+                 revoked_at AS "revokedAt", created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [
+        principal.id,
+        principal.principalId,
+        principal.displayName,
+        principal.secretHash,
+        principal.keyId,
+        JSON.stringify(principal.scopes || ['evidence:review']),
+        principal.status,
+        principal.expiresAt || null,
+        principal.revokedAt || null,
+      ]
+    );
+    const r = res.rows[0];
+    return {
+      id: r.id,
+      principalId: r.principalId,
+      displayName: r.displayName,
+      secretHash: r.secretHash,
+      keyId: r.keyId,
+      scopes: typeof r.scopes === 'string' ? JSON.parse(r.scopes) : Array.isArray(r.scopes) ? r.scopes : [],
+      status: r.status === 'revoked' ? 'revoked' : 'active',
+      expiresAt: r.expiresAt ? new Date(r.expiresAt).toISOString() : null,
+      revokedAt: r.revokedAt ? new Date(r.revokedAt).toISOString() : null,
+      createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : undefined,
+      updatedAt: r.updatedAt ? new Date(r.updatedAt).toISOString() : undefined,
+    };
+  }
+
+  async revokeReviewerServicePrincipal(principalId: string): Promise<void> {
+    await this.query(
+      `UPDATE reviewer_service_principals
+       SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
+       WHERE principal_id = $1`,
+      [principalId]
+    );
+  }
+
   async getEvidenceReviewAuditLog(workspaceId: string, evidenceId?: string): Promise<EvidenceReviewAuditEntry[]> {
     const res = evidenceId
       ? await this.query<any>(
           `SELECT id, workspace_id AS "workspaceId", evidence_id AS "evidenceId", product_id AS "productId",
                   action, decision, reviewer_id AS "reviewerId", reviewer_role AS "reviewerRole",
+                  principal_type AS "principalType", auth_method AS "authMethod",
                   reason, integrity_hash AS "integrityHash", metadata_json AS "metadata", created_at AS "createdAt"
            FROM evidence_review_audit_log
            WHERE workspace_id = $1 AND evidence_id = $2
@@ -5219,6 +5846,7 @@ export class PostgresRepository implements DatabaseRepository {
       : await this.query<any>(
           `SELECT id, workspace_id AS "workspaceId", evidence_id AS "evidenceId", product_id AS "productId",
                   action, decision, reviewer_id AS "reviewerId", reviewer_role AS "reviewerRole",
+                  principal_type AS "principalType", auth_method AS "authMethod",
                   reason, integrity_hash AS "integrityHash", metadata_json AS "metadata", created_at AS "createdAt"
            FROM evidence_review_audit_log
            WHERE workspace_id = $1
@@ -5235,6 +5863,8 @@ export class PostgresRepository implements DatabaseRepository {
       decision: r.decision,
       reviewerId: r.reviewerId || undefined,
       reviewerRole: r.reviewerRole || undefined,
+      principalType: r.principalType || undefined,
+      authMethod: r.authMethod || undefined,
       reason: r.reason || undefined,
       integrityHash: r.integrityHash,
       metadata: typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata || {},
@@ -5283,6 +5913,334 @@ export class PostgresRepository implements DatabaseRepository {
       `DELETE FROM shopify_product_provenance WHERE workspace_id = $1 AND product_id = $2`,
       [workspaceId, productId]
     );
+  }
+
+  private mapGuestTransferAuthRow(r: any): GuestTransferAuthorizationRecord {
+    return {
+      id: r.id,
+      workspaceId: r.workspace_id,
+      userId: r.user_id,
+      tokenHash: r.token_hash,
+      idempotencyKey: r.idempotency_key,
+      payloadSha256: r.payload_sha256,
+      conflictStrategy: r.conflict_strategy,
+      status: r.status,
+      expiresAt: new Date(r.expires_at).toISOString(),
+      committedAt: r.committed_at ? new Date(r.committed_at).toISOString() : null,
+      resultSummary: r.result_summary_json
+        ? typeof r.result_summary_json === 'string'
+          ? JSON.parse(r.result_summary_json)
+          : r.result_summary_json
+        : null,
+      createdAt: new Date(r.created_at).toISOString(),
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+
+  async createGuestTransferAuthorization(
+    record: GuestTransferAuthorizationRecord
+  ): Promise<GuestTransferAuthorizationRecord> {
+    return this.withTransaction(async (client) => {
+      await client.query(
+        `DELETE FROM guest_transfer_authorizations
+         WHERE workspace_id = $1 AND user_id = $2 AND idempotency_key = $3 AND status <> 'committed'`,
+        [record.workspaceId, record.userId, record.idempotencyKey]
+      );
+      const res = await client.query<any>(
+        `INSERT INTO guest_transfer_authorizations (
+           id, workspace_id, user_id, token_hash, idempotency_key, payload_sha256,
+           conflict_strategy, status, expires_at, committed_at, result_summary_json, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10::timestamptz, $11::jsonb, NOW(), NOW())
+         RETURNING *`,
+        [
+          record.id,
+          record.workspaceId,
+          record.userId,
+          record.tokenHash,
+          record.idempotencyKey,
+          record.payloadSha256,
+          record.conflictStrategy,
+          record.status,
+          record.expiresAt,
+          record.committedAt || null,
+          record.resultSummary ? JSON.stringify(record.resultSummary) : null,
+        ]
+      );
+      return this.mapGuestTransferAuthRow(res.rows[0]);
+    });
+  }
+
+  async getGuestTransferAuthorizationByTokenHash(
+    tokenHash: string
+  ): Promise<GuestTransferAuthorizationRecord | null> {
+    const res = await this.query<any>(
+      `SELECT * FROM guest_transfer_authorizations WHERE token_hash = $1 LIMIT 1`,
+      [tokenHash]
+    );
+    if (res.rows.length === 0) return null;
+    return this.mapGuestTransferAuthRow(res.rows[0]);
+  }
+
+  async getGuestTransferAuthorizationByIdempotencyKey(
+    workspaceId: string,
+    userId: string,
+    idempotencyKey: string
+  ): Promise<GuestTransferAuthorizationRecord | null> {
+    const res = await this.query<any>(
+      `SELECT * FROM guest_transfer_authorizations
+       WHERE workspace_id = $1 AND user_id = $2 AND idempotency_key = $3
+       LIMIT 1`,
+      [workspaceId, userId, idempotencyKey]
+    );
+    if (res.rows.length === 0) return null;
+    return this.mapGuestTransferAuthRow(res.rows[0]);
+  }
+
+  async markGuestTransferAuthorizationExpired(id: string): Promise<void> {
+    await this.query(
+      `UPDATE guest_transfer_authorizations
+       SET status = 'expired', updated_at = NOW()
+       WHERE id = $1 AND status = 'pending'`,
+      [id]
+    );
+  }
+
+  async commitGuestTransferAtomic(params: {
+    authorizationId: string;
+    workspaceId: string;
+    userId: string;
+    payloadSha256: string;
+    conflictStrategy: GuestTransferConflictStrategy;
+    guestPayload: StoragePayloadV1;
+    buildMergedCatalog: (ctx: {
+      existingCatalog: StoragePayloadV1 | null;
+      authoritativeStore: StoreProfile;
+      subscription: SubscriptionRecord | null;
+      catalogVersionBefore: number;
+    }) => {
+      mergedPayload: StoragePayloadV1;
+      summary: GuestTransferCommitResult;
+      importedCount: number;
+      skippedCount: number;
+      conflictsCount: number;
+    };
+  }): Promise<GuestTransferCommitResult> {
+    return this.withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [
+        params.workspaceId,
+      ]);
+
+      const authRes = await client.query<any>(
+        `SELECT * FROM guest_transfer_authorizations WHERE id = $1 FOR UPDATE`,
+        [params.authorizationId]
+      );
+      if (authRes.rows.length === 0) {
+        throw new GuestTransferError('Invalid guest transfer authorization.', 'TRANSFER_AUTHORIZATION_INVALID', 403);
+      }
+      const auth = this.mapGuestTransferAuthRow(authRes.rows[0]);
+      if (auth.workspaceId !== params.workspaceId || auth.userId !== params.userId) {
+        throw new GuestTransferError(
+          'Forbidden: guest transfer authorization is bound to a different user or workspace.',
+          'TRANSFER_TENANT_MISMATCH',
+          403
+        );
+      }
+      if (auth.status === 'committed') {
+        if (auth.payloadSha256 === params.payloadSha256 && auth.resultSummary) {
+          return { ...auth.resultSummary, idempotentReplay: true };
+        }
+        throw new GuestTransferError(
+          'Single-use guest transfer authorization has already been consumed.',
+          'TRANSFER_TOKEN_ALREADY_USED',
+          409
+        );
+      }
+      if (auth.status === 'expired' || new Date(auth.expiresAt).getTime() <= Date.now()) {
+        await client.query(
+          `UPDATE guest_transfer_authorizations SET status = 'expired', updated_at = NOW() WHERE id = $1 AND status = 'pending'`,
+          [auth.id]
+        );
+        throw new GuestTransferError('Guest transfer authorization has expired.', 'TRANSFER_AUTHORIZATION_EXPIRED', 410);
+      }
+
+      const storeId = `store_${params.workspaceId}`;
+      let storeRes = await client.query<any>(
+        `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json,
+                evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency,
+                sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+         FROM stores WHERE workspace_id = $1 FOR UPDATE`,
+        [params.workspaceId]
+      );
+      if (storeRes.rows.length === 0) {
+        await client.query(
+          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+           VALUES ($1, $2, $3, '', 'USD', 0, 0, 'standard', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
+           ON CONFLICT (id) DO NOTHING`,
+          [storeId, params.workspaceId, `${params.workspaceId} Store`]
+        );
+        storeRes = await client.query<any>(
+          `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json,
+                  evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency,
+                  sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+           FROM stores WHERE workspace_id = $1 FOR UPDATE`,
+          [params.workspaceId]
+        );
+      }
+
+      const lockedRow = storeRes.rows[0];
+      const catalogVersionBefore = Number(lockedRow?.catalog_version ?? 1);
+      const lockedDomain = lockedRow?.domain ?? '';
+      const lockedMeta = lockedRow?.source_metadata_json
+        ? typeof lockedRow.source_metadata_json === 'string'
+          ? JSON.parse(lockedRow.source_metadata_json)
+          : lockedRow.source_metadata_json
+        : undefined;
+      const authoritativeStore: StoreProfile = {
+        name: lockedRow?.name || `${params.workspaceId} Store`,
+        domain: lockedDomain,
+        websiteUrl: lockedRow?.website_url ?? lockedDomain,
+        ...(lockedRow?.platform ? { platform: lockedRow.platform } : {}),
+        sourceClassification:
+          lockedRow?.source_classification || (lockedRow?.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
+        ...(lockedMeta && Object.keys(lockedMeta).length > 0 ? { sourceMetadata: lockedMeta } : {}),
+        shopifyConnected: Boolean(lockedRow?.shopify_connected),
+        ...(lockedRow?.shopify_shop_domain ? { shopifyShopDomain: lockedRow.shopify_shop_domain } : {}),
+        currency: lockedRow?.currency || 'USD',
+        skuCount: lockedRow?.sku_count || 0,
+        catalogCompletenessAvg: lockedRow?.catalog_completeness_avg || 0,
+        truthBoundaryStrictness: (lockedRow?.truth_boundary_strictness || 'standard') as any,
+        tier: (lockedRow?.tier || 'Free Audit') as any,
+        skuLimit: lockedRow?.sku_limit !== null && lockedRow?.sku_limit !== undefined ? lockedRow.sku_limit : undefined,
+        connectors:
+          typeof lockedRow?.connectors_json === 'string'
+            ? JSON.parse(lockedRow.connectors_json)
+            : lockedRow?.connectors_json || [],
+      };
+
+      const subRes = await client.query<any>(
+        `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId",
+                tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd",
+                cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated",
+                created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM subscriptions WHERE workspace_id = $1 LIMIT 1`,
+        [params.workspaceId]
+      );
+      const subscription: SubscriptionRecord | null = subRes.rows[0] || null;
+      const existingCatalog = await this.loadCatalogRows(client, params.workspaceId, authoritativeStore);
+
+      const built = params.buildMergedCatalog({
+        existingCatalog,
+        authoritativeStore,
+        subscription,
+        catalogVersionBefore,
+      });
+
+      const nextVersion = await this.saveCatalogRows(
+        client,
+        params.workspaceId,
+        built.mergedPayload,
+        storeId,
+        authoritativeStore
+      );
+
+      const summary: GuestTransferCommitResult = {
+        ...built.summary,
+        catalogVersion: nextVersion,
+      };
+
+      const auditId = `gta_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      await client.query(
+        `INSERT INTO guest_transfer_audit_log (
+           id, transfer_id, workspace_id, user_id, outcome, conflict_strategy,
+           imported_count, skipped_count, conflicts_count, catalog_version_before, catalog_version_after,
+           details_json, created_at
+         ) VALUES ($1, $2, $3, $4, 'committed', $5, $6, $7, $8, $9, $10, $11::jsonb, NOW())`,
+        [
+          auditId,
+          auth.id,
+          params.workspaceId,
+          params.userId,
+          params.conflictStrategy,
+          built.importedCount,
+          built.skippedCount,
+          built.conflictsCount,
+          catalogVersionBefore,
+          nextVersion,
+          JSON.stringify({
+            renamedCount: summary.renamedCount,
+            preservedSourceClassifications: summary.preservedSourceClassifications,
+            totalWorkspaceProducts: summary.totalWorkspaceProducts,
+          }),
+        ]
+      );
+
+      await client.query(
+        `UPDATE guest_transfer_authorizations
+         SET status = 'committed',
+             conflict_strategy = $2,
+             committed_at = COALESCE($3::timestamptz, NOW()),
+             result_summary_json = $4::jsonb,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [auth.id, params.conflictStrategy, summary.committedAt, JSON.stringify(summary)]
+      );
+
+      return summary;
+    });
+  }
+
+  async recordGuestTransferAudit(record: GuestTransferAuditRecord): Promise<void> {
+    await this.query(
+      `INSERT INTO guest_transfer_audit_log (
+         id, transfer_id, workspace_id, user_id, outcome, conflict_strategy,
+         imported_count, skipped_count, conflicts_count, catalog_version_before, catalog_version_after,
+         details_json, created_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, COALESCE($13::timestamptz, NOW()))`,
+      [
+        record.id,
+        record.transferId,
+        record.workspaceId,
+        record.userId,
+        record.outcome,
+        record.conflictStrategy,
+        record.importedCount,
+        record.skippedCount,
+        record.conflictsCount,
+        record.catalogVersionBefore ?? null,
+        record.catalogVersionAfter ?? null,
+        JSON.stringify(record.details || {}),
+        record.createdAt || null,
+      ]
+    );
+  }
+
+  async getGuestTransferAuditLog(workspaceId: string): Promise<GuestTransferAuditRecord[]> {
+    const res = await this.query<any>(
+      `SELECT id, transfer_id AS "transferId", workspace_id AS "workspaceId", user_id AS "userId",
+              outcome, conflict_strategy AS "conflictStrategy", imported_count AS "importedCount",
+              skipped_count AS "skippedCount", conflicts_count AS "conflictsCount",
+              catalog_version_before AS "catalogVersionBefore", catalog_version_after AS "catalogVersionAfter",
+              details_json AS "details", created_at AS "createdAt"
+       FROM guest_transfer_audit_log
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC`,
+      [workspaceId]
+    );
+    return res.rows.map((r: any) => ({
+      id: r.id,
+      transferId: r.transferId,
+      workspaceId: r.workspaceId,
+      userId: r.userId,
+      outcome: r.outcome,
+      conflictStrategy: r.conflictStrategy,
+      importedCount: Number(r.importedCount || 0),
+      skippedCount: Number(r.skippedCount || 0),
+      conflictsCount: Number(r.conflictsCount || 0),
+      catalogVersionBefore: r.catalogVersionBefore !== null ? Number(r.catalogVersionBefore) : null,
+      catalogVersionAfter: r.catalogVersionAfter !== null ? Number(r.catalogVersionAfter) : null,
+      details: typeof r.details === 'string' ? JSON.parse(r.details) : r.details || {},
+      createdAt: new Date(r.createdAt).toISOString(),
+    }));
   }
 }
 

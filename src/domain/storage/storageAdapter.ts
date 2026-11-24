@@ -16,6 +16,7 @@ import {
 } from '../../types';
 
 export const STORAGE_KEY = 'aixshop_catalog_v1';
+export const PENDING_GUEST_TRANSFER_KEY = 'aixshop_guest_transfer_pending_v1';
 export const CURRENT_SCHEMA_VERSION = 1;
 export const APP_VERSION = '1.0.0';
 export const DEFAULT_TENANT_ID = 'tenant_solstice_demo';
@@ -539,5 +540,47 @@ export class CatalogStorageAdapter {
       }
     }
     return keys;
+  }
+
+  public savePendingGuestTransfer(
+    checkpoint: import('../catalog/guestTransfer').GuestTransferPendingCheckpoint
+  ): boolean {
+    try {
+      this.backend.setItem(PENDING_GUEST_TRANSFER_KEY, JSON.stringify(checkpoint));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public loadPendingGuestTransfer():
+    | import('../catalog/guestTransfer').GuestTransferPendingCheckpoint
+    | null {
+    try {
+      const raw = this.backend.getItem(PENDING_GUEST_TRANSFER_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (
+        !parsed ||
+        typeof parsed !== 'object' ||
+        typeof parsed.transferToken !== 'string' ||
+        typeof parsed.idempotencyKey !== 'string' ||
+        typeof parsed.targetWorkspaceId !== 'string'
+      ) {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  public clearPendingGuestTransfer(): boolean {
+    try {
+      this.backend.removeItem(PENDING_GUEST_TRANSFER_KEY);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

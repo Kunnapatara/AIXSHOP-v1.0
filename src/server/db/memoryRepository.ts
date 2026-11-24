@@ -41,8 +41,12 @@ import {
   ProductCandidate,
   EvidencePurpose,
   EvidenceReviewAuditEntry,
+  ExternalVerificationStatus,
+  ReviewerPrincipalType,
   ShopifyProductProvenanceRecord
 } from '../../types';
+import { ReviewerServicePrincipalRecord } from '../security/reviewerAuth';
+import { ExternalRegistryVerificationEvaluation } from '../services/externalRegistryService';
 import {
   buildTrustedGtinVerificationContext,
   computeEvidenceIntegrityHash,
@@ -68,6 +72,13 @@ import {
   countCatalogSkus, 
   PlanQuotaExceededError 
 } from '../services/entitlementService';
+import {
+  GuestTransferAuditRecord,
+  GuestTransferAuthorizationRecord,
+  GuestTransferCommitResult,
+  GuestTransferConflictStrategy,
+} from '../../domain/catalog/guestTransfer';
+import { GuestTransferError } from '../services/guestTransferService';
 
 export class MemoryRepository implements DatabaseRepository {
   private users: Map<string, UserRecord> = new Map();
@@ -93,6 +104,10 @@ export class MemoryRepository implements DatabaseRepository {
   private workspaceOperationLeases: Map<string, { workspaceId: string; operationKey: string; leaseOwner: string; leaseExpiresAt: number }> = new Map();
   private evidenceReviewAuditLog: Map<string, EvidenceReviewAuditEntry[]> = new Map(); // workspaceId -> entries
   private shopifyProductProvenance: Map<string, Map<string, ShopifyProductProvenanceRecord>> = new Map(); // workspaceId -> productId -> record
+  private reviewerServicePrincipals: Map<string, ReviewerServicePrincipalRecord> = new Map(); // principalId -> record
+  private userPlatformGrants: Map<string, { platformRole: 'none' | 'platform_reviewer'; scopes: string[]; revokedAt?: string | null }> = new Map();
+  private guestTransferAuthorizations: Map<string, GuestTransferAuthorizationRecord> = new Map(); // id -> record
+  private guestTransferAuditLog: Map<string, GuestTransferAuditRecord[]> = new Map(); // workspaceId -> entries
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -200,8 +215,17 @@ export class MemoryRepository implements DatabaseRepository {
           'schema_migrations',
           'evidence_review_audit_log',
           'shopify_product_provenance',
+          'reviewer_service_principals',
+          'guest_transfer_authorizations',
+          'guest_transfer_audit_log',
         ],
-        appliedMigrations: ['001_initial_schema.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql'],
+        appliedMigrations: [
+          '001_initial_schema.sql',
+          '015_gtin_evidence_trust.sql',
+          '016_source_classification_and_domain_cleanup.sql',
+          '017_reviewer_identity_and_registry_trust.sql',
+          '018_guest_transfer_authorizations.sql',
+        ],
       },
     };
   }
@@ -1476,10 +1500,18 @@ export class MemoryRepository implements DatabaseRepository {
           metadata: {
             evidencePurpose: e.evidencePurpose || 'general',
             verificationSource: e.verificationSource || 'client_submission',
+            externalVerificationStatus: e.externalVerificationStatus || 'not_externally_verified',
             verifiedBy: e.verifiedBy || null,
+            reviewerPrincipalType: e.reviewerPrincipalType || null,
+            reviewerAuthMethod: e.reviewerAuthMethod || null,
             reviewedAt: e.reviewedAt || null,
             decision: e.decision || null,
             decisionReason: e.decisionReason || null,
+            externalProviderName: e.externalProviderName || null,
+            externalProviderRef: e.externalProviderRef || null,
+            externalRequestAt: e.externalRequestAt || null,
+            externalResponseAt: e.externalResponseAt || null,
+            externalVerificationResult: e.externalVerificationResult || null,
             integrityHash: e.integrityHash || null,
           },
           snapshotCreatedAt: snapshotTime,
@@ -2232,6 +2264,15 @@ export class MemoryRepository implements DatabaseRepository {
     });
   }
 
+  async invalidatePasswordResetToken(tokenId: string): Promise<void> {
+    const nowIso = new Date().toISOString();
+    for (const token of this.passwordResetTokens.values()) {
+      if (token.id === tokenId && token.usedAt === null) {
+        token.usedAt = nowIso;
+      }
+    }
+  }
+
   async consumePasswordResetTokenAndUpdatePassword(
     tokenHash: string,
     newPasswordHash: string
@@ -2360,6 +2401,7 @@ export class MemoryRepository implements DatabaseRepository {
         status: 'pending',
         evidencePurpose: purpose,
         verificationSource: 'client_submission',
+        externalVerificationStatus: 'not_externally_verified',
         submittedByUserId: params.submittedByUserId,
         decision: 'pending',
         createdAt: nowIso,
@@ -2392,10 +2434,13 @@ export class MemoryRepository implements DatabaseRepository {
         decision: 'pending',
         reviewerId: params.submittedByUserId,
         reviewerRole: 'merchant_submitter',
+        principalType: 'merchant_submitter',
+        authMethod: 'workspace_session',
         integrityHash: newDoc.integrityHash,
         metadata: {
           evidencePurpose: purpose,
           verificationSource: 'client_submission',
+          externalVerificationStatus: 'not_externally_verified',
         },
         createdAt: nowIso,
       });
@@ -2408,14 +2453,36 @@ export class MemoryRepository implements DatabaseRepository {
     });
   }
 
+  async getEvidenceDocumentById(
+    workspaceId: string,
+    evidenceId: string
+  ): Promise<{ evidence: EvidenceDocument; productId: string; product?: Product } | null> {
+    const catalog = await this.loadWorkspaceCatalog(workspaceId);
+    if (!catalog) return null;
+    for (const p of catalog.products) {
+      const match = (p.evidenceDocuments || []).find(d => d.id === evidenceId);
+      if (match) {
+        return {
+          evidence: JSON.parse(JSON.stringify(match)),
+          productId: p.id,
+          product: JSON.parse(JSON.stringify(p)),
+        };
+      }
+    }
+    return null;
+  }
+
   async reviewEvidenceDocument(params: {
     workspaceId: string;
     evidenceId: string;
     decision: 'approved' | 'rejected';
     reviewerId: string;
     reviewerRole: string;
+    principalType?: ReviewerPrincipalType;
+    authMethod?: string;
+    claimedReviewerId?: string;
     reason?: string;
-    verificationSource?: 'server_reviewer' | 'external_registry';
+    verificationSource?: 'server_reviewer';
   }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }> {
     return this.withWorkspaceLock(params.workspaceId, async () => {
       const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
@@ -2455,7 +2522,12 @@ export class MemoryRepository implements DatabaseRepository {
       }
 
       const nowIso = new Date().toISOString();
-      const source = params.verificationSource || 'server_reviewer';
+      // Reviewer action is ALWAYS 'server_reviewer' and NEVER elevates to 'external_registry_verified'
+      const source: 'server_reviewer' = 'server_reviewer';
+      const externalStatus: ExternalVerificationStatus =
+        params.decision === 'approved' ? 'reviewer_verified' : 'not_externally_verified';
+      const principalType: ReviewerPrincipalType = params.principalType || 'service_principal';
+      const authMethod = params.authMethod || 'platform_service_secret';
       const effectiveDateVerified = foundDoc.dateVerified || nowIso;
       const updatedIntegrityHash = computeEvidenceIntegrityHash(params.workspaceId, foundProduct.id, {
         ...foundDoc,
@@ -2467,7 +2539,10 @@ export class MemoryRepository implements DatabaseRepository {
         decision: params.decision,
         decisionReason: params.reason,
         verificationSource: source,
+        externalVerificationStatus: externalStatus,
         verifiedBy: params.reviewerId,
+        reviewerPrincipalType: principalType,
+        reviewerAuthMethod: authMethod,
         reviewedAt: nowIso,
         dateVerified: effectiveDateVerified,
         integrityHash: updatedIntegrityHash,
@@ -2499,12 +2574,16 @@ export class MemoryRepository implements DatabaseRepository {
         decision: params.decision,
         reviewerId: params.reviewerId,
         reviewerRole: params.reviewerRole,
+        principalType,
+        authMethod,
         reason: params.reason,
-        integrityHash: expectedHash,
+        integrityHash: updatedIntegrityHash,
         metadata: {
           evidencePurpose: updatedDoc.evidencePurpose || 'general',
           verificationSource: source,
+          externalVerificationStatus: externalStatus,
           previousStatus: foundDoc.status,
+          ...(params.claimedReviewerId ? { claimedReviewerId: params.claimedReviewerId } : {}),
         },
         createdAt: nowIso,
       };
@@ -2519,6 +2598,211 @@ export class MemoryRepository implements DatabaseRepository {
         catalogVersion: this.catalogVersions.get(params.workspaceId),
       };
     });
+  }
+
+  async recordExternalRegistryVerification(params: {
+    workspaceId: string;
+    evidenceId: string;
+    initiatedByReviewerId: string;
+    initiatedByPrincipalType: ReviewerPrincipalType;
+    initiatedByAuthMethod: string;
+    claimedReviewerId?: string;
+    evaluation: ExternalRegistryVerificationEvaluation;
+  }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
+      if (!catalog) {
+        const err: any = new Error(`Workspace ${params.workspaceId} catalog not found`);
+        err.statusCode = 404;
+        err.code = 'CATALOG_NOT_FOUND';
+        throw err;
+      }
+
+      let foundProduct: Product | undefined;
+      let foundDoc: EvidenceDocument | undefined;
+      for (const p of catalog.products) {
+        const match = (p.evidenceDocuments || []).find(d => d.id === params.evidenceId);
+        if (match) {
+          foundProduct = p;
+          foundDoc = match;
+          break;
+        }
+      }
+
+      if (!foundProduct || !foundDoc) {
+        const err: any = new Error(`Evidence document "${params.evidenceId}" not found in workspace ${params.workspaceId}`);
+        err.statusCode = 404;
+        err.code = 'EVIDENCE_NOT_FOUND';
+        throw err;
+      }
+
+      const expectedHash = computeEvidenceIntegrityHash(params.workspaceId, foundProduct.id, foundDoc);
+      if (foundDoc.integrityHash && foundDoc.integrityHash !== expectedHash) {
+        const err: any = new Error(
+          `Evidence document "${params.evidenceId}" integrity hash mismatch: content may have been altered.`
+        );
+        err.statusCode = 409;
+        err.code = 'EVIDENCE_INTEGRITY_MISMATCH';
+        throw err;
+      }
+
+      const nowIso = new Date().toISOString();
+      const evalRes = params.evaluation;
+      let updatedDoc: EvidenceDocument;
+
+      if (evalRes.verified) {
+        const effectiveDateVerified = foundDoc.dateVerified || nowIso;
+        const updatedIntegrityHash = computeEvidenceIntegrityHash(params.workspaceId, foundProduct.id, {
+          ...foundDoc,
+          dateVerified: effectiveDateVerified,
+        });
+        updatedDoc = {
+          ...foundDoc,
+          status: 'verified',
+          decision: 'approved',
+          decisionReason: evalRes.reason,
+          verificationSource: 'external_registry',
+          externalVerificationStatus: 'external_registry_verified',
+          verifiedBy: evalRes.providerName || params.initiatedByReviewerId,
+          reviewerPrincipalType: 'external_registry_provider',
+          reviewerAuthMethod: 'external_registry_adapter',
+          reviewedAt: evalRes.responseAt || nowIso,
+          dateVerified: effectiveDateVerified,
+          externalProviderName: evalRes.providerName,
+          externalProviderRef: evalRes.providerRef,
+          externalRequestAt: evalRes.requestAt,
+          externalResponseAt: evalRes.responseAt,
+          externalVerificationResult: evalRes.outcome,
+          externalVerificationEvidence: evalRes.sanitizedEvidence,
+          integrityHash: updatedIntegrityHash,
+        };
+      } else {
+        // Never elevate verification status on failed, mismatched, ambiguous, or timed-out external lookups
+        updatedDoc = {
+          ...foundDoc,
+          externalProviderName: evalRes.providerName || foundDoc.externalProviderName,
+          externalProviderRef: evalRes.providerRef || foundDoc.externalProviderRef,
+          externalRequestAt: evalRes.requestAt || nowIso,
+          externalResponseAt: evalRes.responseAt || nowIso,
+          externalVerificationResult: evalRes.outcome,
+          externalVerificationStatus:
+            foundDoc.externalVerificationStatus === 'reviewer_verified'
+              ? 'reviewer_verified'
+              : 'not_externally_verified',
+        };
+      }
+
+      const nextProducts = catalog.products.map(p => {
+        if (p.id !== foundProduct!.id) return p;
+        return {
+          ...p,
+          evidenceDocuments: (p.evidenceDocuments || []).map(d =>
+            d.id === params.evidenceId ? updatedDoc : d
+          ),
+        };
+      });
+
+      const updatedCatalog: StoragePayloadV1 = {
+        ...catalog,
+        products: nextProducts,
+        evidence: nextProducts.flatMap(p => p.evidenceDocuments || []),
+      };
+      await this.saveWorkspaceCatalogInternal(params.workspaceId, updatedCatalog);
+
+      const auditEntry: EvidenceReviewAuditEntry = {
+        id: `evlog_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        workspaceId: params.workspaceId,
+        evidenceId: foundDoc.id,
+        productId: foundProduct.id,
+        action: evalRes.verified ? 'external_verified' : 'external_verification_failed',
+        decision: updatedDoc.decision || 'pending',
+        reviewerId: params.initiatedByReviewerId,
+        reviewerRole: 'platform_reviewer',
+        principalType: evalRes.verified ? 'external_registry_provider' : params.initiatedByPrincipalType,
+        authMethod: evalRes.verified ? 'external_registry_adapter' : params.initiatedByAuthMethod,
+        reason: evalRes.reason,
+        integrityHash: updatedDoc.integrityHash || expectedHash,
+        metadata: {
+          evidencePurpose: updatedDoc.evidencePurpose || 'general',
+          verificationSource: updatedDoc.verificationSource || 'client_submission',
+          externalVerificationStatus: updatedDoc.externalVerificationStatus,
+          externalOutcome: evalRes.outcome,
+          externalProviderName: evalRes.providerName || null,
+          externalProviderRef: evalRes.providerRef || null,
+          externalRequestAt: evalRes.requestAt || null,
+          externalResponseAt: evalRes.responseAt || null,
+          initiatedByReviewerId: params.initiatedByReviewerId,
+          ...(params.claimedReviewerId ? { claimedReviewerId: params.claimedReviewerId } : {}),
+        },
+        createdAt: nowIso,
+      };
+
+      const logList = this.evidenceReviewAuditLog.get(params.workspaceId) || [];
+      logList.push(auditEntry);
+      this.evidenceReviewAuditLog.set(params.workspaceId, logList);
+
+      return {
+        evidence: JSON.parse(JSON.stringify(updatedDoc)),
+        auditEntry: JSON.parse(JSON.stringify(auditEntry)),
+        catalogVersion: this.catalogVersions.get(params.workspaceId),
+      };
+    });
+  }
+
+  async getPlatformReviewerGrant(userId: string): Promise<{
+    platformRole: 'none' | 'platform_reviewer';
+    scopes: string[];
+    revokedAt?: string | null;
+  } | null> {
+    const grant = this.userPlatformGrants.get(userId);
+    if (!grant) return null;
+    return {
+      platformRole: grant.platformRole,
+      scopes: [...grant.scopes],
+      revokedAt: grant.revokedAt ?? null,
+    };
+  }
+
+  async setPlatformReviewerGrant(params: {
+    userId: string;
+    platformRole: 'none' | 'platform_reviewer';
+    scopes?: string[];
+    revokedAt?: string | null;
+  }): Promise<void> {
+    this.userPlatformGrants.set(params.userId, {
+      platformRole: params.platformRole,
+      scopes: params.scopes ? [...params.scopes] : [],
+      revokedAt: params.revokedAt ?? null,
+    });
+  }
+
+  async listReviewerServicePrincipals(): Promise<ReviewerServicePrincipalRecord[]> {
+    return JSON.parse(JSON.stringify(Array.from(this.reviewerServicePrincipals.values())));
+  }
+
+  async saveReviewerServicePrincipal(principal: ReviewerServicePrincipalRecord): Promise<ReviewerServicePrincipalRecord> {
+    const nowIso = new Date().toISOString();
+    const existing = this.reviewerServicePrincipals.get(principal.principalId);
+    const saved: ReviewerServicePrincipalRecord = {
+      ...JSON.parse(JSON.stringify(principal)),
+      createdAt: existing?.createdAt || principal.createdAt || nowIso,
+      updatedAt: nowIso,
+    };
+    this.reviewerServicePrincipals.set(principal.principalId, saved);
+    return JSON.parse(JSON.stringify(saved));
+  }
+
+  async revokeReviewerServicePrincipal(principalId: string): Promise<void> {
+    const existing = this.reviewerServicePrincipals.get(principalId);
+    if (existing) {
+      const nowIso = new Date().toISOString();
+      this.reviewerServicePrincipals.set(principalId, {
+        ...existing,
+        status: 'revoked',
+        revokedAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
   }
 
   async getEvidenceReviewAuditLog(workspaceId: string, evidenceId?: string): Promise<EvidenceReviewAuditEntry[]> {
@@ -2557,6 +2841,219 @@ export class MemoryRepository implements DatabaseRepository {
     if (wsMap) {
       wsMap.delete(productId);
     }
+  }
+
+  async createGuestTransferAuthorization(
+    record: GuestTransferAuthorizationRecord
+  ): Promise<GuestTransferAuthorizationRecord> {
+    const cloned: GuestTransferAuthorizationRecord = JSON.parse(JSON.stringify(record));
+    // Enforce unique (workspaceId, userId, idempotencyKey) for non-expired or existing active/committed rows
+    for (const [existingId, existing] of this.guestTransferAuthorizations.entries()) {
+      if (
+        existing.workspaceId === cloned.workspaceId &&
+        existing.userId === cloned.userId &&
+        existing.idempotencyKey === cloned.idempotencyKey
+      ) {
+        if (existing.status === 'committed') {
+          const err: any = new Error('duplicate idempotency key already committed');
+          err.code = '23505';
+          throw err;
+        }
+        // Replace superseded pending/expired authorization with the same idempotencyKey
+        this.guestTransferAuthorizations.delete(existingId);
+      }
+    }
+    this.guestTransferAuthorizations.set(cloned.id, cloned);
+    return JSON.parse(JSON.stringify(cloned));
+  }
+
+  async getGuestTransferAuthorizationByTokenHash(
+    tokenHash: string
+  ): Promise<GuestTransferAuthorizationRecord | null> {
+    for (const rec of this.guestTransferAuthorizations.values()) {
+      if (rec.tokenHash === tokenHash) {
+        return JSON.parse(JSON.stringify(rec));
+      }
+    }
+    return null;
+  }
+
+  async getGuestTransferAuthorizationByIdempotencyKey(
+    workspaceId: string,
+    userId: string,
+    idempotencyKey: string
+  ): Promise<GuestTransferAuthorizationRecord | null> {
+    for (const rec of this.guestTransferAuthorizations.values()) {
+      if (
+        rec.workspaceId === workspaceId &&
+        rec.userId === userId &&
+        rec.idempotencyKey === idempotencyKey
+      ) {
+        return JSON.parse(JSON.stringify(rec));
+      }
+    }
+    return null;
+  }
+
+  async markGuestTransferAuthorizationExpired(id: string): Promise<void> {
+    const existing = this.guestTransferAuthorizations.get(id);
+    if (existing && existing.status === 'pending') {
+      existing.status = 'expired';
+      existing.updatedAt = new Date().toISOString();
+    }
+  }
+
+  async commitGuestTransferAtomic(params: {
+    authorizationId: string;
+    workspaceId: string;
+    userId: string;
+    payloadSha256: string;
+    conflictStrategy: GuestTransferConflictStrategy;
+    guestPayload: StoragePayloadV1;
+    buildMergedCatalog: (ctx: {
+      existingCatalog: StoragePayloadV1 | null;
+      authoritativeStore: StoreProfile;
+      subscription: SubscriptionRecord | null;
+      catalogVersionBefore: number;
+    }) => {
+      mergedPayload: StoragePayloadV1;
+      summary: GuestTransferCommitResult;
+      importedCount: number;
+      skippedCount: number;
+      conflictsCount: number;
+    };
+  }): Promise<GuestTransferCommitResult> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      const auth = this.guestTransferAuthorizations.get(params.authorizationId);
+      if (!auth) {
+        throw new GuestTransferError('Invalid guest transfer authorization.', 'TRANSFER_AUTHORIZATION_INVALID', 403);
+      }
+      if (auth.workspaceId !== params.workspaceId || auth.userId !== params.userId) {
+        throw new GuestTransferError(
+          'Forbidden: guest transfer authorization is bound to a different user or workspace.',
+          'TRANSFER_TENANT_MISMATCH',
+          403
+        );
+      }
+      if (auth.status === 'committed') {
+        if (auth.payloadSha256 === params.payloadSha256 && auth.resultSummary) {
+          return { ...JSON.parse(JSON.stringify(auth.resultSummary)), idempotentReplay: true };
+        }
+        throw new GuestTransferError(
+          'Single-use guest transfer authorization has already been consumed.',
+          'TRANSFER_TOKEN_ALREADY_USED',
+          409
+        );
+      }
+      if (auth.status === 'expired' || new Date(auth.expiresAt).getTime() <= Date.now()) {
+        auth.status = 'expired';
+        auth.updatedAt = new Date().toISOString();
+        throw new GuestTransferError('Guest transfer authorization has expired.', 'TRANSFER_AUTHORIZATION_EXPIRED', 410);
+      }
+
+      const prevCatalog = this.catalogs.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.catalogs.get(params.workspaceId)))
+        : undefined;
+      const prevStore = this.stores.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.stores.get(params.workspaceId)))
+        : undefined;
+      const prevVersion = this.catalogVersions.get(params.workspaceId);
+      const prevAuth = JSON.parse(JSON.stringify(auth));
+      const prevAudit = JSON.parse(JSON.stringify(this.guestTransferAuditLog.get(params.workspaceId) || []));
+
+      try {
+        const currentVersion = prevVersion || 1;
+        const authoritativeStore: StoreProfile = prevStore || {
+          name: `${params.workspaceId} Store`,
+          domain: '',
+          websiteUrl: '',
+          sourceClassification: 'unconfigured',
+          shopifyConnected: false,
+          currency: 'USD',
+          skuCount: 0,
+          catalogCompletenessAvg: 0,
+          truthBoundaryStrictness: 'standard',
+          tier: 'Free Audit',
+          connectors: [],
+        };
+        const subscription = await this.getSubscriptionByWorkspace(params.workspaceId);
+
+        const built = params.buildMergedCatalog({
+          existingCatalog: prevCatalog ?? null,
+          authoritativeStore,
+          subscription,
+          catalogVersionBefore: currentVersion,
+        });
+
+        await this.saveWorkspaceCatalogInternal(params.workspaceId, built.mergedPayload, {
+          expectedVersion: currentVersion,
+        });
+
+        const nextVersion = this.catalogVersions.get(params.workspaceId) || currentVersion + 1;
+        const summary: GuestTransferCommitResult = {
+          ...built.summary,
+          catalogVersion: nextVersion,
+        };
+
+        const nowIso = new Date().toISOString();
+        auth.status = 'committed';
+        auth.conflictStrategy = params.conflictStrategy;
+        auth.committedAt = summary.committedAt || nowIso;
+        auth.resultSummary = JSON.parse(JSON.stringify(summary));
+        auth.updatedAt = nowIso;
+
+        const auditEntry: GuestTransferAuditRecord = {
+          id: `gta_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          transferId: auth.id,
+          workspaceId: params.workspaceId,
+          userId: params.userId,
+          outcome: 'committed',
+          conflictStrategy: params.conflictStrategy,
+          importedCount: built.importedCount,
+          skippedCount: built.skippedCount,
+          conflictsCount: built.conflictsCount,
+          catalogVersionBefore: currentVersion,
+          catalogVersionAfter: nextVersion,
+          details: {
+            renamedCount: summary.renamedCount,
+            preservedSourceClassifications: summary.preservedSourceClassifications,
+            totalWorkspaceProducts: summary.totalWorkspaceProducts,
+          },
+          createdAt: nowIso,
+        };
+        const entries = this.guestTransferAuditLog.get(params.workspaceId) || [];
+        entries.push(auditEntry);
+        this.guestTransferAuditLog.set(params.workspaceId, entries);
+
+        return summary;
+      } catch (err) {
+        // Atomic rollback of in-memory state on any persistence failure
+        if (prevCatalog !== undefined) this.catalogs.set(params.workspaceId, prevCatalog);
+        else this.catalogs.delete(params.workspaceId);
+        if (prevStore !== undefined) this.stores.set(params.workspaceId, prevStore);
+        else this.stores.delete(params.workspaceId);
+        if (prevVersion !== undefined) this.catalogVersions.set(params.workspaceId, prevVersion);
+        else this.catalogVersions.delete(params.workspaceId);
+        this.guestTransferAuthorizations.set(params.authorizationId, prevAuth);
+        this.guestTransferAuditLog.set(params.workspaceId, prevAudit);
+        throw err;
+      }
+    });
+  }
+
+  async recordGuestTransferAudit(record: GuestTransferAuditRecord): Promise<void> {
+    const entries = this.guestTransferAuditLog.get(record.workspaceId) || [];
+    entries.push(JSON.parse(JSON.stringify(record)));
+    this.guestTransferAuditLog.set(record.workspaceId, entries);
+  }
+
+  async getGuestTransferAuditLog(workspaceId: string): Promise<GuestTransferAuditRecord[]> {
+    const entries = this.guestTransferAuditLog.get(workspaceId) || [];
+    return JSON.parse(
+      JSON.stringify(
+        [...entries].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      )
+    );
   }
 }
 

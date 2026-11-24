@@ -356,6 +356,9 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
   let origGetCatalog: typeof apiClient.getCatalog;
   let origRunAudit: typeof apiClient.runAudit;
   let origApproveAction: typeof apiClient.approveAction;
+  let origAuthorizeGuestTransfer: typeof apiClient.authorizeGuestTransfer;
+  let origCommitGuestTransfer: typeof apiClient.commitGuestTransfer;
+  let origGetGuestTransferStatus: typeof apiClient.getGuestTransferStatus;
   let root: Root | null = null;
 
   beforeEach(() => {
@@ -365,6 +368,9 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
     origGetCatalog = apiClient.getCatalog.bind(apiClient);
     origRunAudit = apiClient.runAudit.bind(apiClient);
     origApproveAction = apiClient.approveAction.bind(apiClient);
+    origAuthorizeGuestTransfer = apiClient.authorizeGuestTransfer.bind(apiClient);
+    origCommitGuestTransfer = apiClient.commitGuestTransfer.bind(apiClient);
+    origGetGuestTransferStatus = apiClient.getGuestTransferStatus.bind(apiClient);
 
     const dom = createMinimalDom();
     (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -383,6 +389,9 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
     apiClient.getCatalog = origGetCatalog;
     apiClient.runAudit = origRunAudit;
     apiClient.approveAction = origApproveAction;
+    apiClient.authorizeGuestTransfer = origAuthorizeGuestTransfer;
+    apiClient.commitGuestTransfer = origCommitGuestTransfer;
+    apiClient.getGuestTransferStatus = origGetGuestTransferStatus;
     if (origWindow === undefined) delete (globalThis as any).window;
     else (globalThis as any).window = origWindow;
     if (origDocument === undefined) delete (globalThis as any).document;
@@ -1335,5 +1344,292 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+
+  test('14. Workstream 5: Guest data remains preserved locally on pre-commit network failure, conflict 409, and failed catalog reconciliation', async () => {
+    const storageAdapter = new CatalogStorageAdapter(new MemoryStorageBackend());
+    const guestProd = { ...makeProduct('guest_local_1', 'Guest Preserved Matcha'), sourceClassification: 'public_feed' as const };
+    storageAdapter.save(
+      makeCatalogPayload({
+        storeName: 'Guest Matcha Shop',
+        products: [guestProd],
+        catalogVersion: 1,
+      })
+    );
+
+    let catalogShouldReturnEmpty = false;
+    apiClient.getCatalog = async () => ({
+      workspaceId: 'ws_a',
+      catalog: makeCatalogPayload({
+        storeName: 'Workspace A Store',
+        products: catalogShouldReturnEmpty ? [] : [makeProduct('cloud_1', 'Existing Cloud Item')],
+        catalogVersion: 1,
+      }),
+    });
+
+    // 14a. Network failure before server commit leaves guest catalog + pending checkpoint intact
+    apiClient.authorizeGuestTransfer = async () => ({
+      success: true,
+      transferId: 'gtr_fail_1',
+      transferToken: 'tok_fail_1',
+      idempotencyKey: 'gt_fail_key_1',
+      payloadSha256: 'sha_1',
+      workspaceId: 'ws_a',
+      userId: 'user_a',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      preflight: {
+        incomingProductsCount: 1,
+        incomingVariantsCount: 0,
+        incomingSkusCount: 0,
+        incomingEvidenceCount: 0,
+        existingCloudProductsCount: 1,
+        conflictsCount: 0,
+        conflicts: [],
+        quotaAllowed: true,
+        sourceClassifications: ['public_feed'],
+      },
+    });
+    apiClient.commitGuestTransfer = async () => {
+      throw new Error('ECONNRESET before server commit');
+    };
+    apiClient.getGuestTransferStatus = async () => ({
+      found: true,
+      status: 'pending',
+      idempotencyKey: 'gt_fail_key_1',
+      workspaceId: 'ws_a',
+    });
+
+    const rig = createTestRig(storageAdapter);
+    await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA], isAuthenticated: true });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    assert.equal(rig.getApp().guestTransferEligibility?.hasTransferableData, true);
+
+    await act(async () => {
+      const res = await rig.getApp().transferGuestCatalogToCloud!('abort_on_conflict');
+      assert.equal(res, null);
+      await flushMicrotasks();
+    });
+
+    // Local guest catalog & checkpoint must still exist!
+    const stillLocal = storageAdapter.load();
+    assert.equal(stillLocal.type, 'valid');
+    if (stillLocal.type === 'valid') {
+      assert.deepEqual(stillLocal.envelope.payload.products.map(p => p.id), ['guest_local_1']);
+    }
+    assert.ok(storageAdapter.loadPendingGuestTransfer());
+
+    // 14b. 409 conflict exposes guestTransferConflicts & preserves local guest catalog
+    apiClient.commitGuestTransfer = async () => {
+      const err: any = new Error('Conflict detected');
+      err.status = 409;
+      err.code = 'GUEST_TRANSFER_CONFLICT';
+      err.conflicts = [
+        {
+          productId: 'guest_local_1',
+          incomingTitle: 'Guest Preserved Matcha',
+          existingProductId: 'cloud_1',
+          existingTitle: 'Existing Cloud Item',
+          matchedBy: 'title',
+        },
+      ];
+      throw err;
+    };
+
+    await act(async () => {
+      await rig.getApp().transferGuestCatalogToCloud!('abort_on_conflict');
+      await flushMicrotasks();
+    });
+    assert.equal(rig.getApp().guestTransferConflicts?.length, 1);
+    assert.equal(storageAdapter.load().type, 'valid');
+
+    // 14c. If commit succeeds but subsequent getCatalog verification returns empty (0 products when importedCount > 0), fail closed and keep guest data
+    catalogShouldReturnEmpty = true;
+    apiClient.commitGuestTransfer = async () => ({
+      success: true,
+      transferId: 'gtr_fail_1',
+      workspaceId: 'ws_a',
+      idempotentReplay: false,
+      status: 'committed',
+      conflictStrategy: 'skip_existing',
+      importedCount: 1,
+      skippedCount: 0,
+      renamedCount: 0,
+      conflicts: [],
+      catalogVersion: 2,
+      totalWorkspaceProducts: 2,
+      totalWorkspaceSkus: 2,
+      preservedSourceClassifications: ['public_feed'],
+      committedAt: new Date().toISOString(),
+    });
+    await act(async () => {
+      const res = await rig.getApp().transferGuestCatalogToCloud!('skip_existing');
+      assert.equal(res, null);
+      await flushMicrotasks();
+    });
+    assert.equal(storageAdapter.load().type, 'valid', 'Guest buffer must NOT be cleared if server reconciliation fails');
+  });
+
+  test('15. Workstream 5: Post-commit network drop recovers cleanly via status endpoint and clears local guest buffer only after getCatalog confirmation', async () => {
+    const storageAdapter = new CatalogStorageAdapter(new MemoryStorageBackend());
+    const guestProd = { ...makeProduct('guest_rec_1', 'Guest Recoverable Kettle'), sourceClassification: 'public_feed' as const };
+    storageAdapter.save(
+      makeCatalogPayload({
+        storeName: 'Guest Kettle Shop',
+        products: [guestProd],
+        catalogVersion: 1,
+      })
+    );
+
+    let cloudHasTransferredProd = false;
+    apiClient.getCatalog = async () => ({
+      workspaceId: 'ws_a',
+      catalog: makeCatalogPayload({
+        storeName: 'Cloud Store Alpha',
+        products: cloudHasTransferredProd ? [guestProd] : [],
+        catalogVersion: cloudHasTransferredProd ? 2 : 1,
+      }),
+    });
+
+    apiClient.authorizeGuestTransfer = async (input) => ({
+      success: true,
+      transferId: 'gtr_drop_1',
+      transferToken: 'tok_drop_1',
+      idempotencyKey: input.idempotencyKey || 'gt_drop_1',
+      payloadSha256: 'sha_drop_1',
+      workspaceId: 'ws_a',
+      userId: 'user_a',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      preflight: {
+        incomingProductsCount: 1,
+        incomingVariantsCount: 0,
+        incomingSkusCount: 0,
+        incomingEvidenceCount: 0,
+        existingCloudProductsCount: 0,
+        conflictsCount: 0,
+        conflicts: [],
+        quotaAllowed: true,
+        sourceClassifications: ['public_feed'],
+      },
+    });
+
+    // Server committed the transfer, but HTTP response dropped before client received it
+    apiClient.commitGuestTransfer = async () => {
+      cloudHasTransferredProd = true;
+      throw new Error('504 Gateway Timeout after server commit');
+    };
+    apiClient.getGuestTransferStatus = async (key) => ({
+      found: true,
+      status: 'committed',
+      transferId: 'gtr_drop_1',
+      idempotencyKey: key,
+      workspaceId: 'ws_a',
+      receipt: {
+        success: true,
+        transferId: 'gtr_drop_1',
+        workspaceId: 'ws_a',
+        idempotentReplay: true,
+        status: 'committed',
+        conflictStrategy: 'abort_on_conflict',
+        importedCount: 1,
+        skippedCount: 0,
+        renamedCount: 0,
+        conflicts: [],
+        catalogVersion: 2,
+        totalWorkspaceProducts: 1,
+        totalWorkspaceSkus: 1,
+        preservedSourceClassifications: ['public_feed'],
+        committedAt: new Date().toISOString(),
+      },
+    });
+
+    const rig = createTestRig(storageAdapter);
+    await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA], isAuthenticated: true });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    let receipt: any = null;
+    await act(async () => {
+      receipt = await rig.getApp().transferGuestCatalogToCloud!('abort_on_conflict');
+      await flushMicrotasks();
+    });
+
+    assert.ok(receipt);
+    assert.equal(receipt.transferId, 'gtr_drop_1');
+    assert.equal(receipt.importedCount, 1);
+    assert.deepEqual(rig.getApp().products.map(p => p.id), ['guest_rec_1']);
+    assert.equal(storageAdapter.load().type, 'not_found', 'Local guest data must be cleared once getCatalog positively confirms commit');
+    assert.equal(storageAdapter.loadPendingGuestTransfer(), null);
+  });
+
+  test('16. Workstream 5: Reloading AppProvider with an interrupted pending checkpoint recovers committed transfer automatically', async () => {
+    const storageAdapter = new CatalogStorageAdapter(new MemoryStorageBackend());
+    const guestProd = { ...makeProduct('guest_reload_1', 'Guest Reload Item'), sourceClassification: 'manual_import' as const };
+    storageAdapter.save(
+      makeCatalogPayload({
+        storeName: 'Guest Reload Store',
+        products: [guestProd],
+        catalogVersion: 1,
+      })
+    );
+    storageAdapter.savePendingGuestTransfer({
+      transferId: 'gtr_reload_1',
+      transferToken: 'tok_reload_1',
+      idempotencyKey: 'gt_reload_key_1',
+      payloadSha256: 'sha_reload_1',
+      targetWorkspaceId: 'ws_a',
+      targetUserId: 'user_a',
+      conflictStrategy: 'abort_on_conflict',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      createdAt: new Date().toISOString(),
+      state: 'committing',
+    });
+
+    apiClient.getCatalog = async () => ({
+      workspaceId: 'ws_a',
+      catalog: makeCatalogPayload({
+        storeName: 'Cloud Reloaded Store',
+        products: [guestProd],
+        catalogVersion: 4,
+      }),
+    });
+    apiClient.getGuestTransferStatus = async (key) => ({
+      found: true,
+      status: 'committed',
+      transferId: 'gtr_reload_1',
+      idempotencyKey: key,
+      workspaceId: 'ws_a',
+      receipt: {
+        success: true,
+        transferId: 'gtr_reload_1',
+        workspaceId: 'ws_a',
+        idempotentReplay: true,
+        status: 'committed',
+        conflictStrategy: 'abort_on_conflict',
+        importedCount: 1,
+        skippedCount: 0,
+        renamedCount: 0,
+        conflicts: [],
+        catalogVersion: 4,
+        totalWorkspaceProducts: 1,
+        totalWorkspaceSkus: 1,
+        preservedSourceClassifications: ['manual_import'],
+        committedAt: new Date().toISOString(),
+      },
+    });
+
+    const rig = createTestRig(storageAdapter);
+    await rig.renderWithAuth({ user: userA, activeWorkspace: wsA, workspaces: [wsA], isAuthenticated: true });
+    await act(async () => {
+      await flushMicrotasks(12);
+    });
+
+    assert.deepEqual(rig.getApp().products.map(p => p.id), ['guest_reload_1']);
+    assert.equal(storageAdapter.load().type, 'not_found', 'Reload recovery must verify server catalog and clear guest buffer');
+    assert.equal(storageAdapter.loadPendingGuestTransfer(), null);
+    assert.equal(rig.getApp().guestTransferEligibility, null);
   });
 });

@@ -879,7 +879,8 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         'shopify_webhook_events', 'shopify_oauth_states', 'workspace_business_profiles',
         'ai_visibility_imports', 'ai_visibility_metrics', 'ai_visibility_observation_history',
         'auth_rate_limits', 'password_reset_tokens', 'workspace_operation_leases',
-        'evidence_review_audit_log', 'shopify_product_provenance',
+        'evidence_review_audit_log', 'shopify_product_provenance', 'reviewer_service_principals',
+        'guest_transfer_authorizations', 'guest_transfer_audit_log',
       ];
       const validCols = [
         { table_name: 'variants', column_name: 'price', data_type: 'numeric', numeric_precision: 14, numeric_scale: 2, is_nullable: 'NO', character_maximum_length: null },
@@ -897,6 +898,8 @@ describe('AIXSHOP v1.0 — Remediation Verification Suite (C1-C3, E1-E2, M010-S,
         '014_auth_recovery_and_operation_leases.sql',
         '015_gtin_evidence_trust.sql',
         '016_source_classification_and_domain_cleanup.sql',
+        '017_reviewer_identity_and_registry_trust.sql',
+        '018_guest_transfer_authorizations.sql',
       ];
       const baseConstraints = [
         { source_schema: 'tenant_prod', source_table: 'stores', target_schema: '', target_table: '', constraint_name: 'uq_stores_ws_id', constraint_type: 'u', source_columns: 'workspace_id,id', target_columns: '', is_partial_index: false },

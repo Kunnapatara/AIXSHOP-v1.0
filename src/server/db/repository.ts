@@ -18,10 +18,20 @@ import {
   ProductCandidate,
   EvidencePurpose,
   EvidenceReviewAuditEntry,
+  ExternalVerificationStatus,
+  ReviewerPrincipalType,
   ShopifyProductProvenanceRecord
 } from '../../types';
+import { ReviewerServicePrincipalRecord } from '../security/reviewerAuth';
+import { ExternalRegistryVerificationEvaluation } from '../services/externalRegistryService';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
+import {
+  GuestTransferAuditRecord,
+  GuestTransferAuthorizationRecord,
+  GuestTransferCommitResult,
+  GuestTransferConflictStrategy,
+} from '../../domain/catalog/guestTransfer';
 
 export interface CreateUserData {
   id: string;
@@ -150,6 +160,7 @@ export interface DatabaseRepository {
     expiresAt: string;
     requestedIp?: string;
   }): Promise<void>;
+  invalidatePasswordResetToken(tokenId: string): Promise<void>;
   consumePasswordResetTokenAndUpdatePassword(
     tokenHash: string,
     newPasswordHash: string
@@ -244,21 +255,88 @@ export interface DatabaseRepository {
     id?: string;
   }): Promise<{ evidence: EvidenceDocument; catalogVersion?: number }>;
 
+  getEvidenceDocumentById(
+    workspaceId: string,
+    evidenceId: string
+  ): Promise<{ evidence: EvidenceDocument; productId: string; product?: Product } | null>;
+
   reviewEvidenceDocument(params: {
     workspaceId: string;
     evidenceId: string;
     decision: 'approved' | 'rejected';
     reviewerId: string;
     reviewerRole: string;
+    principalType?: ReviewerPrincipalType;
+    authMethod?: string;
+    claimedReviewerId?: string;
     reason?: string;
-    verificationSource?: 'server_reviewer' | 'external_registry';
+    verificationSource?: 'server_reviewer';
   }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }>;
+
+  recordExternalRegistryVerification(params: {
+    workspaceId: string;
+    evidenceId: string;
+    initiatedByReviewerId: string;
+    initiatedByPrincipalType: ReviewerPrincipalType;
+    initiatedByAuthMethod: string;
+    claimedReviewerId?: string;
+    evaluation: ExternalRegistryVerificationEvaluation;
+  }): Promise<{ evidence: EvidenceDocument; auditEntry: EvidenceReviewAuditEntry; catalogVersion?: number }>;
+
+  getPlatformReviewerGrant(userId: string): Promise<{
+    platformRole: 'none' | 'platform_reviewer';
+    scopes: string[];
+    revokedAt?: string | null;
+  } | null>;
+
+  setPlatformReviewerGrant(params: {
+    userId: string;
+    platformRole: 'none' | 'platform_reviewer';
+    scopes?: string[];
+    revokedAt?: string | null;
+  }): Promise<void>;
+
+  listReviewerServicePrincipals(): Promise<ReviewerServicePrincipalRecord[]>;
+  saveReviewerServicePrincipal(principal: ReviewerServicePrincipalRecord): Promise<ReviewerServicePrincipalRecord>;
+  revokeReviewerServicePrincipal(principalId: string): Promise<void>;
 
   getEvidenceReviewAuditLog(workspaceId: string, evidenceId?: string): Promise<EvidenceReviewAuditEntry[]>;
 
   upsertShopifyProductProvenance(record: ShopifyProductProvenanceRecord): Promise<void>;
   getShopifyProductProvenance(workspaceId: string): Promise<ShopifyProductProvenanceRecord[]>;
   deleteShopifyProductProvenance(workspaceId: string, productId: string): Promise<void>;
+
+  // Guest-to-Cloud Catalog Transfer Authorizations & Audit Trail (Migration 018)
+  createGuestTransferAuthorization(record: GuestTransferAuthorizationRecord): Promise<GuestTransferAuthorizationRecord>;
+  getGuestTransferAuthorizationByTokenHash(tokenHash: string): Promise<GuestTransferAuthorizationRecord | null>;
+  getGuestTransferAuthorizationByIdempotencyKey(
+    workspaceId: string,
+    userId: string,
+    idempotencyKey: string
+  ): Promise<GuestTransferAuthorizationRecord | null>;
+  markGuestTransferAuthorizationExpired(id: string): Promise<void>;
+  commitGuestTransferAtomic(params: {
+    authorizationId: string;
+    workspaceId: string;
+    userId: string;
+    payloadSha256: string;
+    conflictStrategy: GuestTransferConflictStrategy;
+    guestPayload: StoragePayloadV1;
+    buildMergedCatalog: (ctx: {
+      existingCatalog: StoragePayloadV1 | null;
+      authoritativeStore: StoreProfile;
+      subscription: SubscriptionRecord | null;
+      catalogVersionBefore: number;
+    }) => {
+      mergedPayload: StoragePayloadV1;
+      summary: GuestTransferCommitResult;
+      importedCount: number;
+      skippedCount: number;
+      conflictsCount: number;
+    };
+  }): Promise<GuestTransferCommitResult>;
+  recordGuestTransferAudit(record: GuestTransferAuditRecord): Promise<void>;
+  getGuestTransferAuditLog(workspaceId: string): Promise<GuestTransferAuditRecord[]>;
 
   // Billing & Subscriptions
   getSubscriptionByWorkspace(workspaceId: string): Promise<SubscriptionRecord | null>;

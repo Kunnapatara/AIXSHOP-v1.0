@@ -2,6 +2,8 @@ import { isIP } from 'node:net';
 import { Request } from 'express';
 import { getPostgresPoolConfig } from '../db/index';
 import { getEncryptionKey } from '../security/encryption';
+import { validateStripePriceConfiguration } from '../billing/providerAdapter';
+import { validateSmtpConfig } from '../services/emailService';
 
 export interface ProductionConfigValidationResult {
   valid: boolean;
@@ -12,6 +14,8 @@ export interface ProductionConfigValidationResult {
     appUrlValid: boolean;
     encryptionKeyValid: boolean;
     billingConfigValid: boolean;
+    stripePriceIdsValid: boolean;
+    smtpConfigValid: boolean;
     shopifyConfigValid: boolean;
     trustProxyValid: boolean;
     devOverridesDisabled: boolean;
@@ -618,16 +622,25 @@ export function validateProductionConfig(): ProductionConfigValidationResult {
     missingOrInvalid.push('SHOPIFY_TOKEN_ENCRYPTION_KEY (64-char hex / 32-byte key required)');
   }
 
-  // 4. Billing
+  // 4. Billing (Stripe secrets + all 3 authoritative paid tier Price IDs mandatory in production)
   const billingProvider = (process.env.BILLING_PROVIDER || '').trim().toLowerCase();
   const billingDevDisabled = billingProvider !== 'sandbox';
-  const hasStripeSecrets = Boolean(process.env.STRIPE_SECRET_KEY?.trim() && process.env.STRIPE_WEBHOOK_SECRET?.trim());
-  const billingConfigValid = isProd ? (billingDevDisabled && hasStripeSecrets) : true;
+  const stripeSecret = process.env.STRIPE_SECRET_KEY?.trim() || '';
+  const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET?.trim() || '';
+  const hasStripeSecrets = Boolean(stripeSecret && stripeWebhookSecret);
+  const stripePriceCheck = validateStripePriceConfiguration();
+  const stripePriceIdsValid = isProd ? stripePriceCheck.valid : true;
+  const billingConfigValid = isProd ? (billingDevDisabled && hasStripeSecrets && stripePriceIdsValid) : true;
   if (isProd && !billingDevDisabled) {
     missingOrInvalid.push('BILLING_PROVIDER (sandbox prohibited in production)');
   }
   if (isProd && !hasStripeSecrets) {
     missingOrInvalid.push('STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET');
+  }
+  if (isProd && !stripePriceCheck.valid) {
+    for (const item of stripePriceCheck.missingOrInvalid) {
+      missingOrInvalid.push(item);
+    }
   }
 
   // 5. Shopify (validate key/secret pair and production Shopify URL configuration when Shopify is enabled or URLs overridden)
@@ -672,6 +685,19 @@ export function validateProductionConfig(): ProductionConfigValidationResult {
     missingOrInvalid.push('AUTH_RATE_LIMIT_FAILURE_MODE');
   }
 
+  // 9. SMTP transactional email readiness (mandatory and validated in production; validated if configured in dev/test)
+  const smtpCheck = validateSmtpConfig({ isProd });
+  const smtpConfigValid = isProd ? smtpCheck.valid : (!smtpCheck.configured || smtpCheck.valid);
+  if (isProd && !smtpCheck.valid) {
+    for (const item of smtpCheck.missingOrInvalid) {
+      missingOrInvalid.push(item);
+    }
+  } else if (!isProd && smtpCheck.configured && !smtpCheck.valid) {
+    for (const item of smtpCheck.missingOrInvalid) {
+      missingOrInvalid.push(item);
+    }
+  }
+
   return {
     valid: missingOrInvalid.length === 0,
     environment: env,
@@ -681,6 +707,8 @@ export function validateProductionConfig(): ProductionConfigValidationResult {
       appUrlValid,
       encryptionKeyValid,
       billingConfigValid,
+      stripePriceIdsValid,
+      smtpConfigValid,
       shopifyConfigValid,
       trustProxyValid,
       devOverridesDisabled,
