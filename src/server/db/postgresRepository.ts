@@ -1117,6 +1117,18 @@ export class PostgresRepository implements DatabaseRepository {
   }
 
   async saveStoreProfile(workspaceId: string, profile: StoreProfile): Promise<StoreProfile> {
+    return this.saveStoreProfileWithClient(
+      { query: (text: string, params?: any[]) => this.query(text, params) },
+      workspaceId,
+      profile
+    );
+  }
+
+  private async saveStoreProfileWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    workspaceId: string,
+    profile: StoreProfile
+  ): Promise<StoreProfile> {
     const storeId = `store_${workspaceId}`;
     const cleanSkuLimit = (typeof profile.skuLimit === 'number' && Number.isInteger(profile.skuLimit) && profile.skuLimit >= 0)
       ? profile.skuLimit
@@ -1152,7 +1164,7 @@ export class PostgresRepository implements DatabaseRepository {
         updated_at = NOW()
       RETURNING name, domain, website_url AS "websiteUrl", platform, source_classification AS "sourceClassification", source_metadata_json AS "sourceMetadataJson", evidence_coverage_avg AS "evidenceCoverageAvg", last_audit_date AS "lastAuditDate", shopify_connected AS "shopifyConnected", shopify_shop_domain AS "shopifyShopDomain", currency, sku_count AS "skuCount", sku_limit AS "skuLimit", catalog_completeness_avg AS "catalogCompletenessAvg", truth_boundary_strictness AS "truthBoundaryStrictness", tier, connectors_json AS "connectorsJson"
     `;
-    const res = await this.query(query, [
+    const res = await queryable.query(query, [
       storeId,
       workspaceId,
       profile.name,
@@ -2025,6 +2037,102 @@ export class PostgresRepository implements DatabaseRepository {
     });
   }
 
+  private async lockStoreAndLoadCatalogForUpdate(
+    client: PoolClient,
+    workspaceId: string,
+    options: { createStoreIfMissing?: boolean } = {}
+  ): Promise<{ storeId: string; authoritativeStore: StoreProfile; catalog: StoragePayloadV1 }> {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
+    const storeId = `store_${workspaceId}`;
+
+    // 1. Consistent lock order: Acquire row-level lock on stores table first
+    let storeRes = await client.query<{
+      id: string;
+      tier: string;
+      sku_limit: number | null;
+      name: string;
+      domain: string;
+      website_url?: string;
+      platform?: string | null;
+      source_classification?: any;
+      source_metadata_json?: any;
+      evidence_coverage_avg?: number | null;
+      last_audit_date?: string | null;
+      shopify_connected?: boolean;
+      shopify_shop_domain?: string | null;
+      currency: string;
+      sku_count: number;
+      catalog_completeness_avg: number;
+      truth_boundary_strictness: string;
+      connectors_json: any;
+      catalog_version?: number;
+    }>(
+      `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+       FROM stores
+       WHERE workspace_id = $1
+       FOR UPDATE`,
+      [workspaceId]
+    );
+
+    if (storeRes.rows.length === 0 && options.createStoreIfMissing) {
+      await client.query(
+        `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING`,
+        [storeId, workspaceId, `${workspaceId} Store`, '', 'USD']
+      );
+      storeRes = await client.query(
+        `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
+         FROM stores
+         WHERE workspace_id = $1
+         FOR UPDATE`,
+        [workspaceId]
+      );
+    }
+
+    if (storeRes.rows.length === 0) {
+      throw new Error(`Workspace ${workspaceId} catalog not found`);
+    }
+
+    const lockedRow = storeRes.rows[0];
+    const lockedDomain = lockedRow.domain ?? '';
+    const lockedMeta = lockedRow.source_metadata_json
+      ? (typeof lockedRow.source_metadata_json === 'string' ? JSON.parse(lockedRow.source_metadata_json) : lockedRow.source_metadata_json)
+      : undefined;
+    const authoritativeStore: StoreProfile = {
+      name: lockedRow.name || 'Store',
+      domain: lockedDomain,
+      websiteUrl: lockedRow.website_url ?? lockedDomain,
+      ...(lockedRow.platform ? { platform: lockedRow.platform } : {}),
+      sourceClassification: lockedRow.source_classification || (lockedRow.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
+      ...(lockedMeta && Object.keys(lockedMeta).length > 0 ? { sourceMetadata: lockedMeta } : {}),
+      shopifyConnected: Boolean(lockedRow.shopify_connected),
+      ...(lockedRow.shopify_shop_domain ? { shopifyShopDomain: lockedRow.shopify_shop_domain } : {}),
+      currency: lockedRow.currency || 'USD',
+      skuCount: lockedRow.sku_count || 0,
+      catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
+      ...(typeof lockedRow.evidence_coverage_avg === 'number' && !isNaN(lockedRow.evidence_coverage_avg)
+        ? { evidenceCoverageAvg: lockedRow.evidence_coverage_avg }
+        : {}),
+      ...(lockedRow.last_audit_date ? { lastAuditDate: lockedRow.last_audit_date } : {}),
+      truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
+      tier: (lockedRow.tier || 'Free Audit') as any,
+      skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
+      connectors: typeof lockedRow.connectors_json === 'string' ? JSON.parse(lockedRow.connectors_json) : (lockedRow.connectors_json || []),
+    };
+
+    // 2. Read latest catalog state using that same transaction client, AFTER acquiring the lock
+    const catalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
+    if (!catalog) {
+      throw new Error(`Workspace ${workspaceId} catalog not found`);
+    }
+    if (lockedRow.catalog_version !== undefined) {
+      catalog.catalogVersion = Number(lockedRow.catalog_version);
+    }
+
+    return { storeId, authoritativeStore, catalog };
+  }
+
   private async mutateCatalogUnderLock<T>(
     workspaceId: string,
     mutator: (
@@ -2034,93 +2142,11 @@ export class PostgresRepository implements DatabaseRepository {
     options: { createStoreIfMissing?: boolean } = {}
   ): Promise<{ result: T; catalogVersion?: number }> {
     return this.withTransaction(async (client) => {
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_cat'), hashtext($1))`, [workspaceId]);
-      const storeId = `store_${workspaceId}`;
-
-      // 1. Consistent lock order: Acquire row-level lock on stores table first
-      let storeRes = await client.query<{
-        id: string;
-        tier: string;
-        sku_limit: number | null;
-        name: string;
-        domain: string;
-        website_url?: string;
-        platform?: string | null;
-        source_classification?: any;
-        source_metadata_json?: any;
-        evidence_coverage_avg?: number | null;
-        last_audit_date?: string | null;
-        shopify_connected?: boolean;
-        shopify_shop_domain?: string | null;
-        currency: string;
-        sku_count: number;
-        catalog_completeness_avg: number;
-        truth_boundary_strictness: string;
-        connectors_json: any;
-        catalog_version?: number;
-      }>(
-        `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
-         FROM stores
-         WHERE workspace_id = $1
-         FOR UPDATE`,
-        [workspaceId]
+      const { storeId, authoritativeStore, catalog } = await this.lockStoreAndLoadCatalogForUpdate(
+        client,
+        workspaceId,
+        options
       );
-
-      if (storeRes.rows.length === 0 && options.createStoreIfMissing) {
-        await client.query(
-          `INSERT INTO stores (id, workspace_id, name, domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, tier, connectors_json, website_url, source_classification, shopify_connected, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, 0, 0, 'standard', 'Free Audit', '[]'::jsonb, '', 'unconfigured', FALSE, NOW(), NOW())
-           ON CONFLICT (id) DO NOTHING`,
-          [storeId, workspaceId, `${workspaceId} Store`, '', 'USD']
-        );
-        storeRes = await client.query(
-          `SELECT id, tier, sku_limit, name, domain, website_url, platform, source_classification, source_metadata_json, evidence_coverage_avg, last_audit_date, shopify_connected, shopify_shop_domain, currency, sku_count, catalog_completeness_avg, truth_boundary_strictness, connectors_json, catalog_version
-           FROM stores
-           WHERE workspace_id = $1
-           FOR UPDATE`,
-          [workspaceId]
-        );
-      }
-
-      if (storeRes.rows.length === 0) {
-        throw new Error(`Workspace ${workspaceId} catalog not found`);
-      }
-
-      const lockedRow = storeRes.rows[0];
-      const lockedDomain = lockedRow.domain ?? '';
-      const lockedMeta = lockedRow.source_metadata_json
-        ? (typeof lockedRow.source_metadata_json === 'string' ? JSON.parse(lockedRow.source_metadata_json) : lockedRow.source_metadata_json)
-        : undefined;
-      const authoritativeStore: StoreProfile = {
-        name: lockedRow.name || 'Store',
-        domain: lockedDomain,
-        websiteUrl: lockedRow.website_url ?? lockedDomain,
-        ...(lockedRow.platform ? { platform: lockedRow.platform } : {}),
-        sourceClassification: lockedRow.source_classification || (lockedRow.shopify_connected ? 'shopify_oauth' : 'unconfigured'),
-        ...(lockedMeta && Object.keys(lockedMeta).length > 0 ? { sourceMetadata: lockedMeta } : {}),
-        shopifyConnected: Boolean(lockedRow.shopify_connected),
-        ...(lockedRow.shopify_shop_domain ? { shopifyShopDomain: lockedRow.shopify_shop_domain } : {}),
-        currency: lockedRow.currency || 'USD',
-        skuCount: lockedRow.sku_count || 0,
-        catalogCompletenessAvg: lockedRow.catalog_completeness_avg || 0,
-        ...(typeof lockedRow.evidence_coverage_avg === 'number' && !isNaN(lockedRow.evidence_coverage_avg)
-          ? { evidenceCoverageAvg: lockedRow.evidence_coverage_avg }
-          : {}),
-        ...(lockedRow.last_audit_date ? { lastAuditDate: lockedRow.last_audit_date } : {}),
-        truthBoundaryStrictness: (lockedRow.truth_boundary_strictness || 'standard') as any,
-        tier: (lockedRow.tier || 'Free Audit') as any,
-        skuLimit: lockedRow.sku_limit !== null ? lockedRow.sku_limit : undefined,
-        connectors: typeof lockedRow.connectors_json === 'string' ? JSON.parse(lockedRow.connectors_json) : (lockedRow.connectors_json || []),
-      };
-
-      // 2. Read latest catalog state using that same transaction client, AFTER acquiring the lock
-      const catalog = await this.loadCatalogRows(client, workspaceId, authoritativeStore);
-      if (!catalog) {
-        throw new Error(`Workspace ${workspaceId} catalog not found`);
-      }
-      if (lockedRow.catalog_version !== undefined) {
-        catalog.catalogVersion = Number(lockedRow.catalog_version);
-      }
 
       // 3. Apply the requested mutation to the latest authoritative state
       const { nextCatalog, result } = await mutator(catalog, authoritativeStore);
@@ -3832,6 +3858,20 @@ export class PostgresRepository implements DatabaseRepository {
     workspaceId: string,
     updates: Partial<import('../shopify/types').ShopifySyncRunRecord>
   ): Promise<import('../shopify/types').ShopifySyncRunRecord> {
+    return this.updateShopifySyncRunWithClient(
+      { query: (text: string, params?: any[]) => this.query(text, params) },
+      id,
+      workspaceId,
+      updates
+    );
+  }
+
+  private async updateShopifySyncRunWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    id: string,
+    workspaceId: string,
+    updates: Partial<import('../shopify/types').ShopifySyncRunRecord>
+  ): Promise<import('../shopify/types').ShopifySyncRunRecord> {
     const setClauses: string[] = ['updated_at = NOW()'];
     const params: any[] = [id, workspaceId];
 
@@ -3888,7 +3928,7 @@ export class PostgresRepository implements DatabaseRepository {
       setClauses.push(`pagination_metadata_json = $${params.length}::jsonb`);
     }
 
-    const res = await this.query<any>(
+    const res = await queryable.query(
       `UPDATE shopify_sync_runs
        SET ${setClauses.join(', ')}
        WHERE id = $1 AND workspace_id = $2
@@ -4084,6 +4124,26 @@ export class PostgresRepository implements DatabaseRepository {
     error?: string,
     leaseOwner?: string
   ): Promise<void> {
+    return this.updateShopifyWebhookEventStatusWithClient(
+      { query: (text: string, params?: any[]) => this.query(text, params) },
+      eventId,
+      shopDomain,
+      topic,
+      status,
+      error,
+      leaseOwner
+    );
+  }
+
+  private async updateShopifyWebhookEventStatusWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    eventId: string,
+    shopDomain: string,
+    topic: string,
+    status: 'processing' | 'processed' | 'failed' | 'ignored',
+    error?: string,
+    leaseOwner?: string
+  ): Promise<void> {
     const params: any[] = [shopDomain, topic, eventId, status, error || null];
     let whereClause = 'WHERE shop_domain = $1 AND topic = $2 AND event_id = $3';
     if (leaseOwner) {
@@ -4097,7 +4157,7 @@ export class PostgresRepository implements DatabaseRepository {
         )`;
     }
 
-    const res = await this.query(
+    const res = await queryable.query(
       `UPDATE shopify_webhook_events
        SET status = $4,
            last_error = $5,
@@ -5872,8 +5932,11 @@ export class PostgresRepository implements DatabaseRepository {
     }));
   }
 
-  async upsertShopifyProductProvenance(record: ShopifyProductProvenanceRecord): Promise<void> {
-    await this.query(
+  private async upsertShopifyProductProvenanceWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    record: ShopifyProductProvenanceRecord
+  ): Promise<void> {
+    await queryable.query(
       `INSERT INTO shopify_product_provenance (
          workspace_id, product_id, shop_domain, shopify_product_id, shopify_gid,
          is_gift_card, source_type, shopify_updated_at, verified_at, created_at, updated_at
@@ -5901,6 +5964,13 @@ export class PostgresRepository implements DatabaseRepository {
     );
   }
 
+  async upsertShopifyProductProvenance(record: ShopifyProductProvenanceRecord): Promise<void> {
+    await this.upsertShopifyProductProvenanceWithClient(
+      { query: (text: string, params?: any[]) => this.query(text, params) },
+      record
+    );
+  }
+
   async getShopifyProductProvenance(workspaceId: string): Promise<ShopifyProductProvenanceRecord[]> {
     return this.getShopifyProductProvenanceWithClient(
       { query: (text: string, params?: any[]) => this.query(text, params) },
@@ -5908,11 +5978,183 @@ export class PostgresRepository implements DatabaseRepository {
     );
   }
 
-  async deleteShopifyProductProvenance(workspaceId: string, productId: string): Promise<void> {
-    await this.query(
+  private async deleteShopifyProductProvenanceWithClient(
+    queryable: { query: (text: string, params?: any[]) => Promise<any> },
+    workspaceId: string,
+    productId: string
+  ): Promise<void> {
+    await queryable.query(
       `DELETE FROM shopify_product_provenance WHERE workspace_id = $1 AND product_id = $2`,
       [workspaceId, productId]
     );
+  }
+
+  async deleteShopifyProductProvenance(workspaceId: string, productId: string): Promise<void> {
+    await this.deleteShopifyProductProvenanceWithClient(
+      { query: (text: string, params?: any[]) => this.query(text, params) },
+      workspaceId,
+      productId
+    );
+  }
+
+  async commitShopifyCatalogSyncAtomic(params: {
+    workspaceId: string;
+    syncRunId: string;
+    syncRunUpdates: Partial<import('../shopify/types').ShopifySyncRunRecord>;
+    buildNextCatalog: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{
+      nextCatalog?: StoragePayloadV1;
+      provenanceRecords: ShopifyProductProvenanceRecord[];
+    }> | {
+      nextCatalog?: StoragePayloadV1;
+      provenanceRecords: ShopifyProductProvenanceRecord[];
+    };
+  }): Promise<{
+    syncRun: import('../shopify/types').ShopifySyncRunRecord;
+    catalogVersion?: number;
+  }> {
+    return this.withTransaction(async (client) => {
+      const { storeId, authoritativeStore, catalog } = await this.lockStoreAndLoadCatalogForUpdate(
+        client,
+        params.workspaceId,
+        { createStoreIfMissing: true }
+      );
+
+      const { nextCatalog, provenanceRecords } = await params.buildNextCatalog(catalog, authoritativeStore);
+
+      let persistedVersion: number | undefined = catalog.catalogVersion;
+      if (nextCatalog) {
+        const proposedSkus = countCatalogSkus(nextCatalog.products);
+        const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
+        if (!quotaCheck.allowed) {
+          throw new PlanQuotaExceededError(quotaCheck);
+        }
+
+        persistedVersion = await this.saveCatalogRows(client, params.workspaceId, nextCatalog, storeId, authoritativeStore);
+        nextCatalog.catalogVersion = persistedVersion;
+      }
+
+      for (const provRecord of provenanceRecords) {
+        await this.upsertShopifyProductProvenanceWithClient(client, provRecord);
+      }
+
+      const syncRun = await this.updateShopifySyncRunWithClient(
+        client,
+        params.syncRunId,
+        params.workspaceId,
+        params.syncRunUpdates
+      );
+
+      return { syncRun, catalogVersion: persistedVersion };
+    });
+  }
+
+  async commitShopifyWebhookMutationAtomic<T = void>(params: {
+    workspaceId: string;
+    shopDomain: string;
+    topic: string;
+    eventId: string;
+    leaseOwner?: string;
+    defaultWebhookStatus: 'processed' | 'ignored';
+    applyMutation: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile,
+      subscription: SubscriptionRecord | null
+    ) => Promise<{
+      nextCatalog?: StoragePayloadV1;
+      nextStoreProfile?: StoreProfile;
+      provenanceUpserts?: ShopifyProductProvenanceRecord[];
+      provenanceDeletes?: string[];
+      disconnectShopifyConnection?: boolean;
+      webhookStatus?: 'processed' | 'ignored';
+      webhookError?: string;
+      result: T;
+    }> | {
+      nextCatalog?: StoragePayloadV1;
+      nextStoreProfile?: StoreProfile;
+      provenanceUpserts?: ShopifyProductProvenanceRecord[];
+      provenanceDeletes?: string[];
+      disconnectShopifyConnection?: boolean;
+      webhookStatus?: 'processed' | 'ignored';
+      webhookError?: string;
+      result: T;
+    };
+  }): Promise<{
+    result: T;
+    catalogVersion?: number;
+  }> {
+    return this.withTransaction(async (client) => {
+      const { storeId, authoritativeStore, catalog } = await this.lockStoreAndLoadCatalogForUpdate(
+        client,
+        params.workspaceId,
+        { createStoreIfMissing: true }
+      );
+
+      const subRes = await client.query<any>(
+        `SELECT id, workspace_id AS "workspaceId", provider, customer_id AS "customerId", subscription_id AS "subscriptionId",
+                tier, status, current_period_start AS "currentPeriodStart", current_period_end AS "currentPeriodEnd",
+                cancel_at_period_end AS "cancelAtPeriodEnd", last_event_created AS "lastEventCreated",
+                created_at AS "createdAt", updated_at AS "updatedAt"
+         FROM subscriptions WHERE workspace_id = $1 LIMIT 1`,
+        [params.workspaceId]
+      );
+      const subscription: SubscriptionRecord | null = subRes.rows[0] || null;
+
+      const mutation = await params.applyMutation(catalog, authoritativeStore, subscription);
+
+      let persistedVersion: number | undefined = catalog.catalogVersion;
+      if (mutation.disconnectShopifyConnection) {
+        await client.query(
+          `UPDATE shopify_connections
+           SET status = 'disconnected',
+               access_token_encrypted = '',
+               refresh_token_encrypted = NULL,
+               updated_at = NOW()
+           WHERE workspace_id = $1`,
+          [params.workspaceId]
+        );
+        if (mutation.nextStoreProfile) {
+          await this.saveStoreProfileWithClient(client, params.workspaceId, mutation.nextStoreProfile);
+        }
+      } else if (mutation.nextCatalog) {
+        const proposedSkus = countCatalogSkus(mutation.nextCatalog.products);
+        const quotaCheck = checkPlanQuota(authoritativeStore, [], proposedSkus);
+        if (!quotaCheck.allowed) {
+          throw new PlanQuotaExceededError(quotaCheck);
+        }
+
+        persistedVersion = await this.saveCatalogRows(
+          client,
+          params.workspaceId,
+          mutation.nextCatalog,
+          storeId,
+          authoritativeStore
+        );
+        mutation.nextCatalog.catalogVersion = persistedVersion;
+      }
+
+      for (const provRecord of mutation.provenanceUpserts || []) {
+        await this.upsertShopifyProductProvenanceWithClient(client, provRecord);
+      }
+
+      for (const productId of mutation.provenanceDeletes || []) {
+        await this.deleteShopifyProductProvenanceWithClient(client, params.workspaceId, productId);
+      }
+
+      await this.updateShopifyWebhookEventStatusWithClient(
+        client,
+        params.eventId,
+        params.shopDomain,
+        params.topic,
+        mutation.webhookStatus ?? params.defaultWebhookStatus,
+        mutation.webhookError,
+        params.leaseOwner
+      );
+
+      return { result: mutation.result, catalogVersion: persistedVersion };
+    });
   }
 
   private mapGuestTransferAuthRow(r: any): GuestTransferAuthorizationRecord {

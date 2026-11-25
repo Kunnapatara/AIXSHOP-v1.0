@@ -2843,6 +2843,245 @@ export class MemoryRepository implements DatabaseRepository {
     }
   }
 
+  async commitShopifyCatalogSyncAtomic(params: {
+    workspaceId: string;
+    syncRunId: string;
+    syncRunUpdates: Partial<import('../shopify/types').ShopifySyncRunRecord>;
+    buildNextCatalog: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{
+      nextCatalog?: StoragePayloadV1;
+      provenanceRecords: ShopifyProductProvenanceRecord[];
+    }> | {
+      nextCatalog?: StoragePayloadV1;
+      provenanceRecords: ShopifyProductProvenanceRecord[];
+    };
+  }): Promise<{
+    syncRun: import('../shopify/types').ShopifySyncRunRecord;
+    catalogVersion?: number;
+  }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      if (!this.workspaces.has(params.workspaceId)) {
+        throw new Error(`Workspace ${params.workspaceId} catalog not found`);
+      }
+
+      const prevCatalog = this.catalogs.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.catalogs.get(params.workspaceId)))
+        : undefined;
+      const prevStore = this.stores.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.stores.get(params.workspaceId)))
+        : undefined;
+      const prevVersion = this.catalogVersions.get(params.workspaceId);
+      const prevProvMap = this.shopifyProductProvenance.get(params.workspaceId);
+      const prevProvEntries = prevProvMap
+        ? new Map<string, ShopifyProductProvenanceRecord>(
+            Array.from(prevProvMap.entries()).map(([k, v]) => [k, JSON.parse(JSON.stringify(v))])
+          )
+        : undefined;
+      const prevSyncRun = this.shopifySyncRuns.get(params.syncRunId)
+        ? JSON.parse(JSON.stringify(this.shopifySyncRuns.get(params.syncRunId)))
+        : undefined;
+
+      try {
+        if (!this.stores.has(params.workspaceId)) {
+          this.stores.set(params.workspaceId, {
+            name: `${params.workspaceId} Store`,
+            domain: '',
+            websiteUrl: '',
+            sourceClassification: 'unconfigured',
+            shopifyConnected: false,
+            currency: 'USD',
+            skuCount: 0,
+            catalogCompletenessAvg: 0,
+            truthBoundaryStrictness: 'standard',
+            tier: 'Free Audit',
+            connectors: [],
+          });
+        }
+        const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
+        if (!catalog) {
+          throw new Error(`Workspace ${params.workspaceId} catalog not found`);
+        }
+        const currentVersion = this.catalogVersions.get(params.workspaceId) || 1;
+        catalog.catalogVersion = currentVersion;
+        const authoritativeStore = this.stores.get(params.workspaceId) || catalog.storeProfile;
+
+        const { nextCatalog, provenanceRecords } = await params.buildNextCatalog(catalog, authoritativeStore);
+        if (nextCatalog) {
+          if (nextCatalog.catalogVersion === undefined) {
+            nextCatalog.catalogVersion = currentVersion;
+          }
+          await this.saveWorkspaceCatalogInternal(params.workspaceId, nextCatalog);
+        }
+
+        for (const provRecord of provenanceRecords) {
+          await this.upsertShopifyProductProvenance(provRecord);
+        }
+
+        const syncRun = await this.updateShopifySyncRun(
+          params.syncRunId,
+          params.workspaceId,
+          params.syncRunUpdates
+        );
+
+        return {
+          syncRun,
+          catalogVersion: this.catalogVersions.get(params.workspaceId) || currentVersion,
+        };
+      } catch (err) {
+        if (prevCatalog !== undefined) this.catalogs.set(params.workspaceId, prevCatalog);
+        else this.catalogs.delete(params.workspaceId);
+        if (prevStore !== undefined) this.stores.set(params.workspaceId, prevStore);
+        else this.stores.delete(params.workspaceId);
+        if (prevVersion !== undefined) this.catalogVersions.set(params.workspaceId, prevVersion);
+        else this.catalogVersions.delete(params.workspaceId);
+        if (prevProvEntries !== undefined) this.shopifyProductProvenance.set(params.workspaceId, prevProvEntries);
+        else this.shopifyProductProvenance.delete(params.workspaceId);
+        if (prevSyncRun !== undefined) this.shopifySyncRuns.set(params.syncRunId, prevSyncRun);
+        throw err;
+      }
+    });
+  }
+
+  async commitShopifyWebhookMutationAtomic<T = void>(params: {
+    workspaceId: string;
+    shopDomain: string;
+    topic: string;
+    eventId: string;
+    leaseOwner?: string;
+    defaultWebhookStatus: 'processed' | 'ignored';
+    applyMutation: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile,
+      subscription: SubscriptionRecord | null
+    ) => Promise<{
+      nextCatalog?: StoragePayloadV1;
+      nextStoreProfile?: StoreProfile;
+      provenanceUpserts?: ShopifyProductProvenanceRecord[];
+      provenanceDeletes?: string[];
+      disconnectShopifyConnection?: boolean;
+      webhookStatus?: 'processed' | 'ignored';
+      webhookError?: string;
+      result: T;
+    }> | {
+      nextCatalog?: StoragePayloadV1;
+      nextStoreProfile?: StoreProfile;
+      provenanceUpserts?: ShopifyProductProvenanceRecord[];
+      provenanceDeletes?: string[];
+      disconnectShopifyConnection?: boolean;
+      webhookStatus?: 'processed' | 'ignored';
+      webhookError?: string;
+      result: T;
+    };
+  }): Promise<{
+    result: T;
+    catalogVersion?: number;
+  }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      if (!this.workspaces.has(params.workspaceId)) {
+        throw new Error(`Workspace ${params.workspaceId} catalog not found`);
+      }
+
+      const webhookKey = `${params.shopDomain}:${params.topic}:${params.eventId}`;
+      const prevCatalog = this.catalogs.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.catalogs.get(params.workspaceId)))
+        : undefined;
+      const prevStore = this.stores.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.stores.get(params.workspaceId)))
+        : undefined;
+      const prevVersion = this.catalogVersions.get(params.workspaceId);
+      const prevProvMap = this.shopifyProductProvenance.get(params.workspaceId);
+      const prevProvEntries = prevProvMap
+        ? new Map<string, ShopifyProductProvenanceRecord>(
+            Array.from(prevProvMap.entries()).map(([k, v]) => [k, JSON.parse(JSON.stringify(v))])
+          )
+        : undefined;
+      const prevConnection = this.shopifyConnections.get(params.workspaceId)
+        ? JSON.parse(JSON.stringify(this.shopifyConnections.get(params.workspaceId)))
+        : undefined;
+      const prevWebhookEvent = this.shopifyWebhookEvents.get(webhookKey)
+        ? JSON.parse(JSON.stringify(this.shopifyWebhookEvents.get(webhookKey)))
+        : undefined;
+
+      try {
+        if (!this.stores.has(params.workspaceId)) {
+          this.stores.set(params.workspaceId, {
+            name: `${params.workspaceId} Store`,
+            domain: '',
+            websiteUrl: '',
+            sourceClassification: 'unconfigured',
+            shopifyConnected: false,
+            currency: 'USD',
+            skuCount: 0,
+            catalogCompletenessAvg: 0,
+            truthBoundaryStrictness: 'standard',
+            tier: 'Free Audit',
+            connectors: [],
+          });
+        }
+        const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
+        if (!catalog) {
+          throw new Error(`Workspace ${params.workspaceId} catalog not found`);
+        }
+        const currentVersion = this.catalogVersions.get(params.workspaceId) || 1;
+        catalog.catalogVersion = currentVersion;
+        const authoritativeStore = this.stores.get(params.workspaceId) || catalog.storeProfile;
+        const subscription = await this.getSubscriptionByWorkspace(params.workspaceId);
+
+        const mutation = await params.applyMutation(catalog, authoritativeStore, subscription);
+
+        if (mutation.disconnectShopifyConnection) {
+          await this.deleteShopifyConnection(params.workspaceId);
+          if (mutation.nextStoreProfile) {
+            await this.saveStoreProfile(params.workspaceId, mutation.nextStoreProfile);
+          }
+        } else if (mutation.nextCatalog) {
+          if (mutation.nextCatalog.catalogVersion === undefined) {
+            mutation.nextCatalog.catalogVersion = currentVersion;
+          }
+          await this.saveWorkspaceCatalogInternal(params.workspaceId, mutation.nextCatalog);
+        }
+
+        for (const provRecord of mutation.provenanceUpserts || []) {
+          await this.upsertShopifyProductProvenance(provRecord);
+        }
+
+        for (const productId of mutation.provenanceDeletes || []) {
+          await this.deleteShopifyProductProvenance(params.workspaceId, productId);
+        }
+
+        await this.updateShopifyWebhookEventStatus(
+          params.eventId,
+          params.shopDomain,
+          params.topic,
+          mutation.webhookStatus ?? params.defaultWebhookStatus,
+          mutation.webhookError,
+          params.leaseOwner
+        );
+
+        return {
+          result: mutation.result,
+          catalogVersion: this.catalogVersions.get(params.workspaceId) || currentVersion,
+        };
+      } catch (err) {
+        if (prevCatalog !== undefined) this.catalogs.set(params.workspaceId, prevCatalog);
+        else this.catalogs.delete(params.workspaceId);
+        if (prevStore !== undefined) this.stores.set(params.workspaceId, prevStore);
+        else this.stores.delete(params.workspaceId);
+        if (prevVersion !== undefined) this.catalogVersions.set(params.workspaceId, prevVersion);
+        else this.catalogVersions.delete(params.workspaceId);
+        if (prevProvEntries !== undefined) this.shopifyProductProvenance.set(params.workspaceId, prevProvEntries);
+        else this.shopifyProductProvenance.delete(params.workspaceId);
+        if (prevConnection !== undefined) this.shopifyConnections.set(params.workspaceId, prevConnection);
+        else this.shopifyConnections.delete(params.workspaceId);
+        if (prevWebhookEvent !== undefined) this.shopifyWebhookEvents.set(webhookKey, prevWebhookEvent);
+        else this.shopifyWebhookEvents.delete(webhookKey);
+        throw err;
+      }
+    });
+  }
+
   async createGuestTransferAuthorization(
     record: GuestTransferAuthorizationRecord
   ): Promise<GuestTransferAuthorizationRecord> {

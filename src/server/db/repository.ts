@@ -443,6 +443,58 @@ export interface DatabaseRepository {
     error?: string,
     leaseOwner?: string
   ): Promise<void>;
+  commitShopifyCatalogSyncAtomic(params: {
+    workspaceId: string;
+    syncRunId: string;
+    syncRunUpdates: Partial<import('../shopify/types').ShopifySyncRunRecord>;
+    buildNextCatalog: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile
+    ) => Promise<{
+      nextCatalog?: StoragePayloadV1;
+      provenanceRecords: ShopifyProductProvenanceRecord[];
+    }> | {
+      nextCatalog?: StoragePayloadV1;
+      provenanceRecords: ShopifyProductProvenanceRecord[];
+    };
+  }): Promise<{
+    syncRun: import('../shopify/types').ShopifySyncRunRecord;
+    catalogVersion?: number;
+  }>;
+  commitShopifyWebhookMutationAtomic<T = void>(params: {
+    workspaceId: string;
+    shopDomain: string;
+    topic: string;
+    eventId: string;
+    leaseOwner?: string;
+    defaultWebhookStatus: 'processed' | 'ignored';
+    applyMutation: (
+      catalog: StoragePayloadV1,
+      authoritativeStore: StoreProfile,
+      subscription: SubscriptionRecord | null
+    ) => Promise<{
+      nextCatalog?: StoragePayloadV1;
+      nextStoreProfile?: StoreProfile;
+      provenanceUpserts?: ShopifyProductProvenanceRecord[];
+      provenanceDeletes?: string[];
+      disconnectShopifyConnection?: boolean;
+      webhookStatus?: 'processed' | 'ignored';
+      webhookError?: string;
+      result: T;
+    }> | {
+      nextCatalog?: StoragePayloadV1;
+      nextStoreProfile?: StoreProfile;
+      provenanceUpserts?: ShopifyProductProvenanceRecord[];
+      provenanceDeletes?: string[];
+      disconnectShopifyConnection?: boolean;
+      webhookStatus?: 'processed' | 'ignored';
+      webhookError?: string;
+      result: T;
+    };
+  }): Promise<{
+    result: T;
+    catalogVersion?: number;
+  }>;
   withShopifyRefreshLock<T>(
     workspaceId: string,
     fn: (

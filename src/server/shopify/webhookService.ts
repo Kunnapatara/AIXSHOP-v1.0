@@ -1,8 +1,8 @@
 import { DatabaseRepository } from '../db/repository';
 import { verifyShopifyWebhookHmac } from '../security/encryption';
-import { getShopifyOAuthEnv, disconnectShopify, getValidShopifyAccessToken } from './oauthService';
+import { getShopifyOAuthEnv, getValidShopifyAccessToken } from './oauthService';
 import { normalizeShopDomain, executeShopifyGraphQL } from './client';
-import { Product, Variant } from '../../types';
+import { Product, ShopifyProductProvenanceRecord, StoreProfile, Variant } from '../../types';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
 import { parseSourcePrice } from '../../domain/validation/price';
 import { calculateProductCompleteness } from '../../domain/catalog/completeness';
@@ -775,17 +775,62 @@ export async function processShopifyWebhook(
     let ignoredReason: string | undefined;
 
     if (topic === 'app/uninstalled') {
-      await repo.withWorkspaceLock(workspaceId, async () => {
-        await disconnectShopify(repo, workspaceId);
-      });
-    } else if (topic === 'products/create' || topic === 'products/update' || topic === 'products/delete') {
-      const mutationOutcome = await repo.mutateWorkspaceCatalog<{ status: 'processed' | 'ignored'; reason?: string }>(
+      const uninstallOutcome = await repo.commitShopifyWebhookMutationAtomic<{
+        status: 'processed' | 'ignored';
+        reason?: string;
+      }>({
         workspaceId,
-        async (catalog, authoritativeStore) => {
+        shopDomain: shop,
+        topic,
+        eventId,
+        leaseOwner,
+        defaultWebhookStatus: 'processed',
+        applyMutation: async (_catalog, authoritativeStore) => {
+          const connectors = (authoritativeStore.connectors || []).map(c =>
+            c.id === 'shopify' || c.id === 'shopify_primary' || c.type === 'shopify'
+              ? { ...c, status: 'disconnected' as const }
+              : c
+          );
+          const hasRemainingProducts = (authoritativeStore.skuCount || 0) > 0;
+          const nextClassification =
+            authoritativeStore.sourceClassification === 'shopify_oauth'
+              ? (hasRemainingProducts ? 'manual_import' : 'unconfigured')
+              : authoritativeStore.sourceClassification;
+          const nextStoreProfile: StoreProfile = {
+            ...authoritativeStore,
+            shopifyConnected: false,
+            shopifyShopDomain: undefined,
+            sourceClassification: nextClassification,
+            connectors,
+          };
+
+          return {
+            disconnectShopifyConnection: true,
+            nextStoreProfile,
+            webhookStatus: 'processed',
+            result: { status: 'processed' },
+          };
+        },
+      });
+      outcomeStatus = uninstallOutcome.result.status;
+      ignoredReason = uninstallOutcome.result.reason;
+    } else if (topic === 'products/create' || topic === 'products/update' || topic === 'products/delete') {
+      const mutationOutcome = await repo.commitShopifyWebhookMutationAtomic<{
+        status: 'processed' | 'ignored';
+        reason?: string;
+      }>({
+        workspaceId,
+        shopDomain: shop,
+        topic,
+        eventId,
+        leaseOwner,
+        defaultWebhookStatus: 'processed',
+        applyMutation: async (catalog, authoritativeStore, subscription) => {
           const storeProfile = catalog.storeProfile || authoritativeStore;
+          const numericId = String(payload.id || '');
+          const productId = `p_shopify_${numericId}`;
 
           if (topic === 'products/create' || topic === 'products/update') {
-            const subscription = await repo.getSubscriptionByWorkspace(workspaceId);
             const entitlement = resolveWorkspacePlanEntitlement(storeProfile, subscription);
 
             const incomingProduct = mapWebhookPayloadToDomainProduct(payload, storeProfile?.currency || 'USD', shop);
@@ -805,10 +850,13 @@ export async function processShopifyWebhook(
                 const existingTime = new Date(existing.attributes.shopifyUpdatedAt).getTime();
                 if (!isNaN(incomingTime) && !isNaN(existingTime) && incomingTime < existingTime) {
                   console.warn(`[AIXSHOP Webhook] Out-of-order webhook event discarded for product ${incomingProduct.id}. Incoming: ${payload.updated_at}, Existing: ${existing.attributes.shopifyUpdatedAt}`);
+                  const reason = 'Stale out-of-order event skipped: payload updated_at is older than existing product state.';
                   return {
+                    webhookStatus: 'ignored',
+                    webhookError: reason,
                     result: {
                       status: 'ignored',
-                      reason: 'Stale out-of-order event skipped: payload updated_at is older than existing product state.',
+                      reason,
                     },
                   };
                 }
@@ -832,10 +880,13 @@ export async function processShopifyWebhook(
               const currentUsage = countCatalogSkus(currentProducts);
               if (!entitlement.isUnlimited && currentUsage + incomingSkus > entitlement.skuLimit) {
                 console.warn(`[AIXSHOP Webhook] Product ${incomingProduct.id} rejected: exceeds workspace SKU quota (${entitlement.skuLimit}).`);
+                const reason = `Product creation skipped: workspace reached SKU limit of ${entitlement.skuLimit}.`;
                 return {
+                  webhookStatus: 'ignored',
+                  webhookError: reason,
                   result: {
                     status: 'ignored',
-                    reason: `Product creation skipped: workspace reached SKU limit of ${entitlement.skuLimit}.`,
+                    reason,
                   },
                 };
               }
@@ -851,16 +902,28 @@ export async function processShopifyWebhook(
               },
             };
 
+            const provenanceRecord: ShopifyProductProvenanceRecord = {
+              workspaceId,
+              productId,
+              shopDomain: shop,
+              shopifyProductId: numericId,
+              shopifyGid: `gid://shopify/Product/${numericId}`,
+              isGiftCard: payload.gift_card === true,
+              sourceType: 'shopify_webhook',
+              shopifyUpdatedAt: payload.updated_at || undefined,
+              verifiedAt: new Date().toISOString(),
+            };
+
             return {
               nextCatalog,
+              provenanceUpserts: [provenanceRecord],
+              webhookStatus: 'processed',
               result: { status: 'processed' },
             };
           } else {
             // products/delete
-            const numericId = String(payload.id || '');
-            const targetId = `p_shopify_${numericId}`;
             const currentProducts = catalog.products.filter(
-              (p: Product) => p.id !== targetId && p.attributes?.sourceProductId !== numericId
+              (p: Product) => p.id !== productId && p.attributes?.sourceProductId !== numericId
             );
 
             const nextCatalog: StoragePayloadV1 = {
@@ -874,44 +937,26 @@ export async function processShopifyWebhook(
 
             return {
               nextCatalog,
+              provenanceDeletes: [productId],
+              webhookStatus: 'processed',
               result: { status: 'processed' },
             };
           }
-        }
+        },
+      });
+
+      outcomeStatus = mutationOutcome.result.status;
+      ignoredReason = mutationOutcome.result.reason;
+    } else {
+      await repo.updateShopifyWebhookEventStatus(
+        eventId,
+        shop,
+        topic,
+        outcomeStatus,
+        ignoredReason,
+        leaseOwner
       );
-
-      outcomeStatus = mutationOutcome.status;
-      ignoredReason = mutationOutcome.reason;
-
-      if (outcomeStatus === 'processed') {
-        const numericId = String(payload.id || '');
-        const productId = `p_shopify_${numericId}`;
-        if (topic === 'products/create' || topic === 'products/update') {
-          await repo.upsertShopifyProductProvenance({
-            workspaceId,
-            productId,
-            shopDomain: shop,
-            shopifyProductId: numericId,
-            shopifyGid: `gid://shopify/Product/${numericId}`,
-            isGiftCard: payload.gift_card === true,
-            sourceType: 'shopify_webhook',
-            shopifyUpdatedAt: payload.updated_at || undefined,
-            verifiedAt: new Date().toISOString(),
-          });
-        } else if (topic === 'products/delete') {
-          await repo.deleteShopifyProductProvenance(workspaceId, productId);
-        }
-      }
     }
-
-    await repo.updateShopifyWebhookEventStatus(
-      eventId,
-      shop,
-      topic,
-      outcomeStatus,
-      ignoredReason,
-      leaseOwner
-    );
 
     return {
       processed: outcomeStatus === 'processed',
