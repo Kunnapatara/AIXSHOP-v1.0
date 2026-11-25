@@ -151,3 +151,20 @@ AIXSHOP persists verified Stripe/billing webhook events in `billing_events` with
 - **Shopify Development Store (`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`)**: `BLOCKED — SHOPIFY DEVELOPMENT STORE ACCESS UNAVAILABLE`. Current connector scope is read-only (`read_products`, `writeBackAuthorized: false`).
 - **Complete End-to-End Customer Journey**: `BLOCKED` pending live Stripe Test Mode and Shopify Development Store credentials.
 
+---
+
+## 8. Commercial Integration Verification Infrastructure
+
+See [`docs/COMMERCIAL_VERIFICATION_GUIDE.md`](docs/COMMERCIAL_VERIFICATION_GUIDE.md), [`docs/COMMERCIAL_VERIFICATION_EVIDENCE_TEMPLATE.md`](docs/COMMERCIAL_VERIFICATION_EVIDENCE_TEMPLATE.md), and [`docs/COMMERCIAL_VERIFICATION_REPORT.md`](docs/COMMERCIAL_VERIFICATION_REPORT.md).
+
+- **Unit tests:** `npm run test:unit`
+- **Integration contract & local loopback tests (CI-safe):** `npm run test:contracts`
+- **PostgreSQL integration tests (requires `DATABASE_URL` or `SQL_HOST`):** `npm run test:postgres`
+- **Secret-safe commercial readiness check:** `npm run verify:config`
+- **External stage runners (require `COMMERCIAL_VERIFY_EXTERNAL=true` + real credentials; otherwise report `BLOCKED`):**
+  - `npm run verify:shopify` (Stage 1 — Shopify Development Store)
+  - `npm run verify:stripe` (Stage 2 — Stripe Test Mode, rejects `sk_live_`)
+  - `npm run verify:smtp` (Stage 3 — Real SMTP Provider)
+  - `npm run verify:staging-e2e` (Stage 4 — Staging End-to-End Customer Journey)
+  - `npm run verify:commercial:report -- --write` (Generate aggregate Markdown report)
+

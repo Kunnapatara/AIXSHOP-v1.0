@@ -295,9 +295,9 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 1 Shopify Verif
         const reRes = await handleShopifyCallback(repo, { ...reParams, hmac: reHmac }, { customFetch: mockFetch });
         assert.equal(reRes.shopDomain, 'dev-store.myshopify.com');
 
-        // Conflicting workspace install is blocked
-        const ws2Conn = await initiateShopifyConnect(repo, ws2.id, 'dev-store.myshopify.com');
-        const ws2Params = { ...queryParams, state: ws2Conn.state, code: 'auth_code_3' };
+        // Cross-shop state substitution is blocked
+        const ws2Conn = await initiateShopifyConnect(repo, ws2.id, 'other-store.myshopify.com');
+        const ws2Params = { ...queryParams, shop: 'dev-store.myshopify.com', state: ws2Conn.state, code: 'auth_code_3' };
         const ws2Msg = Object.keys(ws2Params)
           .sort()
           .map((k) => `${k}=${(ws2Params as any)[k]}`)
@@ -305,7 +305,7 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 1 Shopify Verif
         const ws2Hmac = crypto.createHmac('sha256', 'test_shopify_secret_123456').update(ws2Msg).digest('hex');
         await assert.rejects(
           () => handleShopifyCallback(repo, { ...ws2Params, hmac: ws2Hmac }, { customFetch: mockFetch }),
-          /already connected to another workspace/i
+          /State shop mismatch/i
         );
       }
     );
@@ -454,16 +454,16 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 1 Shopify Verif
           variants: [{ id: 8001, title: 'M', sku: 'WH-9001', price: '89.00', inventory_quantity: 5 }],
         });
 
-        // Invalid HMAC -> 401
+        // Invalid HMAC rejected cleanly
         await assert.rejects(
           () =>
             processShopifyWebhook(repo, payload, {
               'x-shopify-hmac-sha256': 'aW52YWxpZF9obWFj',
               'x-shopify-topic': 'products/create',
               'x-shopify-shop-domain': 'wh-store.myshopify.com',
-              'x-shopify-webhook-id': 'wh_invalid_1',
+              'x-shopify-delivery-id': 'wh_invalid_1',
             }),
-          (err: any) => err.statusCode === 401
+          /Invalid webhook HMAC signature/i
         );
 
         const validHmac = signShopifyWebhookHmac(payload, 'shopify_wh_secret_contract');
@@ -471,21 +471,24 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 1 Shopify Verif
           'x-shopify-hmac-sha256': validHmac,
           'x-shopify-topic': 'products/create',
           'x-shopify-shop-domain': 'wh-store.myshopify.com',
-          'x-shopify-webhook-id': 'wh_dup_1',
+          'x-shopify-delivery-id': 'wh_dup_1',
         });
-        assert.equal(first.outcome, 'PROCESSED');
+        assert.equal(first.processed, true);
+        assert.equal(first.duplicate, false);
+        assert.equal(first.outcome, 'CLAIMED');
 
         const dup = await processShopifyWebhook(repo, payload, {
           'x-shopify-hmac-sha256': validHmac,
           'x-shopify-topic': 'products/create',
           'x-shopify-shop-domain': 'wh-store.myshopify.com',
-          'x-shopify-webhook-id': 'wh_dup_1',
+          'x-shopify-delivery-id': 'wh_dup_1',
         });
-        assert.equal(dup.outcome, 'DUPLICATE_ALREADY_PROCESSED');
+        assert.equal(dup.duplicate, true);
+        assert.equal(dup.outcome, 'ALREADY_PROCESSED');
 
-        // Expired lease recovery
+        // Active lease rejection + Expired lease recovery (min lease 50ms)
         const nowWhIso = new Date().toISOString();
-        const expiredClaim = await repo.claimShopifyWebhookEvent(
+        const shortClaim = await repo.claimShopifyWebhookEvent(
           {
             id: 'wh_expired_1',
             eventId: 'wh_expired_1',
@@ -498,9 +501,26 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 1 Shopify Verif
             createdAt: nowWhIso,
             updatedAt: nowWhIso,
           },
-          { leaseOwner: 'dead_worker', leaseDurationMs: -5000 }
+          { leaseOwner: 'dead_worker', leaseDurationMs: 50 }
         );
-        assert.equal(expiredClaim.outcome, 'CLAIMED');
+        assert.equal(shortClaim.outcome, 'CLAIMED');
+        const whileActive = await repo.claimShopifyWebhookEvent(
+          {
+            id: 'wh_expired_1',
+            eventId: 'wh_expired_1',
+            shopDomain: 'wh-store.myshopify.com',
+            topic: 'products/update',
+            workspaceId: ws.id,
+            payload: {},
+            status: 'processing',
+            retryCount: 0,
+            createdAt: nowWhIso,
+            updatedAt: nowWhIso,
+          },
+          { leaseOwner: 'contender_worker', leaseDurationMs: 60_000 }
+        );
+        assert.equal(whileActive.outcome, 'CURRENTLY_PROCESSING');
+        await new Promise((r) => setTimeout(r, 75));
         const reclaimed = await repo.claimShopifyWebhookEvent(
           {
             id: 'wh_expired_1',
@@ -528,7 +548,6 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 2 Stripe Billin
     const owner = await repo.createUser({ id: 'usr_b2', email: 'b2@example.com', passwordHash: 'h', fullName: 'B2' });
     const { workspace: ws } = await repo.createWorkspace({ id: 'ws_b2', name: 'B2 WS', slug: 'ws-b2' }, owner.id);
     await repo.saveWorkspaceCatalog(ws.id, {
-      version: 1,
       storeProfile: {
         name: 'B2 Store',
         domain: 'b2-store.example.com',
@@ -560,10 +579,11 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 2 Stripe Billin
           lastAudited: 'N/A',
         },
       ],
-      issues: [],
+      variants: [],
+      offers: [],
+      findings: [],
       actions: [],
-      auditHistory: [],
-      updatedAt: new Date().toISOString(),
+      evidence: [],
     });
 
     const priceMap = {

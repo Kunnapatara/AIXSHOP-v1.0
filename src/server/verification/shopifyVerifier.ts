@@ -324,8 +324,8 @@ export async function runShopifyExternalVerification(
 
       const sampleRawBody = JSON.stringify({ id: 123456, title: 'Webhook Verification Check' });
       const validHmac = crypto.createHmac('sha256', apiSecret).update(sampleRawBody, 'utf8').digest('base64');
-      const validOk = verifyShopifyWebhookHmac(sampleRawBody, validHmac, apiSecret);
-      const invalidRejected = !verifyShopifyWebhookHmac(sampleRawBody, 'aW52YWxpZA==', apiSecret);
+      const validOk = verifyShopifyWebhookHmac(sampleRawBody, apiSecret, validHmac);
+      const invalidRejected = !verifyShopifyWebhookHmac(sampleRawBody, apiSecret, 'aW52YWxpZA==');
 
       if (!validOk || !invalidRejected) {
         throw new Error('Shopify webhook HMAC verification check failed.');
