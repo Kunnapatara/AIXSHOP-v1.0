@@ -287,10 +287,12 @@ function makeCatalogPayload(opts: {
   findings?: Finding[];
   actions?: ActionItem[];
   catalogVersion: number;
+  platform?: string;
 }): StoragePayloadV1 {
   const storeProfile: StoreProfile = {
     name: opts.storeName,
     domain: `${opts.storeName.toLowerCase().replace(/\s+/g, '-')}.myshopify.com`,
+    ...(opts.platform !== undefined ? { platform: opts.platform } : {}),
     currency: 'USD',
     skuCount: opts.products.length,
     skuLimit: 2500,
@@ -1354,6 +1356,7 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
         storeName: 'Guest Matcha Shop',
         products: [guestProd],
         catalogVersion: 1,
+        platform: 'Public Storefront Feed',
       })
     );
 
@@ -1480,6 +1483,7 @@ describe('AppContext Workspace & Auth State Isolation (Failure & Race Injection)
         storeName: 'Guest Kettle Shop',
         products: [guestProd],
         catalogVersion: 1,
+        platform: 'Public Storefront Feed',
       })
     );
 

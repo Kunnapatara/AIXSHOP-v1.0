@@ -196,7 +196,7 @@ describe('Workstream 5: Guest-to-Cloud Catalog Transfer', () => {
     );
     const sql = fs.readFileSync(sqlPath, 'utf8');
     assert.match(sql, /CREATE TABLE IF NOT EXISTS guest_transfer_authorizations/i);
-    assert.match(sql, /token_hash VARCHAR\(128\) NOT NULL UNIQUE/i);
+    assert.match(sql, /token_hash\s+VARCHAR\(128\)\s+(?:UNIQUE\s+NOT\s+NULL|NOT\s+NULL\s+UNIQUE)/i);
     assert.match(sql, /UNIQUE\s*\(workspace_id,\s*user_id,\s*idempotency_key\)/i);
     assert.match(sql, /CREATE TABLE IF NOT EXISTS guest_transfer_audit_log/i);
   });
@@ -445,7 +445,10 @@ describe('Workstream 5: Guest-to-Cloud Catalog Transfer', () => {
       'gt_expired_test_001'
     );
     assert.ok(stored);
-    stored.expiresAt = new Date(Date.now() - 5000).toISOString();
+    await repo.createGuestTransferAuthorization({
+      ...stored,
+      expiresAt: new Date(Date.now() - 5000).toISOString(),
+    });
 
     await assert.rejects(
       () =>
