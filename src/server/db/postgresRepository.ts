@@ -4159,10 +4159,10 @@ export class PostgresRepository implements DatabaseRepository {
 
     const res = await queryable.query(
       `UPDATE shopify_webhook_events
-       SET status = $4,
+       SET status = CAST($4 AS VARCHAR(32)),
            last_error = $5,
-           lease_expires_at = CASE WHEN $4 <> 'processing' THEN NULL ELSE lease_expires_at END,
-           processed_at = CASE WHEN $4 = 'processed' THEN clock_timestamp() ELSE processed_at END,
+           lease_expires_at = CASE WHEN CAST($4 AS VARCHAR(32)) <> 'processing' THEN NULL ELSE lease_expires_at END,
+           processed_at = CASE WHEN CAST($4 AS VARCHAR(32)) = 'processed' THEN clock_timestamp() ELSE processed_at END,
            updated_at = clock_timestamp()
        ${whereClause}`,
       params

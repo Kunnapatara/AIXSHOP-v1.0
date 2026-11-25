@@ -721,7 +721,7 @@ describe('AIXSHOP v1.0 — Workstream 6: Shopify Catalog + Provenance Atomicity 
       const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       const userId = `u_ws6_pg_${suffix}`;
       const wsId = `ws_ws6_pg_${suffix}`;
-      const shopDomain = `ws6-pg-${suffix}.myshopify.com`;
+      const shopDomain = `ws6-pg-${suffix.replace(/_/g, '-')}.myshopify.com`;
 
       try {
         await pgRepo.createUser({
