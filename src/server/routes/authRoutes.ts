@@ -478,5 +478,21 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
     }
   });
 
+  // DELETE /api/auth/account — Self-service account & sole-owned workspace deletion
+  router.delete('/account', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const userId = req.user!.id;
+      const result = await repo.deleteAccountAndOwnedWorkspaces(userId);
+      clearSessionCookie(res);
+      return res.json({
+        success: true,
+        ...result,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Auth] Account deletion error:', sanitizeSmtpErrorMessage(err));
+      return res.status(500).json({ error: 'Internal error deleting account' });
+    }
+  });
+
   return router;
 }

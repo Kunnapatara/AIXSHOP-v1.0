@@ -48,7 +48,7 @@ import {
   evaluateGuestTransferEligibility,
 } from '../domain/catalog/guestTransfer';
 import { useAuth } from './AuthContext';
-import { apiClient, PreliminaryAuditSummary, ReportEntitlement } from '../api/client';
+import { apiClient, PreliminaryAuditSummary, ReportEntitlement, ShopifyWriteBackResponse } from '../api/client';
 
 export interface ToastMessage {
   id: string;
@@ -103,6 +103,7 @@ export interface AppContextType {
   approveAction: (actionId: string, customApprovedValue?: string) => Promise<void> | void;
   dismissAction: (actionId: string) => Promise<void> | void;
   recheckAction: (actionId: string) => Promise<void> | void;
+  writeBackActionToShopify?: (actionId: string) => Promise<ShopifyWriteBackResponse | null>;
   recheckProduct: (productId: string) => void;
   updateStoreProfile: (updates: Partial<StoreProfile>) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
   toggleConnectorSync: (connectorId: string) => Promise<{ success: boolean; error?: string }> | { success: boolean; error?: string };
@@ -1053,6 +1054,71 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
     }
   };
 
+  const writeBackActionToShopify = async (actionId: string): Promise<ShopifyWriteBackResponse | null> => {
+    if (!isCloudWorkspace) {
+      addToast(
+        'Cloud Workspace Required',
+        'Sign in to a workspace and connect a Shopify store with write_products scope to write back remediations.',
+        'warning'
+      );
+      return null;
+    }
+
+    const reqGen = cloudRequestGenRef.current;
+    const targetWsId = activeWorkspaceId;
+    const targetUserId = activeUserId;
+    try {
+      const res = await apiClient.writeBackActionToShopify(actionId);
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId, res?.operation?.workspaceId)) {
+        return null;
+      }
+      if (res.success && res.action) {
+        if (typeof res.catalogVersion === 'number') {
+          catalogVersionRef.current = res.catalogVersion;
+          setCatalogVersion(res.catalogVersion);
+        } else {
+          await reloadWorkspaceCatalog();
+          if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+        }
+        setActionItems(prev => prev.map(a => (a.id === actionId ? res.action : a)));
+        addToast(
+          'Shopify Write-Back Verified',
+          `Updated ${res.operation.fieldPath} in ${res.operation.shopDomain} and verified via post-mutation read-back.`,
+          'success'
+        );
+        return res;
+      }
+      return null;
+    } catch (err: any) {
+      if (!isCurrentCloudRequest(reqGen, targetWsId, targetUserId)) return null;
+      if (err?.code === 'REPORT_PAYMENT_REQUIRED') {
+        if (err.reportEntitlement) setReportEntitlement(err.reportEntitlement);
+        addToast('Paid Plan Required', err.message || 'An active paid plan is required for Shopify write-back.', 'warning');
+      } else if (err?.code === 'SHOPIFY_WRITE_SCOPE_REQUIRED') {
+        addToast(
+          'Write Scope Authorization Required',
+          'Reconnect Shopify in Settings -> Connectors with write_products scope enabled before applying changes.',
+          'warning'
+        );
+      } else if (err?.code === 'MISSING_SHOPIFY_PROVENANCE' || err?.code === 'MISSING_SHOPIFY_VARIANT_GID') {
+        addToast(
+          'Shopify Provenance Required',
+          err.message || 'Run a Shopify catalog sync first so AIXSHOP can verify the target Shopify product and variant GID.',
+          'warning'
+        );
+      } else if (err?.code === 'WRITEBACK_READBACK_MISMATCH') {
+        addToast(
+          'Read-Back Verification Failed',
+          err.message || 'Shopify did not return the expected updated value on read-back; action remains approved for retry.',
+          'error'
+        );
+      } else {
+        addToast('Shopify Write-Back Failed', err?.message || 'Failed to apply approved remediation to Shopify.', 'error');
+      }
+      return null;
+    }
+  };
+
   const recheckProduct = async (productId: string) => {
     const res = executeProductRecheck(productId, {
       products,
@@ -1762,6 +1828,7 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
         approveAction,
         dismissAction,
         recheckAction,
+        writeBackActionToShopify,
         recheckProduct,
         updateStoreProfile,
         toggleConnectorSync,

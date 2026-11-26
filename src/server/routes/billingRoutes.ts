@@ -244,6 +244,23 @@ export function createBillingRoutes(
     }
   });
 
+  // GET /api/billing/email-deliveries — Returns workspace-scoped billing lifecycle email delivery logs (redacted)
+  router.get('/email-deliveries', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
+      const deliveries = await repo.listBillingEmailDeliveries(workspaceId, limit);
+      return res.json({
+        success: true,
+        workspaceId,
+        deliveries,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Billing] Error loading billing email deliveries:', sanitizeBillingErrorMessage(err));
+      return res.status(500).json({ error: 'Failed to retrieve billing email deliveries' });
+    }
+  });
+
   return router;
 }
 

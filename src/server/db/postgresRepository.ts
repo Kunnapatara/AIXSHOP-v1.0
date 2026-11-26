@@ -15,7 +15,9 @@ import {
   UpdateAuditRunData,
   CatalogVersionConflictError,
   CatalogVersionValidationError,
-  WorkspaceLockOrderError
+  WorkspaceLockOrderError,
+  DeleteAccountResult,
+  WorkspaceBillingRecipient,
 } from './repository';
 import { computeMigrationChecksum, getDefaultMigrationsDir, sanitizeDiagnosticMessage } from './migrate';
 import {
@@ -58,7 +60,19 @@ import {
   sanitizeAndValidateImportCandidates,
 } from '../security/catalogSanitizer';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
+import {
+  SubscriptionRecord,
+  BillingEventRecord,
+  BillingEventStatus,
+  PlanTier,
+  BillingEmailDeliveryRecord,
+  BillingEmailDeliveryStatus,
+  BillingEmailEventType,
+} from '../billing/types';
+import {
+  ShopifyWriteBackOperationRecord,
+  ShopifyWriteBackStatus,
+} from '../shopify/types';
 import {
   GuestTransferAuditRecord,
   GuestTransferAuthorizationRecord,
@@ -261,6 +275,8 @@ export class PostgresRepository implements DatabaseRepository {
       'reviewer_service_principals',
       'guest_transfer_authorizations',
       'guest_transfer_audit_log',
+      'shopify_writeback_operations',
+      'billing_email_deliveries',
     ];
 
     try {
@@ -502,6 +518,7 @@ export class PostgresRepository implements DatabaseRepository {
           '016_source_classification_and_domain_cleanup.sql',
           '017_reviewer_identity_and_registry_trust.sql',
           '018_guest_transfer_authorizations.sql',
+          '019_writeback_and_billing_emails.sql',
         ];
         const pendingMigrations = requiredMigrations.filter(m => !appliedMigrations.includes(m));
 
@@ -6483,6 +6500,592 @@ export class PostgresRepository implements DatabaseRepository {
       details: typeof r.details === 'string' ? JSON.parse(r.details) : r.details || {},
       createdAt: new Date(r.createdAt).toISOString(),
     }));
+  }
+
+  async deleteAccountAndOwnedWorkspaces(userId: string): Promise<DeleteAccountResult> {
+    return this.withTransaction(async (client) => {
+      const userCheck = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+        [userId]
+      );
+      if (userCheck.rows.length === 0) {
+        return {
+          deletedUserId: userId,
+          deletedWorkspaceIds: [],
+          preservedSharedWorkspaceIds: [],
+          deletedSessionsCount: 0,
+        };
+      }
+
+      const wsRes = await client.query<{ workspace_id: string; has_other_members: boolean }>(
+        `SELECT m.workspace_id,
+                EXISTS (
+                  SELECT 1 FROM workspace_memberships m2
+                  WHERE m2.workspace_id = m.workspace_id AND m2.user_id <> $1
+                ) AS has_other_members
+         FROM workspace_memberships m
+         WHERE m.user_id = $1`,
+        [userId]
+      );
+
+      const deletedWorkspaceIds: string[] = [];
+      const preservedSharedWorkspaceIds: string[] = [];
+      for (const row of wsRes.rows) {
+        if (row.has_other_members) {
+          preservedSharedWorkspaceIds.push(row.workspace_id);
+        } else {
+          deletedWorkspaceIds.push(row.workspace_id);
+        }
+      }
+
+      const sessDel = await client.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
+      const deletedSessionsCount = Number(sessDel.rowCount || 0);
+
+      await client.query(`DELETE FROM password_reset_tokens WHERE user_id = $1`, [userId]);
+      await client.query(`DELETE FROM workspace_memberships WHERE user_id = $1`, [userId]);
+
+      if (deletedWorkspaceIds.length > 0) {
+        // Break self-referential parent_sync_run_id FK before cascading workspace deletion
+        await client.query(
+          `UPDATE shopify_sync_runs SET parent_sync_run_id = NULL WHERE workspace_id = ANY($1::varchar[])`,
+          [deletedWorkspaceIds]
+        );
+        await client.query(`DELETE FROM workspaces WHERE id = ANY($1::varchar[])`, [deletedWorkspaceIds]);
+      }
+
+      await client.query(`DELETE FROM users WHERE id = $1`, [userId]);
+
+      return {
+        deletedUserId: userId,
+        deletedWorkspaceIds,
+        preservedSharedWorkspaceIds,
+        deletedSessionsCount,
+      };
+    });
+  }
+
+  async getWorkspaceBillingRecipient(workspaceId: string): Promise<WorkspaceBillingRecipient | null> {
+    const res = await this.query<WorkspaceBillingRecipient>(
+      `SELECT u.id AS "userId", u.email, u.full_name AS "fullName"
+       FROM workspace_memberships m
+       JOIN users u ON u.id = m.user_id
+       WHERE m.workspace_id = $1
+       ORDER BY CASE WHEN m.role = 'owner' THEN 0 WHEN m.role = 'admin' THEN 1 ELSE 2 END ASC,
+                m.created_at ASC
+       LIMIT 1`,
+      [workspaceId]
+    );
+    return res.rows[0] || null;
+  }
+
+  private mapBillingEmailRow(r: any): BillingEmailDeliveryRecord {
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      deliveryKey: r.deliveryKey,
+      eventType: r.eventType,
+      recipientEmail: r.recipientEmail,
+      tier: r.tier ?? null,
+      amountCents: r.amountCents !== null && r.amountCents !== undefined ? Number(r.amountCents) : null,
+      currency: r.currency ?? null,
+      status: r.status,
+      smtpMessageAccepted: Boolean(r.smtpMessageAccepted),
+      inboxDeliveryConfirmed: Boolean(r.inboxDeliveryConfirmed),
+      messageId: r.messageId ?? null,
+      errorMessage: r.errorMessage ?? null,
+      attemptCount: Number(r.attemptCount || 1),
+      nextRetryAt: r.nextRetryAt ? new Date(r.nextRetryAt).toISOString() : null,
+      payload: typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload || {},
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+      sentAt: r.sentAt ? new Date(r.sentAt).toISOString() : null,
+    };
+  }
+
+  async createOrClaimBillingEmailDelivery(params: {
+    id: string;
+    workspaceId: string;
+    deliveryKey: string;
+    eventType: BillingEmailEventType;
+    recipientEmail: string;
+    tier?: string | null;
+    amountCents?: number | null;
+    currency?: string | null;
+    payload?: Record<string, unknown>;
+    allowRetryFailed?: boolean;
+  }): Promise<{ claimed: boolean; record: BillingEmailDeliveryRecord }> {
+    return this.withTransaction(async (client) => {
+      const existingRes = await client.query<any>(
+        `SELECT id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+                recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+                status, smtp_message_accepted AS "smtpMessageAccepted",
+                inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+                error_message AS "errorMessage", attempt_count AS "attemptCount",
+                next_retry_at AS "nextRetryAt", payload_json AS "payload",
+                created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"
+         FROM billing_email_deliveries
+         WHERE delivery_key = $1
+         FOR UPDATE`,
+        [params.deliveryKey]
+      );
+
+      if (existingRes.rows.length > 0) {
+        const existing = this.mapBillingEmailRow(existingRes.rows[0]);
+        const stalePending = existing.status === 'pending' && Date.now() - new Date(existing.updatedAt).getTime() > 120_000;
+        const retryableFailed = existing.status === 'failed' && Boolean(params.allowRetryFailed);
+        if (!stalePending && !retryableFailed) {
+          return { claimed: false, record: existing };
+        }
+        const updRes = await client.query<any>(
+          `UPDATE billing_email_deliveries
+           SET status = 'pending',
+               attempt_count = attempt_count + 1,
+               error_message = NULL,
+               recipient_email = $2,
+               tier = COALESCE($3, tier),
+               amount_cents = COALESCE($4, amount_cents),
+               currency = COALESCE($5, currency),
+               payload_json = COALESCE($6::jsonb, payload_json),
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+                     recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+                     status, smtp_message_accepted AS "smtpMessageAccepted",
+                     inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+                     error_message AS "errorMessage", attempt_count AS "attemptCount",
+                     next_retry_at AS "nextRetryAt", payload_json AS "payload",
+                     created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"`,
+          [
+            existing.id,
+            params.recipientEmail,
+            params.tier ?? null,
+            params.amountCents ?? null,
+            params.currency ?? null,
+            params.payload ? JSON.stringify(params.payload) : null,
+          ]
+        );
+        return { claimed: true, record: this.mapBillingEmailRow(updRes.rows[0]) };
+      }
+
+      const insRes = await client.query<any>(
+        `INSERT INTO billing_email_deliveries (
+           id, workspace_id, delivery_key, event_type, recipient_email, tier, amount_cents, currency,
+           status, smtp_message_accepted, inbox_delivery_confirmed, attempt_count, payload_json, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', FALSE, FALSE, 1, $9::jsonb, NOW(), NOW())
+         RETURNING id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+                   recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+                   status, smtp_message_accepted AS "smtpMessageAccepted",
+                   inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+                   error_message AS "errorMessage", attempt_count AS "attemptCount",
+                   next_retry_at AS "nextRetryAt", payload_json AS "payload",
+                   created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"`,
+        [
+          params.id,
+          params.workspaceId,
+          params.deliveryKey,
+          params.eventType,
+          params.recipientEmail,
+          params.tier ?? null,
+          params.amountCents ?? null,
+          params.currency ?? null,
+          JSON.stringify(params.payload || {}),
+        ]
+      );
+      return { claimed: true, record: this.mapBillingEmailRow(insRes.rows[0]) };
+    });
+  }
+
+  async updateBillingEmailDeliveryStatus(
+    id: string,
+    updates: {
+      status: BillingEmailDeliveryStatus;
+      smtpMessageAccepted?: boolean;
+      inboxDeliveryConfirmed?: boolean;
+      messageId?: string | null;
+      errorMessage?: string | null;
+      nextRetryAt?: string | null;
+      sentAt?: string | null;
+      payload?: Record<string, unknown>;
+    }
+  ): Promise<BillingEmailDeliveryRecord> {
+    const res = await this.query<any>(
+      `UPDATE billing_email_deliveries
+       SET status = $2,
+           smtp_message_accepted = COALESCE($3, smtp_message_accepted),
+           inbox_delivery_confirmed = COALESCE($4, inbox_delivery_confirmed),
+           message_id = COALESCE($5, message_id),
+           error_message = $6,
+           next_retry_at = $7::timestamptz,
+           sent_at = COALESCE($8::timestamptz, sent_at),
+           payload_json = COALESCE($9::jsonb, payload_json),
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+                 recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+                 status, smtp_message_accepted AS "smtpMessageAccepted",
+                 inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+                 error_message AS "errorMessage", attempt_count AS "attemptCount",
+                 next_retry_at AS "nextRetryAt", payload_json AS "payload",
+                 created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"`,
+      [
+        id,
+        updates.status,
+        updates.smtpMessageAccepted ?? null,
+        updates.inboxDeliveryConfirmed ?? null,
+        updates.messageId ?? null,
+        updates.errorMessage ?? null,
+        updates.nextRetryAt ?? null,
+        updates.sentAt ?? null,
+        updates.payload ? JSON.stringify(updates.payload) : null,
+      ]
+    );
+    if (res.rows.length === 0) {
+      throw new Error(`Billing email delivery ${id} not found`);
+    }
+    return this.mapBillingEmailRow(res.rows[0]);
+  }
+
+  async getBillingEmailDeliveryByKey(deliveryKey: string): Promise<BillingEmailDeliveryRecord | null> {
+    const res = await this.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+              recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+              status, smtp_message_accepted AS "smtpMessageAccepted",
+              inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+              error_message AS "errorMessage", attempt_count AS "attemptCount",
+              next_retry_at AS "nextRetryAt", payload_json AS "payload",
+              created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"
+       FROM billing_email_deliveries
+       WHERE delivery_key = $1
+       LIMIT 1`,
+      [deliveryKey]
+    );
+    return res.rows[0] ? this.mapBillingEmailRow(res.rows[0]) : null;
+  }
+
+  async listBillingEmailDeliveries(workspaceId: string, limit = 50): Promise<BillingEmailDeliveryRecord[]> {
+    const res = await this.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+              recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+              status, smtp_message_accepted AS "smtpMessageAccepted",
+              inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+              error_message AS "errorMessage", attempt_count AS "attemptCount",
+              next_retry_at AS "nextRetryAt", payload_json AS "payload",
+              created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"
+       FROM billing_email_deliveries
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [workspaceId, limit]
+    );
+    return res.rows.map((r: any) => this.mapBillingEmailRow(r));
+  }
+
+  async listFailedBillingEmailDeliveries(limit = 50): Promise<BillingEmailDeliveryRecord[]> {
+    const res = await this.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
+              recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,
+              status, smtp_message_accepted AS "smtpMessageAccepted",
+              inbox_delivery_confirmed AS "inboxDeliveryConfirmed", message_id AS "messageId",
+              error_message AS "errorMessage", attempt_count AS "attemptCount",
+              next_retry_at AS "nextRetryAt", payload_json AS "payload",
+              created_at AS "createdAt", updated_at AS "updatedAt", sent_at AS "sentAt"
+       FROM billing_email_deliveries
+       WHERE status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+       ORDER BY created_at ASC
+       LIMIT $1`,
+      [limit]
+    );
+    return res.rows.map((r: any) => this.mapBillingEmailRow(r));
+  }
+
+  private mapShopifyWriteBackRow(r: any): ShopifyWriteBackOperationRecord {
+    return {
+      id: r.id,
+      workspaceId: r.workspaceId,
+      actionId: r.actionId,
+      productId: r.productId,
+      shopDomain: r.shopDomain,
+      shopifyProductGid: r.shopifyProductGid,
+      shopifyVariantGid: r.shopifyVariantGid ?? null,
+      fieldPath: r.fieldPath,
+      beforeValue: r.beforeValue ?? null,
+      approvedValue: r.approvedValue,
+      verifiedValue: r.verifiedValue ?? null,
+      status: r.status,
+      idempotencyKey: r.idempotencyKey,
+      shopifyMutationId: r.shopifyMutationId ?? null,
+      operatorUserId: r.operatorUserId,
+      errorCode: r.errorCode ?? null,
+      errorMessage: r.errorMessage ?? null,
+      auditMetadata: typeof r.auditMetadata === 'string' ? JSON.parse(r.auditMetadata) : r.auditMetadata || {},
+      createdAt: new Date(r.createdAt).toISOString(),
+      updatedAt: new Date(r.updatedAt).toISOString(),
+      verifiedAt: r.verifiedAt ? new Date(r.verifiedAt).toISOString() : null,
+    };
+  }
+
+  async createOrClaimShopifyWriteBackOperation(params: {
+    id: string;
+    workspaceId: string;
+    actionId: string;
+    productId: string;
+    shopDomain: string;
+    shopifyProductGid: string;
+    shopifyVariantGid?: string | null;
+    fieldPath: string;
+    beforeValue?: string | null;
+    approvedValue: string;
+    idempotencyKey: string;
+    operatorUserId: string;
+    auditMetadata?: Record<string, any>;
+  }): Promise<{
+    claimed: boolean;
+    conflictReason?: string;
+    record: ShopifyWriteBackOperationRecord;
+  }> {
+    return this.withTransaction(async (client) => {
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('aixshop_wb'), hashtext($1))`, [params.workspaceId]);
+
+      const verifiedActionRes = await client.query<any>(
+        `SELECT id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+                shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+                shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+                before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+                status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+                operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+                audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"
+         FROM shopify_writeback_operations
+         WHERE workspace_id = $1 AND action_id = $2 AND status = 'verified_applied'
+         LIMIT 1`,
+        [params.workspaceId, params.actionId]
+      );
+      if (verifiedActionRes.rows.length > 0) {
+        return {
+          claimed: false,
+          conflictReason: 'WRITEBACK_ALREADY_APPLIED',
+          record: this.mapShopifyWriteBackRow(verifiedActionRes.rows[0]),
+        };
+      }
+
+      const keyRes = await client.query<any>(
+        `SELECT id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+                shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+                shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+                before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+                status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+                operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+                audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"
+         FROM shopify_writeback_operations
+         WHERE workspace_id = $1 AND idempotency_key = $2
+         FOR UPDATE`,
+        [params.workspaceId, params.idempotencyKey]
+      );
+      if (keyRes.rows.length > 0) {
+        const existing = this.mapShopifyWriteBackRow(keyRes.rows[0]);
+        if (existing.status === 'verified_applied' || existing.status === 'applied_unverified') {
+          return { claimed: false, conflictReason: 'WRITEBACK_ALREADY_APPLIED', record: existing };
+        }
+        if (existing.status === 'pending' && Date.now() - new Date(existing.updatedAt).getTime() < 120_000) {
+          return { claimed: false, conflictReason: 'WRITEBACK_IN_PROGRESS', record: existing };
+        }
+        const updRes = await client.query<any>(
+          `UPDATE shopify_writeback_operations
+           SET status = 'pending',
+               error_code = NULL,
+               error_message = NULL,
+               operator_user_id = $2,
+               audit_metadata_json = $3::jsonb,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+                     shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+                     shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+                     before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+                     status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+                     operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+                     audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"`,
+          [existing.id, params.operatorUserId, JSON.stringify(params.auditMetadata || {})]
+        );
+        return { claimed: true, record: this.mapShopifyWriteBackRow(updRes.rows[0]) };
+      }
+
+      const insRes = await client.query<any>(
+        `INSERT INTO shopify_writeback_operations (
+           id, workspace_id, action_id, product_id, shop_domain, shopify_product_gid, shopify_variant_gid,
+           field_path, before_value, approved_value, status, idempotency_key, operator_user_id, audit_metadata_json,
+           created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13::jsonb, NOW(), NOW())
+         RETURNING id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+                   shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+                   shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+                   before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+                   status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+                   operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+                   audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"`,
+        [
+          params.id,
+          params.workspaceId,
+          params.actionId,
+          params.productId,
+          params.shopDomain,
+          params.shopifyProductGid,
+          params.shopifyVariantGid ?? null,
+          params.fieldPath,
+          params.beforeValue ?? null,
+          params.approvedValue,
+          params.idempotencyKey,
+          params.operatorUserId,
+          JSON.stringify(params.auditMetadata || {}),
+        ]
+      );
+      return { claimed: true, record: this.mapShopifyWriteBackRow(insRes.rows[0]) };
+    });
+  }
+
+  async completeShopifyWriteBackOperation(params: {
+    operationId: string;
+    workspaceId: string;
+    actionId: string;
+    status: ShopifyWriteBackStatus;
+    verifiedValue?: string | null;
+    shopifyMutationId?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    auditMetadata?: Record<string, any>;
+    markActionAppliedExternally?: boolean;
+    operatorUserId: string;
+    shopDomain: string;
+    beforeValue?: string | null;
+    approvedValue: string;
+    fieldPath: string;
+    shopifyProductGid: string;
+    shopifyVariantGid?: string | null;
+  }): Promise<{
+    operation: ShopifyWriteBackOperationRecord;
+    action?: ActionItem;
+    catalogVersion?: number;
+  }> {
+    return this.withTransaction(async (client) => {
+      const nowIso = new Date().toISOString();
+      const opRes = await client.query<any>(
+        `UPDATE shopify_writeback_operations
+         SET status = $3,
+             verified_value = COALESCE($4, verified_value),
+             shopify_mutation_id = COALESCE($5, shopify_mutation_id),
+             error_code = $6,
+             error_message = $7,
+             audit_metadata_json = COALESCE(audit_metadata_json, '{}'::jsonb) || $8::jsonb,
+             verified_at = CASE WHEN $3 = 'verified_applied' THEN NOW() ELSE verified_at END,
+             updated_at = NOW()
+         WHERE id = $1 AND workspace_id = $2
+         RETURNING id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+                   shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+                   shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+                   before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+                   status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+                   operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+                   audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"`,
+        [
+          params.operationId,
+          params.workspaceId,
+          params.status,
+          params.verifiedValue ?? null,
+          params.shopifyMutationId ?? null,
+          params.errorCode ?? null,
+          params.errorMessage ?? null,
+          JSON.stringify(params.auditMetadata || {}),
+        ]
+      );
+      if (opRes.rows.length === 0) {
+        throw new Error(`Shopify write-back operation ${params.operationId} not found`);
+      }
+
+      let updatedAction: ActionItem | undefined;
+      let catalogVersion: number | undefined;
+
+      if (params.markActionAppliedExternally && params.status === 'verified_applied') {
+        const { storeId, authoritativeStore, catalog } = await this.lockStoreAndLoadCatalogForUpdate(
+          client,
+          params.workspaceId
+        );
+        const nextActions = catalog.actions.map((a) => {
+          if (a.id !== params.actionId) return a;
+          const entry = {
+            timestamp: nowIso,
+            actor: 'merchant_operator',
+            operatorUserId: params.operatorUserId,
+            event: 'shopify_writeback_verified',
+            operationId: params.operationId,
+            shopDomain: params.shopDomain,
+            shopifyProductGid: params.shopifyProductGid,
+            shopifyVariantGid: params.shopifyVariantGid ?? null,
+            fieldPath: params.fieldPath,
+            from: params.beforeValue ?? a.proposedChange.from,
+            to: params.approvedValue,
+            verifiedValue: params.verifiedValue ?? params.approvedValue,
+            shopifyMutationId: params.shopifyMutationId ?? null,
+          };
+          const nextAction: ActionItem = {
+            ...a,
+            status: 'applied_externally',
+            verificationStatus: 'verified_in_catalog',
+            auditLog: [...(Array.isArray(a.auditLog) ? a.auditLog : []), entry],
+          };
+          updatedAction = nextAction;
+          return nextAction;
+        });
+
+        const nextCatalog: StoragePayloadV1 = {
+          ...catalog,
+          actions: nextActions,
+        };
+        catalogVersion = await this.saveCatalogRows(client, params.workspaceId, nextCatalog, storeId, authoritativeStore);
+      }
+
+      return {
+        operation: this.mapShopifyWriteBackRow(opRes.rows[0]),
+        action: updatedAction,
+        catalogVersion,
+      };
+    });
+  }
+
+  async listShopifyWriteBackOperations(workspaceId: string, limit = 50): Promise<ShopifyWriteBackOperationRecord[]> {
+    const res = await this.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+              shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+              shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+              before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+              status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+              operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+              audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"
+       FROM shopify_writeback_operations
+       WHERE workspace_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2`,
+      [workspaceId, limit]
+    );
+    return res.rows.map((r: any) => this.mapShopifyWriteBackRow(r));
+  }
+
+  async getShopifyWriteBackOperationByKey(
+    workspaceId: string,
+    idempotencyKey: string
+  ): Promise<ShopifyWriteBackOperationRecord | null> {
+    const res = await this.query<any>(
+      `SELECT id, workspace_id AS "workspaceId", action_id AS "actionId", product_id AS "productId",
+              shop_domain AS "shopDomain", shopify_product_gid AS "shopifyProductGid",
+              shopify_variant_gid AS "shopifyVariantGid", field_path AS "fieldPath",
+              before_value AS "beforeValue", approved_value AS "approvedValue", verified_value AS "verifiedValue",
+              status, idempotency_key AS "idempotencyKey", shopify_mutation_id AS "shopifyMutationId",
+              operator_user_id AS "operatorUserId", error_code AS "errorCode", error_message AS "errorMessage",
+              audit_metadata_json AS "auditMetadata", created_at AS "createdAt", updated_at AS "updatedAt", verified_at AS "verifiedAt"
+       FROM shopify_writeback_operations
+       WHERE workspace_id = $1 AND idempotency_key = $2
+       LIMIT 1`,
+      [workspaceId, idempotencyKey]
+    );
+    return res.rows[0] ? this.mapShopifyWriteBackRow(res.rows[0]) : null;
   }
 }
 

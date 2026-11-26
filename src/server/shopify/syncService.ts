@@ -8,7 +8,7 @@ import {
 } from './types';
 import { fetchProductsPage, isValidShopDomain, normalizeShopDomain } from './client';
 import { decryptCredential } from '../security/encryption';
-import { getValidShopifyAccessToken } from './oauthService';
+import { getValidShopifyAccessToken, hasShopifyWriteScope } from './oauthService';
 import { parseSourcePrice } from '../../domain/validation/price';
 import { calculateProductCompleteness } from '../../domain/catalog/completeness';
 import {
@@ -476,6 +476,7 @@ async function executeSyncShopifyCatalog(
         );
         const existingConnectorId = shopifyConnectorIdx >= 0 ? connectors[shopifyConnectorIdx].id : 'shopify';
         const nowSyncIso = new Date().toISOString();
+        const writeBackAuthorized = hasShopifyWriteScope(connection.grantedScopes);
         const updatedConnector = {
           id: existingConnectorId,
           name: `Shopify (${shop})`,
@@ -483,7 +484,8 @@ async function executeSyncShopifyCatalog(
           status: 'connected' as const,
           productCountSynced: importedVariantsCount,
           lastSync: nowSyncIso,
-          writeBackAuthorized: false,
+          readOnly: !writeBackAuthorized,
+          writeBackAuthorized,
         };
         const nextConnectors = [...connectors];
         if (shopifyConnectorIdx >= 0) {

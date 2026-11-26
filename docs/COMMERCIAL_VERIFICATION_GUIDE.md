@@ -88,10 +88,10 @@ npm run verify:shopify
    - `customer.subscription.created`
    - `customer.subscription.updated`
    - `customer.subscription.deleted`
-   - `invoice.payment_succeeded`
+   - `invoice.payment_succeeded` / `invoice.paid`
    - `invoice.payment_failed`
    - `charge.refunded`
-   - Unhandled/unsupported events (e.g., `invoice.paid`) are safely acknowledged/ignored without mutating subscription state.
+   - Unhandled/unsupported events (e.g., `customer.discount.created`) are safely acknowledged/ignored without mutating subscription state.
 
 ### Required ENV Variables
 - `COMMERCIAL_VERIFY_EXTERNAL="true"`

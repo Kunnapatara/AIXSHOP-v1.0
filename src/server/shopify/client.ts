@@ -575,3 +575,246 @@ export async function fetchRemainingProductVariants(
     endCursor: pageInfo?.endCursor || null,
   };
 }
+
+export interface ShopifyUserError {
+  field?: string[] | null;
+  message: string;
+}
+
+export interface ShopifyWriteBackVariantResult {
+  success: boolean;
+  productVariants: Array<{
+    id: string;
+    sku: string | null;
+    barcode: string | null;
+    price: string | null;
+  }>;
+  userErrors: ShopifyUserError[];
+  mutationId?: string | null;
+}
+
+export async function updateShopifyProductVariant(
+  shopDomain: string,
+  accessToken: string,
+  params: {
+    productId: string;
+    variantId: string;
+    barcode?: string;
+    sku?: string;
+    price?: string;
+  },
+  options?: GraphQLClientOptions
+): Promise<ShopifyWriteBackVariantResult> {
+  const mutation = `
+    mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+        product {
+          id
+          title
+        }
+        productVariants {
+          id
+          sku
+          barcode
+          price
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const variantInput: Record<string, any> = {
+    id: params.variantId,
+  };
+  if (params.barcode !== undefined) {
+    variantInput.barcode = params.barcode;
+  }
+  if (params.price !== undefined) {
+    variantInput.price = params.price;
+  }
+  if (params.sku !== undefined) {
+    variantInput.inventoryItem = { sku: params.sku };
+  }
+
+  const res = await executeShopifyGraphQL<{
+    productVariantsBulkUpdate?: {
+      product?: { id: string; title: string } | null;
+      productVariants?: Array<{
+        id: string;
+        sku: string | null;
+        barcode: string | null;
+        price: string | null;
+      }>;
+      userErrors?: ShopifyUserError[];
+    };
+  }>(
+    shopDomain,
+    accessToken,
+    mutation,
+    { productId: params.productId, variants: [variantInput] },
+    options
+  );
+
+  const payload = res.data?.productVariantsBulkUpdate;
+  const userErrors = payload?.userErrors || [];
+  const productVariants = payload?.productVariants || [];
+
+  return {
+    success: userErrors.length === 0 && productVariants.length > 0,
+    productVariants,
+    userErrors,
+    mutationId: payload?.product?.id || params.variantId,
+  };
+}
+
+export interface ShopifyWriteBackTitleResult {
+  success: boolean;
+  product?: { id: string; title: string } | null;
+  userErrors: ShopifyUserError[];
+  mutationId?: string | null;
+}
+
+export async function updateShopifyProductTitle(
+  shopDomain: string,
+  accessToken: string,
+  params: {
+    productId: string;
+    title: string;
+  },
+  options?: GraphQLClientOptions
+): Promise<ShopifyWriteBackTitleResult> {
+  const mutation = `
+    mutation productUpdate($input: ProductInput!) {
+      productUpdate(input: $input) {
+        product {
+          id
+          title
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const res = await executeShopifyGraphQL<{
+    productUpdate?: {
+      product?: { id: string; title: string } | null;
+      userErrors?: ShopifyUserError[];
+    };
+  }>(
+    shopDomain,
+    accessToken,
+    mutation,
+    { input: { id: params.productId, title: params.title } },
+    options
+  );
+
+  const payload = res.data?.productUpdate;
+  const userErrors = payload?.userErrors || [];
+
+  return {
+    success: userErrors.length === 0 && Boolean(payload?.product?.id),
+    product: payload?.product || null,
+    userErrors,
+    mutationId: payload?.product?.id || params.productId,
+  };
+}
+
+export interface ShopifyProductVerificationSnapshot {
+  id: string;
+  title: string;
+  variants: Array<{
+    id: string;
+    sku: string | null;
+    barcode: string | null;
+    price: string | null;
+  }>;
+}
+
+export async function fetchShopifyProductVerificationSnapshot(
+  shopDomain: string,
+  accessToken: string,
+  productGid: string,
+  variantGid?: string | null,
+  options?: GraphQLClientOptions
+): Promise<ShopifyProductVerificationSnapshot | null> {
+  const query = `
+    query verifyProductWriteBack($productId: ID!) {
+      product(id: $productId) {
+        id
+        title
+        variants(first: 100) {
+          edges {
+            node {
+              id
+              sku
+              barcode
+              price
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await executeShopifyGraphQL<{
+    product?: {
+      id: string;
+      title: string;
+      variants?: {
+        edges?: Array<{
+          node: {
+            id: string;
+            sku: string | null;
+            barcode: string | null;
+            price: string | null;
+          };
+        }>;
+      };
+    } | null;
+  }>(shopDomain, accessToken, query, { productId: productGid }, options);
+
+  const product = res.data?.product;
+  if (!product) {
+    return null;
+  }
+
+  const variants = (product.variants?.edges || []).map((e) => e.node);
+
+  // Fallback lookup if product has >100 variants and target variant was not in the first page
+  if (variantGid && !variants.some((v) => v.id === variantGid)) {
+    const variantQuery = `
+      query verifySingleVariant($variantId: ID!) {
+        productVariant(id: $variantId) {
+          id
+          sku
+          barcode
+          price
+        }
+      }
+    `;
+    const vRes = await executeShopifyGraphQL<{
+      productVariant?: {
+        id: string;
+        sku: string | null;
+        barcode: string | null;
+        price: string | null;
+      } | null;
+    }>(shopDomain, accessToken, variantQuery, { variantId: variantGid }, options);
+    if (vRes.data?.productVariant) {
+      variants.push(vRes.data.productVariant);
+    }
+  }
+
+  return {
+    id: product.id,
+    title: product.title,
+    variants,
+  };
+}
+

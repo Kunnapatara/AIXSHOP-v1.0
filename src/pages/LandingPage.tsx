@@ -393,10 +393,10 @@ export const LandingPage: React.FC = () => {
         <div className="max-w-4xl mx-auto">
           <div className="text-center max-w-2xl mx-auto mb-8">
             <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-stone-950">
-              Run a Free Store Catalog Health Check
+              Public Store Discovery — Quick Sample Check
             </h2>
             <p className="text-sm text-stone-600 mt-2 leading-relaxed">
-              Analyze public catalog metadata, schema markup completeness, GTIN consistency, and attribute conflicts across your product feed.
+              Run an unauthenticated quick check on up to 25 public products via <code className="font-mono text-stone-800">/products.json</code> (no OAuth required, subject to browser CORS), or connect Authenticated Shopify OAuth inside Settings for full paginated catalog synchronization.
             </p>
           </div>
 
@@ -445,9 +445,34 @@ export const LandingPage: React.FC = () => {
 
             <div className="mt-4 pt-3 border-t border-stone-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-stone-500">
               <span>Evaluates: Variant GTIN/UPC completeness · Attribute &amp; schema gaps · Claim conflicts</span>
-              <span className="font-mono text-stone-400">Checks 25-product /products.json public feed sample (not a full site crawl) or demo fixture</span>
+              <span className="font-mono text-stone-500">Limited Sample (≤25 products) · Unauthenticated /products.json · Subject to CORS</span>
             </div>
           </form>
+
+          <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="bg-stone-50 border border-stone-200 rounded-xl p-4 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-stone-900">Public Store Discovery</span>
+                <span className="text-[11px] font-mono text-amber-800 bg-amber-100/80 px-2 py-0.5 rounded">
+                  Limited Sample (up to 25)
+                </span>
+              </div>
+              <p className="text-xs text-stone-600 leading-relaxed">
+                Zero OAuth required. Reads public <code className="font-mono text-stone-800">/products.json?limit=25</code> directly from the browser (subject to storefront CORS headers; partial catalog preview only).
+              </p>
+            </div>
+            <div className="bg-stone-50 border border-stone-200 rounded-xl p-4 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-stone-900">Full Shopify Catalog Sync</span>
+                <span className="text-[11px] font-mono text-emerald-800 bg-emerald-100/80 px-2 py-0.5 rounded">
+                  Authenticated OAuth
+                </span>
+              </div>
+              <p className="text-xs text-stone-600 leading-relaxed">
+                Uses Shopify Admin GraphQL API (<code className="font-mono text-stone-800">2026-10</code>) with cursor pagination, deduplication, interrupted-sync resume, tenant isolation, and optional approved write-back.
+              </p>
+            </div>
+          </div>
 
           {/* Quick Health Check Result */}
           {quickCheckResult && (
@@ -461,7 +486,7 @@ export const LandingPage: React.FC = () => {
                     <span className="text-xs text-stone-500 font-mono">
                       {quickCheckResult.detectedPlatform}
                       {quickCheckResult.ingestionResult?.source?.classification === 'public_feed'
-                        ? ' · Public Feed (25-product sample)'
+                        ? ' · Public Store Discovery (Limited Sample ≤25 products)'
                         : quickCheckResult.ingestionResult?.source?.classification === 'demo'
                         ? ' · Demo Fixture'
                         : ''}
@@ -587,7 +612,7 @@ export const LandingPage: React.FC = () => {
                           </h4>
                           {ingestion.source.isPartialSample && (
                             <span className="text-[11px] font-medium px-2 py-0.5 rounded bg-amber-100 text-amber-800">
-                              25-Product Sample
+                              Limited Sample (≤25 Products)
                             </span>
                           )}
                         </div>
@@ -1044,7 +1069,7 @@ export const LandingPage: React.FC = () => {
                 Does approving a correction write directly to my live store?
               </h3>
               <p className="text-xs text-stone-600 mt-1.5 leading-relaxed">
-                Approval in AIXSHOP updates your verified workspace intelligence catalog and audit trail only. Live write-back to Shopify or external ERPs is not implemented in this version; Shopify integration operates in read-only catalog sync mode.
+                Approval in AIXSHOP updates your verified workspace catalog and audit trail first. By default, Shopify OAuth connects in read-only catalog sync mode (read_products); if you explicitly grant write_products, you can push individual merchant-approved SKU, GTIN barcode, and title corrections to Shopify with automatic read-back verification.
               </p>
             </div>
           </div>

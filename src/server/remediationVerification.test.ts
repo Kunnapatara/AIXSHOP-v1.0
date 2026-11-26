@@ -853,7 +853,7 @@ describe('Workstreams A, B, C, H, I, K — Deterministic Remediation Verificatio
       );
       assert.match(
         html,
-        /Live write-back to Shopify or external ERPs is not implemented in this version/
+        /By default, Shopify OAuth connects in read-only catalog sync mode \(read_products\); if you explicitly grant write_products/
       );
       assert.match(html, /Demo Reference Tier/);
       assert.match(html, /On-demand catalog schema audit/);

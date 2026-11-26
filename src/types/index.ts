@@ -224,6 +224,7 @@ export interface ActionItem {
     from: string;
     to: string;
   };
+  merchantApprovedValue?: string;
   verificationStatus: VerificationStatus;
   needsMerchantInput?: boolean;
   recheckNotes?: string;

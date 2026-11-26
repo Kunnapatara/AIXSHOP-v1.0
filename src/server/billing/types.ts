@@ -142,4 +142,36 @@ export interface IBillingProvider {
   getPlanPriceMap?(): Record<string, string> | undefined;
 }
 
+export type BillingEmailEventType =
+  | 'initial_payment_confirmed'
+  | 'recurring_renewal'
+  | 'plan_changed'
+  | 'subscription_canceled'
+  | 'payment_failed';
+
+export type BillingEmailDeliveryStatus = 'pending' | 'sent' | 'failed' | 'skipped';
+
+export interface BillingEmailDeliveryRecord {
+  id: string;
+  workspaceId: string;
+  deliveryKey: string;
+  eventType: BillingEmailEventType;
+  recipientEmail: string;
+  tier?: string | null;
+  amountCents?: number | null;
+  currency?: string | null;
+  status: BillingEmailDeliveryStatus;
+  smtpMessageAccepted: boolean;
+  inboxDeliveryConfirmed: boolean;
+  messageId?: string | null;
+  errorMessage?: string | null;
+  attemptCount: number;
+  nextRetryAt?: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+  sentAt?: string | null;
+}
+
+
 

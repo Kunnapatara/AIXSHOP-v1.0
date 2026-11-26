@@ -1,14 +1,17 @@
+import crypto from 'node:crypto';
 import { DatabaseRepository } from '../db/repository';
 import { 
   IBillingProvider, 
   SubscriptionRecord, 
   BillingEventRecord, 
+  BillingEmailEventType,
   PlanTier, 
   AUTHORITATIVE_PLANS,
   WebhookEventPayload 
 } from '../billing/types';
 import { findPlanByPriceId } from '../billing/providerAdapter';
 import { StoreProfile } from '../../types';
+import { sendBillingLifecycleEmail, sanitizeSmtpErrorMessage } from './emailService';
 
 export interface WebhookProcessingResult {
   success: boolean;
@@ -396,7 +399,7 @@ export class BillingService {
       ? new Date(subscriptionObj.current_period_end * 1000).toISOString()
       : new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    return this.repo.withWorkspaceLock(workspaceId, async () => {
+    const result = await this.repo.withWorkspaceLock(workspaceId, async () => {
       const existingSub = await this.repo.getSubscriptionByWorkspace(workspaceId);
       const subRecord: SubscriptionRecord = {
         id: existingSub?.id || `subrec_${workspaceId}`,
@@ -431,6 +434,131 @@ export class BillingService {
         storeProfile: updatedStore,
       };
     });
+
+    await this.dispatchBillingLifecycleEmail({
+      workspaceId,
+      deliveryKey: `billing_email:initial:${workspaceId}:${result.subscription.subscriptionId}`,
+      eventType: 'initial_payment_confirmed',
+      tier: result.subscription.tier,
+      amountCents: plan.priceCents,
+      currency: plan.currency,
+      billingInterval: plan.billingInterval,
+      subscriptionStatus: result.subscription.status,
+      currentPeriodStart: result.subscription.currentPeriodStart,
+      currentPeriodEnd: result.subscription.currentPeriodEnd,
+    });
+
+    return result;
+  }
+
+  private async dispatchBillingLifecycleEmail(params: {
+    workspaceId: string;
+    deliveryKey: string;
+    eventType: BillingEmailEventType;
+    tier: string;
+    previousTier?: string;
+    amountCents?: number | null;
+    currency?: string;
+    billingInterval?: string;
+    subscriptionStatus: string;
+    currentPeriodStart?: string;
+    currentPeriodEnd?: string;
+    cancelAtPeriodEnd?: boolean;
+  }): Promise<void> {
+    try {
+      const recipient = await this.repo.getWorkspaceBillingRecipient(params.workspaceId);
+      if (!recipient?.email) {
+        return;
+      }
+
+      const workspace = await this.repo.getWorkspaceById(params.workspaceId);
+      const currency = (params.currency || 'USD').toUpperCase();
+      const payloadSummary: Record<string, unknown> = {
+        eventType: params.eventType,
+        tier: params.tier,
+        ...(params.previousTier ? { previousTier: params.previousTier } : {}),
+        amountCents: params.amountCents ?? null,
+        currency,
+        billingInterval: params.billingInterval || 'month',
+        subscriptionStatus: params.subscriptionStatus,
+        currentPeriodStart: params.currentPeriodStart || null,
+        currentPeriodEnd: params.currentPeriodEnd || null,
+        cancelAtPeriodEnd: Boolean(params.cancelAtPeriodEnd),
+        fullName: recipient.fullName,
+        workspaceName: workspace?.name || params.workspaceId,
+      };
+
+      const claim = await this.repo.createOrClaimBillingEmailDelivery({
+        id: `bemail_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+        workspaceId: params.workspaceId,
+        deliveryKey: params.deliveryKey,
+        eventType: params.eventType,
+        recipientEmail: recipient.email,
+        tier: params.tier,
+        amountCents: params.amountCents ?? null,
+        currency,
+        payload: payloadSummary,
+      });
+
+      if (!claim.claimed) {
+        return;
+      }
+
+      try {
+        const delivery = await sendBillingLifecycleEmail({
+          to: recipient.email,
+          fullName: recipient.fullName,
+          workspaceName: workspace?.name,
+          workspaceId: params.workspaceId,
+          eventType: params.eventType,
+          tier: params.tier,
+          previousTier: params.previousTier,
+          amountCents: params.amountCents,
+          currency,
+          billingInterval: params.billingInterval,
+          subscriptionStatus: params.subscriptionStatus,
+          currentPeriodStart: params.currentPeriodStart,
+          currentPeriodEnd: params.currentPeriodEnd,
+          cancelAtPeriodEnd: params.cancelAtPeriodEnd,
+        });
+
+        if (delivery.delivered) {
+          await this.repo.updateBillingEmailDeliveryStatus(claim.record.id, {
+            status: 'sent',
+            smtpMessageAccepted: Boolean(delivery.smtp_message_accepted),
+            inboxDeliveryConfirmed: false,
+            messageId: delivery.messageId ?? null,
+            errorMessage: null,
+            nextRetryAt: null,
+            sentAt: new Date().toISOString(),
+          });
+        } else {
+          const safeErr = sanitizeSmtpErrorMessage(
+            delivery.error || `Email transport mode "${delivery.mode}" did not accept delivery.`
+          );
+          await this.repo.updateBillingEmailDeliveryStatus(claim.record.id, {
+            status: 'failed',
+            smtpMessageAccepted: false,
+            inboxDeliveryConfirmed: false,
+            errorMessage: safeErr,
+            nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+          });
+        }
+      } catch (sendErr: any) {
+        const safeErr = sanitizeSmtpErrorMessage(sendErr);
+        await this.repo
+          .updateBillingEmailDeliveryStatus(claim.record.id, {
+            status: 'failed',
+            smtpMessageAccepted: false,
+            inboxDeliveryConfirmed: false,
+            errorMessage: safeErr,
+            nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+          })
+          .catch(() => {});
+      }
+    } catch (err: any) {
+      console.warn('[AIXSHOP Billing Email] Non-blocking lifecycle email dispatch error:', sanitizeSmtpErrorMessage(err));
+    }
   }
 
   async renewEventLease(
@@ -1225,7 +1353,7 @@ export class BillingService {
           workspaceId,
           provider: this.provider.providerName,
           customerId: customerId || `cust_${workspaceId}`,
-          subscriptionId: subscriptionId || `sub_${Date.now()}`,
+          subscriptionId: subscriptionId || existingSub?.subscriptionId || (dataObj.id ? `sub_${dataObj.id}` : `sub_${Date.now()}`),
           tier: plan.tier,
           status: subStatus,
           currentPeriodStart: now.toISOString(),
@@ -1249,6 +1377,21 @@ export class BillingService {
           markProcessed: true,
           leaseOwner,
         });
+
+        if (grantTier) {
+          await this.dispatchBillingLifecycleEmail({
+            workspaceId,
+            deliveryKey: `billing_email:initial:${workspaceId}:${subscriptionRecord.subscriptionId}`,
+            eventType: 'initial_payment_confirmed',
+            tier: plan.tier,
+            amountCents: plan.priceCents,
+            currency: plan.currency,
+            billingInterval: plan.billingInterval,
+            subscriptionStatus: subscriptionRecord.status,
+            currentPeriodStart: subscriptionRecord.currentPeriodStart,
+            currentPeriodEnd: subscriptionRecord.currentPeriodEnd,
+          });
+        }
 
         return {
           success: true,
@@ -1349,6 +1492,9 @@ export class BillingService {
           };
         }
 
+        const previousTier = existingSub?.tier;
+        const previousCancelAtPeriodEnd = Boolean(existingSub?.cancelAtPeriodEnd);
+
         if (beforeCommitGuard) await beforeCommitGuard();
         await this.repo.applyBillingTransition({
           eventId: event.id,
@@ -1357,6 +1503,36 @@ export class BillingService {
           markProcessed: true,
           leaseOwner,
         });
+
+        if (existingSub && previousTier && previousTier !== subRecord.tier && statusEval.isAuthorizedPaidTier) {
+          await this.dispatchBillingLifecycleEmail({
+            workspaceId,
+            deliveryKey: `billing_email:plan_changed:${workspaceId}:${event.id}`,
+            eventType: 'plan_changed',
+            tier: subRecord.tier,
+            previousTier,
+            amountCents: plan.priceCents,
+            currency: plan.currency,
+            billingInterval: plan.billingInterval,
+            subscriptionStatus: subRecord.status,
+            currentPeriodStart: subRecord.currentPeriodStart,
+            currentPeriodEnd: subRecord.currentPeriodEnd,
+          });
+        } else if (existingSub && !previousCancelAtPeriodEnd && cancelAtPeriodEnd) {
+          await this.dispatchBillingLifecycleEmail({
+            workspaceId,
+            deliveryKey: `billing_email:canceled_scheduled:${workspaceId}:${subRecord.subscriptionId}:${subRecord.currentPeriodEnd}`,
+            eventType: 'subscription_canceled',
+            tier: subRecord.tier,
+            amountCents: plan.priceCents,
+            currency: plan.currency,
+            billingInterval: plan.billingInterval,
+            subscriptionStatus: subRecord.status,
+            currentPeriodStart: subRecord.currentPeriodStart,
+            currentPeriodEnd: subRecord.currentPeriodEnd,
+            cancelAtPeriodEnd: true,
+          });
+        }
 
         return {
           success: true,
@@ -1424,6 +1600,22 @@ export class BillingService {
           leaseOwner,
         });
 
+        const deletedPlanKey = updatedSub.tier.toLowerCase().replace(/\s+/g, '_');
+        const deletedPlan = AUTHORITATIVE_PLANS[deletedPlanKey];
+        await this.dispatchBillingLifecycleEmail({
+          workspaceId,
+          deliveryKey: `billing_email:canceled:${workspaceId}:${updatedSub.subscriptionId}:deleted`,
+          eventType: 'subscription_canceled',
+          tier: updatedSub.tier,
+          amountCents: deletedPlan?.priceCents ?? 0,
+          currency: deletedPlan?.currency ?? 'USD',
+          billingInterval: deletedPlan?.billingInterval ?? 'month',
+          subscriptionStatus: 'canceled',
+          currentPeriodStart: updatedSub.currentPeriodStart,
+          currentPeriodEnd: updatedSub.currentPeriodEnd,
+          cancelAtPeriodEnd: false,
+        });
+
         return {
           success: true,
           action: 'processed',
@@ -1432,9 +1624,11 @@ export class BillingService {
         };
       }
 
+      case 'invoice.paid':
       case 'invoice.payment_succeeded': {
         const subId = dataObj.subscription;
         let workspaceId = dataObj.subscription_details?.metadata?.workspaceId || dataObj.metadata?.workspaceId || dataObj.workspaceId;
+        const billingReason = typeof dataObj.billing_reason === 'string' ? dataObj.billing_reason.trim().toLowerCase() : '';
 
         let existingSub: SubscriptionRecord | null = null;
         if (workspaceId) {
@@ -1452,18 +1646,43 @@ export class BillingService {
             return { success: true, action: 'ignored', message: 'Stale invoice payment event safely ignored.' };
           }
 
+          const planDef = AUTHORITATIVE_PLANS[existingSub.tier.toLowerCase().replace(/\s+/g, '_')];
+          const rawLimit = planDef?.skuLimit;
+          const safeSkuLimit = (rawLimit === Infinity || rawLimit === undefined) ? undefined : rawLimit;
+
+          const linePeriod = dataObj.lines?.data?.[0]?.period;
+          const nextPeriodStart =
+            typeof linePeriod?.start === 'number'
+              ? new Date(linePeriod.start * 1000).toISOString()
+              : typeof dataObj.period_start === 'number'
+              ? new Date(dataObj.period_start * 1000).toISOString()
+              : existingSub.currentPeriodStart;
+          const nextPeriodEnd =
+            typeof linePeriod?.end === 'number'
+              ? new Date(linePeriod.end * 1000).toISOString()
+              : typeof dataObj.period_end === 'number'
+              ? new Date(dataObj.period_end * 1000).toISOString()
+              : existingSub.currentPeriodEnd;
+
+          const amountCents =
+            typeof dataObj.amount_paid === 'number' && Number.isFinite(dataObj.amount_paid)
+              ? dataObj.amount_paid
+              : planDef?.priceCents ?? null;
+          const currency =
+            typeof dataObj.currency === 'string' && dataObj.currency.trim()
+              ? dataObj.currency.trim().toUpperCase()
+              : planDef?.currency || 'USD';
+
           // Do not resurrect canceled subscription
           if (existingSub.status === 'past_due') {
             const updatedSub: SubscriptionRecord = {
               ...existingSub,
               status: 'active',
+              currentPeriodStart: nextPeriodStart,
+              currentPeriodEnd: nextPeriodEnd,
               lastEventCreated: eventCreated,
               updatedAt: new Date().toISOString(),
             };
-
-            const planDef = AUTHORITATIVE_PLANS[existingSub.tier.toLowerCase().replace(' ', '_')];
-            const rawLimit = planDef?.skuLimit;
-            const safeSkuLimit = (rawLimit === Infinity || rawLimit === undefined) ? undefined : rawLimit;
 
             if (beforeCommitGuard) await beforeCommitGuard();
             await this.repo.applyBillingTransition({
@@ -1476,7 +1695,62 @@ export class BillingService {
               markProcessed: true,
               leaseOwner,
             });
+
+            if (billingReason !== 'subscription_create') {
+              await this.dispatchBillingLifecycleEmail({
+                workspaceId,
+                deliveryKey: `billing_email:renewal:${workspaceId}:${dataObj.id || event.id}`,
+                eventType: 'recurring_renewal',
+                tier: updatedSub.tier,
+                amountCents,
+                currency,
+                billingInterval: planDef?.billingInterval || 'month',
+                subscriptionStatus: updatedSub.status,
+                currentPeriodStart: updatedSub.currentPeriodStart,
+                currentPeriodEnd: updatedSub.currentPeriodEnd,
+              });
+            }
+
             return { success: true, action: 'processed', message: 'Invoice payment succeeded recorded and subscription reactivated.', subscription: updatedSub };
+          }
+
+          if (existingSub.status === 'active' || existingSub.status === 'trialing') {
+            const updatedSub: SubscriptionRecord = {
+              ...existingSub,
+              currentPeriodStart: nextPeriodStart,
+              currentPeriodEnd: nextPeriodEnd,
+              lastEventCreated: Math.max(existingSub.lastEventCreated || 0, eventCreated),
+              updatedAt: new Date().toISOString(),
+            };
+
+            if (beforeCommitGuard) await beforeCommitGuard();
+            await this.repo.applyBillingTransition({
+              eventId: event.id,
+              subscription: updatedSub,
+              storeProfileUpdate: {
+                tier: existingSub.tier,
+                skuLimit: safeSkuLimit,
+              },
+              markProcessed: true,
+              leaseOwner,
+            });
+
+            if (billingReason !== 'subscription_create') {
+              await this.dispatchBillingLifecycleEmail({
+                workspaceId,
+                deliveryKey: `billing_email:renewal:${workspaceId}:${dataObj.id || event.id}`,
+                eventType: 'recurring_renewal',
+                tier: updatedSub.tier,
+                amountCents,
+                currency,
+                billingInterval: planDef?.billingInterval || 'month',
+                subscriptionStatus: updatedSub.status,
+                currentPeriodStart: updatedSub.currentPeriodStart,
+                currentPeriodEnd: updatedSub.currentPeriodEnd,
+              });
+            }
+
+            return { success: true, action: 'processed', message: 'Invoice payment succeeded recorded.', subscription: updatedSub };
           }
         }
         if (leaseOwner) {
@@ -1521,6 +1795,30 @@ export class BillingService {
               markProcessed: true,
               leaseOwner,
             });
+
+            const failedPlan = AUTHORITATIVE_PLANS[existingSub.tier.toLowerCase().replace(/\s+/g, '_')];
+            const amountCents =
+              typeof dataObj.amount_due === 'number' && Number.isFinite(dataObj.amount_due)
+                ? dataObj.amount_due
+                : failedPlan?.priceCents ?? null;
+            const currency =
+              typeof dataObj.currency === 'string' && dataObj.currency.trim()
+                ? dataObj.currency.trim().toUpperCase()
+                : failedPlan?.currency || 'USD';
+
+            await this.dispatchBillingLifecycleEmail({
+              workspaceId,
+              deliveryKey: `billing_email:payment_failed:${workspaceId}:${dataObj.id || event.id}`,
+              eventType: 'payment_failed',
+              tier: updatedSub.tier,
+              amountCents,
+              currency,
+              billingInterval: failedPlan?.billingInterval || 'month',
+              subscriptionStatus: 'past_due',
+              currentPeriodStart: updatedSub.currentPeriodStart,
+              currentPeriodEnd: updatedSub.currentPeriodEnd,
+            });
+
             return { success: true, action: 'processed', message: 'Invoice payment failure processed; status marked past_due.', subscription: updatedSub };
           }
         }
@@ -1586,6 +1884,21 @@ export class BillingService {
             leaseOwner,
           });
 
+          const refundedPlan = AUTHORITATIVE_PLANS[existingSub.tier.toLowerCase().replace(/\s+/g, '_')];
+          await this.dispatchBillingLifecycleEmail({
+            workspaceId,
+            deliveryKey: `billing_email:canceled:${workspaceId}:${updatedSub.subscriptionId}:refunded:${event.id}`,
+            eventType: 'subscription_canceled',
+            tier: updatedSub.tier,
+            amountCents: refundedPlan?.priceCents ?? 0,
+            currency: refundedPlan?.currency ?? 'USD',
+            billingInterval: refundedPlan?.billingInterval ?? 'month',
+            subscriptionStatus: 'canceled',
+            currentPeriodStart: updatedSub.currentPeriodStart,
+            currentPeriodEnd: updatedSub.currentPeriodEnd,
+            cancelAtPeriodEnd: false,
+          });
+
           return {
             success: true,
             action: 'processed',
@@ -1610,4 +1923,105 @@ export class BillingService {
         return { success: true, action: 'ignored', message: `Unhandled event type "${event.type}" safely ignored.` };
     }
   }
+}
+
+export interface RetryBillingEmailsSummary {
+  scanned: number;
+  retried: number;
+  sent: number;
+  failed: number;
+}
+
+export async function retryFailedBillingEmails(
+  repo: DatabaseRepository,
+  options: { limit?: number } = {}
+): Promise<RetryBillingEmailsSummary> {
+  const candidates = await repo.listFailedBillingEmailDeliveries(options.limit ?? 50);
+  const summary: RetryBillingEmailsSummary = {
+    scanned: candidates.length,
+    retried: 0,
+    sent: 0,
+    failed: 0,
+  };
+
+  for (const rec of candidates) {
+    const claim = await repo.createOrClaimBillingEmailDelivery({
+      id: rec.id,
+      workspaceId: rec.workspaceId,
+      deliveryKey: rec.deliveryKey,
+      eventType: rec.eventType,
+      recipientEmail: rec.recipientEmail,
+      tier: rec.tier,
+      amountCents: rec.amountCents,
+      currency: rec.currency,
+      payload: rec.payload,
+      allowRetryFailed: true,
+    });
+
+    if (!claim.claimed) {
+      continue;
+    }
+
+    summary.retried += 1;
+    const p = (claim.record.payload || {}) as Record<string, any>;
+
+    try {
+      const delivery = await sendBillingLifecycleEmail({
+        to: claim.record.recipientEmail,
+        fullName: typeof p.fullName === 'string' ? p.fullName : undefined,
+        workspaceName: typeof p.workspaceName === 'string' ? p.workspaceName : undefined,
+        workspaceId: claim.record.workspaceId,
+        eventType: claim.record.eventType,
+        tier: claim.record.tier || (typeof p.tier === 'string' ? p.tier : 'Starter'),
+        previousTier: typeof p.previousTier === 'string' ? p.previousTier : undefined,
+        amountCents: claim.record.amountCents,
+        currency: claim.record.currency || 'USD',
+        billingInterval: typeof p.billingInterval === 'string' ? p.billingInterval : 'month',
+        subscriptionStatus:
+          typeof p.subscriptionStatus === 'string' ? p.subscriptionStatus : 'active',
+        currentPeriodStart:
+          typeof p.currentPeriodStart === 'string' ? p.currentPeriodStart : undefined,
+        currentPeriodEnd:
+          typeof p.currentPeriodEnd === 'string' ? p.currentPeriodEnd : undefined,
+        cancelAtPeriodEnd: Boolean(p.cancelAtPeriodEnd),
+      });
+
+      if (delivery.delivered) {
+        await repo.updateBillingEmailDeliveryStatus(claim.record.id, {
+          status: 'sent',
+          smtpMessageAccepted: Boolean(delivery.smtp_message_accepted),
+          inboxDeliveryConfirmed: false,
+          messageId: delivery.messageId ?? null,
+          errorMessage: null,
+          nextRetryAt: null,
+          sentAt: new Date().toISOString(),
+        });
+        summary.sent += 1;
+      } else {
+        const safeErr = sanitizeSmtpErrorMessage(
+          delivery.error || `Email transport mode "${delivery.mode}" did not accept delivery.`
+        );
+        await repo.updateBillingEmailDeliveryStatus(claim.record.id, {
+          status: 'failed',
+          smtpMessageAccepted: false,
+          inboxDeliveryConfirmed: false,
+          errorMessage: safeErr,
+          nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+        });
+        summary.failed += 1;
+      }
+    } catch (err: any) {
+      const safeErr = sanitizeSmtpErrorMessage(err);
+      await repo.updateBillingEmailDeliveryStatus(claim.record.id, {
+        status: 'failed',
+        smtpMessageAccepted: false,
+        inboxDeliveryConfirmed: false,
+        errorMessage: safeErr,
+        nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      summary.failed += 1;
+    }
+  }
+
+  return summary;
 }

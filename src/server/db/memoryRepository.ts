@@ -12,7 +12,9 @@ import {
   UpdateAuditRunData,
   CatalogVersionConflictError,
   CatalogVersionValidationError,
-  WorkspaceLockOrderError
+  WorkspaceLockOrderError,
+  DeleteAccountResult,
+  WorkspaceBillingRecipient,
 } from './repository';
 import {
   TopicPresenceState,
@@ -53,7 +55,19 @@ import {
   sanitizeAndValidateImportCandidates,
 } from '../security/catalogSanitizer';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
+import {
+  SubscriptionRecord,
+  BillingEventRecord,
+  BillingEventStatus,
+  PlanTier,
+  BillingEmailDeliveryRecord,
+  BillingEmailDeliveryStatus,
+  BillingEmailEventType,
+} from '../billing/types';
+import {
+  ShopifyWriteBackOperationRecord,
+  ShopifyWriteBackStatus,
+} from '../shopify/types';
 import { 
   initialProducts, 
   initialFindings, 
@@ -108,6 +122,8 @@ export class MemoryRepository implements DatabaseRepository {
   private userPlatformGrants: Map<string, { platformRole: 'none' | 'platform_reviewer'; scopes: string[]; revokedAt?: string | null }> = new Map();
   private guestTransferAuthorizations: Map<string, GuestTransferAuthorizationRecord> = new Map(); // id -> record
   private guestTransferAuditLog: Map<string, GuestTransferAuditRecord[]> = new Map(); // workspaceId -> entries
+  private shopifyWritebackOperations: Map<string, ShopifyWriteBackOperationRecord> = new Map(); // id -> record
+  private billingEmailDeliveries: Map<string, BillingEmailDeliveryRecord> = new Map(); // id -> record
 
   constructor(seedDefaultDemoWorkspace = false) {
     if (seedDefaultDemoWorkspace) {
@@ -218,6 +234,8 @@ export class MemoryRepository implements DatabaseRepository {
           'reviewer_service_principals',
           'guest_transfer_authorizations',
           'guest_transfer_audit_log',
+          'shopify_writeback_operations',
+          'billing_email_deliveries',
         ],
         appliedMigrations: [
           '001_initial_schema.sql',
@@ -225,6 +243,7 @@ export class MemoryRepository implements DatabaseRepository {
           '016_source_classification_and_domain_cleanup.sql',
           '017_reviewer_identity_and_registry_trust.sql',
           '018_guest_transfer_authorizations.sql',
+          '019_writeback_and_billing_emails.sql',
         ],
       },
     };
@@ -537,6 +556,141 @@ export class MemoryRepository implements DatabaseRepository {
         break;
       }
     }
+  }
+
+  async deleteAccountAndOwnedWorkspaces(userId: string): Promise<DeleteAccountResult> {
+    const existingUser = this.users.get(userId);
+    if (!existingUser) {
+      return {
+        deletedUserId: userId,
+        deletedWorkspaceIds: [],
+        preservedSharedWorkspaceIds: [],
+        deletedSessionsCount: 0,
+      };
+    }
+
+    const userWorkspaceIds = new Set<string>();
+    const membershipIdsToDelete: string[] = [];
+    for (const [memId, mem] of this.memberships.entries()) {
+      if (mem.userId === userId) {
+        userWorkspaceIds.add(mem.workspaceId);
+        membershipIdsToDelete.push(memId);
+      }
+    }
+
+    const deletedWorkspaceIds: string[] = [];
+    const preservedSharedWorkspaceIds: string[] = [];
+
+    for (const wsId of userWorkspaceIds) {
+      let hasOtherMembers = false;
+      for (const mem of this.memberships.values()) {
+        if (mem.workspaceId === wsId && mem.userId !== userId) {
+          hasOtherMembers = true;
+          break;
+        }
+      }
+      if (hasOtherMembers) {
+        preservedSharedWorkspaceIds.push(wsId);
+      } else {
+        deletedWorkspaceIds.push(wsId);
+      }
+    }
+
+    let deletedSessionsCount = 0;
+    for (const [hash, s] of this.sessions.entries()) {
+      if (s.userId === userId) {
+        this.sessions.delete(hash);
+        deletedSessionsCount++;
+      }
+    }
+
+    for (const [tokenId, tok] of this.passwordResetTokens.entries()) {
+      if (tok.userId === userId) {
+        this.passwordResetTokens.delete(tokenId);
+      }
+    }
+
+    this.userPlatformGrants.delete(userId);
+    for (const memId of membershipIdsToDelete) {
+      this.memberships.delete(memId);
+    }
+
+    const deletedSet = new Set(deletedWorkspaceIds);
+    for (const wsId of deletedWorkspaceIds) {
+      this.workspaces.delete(wsId);
+      this.stores.delete(wsId);
+      this.catalogs.delete(wsId);
+      this.subscriptions.delete(wsId);
+      this.shopifyConnections.delete(wsId);
+      this.shopifyProductProvenance.delete(wsId);
+      this.evidenceReviewAuditLog.delete(wsId);
+      this.businessProfiles.delete(wsId);
+      this.catalogVersions.delete(wsId);
+      this.guestTransferAuditLog.delete(wsId);
+    }
+
+    for (const [runId, run] of this.auditRuns.entries()) {
+      if (deletedSet.has(run.workspaceId)) {
+        this.auditRuns.delete(runId);
+        this.auditRunFindings.delete(runId);
+        this.auditRunEvidence.delete(runId);
+        this.auditRunProducts.delete(runId);
+        this.auditRunManifests.delete(runId);
+      }
+    }
+
+    for (const [runId, run] of this.shopifySyncRuns.entries()) {
+      if (deletedSet.has(run.workspaceId)) {
+        this.shopifySyncRuns.delete(runId);
+      }
+    }
+    for (const [k, ev] of this.shopifyWebhookEvents.entries()) {
+      if (deletedSet.has(ev.workspaceId)) {
+        this.shopifyWebhookEvents.delete(k);
+      }
+    }
+    for (const [stateId, st] of this.shopifyOAuthStates.entries()) {
+      if (deletedSet.has(st.workspaceId)) {
+        this.shopifyOAuthStates.delete(stateId);
+      }
+    }
+    for (const [leaseKey, lease] of this.workspaceOperationLeases.entries()) {
+      if (deletedSet.has(lease.workspaceId)) {
+        this.workspaceOperationLeases.delete(leaseKey);
+      }
+    }
+    for (const [authId, auth] of this.guestTransferAuthorizations.entries()) {
+      if (auth.userId === userId || deletedSet.has(auth.workspaceId)) {
+        this.guestTransferAuthorizations.delete(authId);
+      }
+    }
+    for (const [impId, imp] of this.visibilityImports.entries()) {
+      if (deletedSet.has(imp.workspaceId)) {
+        this.visibilityImports.delete(impId);
+      }
+    }
+    for (const [opId, op] of this.shopifyWritebackOperations.entries()) {
+      if (deletedSet.has(op.workspaceId)) {
+        this.shopifyWritebackOperations.delete(opId);
+      }
+    }
+    for (const [delId, del] of this.billingEmailDeliveries.entries()) {
+      if (deletedSet.has(del.workspaceId)) {
+        this.billingEmailDeliveries.delete(delId);
+      }
+    }
+
+    this.visibilityMetrics = this.visibilityMetrics.filter((m) => !deletedSet.has(m.workspaceId));
+    this.visibilityObservationHistory = this.visibilityObservationHistory.filter((h) => !deletedSet.has(h.workspaceId));
+
+    this.users.delete(userId);
+
+    return {
+      deletedUserId: userId,
+      deletedWorkspaceIds,
+      preservedSharedWorkspaceIds,
+      deletedSessionsCount,
+    };
   }
 
   async getStoreByWorkspace(workspaceId: string): Promise<StoreProfile | null> {
@@ -3293,6 +3447,352 @@ export class MemoryRepository implements DatabaseRepository {
         [...entries].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       )
     );
+  }
+
+  async getWorkspaceBillingRecipient(workspaceId: string): Promise<WorkspaceBillingRecipient | null> {
+    const members = Array.from(this.memberships.values())
+      .filter((m) => m.workspaceId === workspaceId)
+      .sort((a, b) => {
+        const rank = (role: WorkspaceRole) => (role === 'owner' ? 0 : role === 'admin' ? 1 : 2);
+        const rDiff = rank(a.role) - rank(b.role);
+        if (rDiff !== 0) return rDiff;
+        return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+      });
+    for (const m of members) {
+      const user = this.users.get(m.userId);
+      if (user) {
+        return { userId: user.id, email: user.email, fullName: user.fullName };
+      }
+    }
+    return null;
+  }
+
+  async createOrClaimBillingEmailDelivery(params: {
+    id: string;
+    workspaceId: string;
+    deliveryKey: string;
+    eventType: BillingEmailEventType;
+    recipientEmail: string;
+    tier?: string | null;
+    amountCents?: number | null;
+    currency?: string | null;
+    payload?: Record<string, unknown>;
+    allowRetryFailed?: boolean;
+  }): Promise<{ claimed: boolean; record: BillingEmailDeliveryRecord }> {
+    const nowIso = new Date().toISOString();
+    let existing: BillingEmailDeliveryRecord | undefined;
+    for (const rec of this.billingEmailDeliveries.values()) {
+      if (rec.deliveryKey === params.deliveryKey) {
+        existing = rec;
+        break;
+      }
+    }
+
+    if (existing) {
+      const updatedMs = new Date(existing.updatedAt).getTime();
+      const stalePending = existing.status === 'pending' && Date.now() - updatedMs > 120_000;
+      const retryableFailed = existing.status === 'failed' && Boolean(params.allowRetryFailed);
+      if (existing.status === 'sent' || (existing.status === 'pending' && !stalePending) || (!retryableFailed && existing.status === 'failed')) {
+        return { claimed: false, record: JSON.parse(JSON.stringify(existing)) };
+      }
+      if (existing.status === 'skipped') {
+        return { claimed: false, record: JSON.parse(JSON.stringify(existing)) };
+      }
+      existing.status = 'pending';
+      existing.attemptCount = (existing.attemptCount || 1) + 1;
+      existing.errorMessage = null;
+      existing.recipientEmail = params.recipientEmail;
+      if (params.tier !== undefined) existing.tier = params.tier;
+      if (params.amountCents !== undefined) existing.amountCents = params.amountCents;
+      if (params.currency !== undefined) existing.currency = params.currency;
+      if (params.payload !== undefined) existing.payload = JSON.parse(JSON.stringify(params.payload));
+      existing.updatedAt = nowIso;
+      return { claimed: true, record: JSON.parse(JSON.stringify(existing)) };
+    }
+
+    const created: BillingEmailDeliveryRecord = {
+      id: params.id,
+      workspaceId: params.workspaceId,
+      deliveryKey: params.deliveryKey,
+      eventType: params.eventType,
+      recipientEmail: params.recipientEmail,
+      tier: params.tier ?? null,
+      amountCents: params.amountCents ?? null,
+      currency: params.currency ?? null,
+      status: 'pending',
+      smtpMessageAccepted: false,
+      inboxDeliveryConfirmed: false,
+      messageId: null,
+      errorMessage: null,
+      attemptCount: 1,
+      nextRetryAt: null,
+      payload: JSON.parse(JSON.stringify(params.payload || {})),
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      sentAt: null,
+    };
+    this.billingEmailDeliveries.set(created.id, created);
+    return { claimed: true, record: JSON.parse(JSON.stringify(created)) };
+  }
+
+  async updateBillingEmailDeliveryStatus(
+    id: string,
+    updates: {
+      status: BillingEmailDeliveryStatus;
+      smtpMessageAccepted?: boolean;
+      inboxDeliveryConfirmed?: boolean;
+      messageId?: string | null;
+      errorMessage?: string | null;
+      nextRetryAt?: string | null;
+      sentAt?: string | null;
+      payload?: Record<string, unknown>;
+    }
+  ): Promise<BillingEmailDeliveryRecord> {
+    const existing = this.billingEmailDeliveries.get(id);
+    if (!existing) {
+      throw new Error(`Billing email delivery ${id} not found`);
+    }
+    existing.status = updates.status;
+    if (updates.smtpMessageAccepted !== undefined) existing.smtpMessageAccepted = updates.smtpMessageAccepted;
+    if (updates.inboxDeliveryConfirmed !== undefined) existing.inboxDeliveryConfirmed = updates.inboxDeliveryConfirmed;
+    if (updates.messageId !== undefined) existing.messageId = updates.messageId;
+    if (updates.errorMessage !== undefined) existing.errorMessage = updates.errorMessage;
+    if (updates.nextRetryAt !== undefined) existing.nextRetryAt = updates.nextRetryAt;
+    if (updates.sentAt !== undefined) existing.sentAt = updates.sentAt;
+    if (updates.payload !== undefined) existing.payload = JSON.parse(JSON.stringify(updates.payload));
+    existing.updatedAt = new Date().toISOString();
+    return JSON.parse(JSON.stringify(existing));
+  }
+
+  async getBillingEmailDeliveryByKey(deliveryKey: string): Promise<BillingEmailDeliveryRecord | null> {
+    for (const rec of this.billingEmailDeliveries.values()) {
+      if (rec.deliveryKey === deliveryKey) {
+        return JSON.parse(JSON.stringify(rec));
+      }
+    }
+    return null;
+  }
+
+  async listBillingEmailDeliveries(workspaceId: string, limit = 50): Promise<BillingEmailDeliveryRecord[]> {
+    return Array.from(this.billingEmailDeliveries.values())
+      .filter((r) => r.workspaceId === workspaceId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(0, limit)
+      .map((r) => JSON.parse(JSON.stringify(r)));
+  }
+
+  async listFailedBillingEmailDeliveries(limit = 50): Promise<BillingEmailDeliveryRecord[]> {
+    const now = Date.now();
+    return Array.from(this.billingEmailDeliveries.values())
+      .filter((r) => r.status === 'failed' && (!r.nextRetryAt || new Date(r.nextRetryAt).getTime() <= now))
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      .slice(0, limit)
+      .map((r) => JSON.parse(JSON.stringify(r)));
+  }
+
+  async createOrClaimShopifyWriteBackOperation(params: {
+    id: string;
+    workspaceId: string;
+    actionId: string;
+    productId: string;
+    shopDomain: string;
+    shopifyProductGid: string;
+    shopifyVariantGid?: string | null;
+    fieldPath: string;
+    beforeValue?: string | null;
+    approvedValue: string;
+    idempotencyKey: string;
+    operatorUserId: string;
+    auditMetadata?: Record<string, any>;
+  }): Promise<{
+    claimed: boolean;
+    conflictReason?: string;
+    record: ShopifyWriteBackOperationRecord;
+  }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      for (const op of this.shopifyWritebackOperations.values()) {
+        if (op.workspaceId === params.workspaceId && op.actionId === params.actionId && op.status === 'verified_applied') {
+          return {
+            claimed: false,
+            conflictReason: 'WRITEBACK_ALREADY_APPLIED',
+            record: JSON.parse(JSON.stringify(op)),
+          };
+        }
+      }
+
+      let existingByKey: ShopifyWriteBackOperationRecord | undefined;
+      for (const op of this.shopifyWritebackOperations.values()) {
+        if (op.workspaceId === params.workspaceId && op.idempotencyKey === params.idempotencyKey) {
+          existingByKey = op;
+          break;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      if (existingByKey) {
+        const ageMs = Date.now() - new Date(existingByKey.updatedAt).getTime();
+        if (existingByKey.status === 'verified_applied' || existingByKey.status === 'applied_unverified') {
+          return {
+            claimed: false,
+            conflictReason: 'WRITEBACK_ALREADY_APPLIED',
+            record: JSON.parse(JSON.stringify(existingByKey)),
+          };
+        }
+        if (existingByKey.status === 'pending' && ageMs < 120_000) {
+          return {
+            claimed: false,
+            conflictReason: 'WRITEBACK_IN_PROGRESS',
+            record: JSON.parse(JSON.stringify(existingByKey)),
+          };
+        }
+        existingByKey.status = 'pending';
+        existingByKey.errorCode = null;
+        existingByKey.errorMessage = null;
+        existingByKey.operatorUserId = params.operatorUserId;
+        existingByKey.auditMetadata = JSON.parse(JSON.stringify(params.auditMetadata || {}));
+        existingByKey.updatedAt = nowIso;
+        return { claimed: true, record: JSON.parse(JSON.stringify(existingByKey)) };
+      }
+
+      const created: ShopifyWriteBackOperationRecord = {
+        id: params.id,
+        workspaceId: params.workspaceId,
+        actionId: params.actionId,
+        productId: params.productId,
+        shopDomain: params.shopDomain,
+        shopifyProductGid: params.shopifyProductGid,
+        shopifyVariantGid: params.shopifyVariantGid ?? null,
+        fieldPath: params.fieldPath,
+        beforeValue: params.beforeValue ?? null,
+        approvedValue: params.approvedValue,
+        verifiedValue: null,
+        status: 'pending',
+        idempotencyKey: params.idempotencyKey,
+        shopifyMutationId: null,
+        operatorUserId: params.operatorUserId,
+        errorCode: null,
+        errorMessage: null,
+        auditMetadata: JSON.parse(JSON.stringify(params.auditMetadata || {})),
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        verifiedAt: null,
+      };
+      this.shopifyWritebackOperations.set(created.id, created);
+      return { claimed: true, record: JSON.parse(JSON.stringify(created)) };
+    });
+  }
+
+  async completeShopifyWriteBackOperation(params: {
+    operationId: string;
+    workspaceId: string;
+    actionId: string;
+    status: ShopifyWriteBackStatus;
+    verifiedValue?: string | null;
+    shopifyMutationId?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    auditMetadata?: Record<string, any>;
+    markActionAppliedExternally?: boolean;
+    operatorUserId: string;
+    shopDomain: string;
+    beforeValue?: string | null;
+    approvedValue: string;
+    fieldPath: string;
+    shopifyProductGid: string;
+    shopifyVariantGid?: string | null;
+  }): Promise<{
+    operation: ShopifyWriteBackOperationRecord;
+    action?: ActionItem;
+    catalogVersion?: number;
+  }> {
+    return this.withWorkspaceLock(params.workspaceId, async () => {
+      const op = this.shopifyWritebackOperations.get(params.operationId);
+      if (!op || op.workspaceId !== params.workspaceId) {
+        throw new Error(`Shopify write-back operation ${params.operationId} not found`);
+      }
+
+      const nowIso = new Date().toISOString();
+      op.status = params.status;
+      if (params.verifiedValue !== undefined) op.verifiedValue = params.verifiedValue;
+      if (params.shopifyMutationId !== undefined) op.shopifyMutationId = params.shopifyMutationId;
+      if (params.errorCode !== undefined) op.errorCode = params.errorCode;
+      if (params.errorMessage !== undefined) op.errorMessage = params.errorMessage;
+      if (params.auditMetadata !== undefined) {
+        op.auditMetadata = { ...op.auditMetadata, ...JSON.parse(JSON.stringify(params.auditMetadata)) };
+      }
+      if (params.status === 'verified_applied') {
+        op.verifiedAt = nowIso;
+      }
+      op.updatedAt = nowIso;
+
+      let updatedAction: ActionItem | undefined;
+      let catalogVersion: number | undefined;
+
+      if (params.markActionAppliedExternally && params.status === 'verified_applied') {
+        const catalog = await this.loadWorkspaceCatalog(params.workspaceId);
+        if (catalog) {
+          const nextActions = catalog.actions.map((a) => {
+            if (a.id !== params.actionId) return a;
+            const entry = {
+              timestamp: nowIso,
+              actor: 'merchant_operator',
+              operatorUserId: params.operatorUserId,
+              event: 'shopify_writeback_verified',
+              operationId: params.operationId,
+              shopDomain: params.shopDomain,
+              shopifyProductGid: params.shopifyProductGid,
+              shopifyVariantGid: params.shopifyVariantGid ?? null,
+              fieldPath: params.fieldPath,
+              from: params.beforeValue ?? a.proposedChange.from,
+              to: params.approvedValue,
+              verifiedValue: params.verifiedValue ?? params.approvedValue,
+              shopifyMutationId: params.shopifyMutationId ?? null,
+            };
+            const nextAction: ActionItem = {
+              ...a,
+              status: 'applied_externally',
+              verificationStatus: 'verified_in_catalog',
+              auditLog: [...(Array.isArray(a.auditLog) ? a.auditLog : []), entry],
+            };
+            updatedAction = nextAction;
+            return nextAction;
+          });
+
+          const nextCatalog: StoragePayloadV1 = {
+            ...catalog,
+            actions: nextActions,
+          };
+          await this.saveWorkspaceCatalogInternal(params.workspaceId, nextCatalog);
+          catalogVersion = this.catalogVersions.get(params.workspaceId);
+        }
+      }
+
+      return {
+        operation: JSON.parse(JSON.stringify(op)),
+        action: updatedAction ? JSON.parse(JSON.stringify(updatedAction)) : undefined,
+        catalogVersion,
+      };
+    });
+  }
+
+  async listShopifyWriteBackOperations(workspaceId: string, limit = 50): Promise<ShopifyWriteBackOperationRecord[]> {
+    return Array.from(this.shopifyWritebackOperations.values())
+      .filter((op) => op.workspaceId === workspaceId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(0, limit)
+      .map((op) => JSON.parse(JSON.stringify(op)));
+  }
+
+  async getShopifyWriteBackOperationByKey(
+    workspaceId: string,
+    idempotencyKey: string
+  ): Promise<ShopifyWriteBackOperationRecord | null> {
+    for (const op of this.shopifyWritebackOperations.values()) {
+      if (op.workspaceId === workspaceId && op.idempotencyKey === idempotencyKey) {
+        return JSON.parse(JSON.stringify(op));
+      }
+    }
+    return null;
   }
 }
 

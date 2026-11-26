@@ -7,6 +7,27 @@ import { getTrustedShopifyUrls } from '../config/productionConfig';
 
 export const DEFAULT_SHOPIFY_SCOPES = 'read_products';
 
+export function hasShopifyWriteScope(grantedScopes?: string | string[] | null): boolean {
+  if (!grantedScopes) return false;
+  const list = Array.isArray(grantedScopes)
+    ? grantedScopes
+    : String(grantedScopes).split(',');
+  return list.map((s) => s.trim()).filter(Boolean).includes('write_products');
+}
+
+export function resolveRequestedShopifyScopes(writeAccess?: boolean): string {
+  const configured = (process.env.SHOPIFY_SCOPES || DEFAULT_SHOPIFY_SCOPES)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const scopeSet = new Set<string>(configured.length > 0 ? configured : [DEFAULT_SHOPIFY_SCOPES]);
+  if (writeAccess === true) {
+    scopeSet.add('read_products');
+    scopeSet.add('write_products');
+  }
+  return Array.from(scopeSet).join(',');
+}
+
 export interface ShopifyOAuthEnv {
   apiKey: string;
   apiSecret: string;
@@ -36,14 +57,16 @@ export function getShopifyOAuthEnv(): ShopifyOAuthEnv {
 export async function initiateShopifyConnect(
   repo: DatabaseRepository,
   workspaceId: string,
-  rawShopDomain: string
-): Promise<{ authUrl: string; state: string; shopDomain: string }> {
+  rawShopDomain: string,
+  options: { writeAccess?: boolean } = {}
+): Promise<{ authUrl: string; state: string; shopDomain: string; scopes: string }> {
   const shop = normalizeShopDomain(rawShopDomain);
   if (!isValidShopDomain(shop)) {
     throw new Error(`[AIXSHOP Shopify OAuth] Invalid shop domain "${rawShopDomain}". Must be a valid *.myshopify.com hostname.`);
   }
 
-  const { apiKey, redirectUri, scopes } = getShopifyOAuthEnv();
+  const { apiKey, redirectUri } = getShopifyOAuthEnv();
+  const scopes = resolveRequestedShopifyScopes(options.writeAccess);
   if (!apiKey) {
     throw new Error(
       '[AIXSHOP Shopify OAuth] SHOPIFY_API_KEY is not configured in the environment. Configure app credentials in Settings or .env.'
@@ -75,6 +98,7 @@ export async function initiateShopifyConnect(
     authUrl,
     state: stateNonce,
     shopDomain: shop,
+    scopes,
   };
 }
 
@@ -269,6 +293,7 @@ export async function handleShopifyCallback(
       c => c.id === 'shopify' || c.id === 'shopify_primary' || c.type === 'shopify'
     );
     const existingConnectorId = shopifyIdx >= 0 ? connectors[shopifyIdx].id : 'shopify';
+    const writeBackAuthorized = hasShopifyWriteScope(grantedScopes);
     const updatedConnector = {
       id: existingConnectorId,
       name: `Shopify (${verifyResult.shopName || shop})`,
@@ -276,7 +301,8 @@ export async function handleShopifyCallback(
       status: 'connected' as const,
       productCountSynced: storeProfile.skuCount || 0,
       lastSync: nowIso,
-      writeBackAuthorized: false,
+      readOnly: !writeBackAuthorized,
+      writeBackAuthorized,
     };
 
     const nextConnectors = [...connectors];

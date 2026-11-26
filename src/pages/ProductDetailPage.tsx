@@ -116,9 +116,9 @@ export const ProductDetailPage: React.FC = () => {
                   <span className="font-mono text-stone-600">
                     Source:{' '}
                     {selectedProduct.sourceClassification === 'shopify_oauth'
-                      ? 'Shopify Connected Store'
+                      ? 'Full Shopify Sync (OAuth)'
                       : selectedProduct.sourceClassification === 'public_feed'
-                      ? 'Public Feed'
+                      ? 'Public Store Discovery (Sample ≤25)'
                       : selectedProduct.sourceClassification === 'demo'
                       ? 'Demo Data'
                       : 'Manual Import'}

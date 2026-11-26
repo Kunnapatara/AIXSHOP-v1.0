@@ -148,7 +148,7 @@ AIXSHOP persists verified Stripe/billing webhook events in `billing_events` with
 
 ### External Integration Verification Truth Boundary
 - **Stripe Test Mode (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`)**: `BLOCKED — TEST CREDENTIALS / CONFIGURATION UNAVAILABLE` (not executed against live Stripe APIs in this environment).
-- **Shopify Development Store (`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`)**: `BLOCKED — SHOPIFY DEVELOPMENT STORE ACCESS UNAVAILABLE`. Current connector scope is read-only (`read_products`, `writeBackAuthorized: false`).
+- **Shopify Development Store (`SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`)**: `BLOCKED — SHOPIFY DEVELOPMENT STORE ACCESS UNAVAILABLE`. Default OAuth scope is `read_products`; optional merchant-approved write-back (`write_products`) is gated behind explicit opt-in and read-back verification.
 - **Complete End-to-End Customer Journey**: `BLOCKED` pending live Stripe Test Mode and Shopify Development Store credentials.
 
 ---
@@ -167,4 +167,19 @@ See [`docs/COMMERCIAL_VERIFICATION_GUIDE.md`](docs/COMMERCIAL_VERIFICATION_GUIDE
   - `npm run verify:smtp` (Stage 3 — Real SMTP Provider)
   - `npm run verify:staging-e2e` (Stage 4 — Staging End-to-End Customer Journey)
   - `npm run verify:commercial:report -- --write` (Generate aggregate Markdown report)
+
+---
+
+## 9. Catalog Acquisition Modes: Public Store Discovery vs. Full Shopify OAuth Sync
+
+AIXSHOP keeps public preview checks strictly distinct from authenticated store synchronization:
+
+| Capability | Public Store Discovery (`public_feed`) | Full Shopify Catalog Sync (`shopify_oauth`) |
+| :--- | :--- | :--- |
+| **Authentication** | None (unauthenticated) | Authenticated Shopify OAuth + encrypted token (`AES-256-GCM`) |
+| **Endpoint / API** | `GET /products.json?limit=25` | Shopify Admin GraphQL API (`2026-10`) |
+| **Coverage** | **Limited Sample (up to 25 products)** | Full catalog across all paginated pages |
+| **Constraints** | Subject to storefront CORS policy; no warehouse stock or write-back | Supports cursor pagination, deduplication, interrupted-run resume, and multi-tenant isolation |
+| **Write-Back** | Not available | Optional merchant-approved remediation push (`write_products` + read-back verification) |
+
 

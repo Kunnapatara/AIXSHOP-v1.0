@@ -25,13 +25,38 @@ import {
 import { ReviewerServicePrincipalRecord } from '../security/reviewerAuth';
 import { ExternalRegistryVerificationEvaluation } from '../services/externalRegistryService';
 import { StoragePayloadV1 } from '../../domain/storage/storageTypes';
-import { SubscriptionRecord, BillingEventRecord, BillingEventStatus, PlanTier } from '../billing/types';
+import {
+  SubscriptionRecord,
+  BillingEventRecord,
+  BillingEventStatus,
+  PlanTier,
+  BillingEmailDeliveryRecord,
+  BillingEmailDeliveryStatus,
+  BillingEmailEventType,
+} from '../billing/types';
+import {
+  ShopifyWriteBackOperationRecord,
+  ShopifyWriteBackStatus,
+} from '../shopify/types';
 import {
   GuestTransferAuditRecord,
   GuestTransferAuthorizationRecord,
   GuestTransferCommitResult,
   GuestTransferConflictStrategy,
 } from '../../domain/catalog/guestTransfer';
+
+export interface DeleteAccountResult {
+  deletedUserId: string;
+  deletedWorkspaceIds: string[];
+  preservedSharedWorkspaceIds: string[];
+  deletedSessionsCount: number;
+}
+
+export interface WorkspaceBillingRecipient {
+  userId: string;
+  email: string;
+  fullName: string;
+}
 
 export interface CreateUserData {
   id: string;
@@ -178,6 +203,7 @@ export interface DatabaseRepository {
   deleteSession(tokenHash: string): Promise<void>;
   deleteUserSessions(userId: string): Promise<void>;
   updateSessionWorkspace(sessionId: string, newWorkspaceId: string): Promise<void>;
+  deleteAccountAndOwnedWorkspaces(userId: string): Promise<DeleteAccountResult>;
 
   // Workspace Operation Leases (Migration 014)
   acquireWorkspaceOperationLease(
@@ -391,6 +417,37 @@ export interface DatabaseRepository {
     leaseOwner?: string;
   }): Promise<void>;
 
+  // Billing Lifecycle Email Deliveries (Migration 019)
+  getWorkspaceBillingRecipient(workspaceId: string): Promise<WorkspaceBillingRecipient | null>;
+  createOrClaimBillingEmailDelivery(params: {
+    id: string;
+    workspaceId: string;
+    deliveryKey: string;
+    eventType: BillingEmailEventType;
+    recipientEmail: string;
+    tier?: string | null;
+    amountCents?: number | null;
+    currency?: string | null;
+    payload?: Record<string, unknown>;
+    allowRetryFailed?: boolean;
+  }): Promise<{ claimed: boolean; record: BillingEmailDeliveryRecord }>;
+  updateBillingEmailDeliveryStatus(
+    id: string,
+    updates: {
+      status: BillingEmailDeliveryStatus;
+      smtpMessageAccepted?: boolean;
+      inboxDeliveryConfirmed?: boolean;
+      messageId?: string | null;
+      errorMessage?: string | null;
+      nextRetryAt?: string | null;
+      sentAt?: string | null;
+      payload?: Record<string, unknown>;
+    }
+  ): Promise<BillingEmailDeliveryRecord>;
+  getBillingEmailDeliveryByKey(deliveryKey: string): Promise<BillingEmailDeliveryRecord | null>;
+  listBillingEmailDeliveries(workspaceId: string, limit?: number): Promise<BillingEmailDeliveryRecord[]>;
+  listFailedBillingEmailDeliveries(limit?: number): Promise<BillingEmailDeliveryRecord[]>;
+
   // Catalog Audit Runs
   createAuditRun(data: CreateAuditRunData): Promise<AuditRunRecord>;
   updateAuditRun(id: string, updates: UpdateAuditRunData): Promise<AuditRunRecord>;
@@ -502,6 +559,55 @@ export interface DatabaseRepository {
       saveConnection: (conn: import('../shopify/types').ShopifyConnectionRecord) => Promise<import('../shopify/types').ShopifyConnectionRecord>
     ) => Promise<T>
   ): Promise<T>;
+
+  // Shopify Approved Write-Back Operations (Migration 019)
+  createOrClaimShopifyWriteBackOperation(params: {
+    id: string;
+    workspaceId: string;
+    actionId: string;
+    productId: string;
+    shopDomain: string;
+    shopifyProductGid: string;
+    shopifyVariantGid?: string | null;
+    fieldPath: string;
+    beforeValue?: string | null;
+    approvedValue: string;
+    idempotencyKey: string;
+    operatorUserId: string;
+    auditMetadata?: Record<string, any>;
+  }): Promise<{
+    claimed: boolean;
+    conflictReason?: string;
+    record: ShopifyWriteBackOperationRecord;
+  }>;
+  completeShopifyWriteBackOperation(params: {
+    operationId: string;
+    workspaceId: string;
+    actionId: string;
+    status: ShopifyWriteBackStatus;
+    verifiedValue?: string | null;
+    shopifyMutationId?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    auditMetadata?: Record<string, any>;
+    markActionAppliedExternally?: boolean;
+    operatorUserId: string;
+    shopDomain: string;
+    beforeValue?: string | null;
+    approvedValue: string;
+    fieldPath: string;
+    shopifyProductGid: string;
+    shopifyVariantGid?: string | null;
+  }): Promise<{
+    operation: ShopifyWriteBackOperationRecord;
+    action?: ActionItem;
+    catalogVersion?: number;
+  }>;
+  listShopifyWriteBackOperations(workspaceId: string, limit?: number): Promise<ShopifyWriteBackOperationRecord[]>;
+  getShopifyWriteBackOperationByKey(
+    workspaceId: string,
+    idempotencyKey: string
+  ): Promise<ShopifyWriteBackOperationRecord | null>;
   getWorkspaceBusinessProfile(workspaceId: string): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile | null>;
   saveWorkspaceBusinessProfile(profile: import('../../domain/businessProfile/types').WorkspaceBusinessProfile): Promise<import('../../domain/businessProfile/types').WorkspaceBusinessProfile>;
   saveVisibilityImport(record: import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord): Promise<import('../../domain/monitoring/aiVisibilityTypes').VisibilityImportRecord>;

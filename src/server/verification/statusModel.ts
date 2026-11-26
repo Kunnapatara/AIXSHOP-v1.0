@@ -5,7 +5,30 @@ import { validateProductionConfig, validateShopifyUrlConfig } from '../config/pr
 import { validateStripePriceConfiguration } from '../billing/providerAdapter';
 import { validateSmtpConfig } from '../services/emailService';
 
-export type VerificationStatus = 'PASS' | 'FAIL' | 'BLOCKED' | 'NOT RUN';
+export type VerificationStatus = 'PASS' | 'FAIL' | 'BLOCKED' | 'NOT RUN' | 'PASS — SIMULATED';
+
+export type StagingCleanupStatus =
+  | 'CLEANED'
+  | 'PARTIAL_CLEANUP'
+  | 'FAILED'
+  | 'SKIPPED_DISABLED'
+  | 'NONE_CREATED';
+
+export interface CleanupReport {
+  enabled: boolean;
+  status: StagingCleanupStatus;
+  trackedResources: {
+    userIds: string[];
+    workspaceIds: string[];
+    checkoutSessionIds: string[];
+    testEmails: string[];
+  };
+  deletedUserIds: string[];
+  deletedWorkspaceIds: string[];
+  preservedSharedWorkspaceIds: string[];
+  warnings: string[];
+  errors: string[];
+}
 
 export type ExecutionMode =
   | 'unit_mock'
@@ -48,6 +71,7 @@ export interface StageVerificationSummary {
   };
   missingEnvVars: string[];
   checks: VerificationCheckResult[];
+  cleanupReport?: CleanupReport;
 }
 
 export interface CommercialReadinessItem {
@@ -77,7 +101,9 @@ export interface CommercialVerificationReport {
   overallExternalStatus: VerificationStatus;
   readiness: CommercialEnvReadinessReport;
   stages: StageVerificationSummary[];
+  simulatedChecks?: VerificationCheckResult[];
   cleanupPerformed: boolean;
+  cleanupReport?: CleanupReport;
   notes: string[];
 }
 
@@ -383,6 +409,7 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   lines.push('');
   lines.push('## Status Model');
   lines.push('- `PASS`: Executed against the intended target with verifiable evidence.');
+  lines.push('- `PASS — SIMULATED`: Executed end-to-end using local mocks, fixtures, or test doubles only (never live external providers).');
   lines.push('- `FAIL`: Executed and failed.');
   lines.push('- `BLOCKED`: Cannot execute because required credentials, targets, or opt-in activation are missing.');
   lines.push('- `NOT RUN`: Not yet executed.');
@@ -412,6 +439,42 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
         ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence)))
         : '—';
       lines.push(`| \`${c.testId}\` | ${c.name} | \`${c.executionMode}\` | **${c.status}** | ${detail.replace(/\|/g, '\\|')} |`);
+    }
+    lines.push('');
+  }
+
+  if (report.simulatedChecks && report.simulatedChecks.length > 0) {
+    lines.push('## Simulated Integration & Customer Journey Checks (`PASS — SIMULATED`)');
+    lines.push('');
+    lines.push('| Test ID | Check | Execution Mode | Status | Evidence |');
+    lines.push('| --- | --- | --- | --- | --- |');
+    for (const c of report.simulatedChecks) {
+      const detail = c.blockerOrFailure
+        ? redactSecrets(c.blockerOrFailure)
+        : c.evidence
+        ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence)))
+        : '—';
+      lines.push(`| \`${c.testId}\` | ${c.name} | \`${c.executionMode}\` | **${c.status}** | ${detail.replace(/\|/g, '\\|')} |`);
+    }
+    lines.push('');
+  }
+
+  const cleanup = report.cleanupReport || report.stages.find((s) => s.cleanupReport)?.cleanupReport;
+  if (cleanup) {
+    lines.push('## Staging E2E Cleanup Summary');
+    lines.push('');
+    lines.push(`- **Cleanup Enabled (\`STAGING_CLEANUP_ENABLED\`):** ${cleanup.enabled ? 'true' : 'false'}`);
+    lines.push(`- **Cleanup Status:** **${cleanup.status}**`);
+    lines.push(`- **Tracked Users:** ${cleanup.trackedResources.userIds.length} (\`${cleanup.trackedResources.userIds.join(', ') || 'none'}\`)`);
+    lines.push(`- **Tracked Workspaces:** ${cleanup.trackedResources.workspaceIds.length} (\`${cleanup.trackedResources.workspaceIds.join(', ') || 'none'}\`)`);
+    lines.push(`- **Tracked Checkout Sessions:** ${cleanup.trackedResources.checkoutSessionIds.length}`);
+    lines.push(`- **Deleted Users:** ${cleanup.deletedUserIds.length} (\`${cleanup.deletedUserIds.join(', ') || 'none'}\`)`);
+    lines.push(`- **Deleted Workspaces:** ${cleanup.deletedWorkspaceIds.length} (\`${cleanup.deletedWorkspaceIds.join(', ') || 'none'}\`)`);
+    if (cleanup.warnings.length > 0) {
+      lines.push(`- **Warnings:** ${cleanup.warnings.map((w) => redactSecrets(w)).join('; ')}`);
+    }
+    if (cleanup.errors.length > 0) {
+      lines.push(`- **Errors:** ${cleanup.errors.map((e) => redactSecrets(e)).join('; ')}`);
     }
     lines.push('');
   }

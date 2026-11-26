@@ -295,9 +295,9 @@ export const ProductsPage: React.FC = () => {
                                   {' · '}
                                   <span className="text-stone-600">
                                     {product.sourceClassification === 'shopify_oauth'
-                                      ? 'Shopify OAuth'
+                                      ? 'Full Shopify Sync (OAuth)'
                                       : product.sourceClassification === 'public_feed'
-                                      ? 'Public Feed'
+                                      ? 'Public Store Discovery (Sample ≤25)'
                                       : product.sourceClassification === 'demo'
                                       ? 'Demo Data'
                                       : 'Manual Import'}
@@ -380,9 +380,9 @@ export const ProductsPage: React.FC = () => {
                   {product.sourceClassification && (
                     <p className="text-[11px] font-mono text-stone-500 truncate">
                       {product.sourceClassification === 'shopify_oauth'
-                        ? 'Shopify Connected Store'
+                        ? 'Full Shopify Sync (OAuth)'
                         : product.sourceClassification === 'public_feed'
-                        ? 'Public Feed'
+                        ? 'Public Store Discovery (Sample ≤25)'
                         : product.sourceClassification === 'demo'
                         ? 'Demo Data'
                         : 'Manual Import'}

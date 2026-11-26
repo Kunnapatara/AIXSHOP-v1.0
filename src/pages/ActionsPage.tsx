@@ -14,7 +14,8 @@ import {
   ShieldCheck,
   ChevronRight,
   Info,
-  Edit3
+  Edit3,
+  UploadCloud
 } from 'lucide-react';
 
 export const ActionsPage: React.FC = () => {
@@ -23,6 +24,7 @@ export const ActionsPage: React.FC = () => {
     approveAction, 
     dismissAction, 
     recheckAction, 
+    writeBackActionToShopify,
     viewProductDetail,
     selectedActionId,
     setSelectedActionId,
@@ -40,6 +42,7 @@ export const ActionsPage: React.FC = () => {
   const [selectedAction, setSelectedAction] = useState<ActionItem | null>(null);
   const [editedValue, setEditedValue] = useState<string>('');
   const [isEditingValue, setIsEditingValue] = useState<boolean>(false);
+  const [writingBackActionId, setWritingBackActionId] = useState<string | null>(null);
 
   useEffect(() => {
     if (selectedActionId) {
@@ -79,6 +82,16 @@ export const ActionsPage: React.FC = () => {
     setSelectedAction(null);
   };
 
+  const handleWriteBackToShopify = async (actionId: string) => {
+    if (writingBackActionId || mutationsDisabled || !writeBackActionToShopify) return;
+    setWritingBackActionId(actionId);
+    try {
+      await writeBackActionToShopify(actionId);
+    } finally {
+      setWritingBackActionId(null);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -93,8 +106,8 @@ export const ActionsPage: React.FC = () => {
         </div>
 
         {/* Status Filters */}
-        <div className="flex items-center bg-stone-100 p-1 rounded-lg">
-          {(['all', 'pending_review', 'approved', 'dismissed'] as const).map(st => (
+        <div className="flex flex-wrap items-center bg-stone-100 p-1 rounded-lg">
+          {(['all', 'pending_review', 'approved', 'applied_externally', 'dismissed'] as const).map(st => (
             <button
               key={st}
               onClick={() => setStatusFilter(st)}
@@ -258,6 +271,26 @@ export const ActionsPage: React.FC = () => {
                   </button>
                 </div>
 
+                {action.status === 'applied_externally' && Array.isArray(action.auditLog) && (() => {
+                  const latestWriteBack = [...action.auditLog]
+                    .reverse()
+                    .find((entry: any) => entry?.event === 'shopify_writeback_verified');
+                  if (!latestWriteBack) return null;
+                  return (
+                    <div className="pt-2 border-t border-stone-100 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-stone-600">
+                      <span>
+                        Shopify Verified Write-Back · {latestWriteBack.shopDomain} · {latestWriteBack.fieldPath || latestWriteBack.field} ={' '}
+                        <strong className="text-stone-900">{String(latestWriteBack.verifiedValue ?? latestWriteBack.to ?? '')}</strong>
+                      </span>
+                      {(latestWriteBack.timestamp || latestWriteBack.verifiedAt) && (
+                        <span className="text-stone-400">
+                          {new Date(latestWriteBack.timestamp || latestWriteBack.verifiedAt).toLocaleString()}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {/* Action Buttons */}
                 <div className="pt-3 border-t border-stone-100 flex flex-wrap items-center justify-between gap-3">
                   <span className="text-[11px] text-stone-400 font-mono">
@@ -299,6 +332,35 @@ export const ActionsPage: React.FC = () => {
                           Approve Remediation
                         </button>
                       </>
+                    )}
+
+                    {action.status === 'approved' && isCloudWorkspace && (
+                      <button
+                        onClick={() => void handleWriteBackToShopify(action.id)}
+                        disabled={mutationsDisabled || writingBackActionId !== null}
+                        title={
+                          mutationsDisabled
+                            ? 'Disabled in locked or read-only mode'
+                            : 'Execute verified write-back to connected Shopify store'
+                        }
+                        className={`px-4 py-2 text-xs font-semibold rounded-lg shadow-xs transition-colors min-h-[38px] flex items-center gap-1.5 ${
+                          mutationsDisabled || writingBackActionId !== null
+                            ? 'bg-stone-300 text-stone-500 cursor-not-allowed'
+                            : 'text-white bg-stone-900 hover:bg-stone-800 cursor-pointer'
+                        }`}
+                      >
+                        {writingBackActionId === action.id ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>Writing to Shopify...</span>
+                          </>
+                        ) : (
+                          <>
+                            <UploadCloud className="w-3.5 h-3.5" />
+                            <span>Write Back to Shopify</span>
+                          </>
+                        )}
+                      </button>
                     )}
                   </div>
                 </div>

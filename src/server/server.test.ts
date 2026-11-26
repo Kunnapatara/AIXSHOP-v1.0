@@ -1322,6 +1322,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
                 { id: '016_source_classification_and_domain_cleanup.sql' },
                 { id: '017_reviewer_identity_and_registry_trust.sql' },
                 { id: '018_guest_transfer_authorizations.sql' },
+                { id: '019_writeback_and_billing_emails.sql' },
               ],
             };
           }
@@ -1332,7 +1333,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       const status = await checkMigrationStatus(pool);
       assert.equal(status.isUpToDate, true);
       assert.equal(status.pendingCount, 0);
-      assert.equal(status.appliedCount, 18);
+      assert.equal(status.appliedCount, 19);
 
       const queries = getExecutedQueries();
       assert.ok(!queries.some((q) => q.includes('BEGIN') || q.includes('INSERT') || q.includes('CREATE')), 'Must be strictly read-only');
@@ -1389,6 +1390,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       '016_source_classification_and_domain_cleanup.sql',
       '017_reviewer_identity_and_registry_trust.sql',
       '018_guest_transfer_authorizations.sql',
+      '019_writeback_and_billing_emails.sql',
     ];
 
     function createMockPostgresPool(options: {
@@ -1412,6 +1414,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
         'password_reset_tokens', 'workspace_operation_leases',
         'evidence_review_audit_log', 'shopify_product_provenance', 'reviewer_service_principals',
         'guest_transfer_authorizations', 'guest_transfer_audit_log',
+        'shopify_writeback_operations', 'billing_email_deliveries',
       ];
 
       const defaultFkRows = [
@@ -1822,7 +1825,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['002_tenant_referential_integrity.sql', '003_store_sku_limit.sql', '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "002_tenant_referential_integrity\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1834,7 +1837,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "004_backfill_store_sku_count\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1846,7 +1849,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['005_billing_subscriptions.sql', '006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "005_billing_subscriptions\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true, 'Must release client back to pool on pending migration');
     });
@@ -1858,7 +1861,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['006_audit_history_snapshots.sql', '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "006_audit_history_snapshots\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1870,7 +1873,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "007_shopify_integration\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1882,7 +1885,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['008_audit_composite_integrity_and_shopify_hardening.sql', '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "008_audit_composite_integrity_and_shopify_hardening\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1894,7 +1897,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "009_durable_sync_runs_and_ai_discovery\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1906,7 +1909,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['010_remediation_integrity_and_leases.sql', '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "010_remediation_integrity_and_leases\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1918,7 +1921,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "011_corrective_integrity_and_visibility_provenance\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1930,7 +1933,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['012_production_blockers_integrity.sql', '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "012_production_blockers_integrity\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1942,7 +1945,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "013_billing_webhook_recovery\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1954,7 +1957,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['014_auth_recovery_and_operation_leases.sql', '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "014_auth_recovery_and_operation_leases\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1966,7 +1969,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "015_gtin_evidence_trust\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1978,7 +1981,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['016_source_classification_and_domain_cleanup.sql', '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "016_source_classification_and_domain_cleanup\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -1990,7 +1993,7 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "017_reviewer_identity_and_registry_trust\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
@@ -2002,8 +2005,29 @@ describe('AIXSHOP v1.0 — Production Backend Foundation & Multi-Tenant Tests', 
       });
       const res = await repo.checkSchemaReadiness();
       assert.equal(res.isReady, false);
-      assert.deepEqual(res.pendingMigrations, ['018_guest_transfer_authorizations.sql']);
+      assert.deepEqual(res.pendingMigrations, ['018_guest_transfer_authorizations.sql', '019_writeback_and_billing_emails.sql']);
       assert.match(res.error!, /Required migration "018_guest_transfer_authorizations\.sql" has not been applied/);
+      assert.equal(getReleaseCalled(), true);
+    });
+
+    test('[Mock Unit Test] 15q. checkSchemaReadiness fails when 019_writeback_and_billing_emails.sql is pending', async () => {
+      const { repo, getReleaseCalled } = createMockPostgresPool({
+        columnRows: validColumns,
+        appliedMigrations: [
+          '001_initial_schema.sql', '002_tenant_referential_integrity.sql', '003_store_sku_limit.sql',
+          '004_backfill_store_sku_count.sql', '005_billing_subscriptions.sql', '006_audit_history_snapshots.sql',
+          '007_shopify_integration.sql', '008_audit_composite_integrity_and_shopify_hardening.sql',
+          '009_durable_sync_runs_and_ai_discovery.sql', '010_remediation_integrity_and_leases.sql',
+          '011_corrective_integrity_and_visibility_provenance.sql', '012_production_blockers_integrity.sql',
+          '013_billing_webhook_recovery.sql', '014_auth_recovery_and_operation_leases.sql',
+          '015_gtin_evidence_trust.sql', '016_source_classification_and_domain_cleanup.sql',
+          '017_reviewer_identity_and_registry_trust.sql', '018_guest_transfer_authorizations.sql',
+        ],
+      });
+      const res = await repo.checkSchemaReadiness();
+      assert.equal(res.isReady, false);
+      assert.deepEqual(res.pendingMigrations, ['019_writeback_and_billing_emails.sql']);
+      assert.match(res.error!, /Required migration "019_writeback_and_billing_emails\.sql" has not been applied/);
       assert.equal(getReleaseCalled(), true);
     });
 

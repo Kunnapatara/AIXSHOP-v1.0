@@ -139,6 +139,7 @@ export interface ShopifyPublicStatus {
   status: 'not_connected' | 'connected' | 'reauth_required' | 'reauthorization_required' | 'disconnected';
   shopDomain: string | null;
   grantedScopes: string[];
+  writeBackAuthorized?: boolean;
   installedAt: string | null;
   lastVerifiedAt: string | null;
   latestSync: ShopifySyncRunRecord | null;
@@ -225,3 +226,35 @@ export interface ShopifyProductConnectionQueryResponse {
     }>;
   };
 }
+
+export type ShopifyWriteBackStatus =
+  | 'pending'
+  | 'applied_unverified'
+  | 'verified_applied'
+  | 'verification_failed'
+  | 'failed';
+
+export interface ShopifyWriteBackOperationRecord {
+  id: string;
+  workspaceId: string;
+  actionId: string;
+  productId: string;
+  shopDomain: string;
+  shopifyProductGid: string;
+  shopifyVariantGid?: string | null;
+  fieldPath: string;
+  beforeValue?: string | null;
+  approvedValue: string;
+  verifiedValue?: string | null;
+  status: ShopifyWriteBackStatus;
+  idempotencyKey: string;
+  shopifyMutationId?: string | null;
+  operatorUserId: string;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  auditMetadata: Record<string, any>;
+  createdAt: string;
+  updatedAt: string;
+  verifiedAt?: string | null;
+}
+

@@ -661,7 +661,7 @@ export async function ingestAndAnalyzeStore(
     return evaluateProductsCatalog(
       domainProducts, 
       origin, 
-      `Public Product Feed Sample (${domainProducts.length} of up to 25 sampled)`, 
+      `Public Store Discovery — Limited Sample (${domainProducts.length} of up to 25 products)`, 
       'real_scan',
       existingCatalog
     );
@@ -815,7 +815,7 @@ export function evaluateProductsCatalog(
     scanStatus,
     notice: scanStatus === 'demo_fixture'
       ? 'Evaluated Solstice Mercantile demo catalog fixtures using deterministic rules (not a live store).'
-      : `Sample evaluation scanned ${products.length} product(s) and ${totalVariants} variant(s) via public /products.json feed (max 25). This is not a full website crawl; connect Shopify OAuth in Settings for full catalog synchronization.`,
+      : `Sample evaluation scanned ${products.length} product(s) and ${totalVariants} variant(s) via Public Store Discovery (/products.json, 25-product sample, subject to browser CORS — not a full website crawl). Connect Full Shopify Catalog Sync (Authenticated OAuth) in Settings for paginated full-catalog sync.`,
   };
 
   const ingestionResult: StoreIngestionResult = {
@@ -835,7 +835,7 @@ export function evaluateProductsCatalog(
       parsedCount: products.length,
     },
     warnings: isPartial
-      ? ['Public feed import is capped at a 25-product sample (/products.json) and is not a full website crawl. Connect Shopify OAuth in Settings for full catalog sync.']
+      ? ['Public Store Discovery — Limited 25-product sample: capped at 25 products via unauthenticated /products.json and subject to browser CORS. Connect Shopify OAuth in Settings for full paginated catalog synchronization.']
       : [],
   };
 

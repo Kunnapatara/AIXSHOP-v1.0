@@ -13,7 +13,8 @@ import {
   handleShopifyCallback, 
   disconnectShopify,
   getShopifyOAuthEnv,
-  getValidShopifyAccessToken
+  getValidShopifyAccessToken,
+  hasShopifyWriteScope,
 } from '../shopify/oauthService';
 import { syncShopifyCatalog, resumeShopifySync } from '../shopify/syncService';
 import { 
@@ -21,6 +22,7 @@ import {
   registerShopifyWebhookSubscriptions,
   verifyShopifyWebhookSubscriptionsLive 
 } from '../shopify/webhookService';
+import { executeShopifyWriteBack, ShopifyWriteBackError } from '../shopify/writeBackService';
 import { ShopifyPublicStatus } from '../shopify/types';
 import { getTrustedBaseUrl, resolveTrustedRedirectUrl } from '../config/productionConfig';
 
@@ -63,6 +65,7 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           status: 'not_connected',
           shopDomain: connection?.shopDomain || null,
           grantedScopes: [],
+          writeBackAuthorized: false,
           installedAt: null,
           lastVerifiedAt: null,
           tokenExpiresAt: null,
@@ -96,6 +99,9 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           status: refreshedConnection.status,
           shopDomain: refreshedConnection.shopDomain,
           grantedScopes: refreshedConnection.grantedScopes.split(',').map(s => s.trim()).filter(Boolean),
+          writeBackAuthorized:
+            refreshedConnection.status === 'connected' &&
+            hasShopifyWriteScope(refreshedConnection.grantedScopes),
           installedAt: refreshedConnection.installedAt,
           lastVerifiedAt: refreshedConnection.lastVerifiedAt,
           tokenExpiresAt: refreshedConnection.tokenExpiresAt || null,
@@ -148,6 +154,9 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         status: connection.status,
         shopDomain: connection.shopDomain,
         grantedScopes: connection.grantedScopes.split(',').map(s => s.trim()).filter(Boolean),
+        writeBackAuthorized:
+          connection.status === 'connected' &&
+          hasShopifyWriteScope(connection.grantedScopes),
         installedAt: connection.installedAt,
         lastVerifiedAt: connection.lastVerifiedAt,
         tokenExpiresAt: connection.tokenExpiresAt || null,
@@ -190,12 +199,14 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
         });
       }
 
-      const connectResult = await initiateShopifyConnect(repo, workspaceId, rawShop);
+      const writeAccess = String(req.query.writeAccess || '').toLowerCase() === 'true';
+      const connectResult = await initiateShopifyConnect(repo, workspaceId, rawShop, { writeAccess });
       return res.json({
         success: true,
         authUrl: connectResult.authUrl,
         state: connectResult.state,
         shopDomain: connectResult.shopDomain,
+        scopes: connectResult.scopes,
       });
     } catch (err: any) {
       console.error('[AIXSHOP Shopify Routes] Error initiating connect:', err);
@@ -470,6 +481,74 @@ export function createShopifyRoutes(repo: DatabaseRepository): Router {
           ? 401
           : 500;
       return res.status(status).json({ error: err.message || 'Webhook processing failed' });
+    }
+  });
+
+  // 7. POST /api/shopify/write-back/:actionId — Executes approved remediation write-back to Shopify Admin API with read-back verification
+  router.post(
+    '/write-back/:actionId',
+    requireAuth,
+    requireRole(['owner', 'admin']),
+    shopifyControlLimiter,
+    async (req: AuthRequest, res: Response) => {
+      try {
+        const workspaceId = req.workspace!.id;
+        const operatorUserId = req.user!.id;
+        const actionId = req.params.actionId;
+        const idempotencyKey =
+          typeof req.body?.idempotencyKey === 'string' ? req.body.idempotencyKey : undefined;
+
+        const result = await executeShopifyWriteBack(repo, {
+          workspaceId,
+          actionId,
+          operatorUserId,
+          idempotencyKey,
+        });
+
+        return res.status(200).json({
+          success: true,
+          operation: result.operation,
+          action: result.action,
+          catalogVersion: result.catalogVersion,
+        });
+      } catch (err: any) {
+        if (err instanceof OperationInProgressError || err?.code === 'OPERATION_IN_PROGRESS') {
+          return res.status(409).json({
+            error: err.message,
+            code: 'OPERATION_IN_PROGRESS',
+            operationKey: err.operationKey,
+          });
+        }
+        if (err instanceof ShopifyWriteBackError) {
+          return res.status(err.statusCode).json({
+            error: err.message,
+            code: err.code,
+            ...(err.operation ? { operation: err.operation } : {}),
+          });
+        }
+        console.error('[AIXSHOP Shopify Write-Back] Unexpected error:', err);
+        return res.status(500).json({
+          error: 'Failed to execute Shopify write-back operation.',
+          code: 'SHOPIFY_WRITEBACK_ERROR',
+        });
+      }
+    }
+  );
+
+  // 8. GET /api/shopify/write-back/history — Lists workspace Shopify write-back operations
+  router.get('/write-back/history', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const workspaceId = req.workspace!.id;
+      const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
+      const operations = await repo.listShopifyWriteBackOperations(workspaceId, limit);
+      return res.json({
+        success: true,
+        workspaceId,
+        operations,
+      });
+    } catch (err: any) {
+      console.error('[AIXSHOP Shopify Write-Back] History load error:', err);
+      return res.status(500).json({ error: 'Failed to load Shopify write-back history' });
     }
   });
 

@@ -33,6 +33,7 @@ import {
   BillingSubscriptionResponse,
   PlanTier,
   ShopifyStatusResponse,
+  ShopifyWriteBackOperation,
 } from '../api/client';
 import {
   isValidBillingRedirectUrl,
@@ -283,6 +284,8 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   // Shopify Integration State
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatusResponse | null>(null);
   const [shopifySyncRuns, setShopifySyncRuns] = useState<any[]>([]);
+  const [shopifyWriteBackHistory, setShopifyWriteBackHistory] = useState<ShopifyWriteBackOperation[]>([]);
+  const [requestWriteBackAccess, setRequestWriteBackAccess] = useState(false);
   const [isLoadingShopify, setIsLoadingShopify] = useState(false);
   const [isConnectingShopify, setIsConnectingShopify] = useState(false);
   const [isSyncingShopify, setIsSyncingShopify] = useState(false);
@@ -478,16 +481,23 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
   const fetchShopifyStatus = useCallback(async () => {
     if (!isAuthenticated) {
       setShopifyStatus(null);
+      setShopifyWriteBackHistory([]);
       return;
     }
     setIsLoadingShopify(true);
     try {
-      const [status, runsRes] = await Promise.all([
+      const historyPromise =
+        typeof apiClient.getShopifyWriteBackHistory === 'function'
+          ? apiClient.getShopifyWriteBackHistory(10).catch(() => ({ operations: [] as ShopifyWriteBackOperation[] }))
+          : Promise.resolve({ operations: [] as ShopifyWriteBackOperation[] });
+      const [status, runsRes, historyRes] = await Promise.all([
         apiClient.getShopifyStatus(),
         apiClient.getShopifySyncRuns(10).catch(() => ({ syncRuns: [] as any[] })),
+        historyPromise,
       ]);
       setShopifyStatus(status);
       setShopifySyncRuns((runsRes as any).syncRuns || (runsRes as any).runs || []);
+      setShopifyWriteBackHistory(Array.isArray((historyRes as any)?.operations) ? (historyRes as any).operations : []);
       if (status.shopDomain) {
         setShopifyShopInput(prev => prev || status.shopDomain || '');
       }
@@ -526,13 +536,36 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
     setIsConnectingShopify(true);
 
     try {
-      const res = await apiClient.connectShopify(validation.shopDomain);
+      const res = requestWriteBackAccess
+        ? await apiClient.connectShopify(validation.shopDomain, { writeAccess: true })
+        : await apiClient.connectShopify(validation.shopDomain);
       if (!res || res.success !== true || !isValidShopifyAuthUrl(res.authUrl)) {
         throw new Error('Server returned an invalid Shopify authorization URL.');
       }
       redirectBrowser(res.authUrl);
     } catch (err: any) {
       setConnectError(err?.message || 'Failed to initiate Shopify OAuth connection.');
+    } finally {
+      connectingShopifyRef.current = false;
+      setIsConnectingShopify(false);
+    }
+  };
+
+  const handleEnableShopifyWriteBack = async () => {
+    if (connectingShopifyRef.current || isConnectingShopify || !shopifyStatus?.shopDomain) {
+      return;
+    }
+    setConnectError(null);
+    connectingShopifyRef.current = true;
+    setIsConnectingShopify(true);
+    try {
+      const res = await apiClient.connectShopify(shopifyStatus.shopDomain, { writeAccess: true });
+      if (!res || res.success !== true || !isValidShopifyAuthUrl(res.authUrl)) {
+        throw new Error('Server returned an invalid Shopify authorization URL.');
+      }
+      redirectBrowser(res.authUrl);
+    } catch (err: any) {
+      addToast('Shopify Re-Authorization Failed', err?.message || 'Unable to initiate write_products OAuth flow.', 'error');
     } finally {
       connectingShopifyRef.current = false;
       setIsConnectingShopify(false);
@@ -1147,10 +1180,26 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                     </span>
                   </div>
                   <div>
-                    <span className="text-stone-500 block font-medium">Security Encryption</span>
-                    <span className="font-mono text-emerald-800 font-semibold mt-0.5 block">
-                      AES-256-GCM (v1)
-                    </span>
+                    <span className="text-stone-500 block font-medium">Write-Back Access</span>
+                    {shopifyStatus.writeBackAuthorized || shopifyStatus.grantedScopes.includes('write_products') ? (
+                      <span className="font-mono text-emerald-800 font-semibold mt-0.5 block">
+                        Authorized (write_products)
+                      </span>
+                    ) : (
+                      <div className="mt-0.5 space-y-1">
+                        <span className="font-mono text-stone-700 font-semibold block">
+                          Read-only (read_products)
+                        </span>
+                        <button
+                          type="button"
+                          disabled={isConnectingShopify}
+                          onClick={() => void handleEnableShopifyWriteBack()}
+                          className="text-[11px] font-semibold text-orange-700 hover:text-orange-800 underline cursor-pointer disabled:opacity-50"
+                        >
+                          {isConnectingShopify ? 'Authorizing...' : 'Enable Write-Back Permission'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                   <div>
                     <span className="text-stone-500 block font-medium">Connected Since</span>
@@ -1423,6 +1472,53 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                       </div>
                     </div>
                   )}
+
+                  {shopifyWriteBackHistory.length > 0 && (
+                    <div className="pt-4 border-t border-stone-100 space-y-2">
+                      <h4 className="text-xs font-bold text-stone-900">Recent Shopify Write-Back Operations</h4>
+                      <div className="overflow-x-auto border border-stone-200 rounded-lg">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead>
+                            <tr className="bg-stone-50 border-b border-stone-200 text-stone-600 font-semibold">
+                              <th className="py-2 px-3">Action / Field</th>
+                              <th className="py-2 px-3">Status</th>
+                              <th className="py-2 px-3">Applied / Read-Back Value</th>
+                              <th className="py-2 px-3 text-right">Verified At</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-stone-100 font-mono tabular-nums">
+                            {shopifyWriteBackHistory.slice(0, 6).map(op => (
+                              <tr key={op.id} className="hover:bg-stone-50">
+                                <td className="py-2 px-3 text-stone-800">
+                                  <div>{op.fieldPath}</div>
+                                  <div className="text-[10px] text-stone-500">{op.actionId}</div>
+                                </td>
+                                <td className="py-2 px-3">
+                                  <span
+                                    className={`font-semibold ${
+                                      op.status === 'verified_applied'
+                                        ? 'text-emerald-700'
+                                        : op.status === 'verification_failed' || op.status === 'failed'
+                                        ? 'text-red-700'
+                                        : 'text-amber-700'
+                                    }`}
+                                  >
+                                    {op.status}
+                                  </span>
+                                </td>
+                                <td className="py-2 px-3 text-stone-700">
+                                  {op.verifiedValue ?? op.approvedValue}
+                                </td>
+                                <td className="py-2 px-3 text-right text-stone-500">
+                                  {op.verifiedAt ? new Date(op.verifiedAt).toLocaleString() : '—'}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -1474,6 +1570,20 @@ export const SettingsPage: React.FC<{ initialTab?: SettingsTabId }> = ({ initial
                       Optional: only required if syncing a Shopify store via OAuth. Enter your <code className="font-mono text-stone-700">myshopify.com</code> store handle or canonical hostname to authorize read-only permissions. Non-Shopify websites can use Public Feed checks or Manual Import.
                     </p>
                   </div>
+                  <label className="flex items-start gap-2.5 text-xs text-stone-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={requestWriteBackAccess}
+                      onChange={e => setRequestWriteBackAccess(e.target.checked)}
+                      className="mt-0.5 rounded border-stone-300 text-orange-600 focus:ring-orange-500"
+                    />
+                    <span>
+                      <span className="font-semibold text-stone-900">Also request write-back scope (<code className="font-mono text-[11px]">write_products</code>)</span>
+                      <span className="block text-[11px] text-stone-500">
+                        Default connection requests <code className="font-mono">read_products</code> only. Enable this to push merchant-approved remediation updates back to Shopify.
+                      </span>
+                    </span>
+                  </label>
                 </form>
 
                 {/* Technical Architecture Guarantees */}

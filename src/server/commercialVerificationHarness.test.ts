@@ -692,10 +692,10 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 2 Stripe Billin
     await svc.handleWebhook(e5.payload, e5.sig);
     assert.equal((await repo.getSubscriptionByWorkspace(ws.id))?.status, 'active');
 
-    // 6. Unhandled event (invoice.paid) is safely ignored without mutating subscription
+    // 6. Unhandled event (customer.discount.created) is safely ignored without mutating subscription
     const eIgn = sign({
       id: 'evt_c2_ign',
-      type: 'invoice.paid',
+      type: 'customer.discount.created',
       created: 1045,
       data: { object: { subscription: 'sub_b2', metadata: { workspaceId: ws.id } } },
     });

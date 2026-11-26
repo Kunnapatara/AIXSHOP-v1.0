@@ -1,5 +1,6 @@
 import net from 'node:net';
 import tls from 'node:tls';
+import { BillingEmailEventType } from '../billing/types';
 
 export interface OutgoingEmail {
   to: string;
@@ -840,3 +841,165 @@ export async function sendPasswordResetEmail(params: {
     text,
   });
 }
+
+export interface BillingLifecycleEmailParams {
+  to: string;
+  fullName?: string;
+  workspaceName?: string;
+  workspaceId: string;
+  eventType: BillingEmailEventType;
+  tier: string;
+  previousTier?: string;
+  amountCents?: number | null;
+  currency?: string;
+  billingInterval?: string;
+  subscriptionStatus: string;
+  currentPeriodStart?: string;
+  currentPeriodEnd?: string;
+  cancelAtPeriodEnd?: boolean;
+  settingsUrl?: string;
+  supportEmail?: string;
+}
+
+export function formatBillingAmount(amountCents?: number | null, currency: string = 'USD'): string {
+  if (typeof amountCents !== 'number' || !Number.isFinite(amountCents)) {
+    return 'N/A';
+  }
+  const iso = (currency || 'USD').toUpperCase();
+  const symbol = iso === 'EUR' ? '€' : iso === 'GBP' ? '£' : '$';
+  const amount = (amountCents / 100).toFixed(2);
+  return `${symbol}${amount} ${iso}`;
+}
+
+function formatBillingDateUtc(iso?: string): string {
+  if (!iso) return 'N/A';
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return 'N/A';
+  return parsed.toISOString().slice(0, 10);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function renderBillingLifecycleEmail(params: BillingLifecycleEmailParams): OutgoingEmail {
+  const safeName = sanitizeHeaderValue(params.fullName || '') || 'Merchant';
+  const safeWorkspace = sanitizeHeaderValue(params.workspaceName || '') || params.workspaceId;
+  const safeTier = sanitizeHeaderValue(params.tier || 'Starter');
+  const safePrevTier = params.previousTier ? sanitizeHeaderValue(params.previousTier) : undefined;
+  const currency = (params.currency || 'USD').toUpperCase();
+  const formattedAmount = formatBillingAmount(params.amountCents, currency);
+  const periodStart = formatBillingDateUtc(params.currentPeriodStart);
+  const periodEnd = formatBillingDateUtc(params.currentPeriodEnd);
+  const supportEmail =
+    sanitizeHeaderValue(params.supportEmail || process.env.SUPPORT_EMAIL || '') ||
+    'support@aixshop.app';
+  const baseAppUrl = (process.env.APP_URL || 'http://localhost:3000').trim().replace(/\/+$/, '');
+  const settingsUrl =
+    params.settingsUrl || `${baseAppUrl}/?page=settings&tab=subscription`;
+
+  let subject = `AIXSHOP: Subscription Update — ${safeTier}`;
+  let headline = 'Subscription Update';
+  let summaryLine = `Your AIXSHOP subscription for workspace "${safeWorkspace}" has been updated.`;
+
+  switch (params.eventType) {
+    case 'initial_payment_confirmed':
+      subject = `AIXSHOP: Payment Confirmed — ${safeTier} Plan Active`;
+      headline = `Welcome to AIXSHOP ${safeTier}`;
+      summaryLine = `Thank you for subscribing! Your payment of ${formattedAmount} (${params.billingInterval || 'month'}) for workspace "${safeWorkspace}" is confirmed and full catalog audit reports are now unlocked.`;
+      break;
+    case 'recurring_renewal':
+      subject = `AIXSHOP: Subscription Renewed — ${safeTier} Plan`;
+      headline = `Subscription Renewal Receipt`;
+      summaryLine = `Your recurring ${safeTier} subscription for workspace "${safeWorkspace}" has renewed (${formattedAmount}).`;
+      break;
+    case 'plan_changed':
+      subject = `AIXSHOP: Plan Updated to ${safeTier}`;
+      headline = `Subscription Plan Changed`;
+      summaryLine = safePrevTier
+        ? `Your workspace "${safeWorkspace}" subscription plan changed from ${safePrevTier} to ${safeTier} (${formattedAmount}/${params.billingInterval || 'month'}).`
+        : `Your workspace "${safeWorkspace}" subscription plan is now ${safeTier} (${formattedAmount}/${params.billingInterval || 'month'}).`;
+      break;
+    case 'subscription_canceled':
+      subject = `AIXSHOP: Subscription Canceled — ${safeWorkspace}`;
+      headline = params.cancelAtPeriodEnd
+        ? `Subscription Scheduled for Cancellation`
+        : `Subscription Canceled`;
+      summaryLine = params.cancelAtPeriodEnd
+        ? `Your ${safeTier} subscription for workspace "${safeWorkspace}" is scheduled to cancel at the end of the current billing period (${periodEnd}).`
+        : `Your subscription for workspace "${safeWorkspace}" has been canceled and the workspace returned to the Free Audit tier without deleting your catalog data.`;
+      break;
+    case 'payment_failed':
+      subject = `AIXSHOP: Payment Action Required — ${safeTier} Plan`;
+      headline = `Subscription Payment Failed`;
+      summaryLine = `We could not collect the renewal payment of ${formattedAmount} for workspace "${safeWorkspace}". Please update your payment method in Billing Settings to restore full audit access.`;
+      break;
+  }
+
+  const detailsLines = [
+    `Workspace: ${safeWorkspace}`,
+    `Recipient: ${safeName} (${sanitizeHeaderValue(params.to)})`,
+    `Plan Tier: ${safeTier}`,
+    ...(safePrevTier ? [`Previous Plan: ${safePrevTier}`] : []),
+    `Amount: ${formattedAmount}`,
+    `Subscription Status: ${params.subscriptionStatus}`,
+    `Billing Period: ${periodStart} to ${periodEnd}`,
+    `Manage Billing: ${settingsUrl}`,
+    `Support Contact: ${supportEmail}`,
+  ];
+
+  const text = [
+    `Hello ${safeName},`,
+    '',
+    headline,
+    '',
+    summaryLine,
+    '',
+    'Subscription Details:',
+    ...detailsLines.map((line) => `- ${line}`),
+    '',
+    'AIXSHOP Billing Operations',
+  ].join('\n');
+
+  const html = [
+    `<div style="font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;color:#1c1917;line-height:1.5;">`,
+    `  <h2 style="margin:0 0 12px;font-size:18px;color:#0c0a09;">${escapeHtml(headline)}</h2>`,
+    `  <p style="margin:0 0 12px;">Hello ${escapeHtml(safeName)},</p>`,
+    `  <p style="margin:0 0 16px;">${escapeHtml(summaryLine)}</p>`,
+    `  <table style="width:100%;border-collapse:collapse;font-size:13px;margin:16px 0;border:1px solid #e7e5e4;">`,
+    `    <tbody>`,
+    `      <tr><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;color:#57534e;">Workspace</td><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;font-weight:600;">${escapeHtml(safeWorkspace)}</td></tr>`,
+    `      <tr><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;color:#57534e;">Plan Tier</td><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;font-weight:600;">${escapeHtml(safeTier)}</td></tr>`,
+    ...(safePrevTier
+      ? [`      <tr><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;color:#57534e;">Previous Plan</td><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;">${escapeHtml(safePrevTier)}</td></tr>`]
+      : []),
+    `      <tr><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;color:#57534e;">Amount</td><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;font-family:monospace;">${escapeHtml(formattedAmount)}</td></tr>`,
+    `      <tr><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;color:#57534e;">Status</td><td style="padding:8px 12px;border-bottom:1px solid #e7e5e4;font-family:monospace;">${escapeHtml(params.subscriptionStatus)}</td></tr>`,
+    `      <tr><td style="padding:8px 12px;color:#57534e;">Billing Period</td><td style="padding:8px 12px;font-family:monospace;">${escapeHtml(periodStart)} &rarr; ${escapeHtml(periodEnd)}</td></tr>`,
+    `    </tbody>`,
+    `  </table>`,
+    `  <p style="margin:16px 0;"><a href="${escapeHtml(settingsUrl)}" style="display:inline-block;padding:10px 16px;background:#ea580c;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:600;font-size:13px;">Manage Billing &amp; Subscription</a></p>`,
+    `  <p style="margin:16px 0 0;font-size:12px;color:#78716c;">Questions? Contact <a href="mailto:${escapeHtml(supportEmail)}">${escapeHtml(supportEmail)}</a>.</p>`,
+    `</div>`,
+  ].join('\n');
+
+  return {
+    to: sanitizeHeaderValue(params.to),
+    subject,
+    text,
+    html,
+  };
+}
+
+export async function sendBillingLifecycleEmail(
+  params: BillingLifecycleEmailParams
+): Promise<EmailDeliveryResult> {
+  const outgoing = renderBillingLifecycleEmail(params);
+  return sendTransactionalEmail(outgoing);
+}
+

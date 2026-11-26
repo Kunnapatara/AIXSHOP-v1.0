@@ -101,6 +101,7 @@ class ApiClient {
         if (body.conflicts !== undefined) error.conflicts = body.conflicts;
         if (body.reportEntitlement !== undefined) error.reportEntitlement = body.reportEntitlement;
         if (body.preliminarySummary !== undefined) error.preliminarySummary = body.preliminarySummary;
+        if (body.operation !== undefined) error.operation = body.operation;
       }
       throw error;
     }
@@ -417,14 +418,15 @@ class ApiClient {
   }
 
   // Shopify Endpoints
-  async connectShopify(shop: string): Promise<ShopifyConnectResponse> {
+  async connectShopify(shop: string, options?: { writeAccess?: boolean }): Promise<ShopifyConnectResponse> {
     const validation = validateAndNormalizeShopDomain(shop);
     if (!validation.valid) {
       throw new Error(validation.error);
     }
 
+    const writeQuery = options?.writeAccess === true ? '&writeAccess=true' : '';
     const data = await this.request<ShopifyConnectResponse>(
-      `/api/shopify/connect?shop=${encodeURIComponent(validation.shopDomain)}`
+      `/api/shopify/connect?shop=${encodeURIComponent(validation.shopDomain)}${writeQuery}`
     );
 
     if (
@@ -510,6 +512,24 @@ class ApiClient {
     return this.request<{ success: boolean; syncRuns: any[] }>(`/api/shopify/sync/runs?limit=${limit}`);
   }
 
+  async writeBackActionToShopify(actionId: string, idempotencyKey?: string): Promise<ShopifyWriteBackResponse> {
+    return this.request<ShopifyWriteBackResponse>(
+      `/api/shopify/write-back/${encodeURIComponent(actionId)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(idempotencyKey ? { idempotencyKey } : {}),
+      }
+    );
+  }
+
+  async getShopifyWriteBackHistory(limit: number = 20): Promise<{
+    success: boolean;
+    workspaceId: string;
+    operations: ShopifyWriteBackOperation[];
+  }> {
+    return this.request(`/api/shopify/write-back/history?limit=${limit}`);
+  }
+
   // AI Discovery Endpoints
   async getDiscoveryAudit(): Promise<{
     success: boolean;
@@ -572,6 +592,7 @@ export interface ShopifyStatusResponse {
   status: 'connected' | 'disconnected' | 'revoked' | 'error' | 'not_connected' | 'not_configured' | 'reauth_required' | 'reauthorization_required';
   shopDomain: string | null;
   grantedScopes: string[];
+  writeBackAuthorized?: boolean;
   installedAt: string | null;
   lastVerifiedAt: string | null;
   canResumeSync?: boolean;
@@ -711,6 +732,38 @@ export interface ShopifyConnectResponse {
   authUrl: string;
   state: string;
   shopDomain: string;
+  scopes?: string[];
+}
+
+export interface ShopifyWriteBackOperation {
+  id: string;
+  workspaceId: string;
+  actionId: string;
+  productId: string;
+  shopDomain: string;
+  shopifyProductGid: string;
+  shopifyVariantGid?: string | null;
+  fieldPath: string;
+  beforeValue?: string | null;
+  approvedValue: string;
+  verifiedValue?: string | null;
+  status: 'pending' | 'applied_unverified' | 'verified_applied' | 'verification_failed' | 'failed';
+  idempotencyKey: string;
+  shopifyMutationId?: string | null;
+  operatorUserId: string;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  auditMetadata?: Record<string, any>;
+  verifiedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShopifyWriteBackResponse {
+  success: boolean;
+  operation: ShopifyWriteBackOperation;
+  action: ActionItem;
+  catalogVersion?: number;
 }
 
 export const apiClient = new ApiClient();

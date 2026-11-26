@@ -61,9 +61,9 @@ export const HomePage: React.FC = () => {
                 const isShopifyOAuth = Boolean(storeProfile.shopifyConnected || storeProfile.sourceClassification === 'shopify_oauth');
                 const cls = storeProfile.sourceClassification;
                 const badgeConfig = isShopifyOAuth
-                  ? { label: 'Shopify Connected Store', clsName: 'text-emerald-800 bg-emerald-50 border-emerald-200' }
+                  ? { label: 'Full Shopify Sync (OAuth)', clsName: 'text-emerald-800 bg-emerald-50 border-emerald-200' }
                   : cls === 'public_feed'
-                  ? { label: 'Public Feed Sample', clsName: 'text-blue-800 bg-blue-50 border-blue-200' }
+                  ? { label: 'Public Store Discovery (Limited Sample ≤25)', clsName: 'text-blue-800 bg-blue-50 border-blue-200' }
                   : cls === 'manual_import'
                   ? { label: 'Manual Import', clsName: 'text-stone-700 bg-stone-100 border-stone-200' }
                   : cls === 'demo'
@@ -79,10 +79,10 @@ export const HomePage: React.FC = () => {
               })()}
             </div>
             <p className="text-xs text-stone-500 font-mono mt-0.5">
-              {storeProfile.platform || (storeProfile.shopifyConnected ? 'Shopify Admin GraphQL API' : 'No catalog feed connected')}
+              {storeProfile.platform || (storeProfile.shopifyConnected ? 'Shopify Admin GraphQL API (2026-10)' : 'No catalog feed connected')}
               {' · '}
               {storeProfile.shopifyConnected && storeProfile.shopifyShopDomain
-                ? `Shopify OAuth: ${storeProfile.shopifyShopDomain}`
+                ? `Full Shopify Sync (OAuth): ${storeProfile.shopifyShopDomain}`
                 : storeProfile.domain || storeProfile.websiteUrl || 'No website URL configured'}
             </p>
           </div>
