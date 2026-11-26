@@ -49,9 +49,9 @@ All outstanding Pre-ENV engineering tasks (**Tasks A–F**), environment variabl
 
 ### Task D — Checkout Confirmation & Billing Lifecycle Emails
 - **Implementation:**
-  - Idempotent, secret-safe transactional billing emails across 5 lifecycle events: Checkout Payment Confirmed, Subscription Renewed (`invoice.payment_succeeded` / `invoice.paid`), Plan Updated (`customer.subscription.updated`), Payment Action Required (`invoice.payment_failed`), and Subscription Canceled (`customer.subscription.deleted`) in `src/server/services/billingService.ts` and `src/server/services/emailService.ts`.
-  - Durable delivery ledger (`billing_email_deliveries`), retry/recovery worker (`retryFailedBillingEmails`), and authenticated read endpoint (`GET /api/billing/email-deliveries`) backed by Migration `019`.
-- **Verification:** `src/server/billingEmail.test.ts` (`PASS — SIMULATED`); `docs/COMMERCIAL_VERIFICATION_GUIDE.md` updated to document `invoice.paid` as supported and `customer.discount.created` as the unhandled example.
+  - Idempotent, secret-safe transactional billing emails across 5 lifecycle event types: Checkout/Payment Confirmed (`initial_payment_confirmed`), Subscription Renewed (`invoice.payment_succeeded` / `invoice.paid`), Plan Updated (`customer.subscription.updated`), Payment Action Required (`invoice.payment_failed`), and Subscription Canceled (`customer.subscription.deleted`, `cancel_at_period_end`, or full `charge.refunded`) in `src/server/services/billingService.ts` and `src/server/services/emailService.ts`.
+  - Durable delivery ledger (`billing_email_deliveries`), explicitly invoked retry helper (`retryFailedBillingEmails` — not scheduled by a background timer in `server.ts`), and workspace-isolated read endpoint (`GET /api/billing/email-deliveries`) backed by Migration `019`.
+- **Verification:** `src/server/billingEmail.test.ts` (`PASS — SIMULATED`); `docs/COMMERCIAL_VERIFICATION_GUIDE.md` updated to document `invoice.paid` as supported, `customer.discount.created` as the unhandled example, and the full Email Event Matrix.
 
 ### Task E — 30-Step Customer Journey E2E & Commercial Verification Reports
 - **Implementation:**

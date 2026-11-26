@@ -69,7 +69,7 @@ STRIPE_PRICE_STARTER="price_starter_..."
 STRIPE_PRICE_GROWTH="price_growth_..."
 STRIPE_PRICE_ENTERPRISE="price_enterprise_..."
 
-# Transactional Email / Password Reset SMTP (Optional in dev, required for password reset delivery in production)
+# Transactional Email / Password Reset & Billing Lifecycle SMTP (Optional in dev, required in production)
 PASSWORD_RESET_TOKEN_TTL_MINUTES="30"
 SMTP_HOST="smtp.example.com"
 SMTP_PORT="587"
@@ -189,7 +189,7 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 | **AI Visibility Monitoring** | `DATA_SOURCE_NOT_CONNECTED` empty state & CSV ingestion deduplication | `visibilityRoutes.ts` / `AiVisibilityPage.tsx` / `workstreams.test.ts` | **PASS** |
 | **Billing & Stale Event Recovery** | Stripe webhook idempotency & >5m `processing` lock reclaim | `billingService.ts` / `postgresRepository.ts` / `workstreams.test.ts` | **PASS** |
 | **Real Shopify Store Live OAuth** | Live Admin GraphQL exchange with Shopify | Live merchant install flow | **BLOCKED — AWAITING CREDENTIALS** (Requires live Shopify store & partner app secrets) |
-| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–016) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |
+| **Live PostgreSQL Production DB** | Production Cloud SQL instance (Migrations 001–019) | `DATABASE_URL` provisioned | **BLOCKED — AWAITING CREDENTIALS** (Passes via MemoryRepository & Postgres mock suite in dev/test) |
 
 ---
 
@@ -197,7 +197,7 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 
 ### Pre-Deployment Preflight Gate
 1. Run `npm run config:check -- --strict` in the target Staging/Production environment to verify without logging secret values that `DATABASE_URL`, `APP_URL`, `SHOPIFY_TOKEN_ENCRYPTION_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SHOPIFY_*` URLs, `TRUST_PROXY`, and `AUTH_RATE_LIMIT_FAILURE_MODE` are valid.
-2. Execute forward-only PostgreSQL migrations (`001..016`) before shifting traffic:
+2. Execute forward-only PostgreSQL migrations (`001..019`) before shifting traffic:
    ```bash
    npm run db:migrate
    npm run db:status
@@ -212,10 +212,10 @@ AIXSHOP registers four mandatory webhook subscriptions via Admin GraphQL:
 
 ### Health & Readiness Probes
 - **Liveness**: `GET /api/health/live` -> `200 OK` (Node event loop responsive).
-- **Readiness**: `GET /api/health/ready` -> `200 OK` only when PostgreSQL connectivity passes, migrations `001..016` schema checks pass, and `validateProductionConfig().valid` is `true` in production (`503` otherwise).
+- **Readiness**: `GET /api/health/ready` -> `200 OK` only when PostgreSQL connectivity passes, migrations `001..019` schema checks pass, and `validateProductionConfig().valid` is `true` in production (`503` otherwise).
 
 ### Safe Rollback Procedure
-1. Migrations `001..016` are strictly **forward-only** (additive columns/tables and constraint hardening). Never drop tables, delete `schema_migrations` entries, or reset databases on rollback.
+1. Migrations `001..019` are strictly **forward-only** (additive columns/tables and constraint hardening). Never drop tables, delete `schema_migrations` entries, or reset databases on rollback.
 2. To roll back an application release cleanly:
    - Shift load balancer / Cloud Run revision traffic back to the prior known-good container digest while preserving the forward-migrated database schema.
    - Do **not** replay modified SQL migration files; `npm run db:status` verifies SHA-256 checksums and fails closed on drift.
