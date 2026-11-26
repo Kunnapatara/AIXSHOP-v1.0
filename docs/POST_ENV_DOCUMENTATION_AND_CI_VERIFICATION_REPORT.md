@@ -1,8 +1,8 @@
 # AIXSHOP v1.0 — Post-ENV Documentation Reconciliation & Latest Commit CI Verification Report
 
-- **Generated At:** 2026-11-26T08:47:15Z
+- **Generated At:** 2026-11-26T08:56:45Z
 - **Repository:** `Kunnapatara/AIXSHOP-v1.0`
-- **Verified GitHub `main` Commit:** `571c92da848f06848d0745e2e40b22778f2db218` (`2026-11-26T08:36:16Z`, `"feat: add Shopify write-back capability"`)
+- **Verified GitHub `main` Commit:** [`ef7a31c54101ece7f2803113abae5a54517f8cfb`](https://github.com/Kunnapatara/AIXSHOP-v1.0/commit/ef7a31c54101ece7f2803113abae5a54517f8cfb) (`2026-11-26T08:49:43Z`, `"docs: update commercial verification and deployment docs"`)
 - **Execution Mode:** Read-Only Source & CI Audit → Minimal Documentation Reconciliation → Post-Edit Verification (zero production code changes, zero fabricated external results)
 
 ---
@@ -72,35 +72,36 @@
 
 ---
 
-## B. Latest Commit CI Verification (`571c92da848f06848d0745e2e40b22778f2db218`)
+## B. Latest Commit CI Verification (`ef7a31c54101ece7f2803113abae5a54517f8cfb`)
 
 ### B.1 GitHub Repository & Run Metadata (Verified via GitHub REST API)
 
-- **Latest Commit on `main`:** `571c92da848f06848d0745e2e40b22778f2db218`
+- **Latest Commit on `main`:** [`ef7a31c54101ece7f2803113abae5a54517f8cfb`](https://github.com/Kunnapatara/AIXSHOP-v1.0/commit/ef7a31c54101ece7f2803113abae5a54517f8cfb) (`ef7a31c`)
   - **Author / Committer:** `Kunnapatara <kunnapatara@yahoo.com>`
-  - **Committed At:** `2026-11-26T08:36:16Z`
-  - **Message:** `feat: add Shopify write-back capability`
-  - **Diff Summary:** 45 files changed (`+7608` / `-354`)
+  - **Committed At:** `2026-11-26T08:49:43Z`
+  - **Message:** `docs: update commercial verification and deployment docs`
+  - **Diff Summary:** 4 documentation files changed (`+170` / `-14`: `docs/COMMERCIAL_VERIFICATION_GUIDE.md`, `docs/PRE_ENV_RELEASE_FREEZE_REPORT.md`, `docs/SHOPIFY_DEPLOYMENT_CHECKLIST.md`, `docs/POST_ENV_DOCUMENTATION_AND_CI_VERIFICATION_REPORT.md`)
 - **Workflow File:** `.github/workflows/ci.yml` (Workflow Name: `CI`, Workflow ID: `396815244`, State: `active`)
-- **Workflow Run:** **Run ID `45784578837`** (Run `#40`)
-  - **URL:** `https://github.com/Kunnapatara/AIXSHOP-v1.0/actions/runs/45784578837`
+- **Latest Workflow Run:** **Run ID `45786474138`** (Run `#41`)
+  - **URL:** `https://github.com/Kunnapatara/AIXSHOP-v1.0/actions/runs/45786474138`
   - **Event / Branch:** `push` on `main`
+  - **Commit SHA:** `ef7a31c54101ece7f2803113abae5a54517f8cfb`
   - **Status / Conclusion:** `completed` / **`success`**
-  - **Timing:** `2026-11-26T08:36:19Z` → `2026-11-26T08:37:19Z`
-  - **Failed / Skipped / Not Run Steps:** **0 failed, 0 skipped, 0 not run**
+  - **Timing:** `2026-11-26T08:49:47Z` → `2026-11-26T08:50:41Z`
+  - **Jobs:** `2/2` success · **Failed:** `0` · **Skipped:** `0` · **Not Run:** `0`
 
-### B.2 Jobs & Step-by-Step Verification
+### B.2 Jobs & Step-by-Step Verification (Run #41 / ID `45786474138`)
 
-1. **Job 1 (`139788007344`): `Lint, Test, and Build`** — `completed` / **`success`** (`08:36:21Z`–`08:36:54Z`)
+1. **Job 1 (`139794389969`): `Lint, Test, and Build`** — **PASS** (`completed` / `success`, `08:49:49Z`–`08:50:34Z`)
    - Checkout repository (`actions/checkout@v4`) → `success`
    - Set up Bun & Install dependencies (`bun install --frozen-lockfile`) → `success`
    - Security dependency audit (`bun audit --audit-level=high`) → `success`
-   - Static security checks (no `sk_live_`/`whsec_` literals in `src/`, cookie-only `src/api/client.ts`) → `success`
+   - Static security checks (no hardcoded live secrets or client `Authorization` headers) → `success`
    - Type check / Lint (`bun run lint`) → `success`
    - Run test suite (`bun run test`) → `success`
    - Secret-safe config check (`bun run config:check`) → `success`
    - Production build (`bun run build`) → `success`
-2. **Job 2 (`139788007743`): `Live PostgreSQL Migrations & Multi-Connection Tests`** — `completed` / **`success`** (`08:36:22Z`–`08:37:19Z`)
+2. **Job 2 (`139794390393`): `Live PostgreSQL Migrations & Multi-Connection Tests`** — **PASS** (`completed` / `success`, `08:49:49Z`–`08:50:41Z`)
    - Initialize PostgreSQL 16 service (`postgres:16-alpine` health check) → `success`
    - Checkout repository, Set up Bun, Set up Node.js (`22`), Install dependencies → `success`
    - Apply PostgreSQL migrations 001–019 (`bun run db:migrate`) → `success`
@@ -109,10 +110,12 @@
    - Type check / Lint (`bun run lint`) → `success`
    - Production build (`bun run build`) → `success`
 
-### B.3 Workspace `.git` Limitation
+> Prior baseline Run `#40` (ID `45784578837`, commit `571c92da848f06848d0745e2e40b22778f2db218`) also completed `success` (`2/2` jobs).
 
-- Running `git status` in `/app/applet` returns `fatal: not a git repository (or any of the parent directories): .git`.
-- Consequently, the minimal documentation updates made in `docs/` (`COMMERCIAL_VERIFICATION_GUIDE.md`, `SHOPIFY_DEPLOYMENT_CHECKLIST.md`, `PRE_ENV_RELEASE_FREEZE_REPORT.md`, and this report) exist in the local workspace after commit `571c92da848f06848d0745e2e40b22778f2db218` and have **not** been committed or pushed to GitHub.
+### B.3 Workspace `.git` Limitation & Push Evidence
+
+- The local container `/app/applet` does not contain a `.git` repository (`git status` returns `fatal: not a git repository (or any of the parent directories): .git`), so direct `git push` commands cannot execute from `/app/applet`.
+- However, the reconciled documentation updates (`docs/COMMERCIAL_VERIFICATION_GUIDE.md`, `docs/PRE_ENV_RELEASE_FREEZE_REPORT.md`, `docs/SHOPIFY_DEPLOYMENT_CHECKLIST.md`, and `docs/POST_ENV_DOCUMENTATION_AND_CI_VERIFICATION_REPORT.md`) were committed and pushed to `Kunnapatara/AIXSHOP-v1.0` via an environment with GitHub repository access, evidenced by commit [`ef7a31c54101ece7f2803113abae5a54517f8cfb`](https://github.com/Kunnapatara/AIXSHOP-v1.0/commit/ef7a31c54101ece7f2803113abae5a54517f8cfb) (`ef7a31c`) and CI Run #41 (`45786474138`).
 
 ---
 
@@ -120,19 +123,21 @@
 
 | Workstream / Verification Target | Status | Summary |
 | --- | --- | --- |
-| Email Source Audit & Minimal Doc Reconciliation | **PASS** | All billing & password-reset email paths audited; contradictory doc lines corrected without altering production code |
-| Email, Billing, Contract & Unit Local Suites | **PASS** | Unit (`164/164`), Contracts (`20/20`), Focused Billing/Email/Journey (`86/86`), and `config:check` all passed using local mocks/loopback SMTP (`PASS — SIMULATED`) |
-| TypeScript Lint & Vite Production Build (Local Post-Edit) | **PASS** | `npm run lint` and `npm run build` executed cleanly after all documentation edits |
-| GitHub Actions CI for Commit `571c92da848f06848d0745e2e40b22778f2db218` | **PASS** | Workflow `CI` Run ID `45784578837` completed with `success` across both jobs (`Lint, Test, and Build` and `Live PostgreSQL Migrations & Multi-Connection Tests`) |
-| Real External SMTP Delivery & Inbox Receipt (`npm run verify:smtp`) | **BLOCKED** | `BLOCKED — SMTP ENV NOT CONFIGURED` (`COMMERCIAL_VERIFY_EXTERNAL`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, non-`.local` `SMTP_FROM`, `SMTP_TEST_RECIPIENT` missing) |
-| Live Shopify Dev Store, Stripe Test Mode & Staging E2E (`verify:config`) | **BLOCKED** | `ALL_EXTERNAL_BLOCKED` — awaiting real external staging credentials and PostgreSQL target |
-| Commit & Push Local Doc Updates to GitHub (`Kunnapatara/AIXSHOP-v1.0`) | **BLOCKED** | Local `/app/applet` workspace has no `.git` repository or remote |
+| Email Source Audit & Documentation Reconciliation | **PASS** | All billing & password-reset email paths audited; contradictory documentation corrected without modifying production code |
+| Documentation Commit & Push | **PASS** | Committed and pushed to `main` as [`ef7a31c54101ece7f2803113abae5a54517f8cfb`](https://github.com/Kunnapatara/AIXSHOP-v1.0/commit/ef7a31c54101ece7f2803113abae5a54517f8cfb) (`docs: update commercial verification and deployment docs`) |
+| Latest GitHub Actions CI (Run #41 / ID `45786474138`) | **PASS** | `Lint, Test, and Build` and `Live PostgreSQL Migrations & Multi-Connection Tests` (Migrations `001–019`) passed (`2/2` jobs `success`, `0` failed, `0` skipped) |
+| Unit, Contract, Billing & Email Simulated Tests | **PASS** | Unit (`164/164`), Contracts (`20/20`), Focused Billing/Email/Journey (`86/86` via `PASS — SIMULATED`), `config:check`, `tsc --noEmit`, and `vite build` passed locally |
+| Real SMTP Delivery & Inbox Receipt (`npm run verify:smtp`) | **BLOCKED** | `BLOCKED — SMTP ENV NOT CONFIGURED` (`COMMERCIAL_VERIFY_EXTERNAL`, `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, non-`.local` `SMTP_FROM`, `SMTP_TEST_RECIPIENT` missing) |
+| Shopify Dev Store Verification (`npm run verify:shopify`) | **BLOCKED** | Missing `COMMERCIAL_VERIFY_EXTERNAL=true`, `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SHOPIFY_TOKEN_ENCRYPTION_KEY`, `SHOPIFY_DEV_STORE_DOMAIN`, `SHOPIFY_DEV_ACCESS_TOKEN` |
+| Stripe Test Mode Verification (`npm run verify:stripe`) | **BLOCKED** | Missing `COMMERCIAL_VERIFY_EXTERNAL=true`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_STARTER` / `GROWTH` / `ENTERPRISE` |
+| Staging E2E Verification (`npm run verify:staging-e2e`) | **BLOCKED** | `ALL_EXTERNAL_BLOCKED` — missing `COMMERCIAL_VERIFY_EXTERNAL=true`, `STAGING_BASE_URL`, `STAGING_CONFIRM_NON_PRODUCTION=true`, and Stage 1–3 ENV |
 
 ---
 
 ## D. Remaining Work
 
-1. **Commit & Push Reconciled Docs to GitHub:** Sync the updated files (`docs/COMMERCIAL_VERIFICATION_GUIDE.md`, `docs/SHOPIFY_DEPLOYMENT_CHECKLIST.md`, `docs/PRE_ENV_RELEASE_FREEZE_REPORT.md`, `docs/POST_ENV_DOCUMENTATION_AND_CI_VERIFICATION_REPORT.md`) to `Kunnapatara/AIXSHOP-v1.0` and verify the subsequent GitHub Actions CI run passes cleanly.
-2. **Real SMTP Provisioning & Inbox Verification (Stage 3):** Provision real SMTP ENV variables (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, verified non-`.local` `SMTP_FROM`, `SMTP_TEST_RECIPIENT`, `COMMERCIAL_VERIFY_EXTERNAL=true`), run `npm run verify:smtp`, and confirm actual recipient inbox arrival for Password Reset and all 5 billing email event types (`inbox_delivery_confirmed`).
-3. **Operational Decision on Automated Email Retries:** `retryFailedBillingEmails(repo)` works cleanly when invoked, but `server.ts` currently only schedules `recoverPendingWebhookEvents` under `BILLING_RECOVERY_ENABLED`; decide whether to wire `retryFailedBillingEmails` into the recovery interval or an external cron/job in a future code change.
-4. **Full Staging Verification (Stages 1, 2, and 4):** Provision Staging PostgreSQL (`001–019`), Shopify Dev Store, and Stripe Test Mode credentials, execute `npm run verify:shopify`, `npm run verify:stripe`, `npm run verify:staging-e2e`, and `npm run verify:commercial:report -- --write`, and complete `docs/MANUAL_EXTERNAL_VERIFICATION_CHECKLIST.md`.
+1. **Real SMTP Provisioning & Inbox Verification:** Provision real SMTP ENV (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, verified non-`.local` `SMTP_FROM`, `SMTP_TEST_RECIPIENT`, `COMMERCIAL_VERIFY_EXTERNAL=true`), run `npm run verify:smtp`, and confirm recipient inbox arrival (`inbox_delivery_confirmed=true`).
+2. **Automated Email Retry Scheduling Decision:** Decide whether `retryFailedBillingEmails()` should be triggered automatically on an interval (e.g., via `server.ts`) or executed by an external Cron job.
+3. **Shopify Dev Store Verification:** Provision Shopify Partner & Dev Store ENV and execute `npm run verify:shopify` plus live browser OAuth/sync/webhooks/write-back checks.
+4. **Stripe Test Mode Verification:** Provision Stripe Test Mode ENV (`sk_test_...`, `whsec_...`, authoritative Price IDs) and execute `npm run verify:stripe` plus Checkout/Portal/webhook/`past_due` checks.
+5. **Staging E2E Verification:** Deploy to isolated Staging with PostgreSQL (`001–019`), execute `npm run verify:staging-e2e` and `npm run verify:commercial:report -- --write`, and complete `docs/MANUAL_EXTERNAL_VERIFICATION_CHECKLIST.md`.
