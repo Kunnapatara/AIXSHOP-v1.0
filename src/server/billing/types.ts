@@ -149,7 +149,7 @@ export type BillingEmailEventType =
   | 'subscription_canceled'
   | 'payment_failed';
 
-export type BillingEmailDeliveryStatus = 'pending' | 'sent' | 'failed' | 'skipped';
+export type BillingEmailDeliveryStatus = 'pending' | 'sent' | 'failed' | 'permanently_failed' | 'skipped';
 
 export interface BillingEmailDeliveryRecord {
   id: string;

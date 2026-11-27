@@ -12,6 +12,7 @@ import {
 import { findPlanByPriceId } from '../billing/providerAdapter';
 import { StoreProfile } from '../../types';
 import { sendBillingLifecycleEmail, sanitizeSmtpErrorMessage } from './emailService';
+import { defaultOpsAlertService } from './monitoringService';
 
 export interface WebhookProcessingResult {
   success: boolean;
@@ -488,6 +489,7 @@ export class BillingService {
         workspaceName: workspace?.name || params.workspaceId,
       };
 
+      const emailRetryPolicy = resolveBillingEmailRetryPolicy();
       const claim = await this.repo.createOrClaimBillingEmailDelivery({
         id: `bemail_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
         workspaceId: params.workspaceId,
@@ -498,11 +500,14 @@ export class BillingService {
         amountCents: params.amountCents ?? null,
         currency,
         payload: payloadSummary,
+        maxAttempts: emailRetryPolicy.maxAttempts,
       });
 
       if (!claim.claimed) {
         return;
       }
+
+      const attemptCount = claim.record.attemptCount || 1;
 
       try {
         const delivery = await sendBillingLifecycleEmail({
@@ -536,23 +541,29 @@ export class BillingService {
           const safeErr = sanitizeSmtpErrorMessage(
             delivery.error || `Email transport mode "${delivery.mode}" did not accept delivery.`
           );
+          const exhausted = attemptCount >= emailRetryPolicy.maxAttempts;
           await this.repo.updateBillingEmailDeliveryStatus(claim.record.id, {
-            status: 'failed',
+            status: exhausted ? 'permanently_failed' : 'failed',
             smtpMessageAccepted: false,
             inboxDeliveryConfirmed: false,
             errorMessage: safeErr,
-            nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+            nextRetryAt: exhausted
+              ? null
+              : computeNextRetryAt(attemptCount, emailRetryPolicy.baseBackoffMs, emailRetryPolicy.maxBackoffMs),
           });
         }
       } catch (sendErr: any) {
         const safeErr = sanitizeSmtpErrorMessage(sendErr);
+        const exhausted = attemptCount >= emailRetryPolicy.maxAttempts;
         await this.repo
           .updateBillingEmailDeliveryStatus(claim.record.id, {
-            status: 'failed',
+            status: exhausted ? 'permanently_failed' : 'failed',
             smtpMessageAccepted: false,
             inboxDeliveryConfirmed: false,
             errorMessage: safeErr,
-            nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+            nextRetryAt: exhausted
+              ? null
+              : computeNextRetryAt(attemptCount, emailRetryPolicy.baseBackoffMs, emailRetryPolicy.maxBackoffMs),
           })
           .catch(() => {});
       }
@@ -1233,6 +1244,15 @@ export class BillingService {
             err.persistenceError = persistOutcome.persistenceError;
           }
         }
+        if (persistOutcome.persisted && shouldMarkPermanent) {
+          void defaultOpsAlertService.sendAlert({
+            severity: 'error',
+            alertKey: `billing_webhook_permanently_failed:${event.id}`,
+            title: `Billing Webhook Permanently Failed (${event.type})`,
+            summary: errorMessage,
+            details: { eventId: event.id, eventType: event.type, attemptCount },
+          });
+        }
       }
       throw err;
     } finally {
@@ -1818,6 +1838,14 @@ export class BillingService {
               currentPeriodStart: updatedSub.currentPeriodStart,
               currentPeriodEnd: updatedSub.currentPeriodEnd,
             });
+            void defaultOpsAlertService.sendAlert({
+              severity: 'warning',
+              alertKey: `billing_invoice_payment_failed:${workspaceId}`,
+              title: 'Subscription Invoice Payment Failed',
+              summary: `Workspace subscription moved to past_due (${updatedSub.tier})`,
+              workspaceId,
+              details: { eventId: event.id, tier: updatedSub.tier, amountCents, currency },
+            });
 
             return { success: true, action: 'processed', message: 'Invoice payment failure processed; status marked past_due.', subscription: updatedSub };
           }
@@ -1925,26 +1953,146 @@ export class BillingService {
   }
 }
 
+export interface BillingEmailRetryPolicy {
+  maxAttempts?: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
+}
+
+export const DEFAULT_BILLING_EMAIL_RETRY_POLICY: Required<BillingEmailRetryPolicy> = {
+  maxAttempts: 5,
+  baseBackoffMs: 60_000,
+  maxBackoffMs: 3_600_000,
+};
+
+export function resolveBillingEmailRetryPolicy(
+  overrides: BillingEmailRetryPolicy = {}
+): Required<BillingEmailRetryPolicy> {
+  const envMaxAttempts = Number.parseInt(process.env.BILLING_EMAIL_RETRY_MAX_ATTEMPTS || '', 10);
+  const envBaseBackoffMs = Number.parseInt(process.env.BILLING_EMAIL_RETRY_BASE_BACKOFF_MS || '', 10);
+  const envMaxBackoffMs = Number.parseInt(process.env.BILLING_EMAIL_RETRY_MAX_BACKOFF_MS || '', 10);
+
+  const maxAttempts =
+    typeof overrides.maxAttempts === 'number' &&
+    Number.isFinite(overrides.maxAttempts) &&
+    overrides.maxAttempts >= 1
+      ? Math.floor(overrides.maxAttempts)
+      : Number.isFinite(envMaxAttempts) && envMaxAttempts >= 1
+      ? envMaxAttempts
+      : DEFAULT_BILLING_EMAIL_RETRY_POLICY.maxAttempts;
+
+  const baseBackoffMs =
+    typeof overrides.baseBackoffMs === 'number' &&
+    Number.isFinite(overrides.baseBackoffMs) &&
+    overrides.baseBackoffMs >= 0
+      ? overrides.baseBackoffMs
+      : Number.isFinite(envBaseBackoffMs) && envBaseBackoffMs >= 0
+      ? envBaseBackoffMs
+      : DEFAULT_BILLING_EMAIL_RETRY_POLICY.baseBackoffMs;
+
+  const maxBackoffMs =
+    typeof overrides.maxBackoffMs === 'number' &&
+    Number.isFinite(overrides.maxBackoffMs) &&
+    overrides.maxBackoffMs >= 0
+      ? overrides.maxBackoffMs
+      : Number.isFinite(envMaxBackoffMs) && envMaxBackoffMs >= 0
+      ? envMaxBackoffMs
+      : DEFAULT_BILLING_EMAIL_RETRY_POLICY.maxBackoffMs;
+
+  return {
+    maxAttempts,
+    baseBackoffMs,
+    maxBackoffMs: Math.max(baseBackoffMs, maxBackoffMs),
+  };
+}
+
 export interface RetryBillingEmailsSummary {
   scanned: number;
   retried: number;
   sent: number;
   failed: number;
+  permanentlyFailed: number;
+  skippedContended: number;
+}
+
+export interface RetryBillingEmailsOptions extends BillingEmailRetryPolicy {
+  limit?: number;
+  nowMs?: number;
+  onPermanentFailure?: (details: {
+    deliveryId: string;
+    workspaceId: string;
+    eventType: BillingEmailEventType;
+    attemptCount: number;
+    errorMessage: string;
+  }) => void | Promise<void>;
 }
 
 export async function retryFailedBillingEmails(
   repo: DatabaseRepository,
-  options: { limit?: number } = {}
+  options: RetryBillingEmailsOptions = {}
 ): Promise<RetryBillingEmailsSummary> {
-  const candidates = await repo.listFailedBillingEmailDeliveries(options.limit ?? 50);
+  const policy = resolveBillingEmailRetryPolicy(options);
+  const candidates = await repo.listFailedBillingEmailDeliveries({ limit: options.limit ?? 50 });
   const summary: RetryBillingEmailsSummary = {
     scanned: candidates.length,
     retried: 0,
     sent: 0,
     failed: 0,
+    permanentlyFailed: 0,
+    skippedContended: 0,
+  };
+
+  const notifyPermanentEmailFailure = async (details: {
+    deliveryId: string;
+    workspaceId: string;
+    eventType: BillingEmailEventType;
+    attemptCount: number;
+    errorMessage: string;
+  }) => {
+    void defaultOpsAlertService.sendAlert({
+      severity: 'error',
+      alertKey: `billing_email_permanently_failed:${details.workspaceId}:${details.eventType}`,
+      title: `Billing Email Delivery Permanently Failed (${details.eventType})`,
+      summary: details.errorMessage,
+      workspaceId: details.workspaceId,
+      details: {
+        deliveryId: details.deliveryId,
+        eventType: details.eventType,
+        attemptCount: details.attemptCount,
+      },
+    });
+    if (options.onPermanentFailure) {
+      try {
+        await options.onPermanentFailure(details);
+      } catch {
+        // Non-blocking alert hook
+      }
+    }
   };
 
   for (const rec of candidates) {
+    if ((rec.attemptCount || 1) >= policy.maxAttempts) {
+      const safeExhaustedErr = sanitizeSmtpErrorMessage(
+        rec.errorMessage || `Maximum email retry attempts (${policy.maxAttempts}) exhausted.`
+      );
+      await repo.updateBillingEmailDeliveryStatus(rec.id, {
+        status: 'permanently_failed',
+        smtpMessageAccepted: false,
+        inboxDeliveryConfirmed: false,
+        errorMessage: safeExhaustedErr,
+        nextRetryAt: null,
+      });
+      summary.permanentlyFailed += 1;
+      await notifyPermanentEmailFailure({
+        deliveryId: rec.id,
+        workspaceId: rec.workspaceId,
+        eventType: rec.eventType,
+        attemptCount: rec.attemptCount || 1,
+        errorMessage: safeExhaustedErr,
+      });
+      continue;
+    }
+
     const claim = await repo.createOrClaimBillingEmailDelivery({
       id: rec.id,
       workspaceId: rec.workspaceId,
@@ -1956,14 +2104,19 @@ export async function retryFailedBillingEmails(
       currency: rec.currency,
       payload: rec.payload,
       allowRetryFailed: true,
+      maxAttempts: policy.maxAttempts,
     });
 
     if (!claim.claimed) {
+      summary.skippedContended += 1;
       continue;
     }
 
     summary.retried += 1;
     const p = (claim.record.payload || {}) as Record<string, any>;
+    const currentAttempt = claim.record.attemptCount || 1;
+    const nowMs =
+      typeof options.nowMs === 'number' && Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
 
     try {
       const delivery = await sendBillingLifecycleEmail({
@@ -2001,27 +2154,124 @@ export async function retryFailedBillingEmails(
         const safeErr = sanitizeSmtpErrorMessage(
           delivery.error || `Email transport mode "${delivery.mode}" did not accept delivery.`
         );
+        const exhausted = currentAttempt >= policy.maxAttempts;
         await repo.updateBillingEmailDeliveryStatus(claim.record.id, {
-          status: 'failed',
+          status: exhausted ? 'permanently_failed' : 'failed',
           smtpMessageAccepted: false,
           inboxDeliveryConfirmed: false,
           errorMessage: safeErr,
-          nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+          nextRetryAt: exhausted
+            ? null
+            : computeNextRetryAt(currentAttempt, policy.baseBackoffMs, policy.maxBackoffMs, nowMs),
         });
         summary.failed += 1;
+        if (exhausted) {
+          summary.permanentlyFailed += 1;
+          await notifyPermanentEmailFailure({
+            deliveryId: claim.record.id,
+            workspaceId: claim.record.workspaceId,
+            eventType: claim.record.eventType,
+            attemptCount: currentAttempt,
+            errorMessage: safeErr,
+          });
+        }
       }
     } catch (err: any) {
       const safeErr = sanitizeSmtpErrorMessage(err);
+      const exhausted = currentAttempt >= policy.maxAttempts;
       await repo.updateBillingEmailDeliveryStatus(claim.record.id, {
-        status: 'failed',
+        status: exhausted ? 'permanently_failed' : 'failed',
         smtpMessageAccepted: false,
         inboxDeliveryConfirmed: false,
         errorMessage: safeErr,
-        nextRetryAt: new Date(Date.now() + 60_000).toISOString(),
+        nextRetryAt: exhausted
+          ? null
+          : computeNextRetryAt(currentAttempt, policy.baseBackoffMs, policy.maxBackoffMs, nowMs),
       });
       summary.failed += 1;
+      if (exhausted) {
+        summary.permanentlyFailed += 1;
+        await notifyPermanentEmailFailure({
+          deliveryId: claim.record.id,
+          workspaceId: claim.record.workspaceId,
+          eventType: claim.record.eventType,
+          attemptCount: currentAttempt,
+          errorMessage: safeErr,
+        });
+      }
     }
   }
 
   return summary;
+}
+
+export interface BillingEmailRetrySchedulerOptions extends RetryBillingEmailsOptions {
+  intervalMs?: number;
+  log?: (msg: string, meta?: Record<string, unknown>) => void;
+  onError?: (errMessage: string) => void;
+}
+
+export interface BillingEmailRetrySchedulerHandle {
+  stop: () => void;
+  runOnce: () => Promise<RetryBillingEmailsSummary | null>;
+}
+
+export function startBillingEmailRetryScheduler(
+  repo: DatabaseRepository,
+  options: BillingEmailRetrySchedulerOptions = {}
+): BillingEmailRetrySchedulerHandle {
+  const rawInterval =
+    options.intervalMs ?? Number.parseInt(process.env.BILLING_EMAIL_RETRY_INTERVAL_MS || '60000', 10);
+  const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 60_000;
+  let inFlight = false;
+  let stopped = false;
+
+  const runOnce = async (): Promise<RetryBillingEmailsSummary | null> => {
+    if (inFlight || stopped) {
+      return null;
+    }
+    inFlight = true;
+    try {
+      const summary = await retryFailedBillingEmails(repo, options);
+      if (summary.scanned > 0 || summary.retried > 0 || summary.permanentlyFailed > 0) {
+        const logFn =
+          options.log ||
+          ((msg: string, meta?: Record<string, unknown>) => console.log(msg, meta));
+        logFn('[AIXSHOP Billing Email Retry]', {
+          scanned: summary.scanned,
+          retried: summary.retried,
+          sent: summary.sent,
+          failed: summary.failed,
+          permanentlyFailed: summary.permanentlyFailed,
+          skippedContended: summary.skippedContended,
+        });
+      }
+      return summary;
+    } catch (err) {
+      const safeMsg = sanitizeSmtpErrorMessage(err);
+      if (options.onError) {
+        options.onError(safeMsg);
+      } else {
+        console.error('[AIXSHOP Billing Email Retry] Sweep error:', safeMsg);
+      }
+      return null;
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void runOnce();
+  }, intervalMs);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+
+  return {
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+    runOnce,
+  };
 }

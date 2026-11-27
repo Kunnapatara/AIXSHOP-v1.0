@@ -137,19 +137,36 @@ function buildEmptyCloudStoreProfile(workspace?: { name?: string; slug?: string 
   };
 }
 
-function resolveInitialPageFromLocation(): NavigationPage {
-  if (typeof window === 'undefined' || !window.location) {
-    return 'home';
+export function resolveNavigationPageFromLocation(
+  rawPathname: string = '',
+  rawSearch: string = ''
+): NavigationPage {
+  const trimmedPath = rawPathname.trim();
+  const normalizedPath =
+    trimmedPath.length > 1 ? trimmedPath.replace(/\/+$/, '').toLowerCase() : trimmedPath.toLowerCase();
+
+  if (normalizedPath === '/privacy' || normalizedPath === '/privacy-policy') {
+    return 'privacy';
   }
-  try {
-    const pathname = typeof window.location.pathname === 'string' ? window.location.pathname : '';
-    if (pathname === '/settings') {
-      return 'settings';
-    }
-    const search = typeof window.location.search === 'string' ? window.location.search : '';
-    if (search) {
-      const params = new URLSearchParams(search);
-      const pageParam = params.get('page');
+  if (normalizedPath === '/terms' || normalizedPath === '/terms-of-service') {
+    return 'terms';
+  }
+  if (normalizedPath === '/settings') {
+    return 'settings';
+  }
+  if (normalizedPath === '/landing') {
+    return 'landing';
+  }
+
+  const isRootPath = normalizedPath === '' || normalizedPath === '/';
+  if (!isRootPath) {
+    return 'not-found';
+  }
+
+  if (rawSearch) {
+    const params = new URLSearchParams(rawSearch);
+    const pageParam = params.get('page');
+    if (pageParam !== null) {
       if (
         pageParam === 'landing' ||
         pageParam === 'home' ||
@@ -160,14 +177,30 @@ function resolveInitialPageFromLocation(): NavigationPage {
         pageParam === 'feed-readiness' ||
         pageParam === 'business-profile' ||
         pageParam === 'ai-visibility' ||
-        pageParam === 'settings'
+        pageParam === 'settings' ||
+        pageParam === 'privacy' ||
+        pageParam === 'terms'
       ) {
         return pageParam;
       }
-      if (params.has('shopify') || params.has('shopify_error')) {
-        return 'settings';
-      }
+      return 'not-found';
     }
+    if (params.has('shopify') || params.has('shopify_error')) {
+      return 'settings';
+    }
+  }
+
+  return 'home';
+}
+
+function resolveInitialPageFromLocation(): NavigationPage {
+  if (typeof window === 'undefined' || !window.location) {
+    return 'home';
+  }
+  try {
+    const pathname = typeof window.location.pathname === 'string' ? window.location.pathname : '';
+    const search = typeof window.location.search === 'string' ? window.location.search : '';
+    return resolveNavigationPageFromLocation(pathname, search);
   } catch {
     // Fallback safely in restricted DOM environments
   }
@@ -634,7 +667,36 @@ export const AppProvider: React.FC<{ children: ReactNode; customStorageAdapter?:
 
   const navigateTo = (page: NavigationPage, entityId?: string, fromPage?: NavigationPage) => {
     setMobileMenuOpen(false);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    try {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch {
+      // Ignore in non-browser test hosts
+    }
+
+    try {
+      if (
+        typeof window !== 'undefined' &&
+        window.history &&
+        typeof window.history.pushState === 'function' &&
+        window.location
+      ) {
+        if (page === 'privacy' && window.location.pathname !== '/privacy') {
+          window.history.pushState({ page: 'privacy' }, '', '/privacy');
+        } else if (page === 'terms' && window.location.pathname !== '/terms') {
+          window.history.pushState({ page: 'terms' }, '', '/terms');
+        } else if (
+          page !== 'privacy' &&
+          page !== 'terms' &&
+          page !== 'not-found' &&
+          window.location.pathname !== '/' &&
+          window.location.pathname !== '/settings'
+        ) {
+          window.history.pushState({ page }, '', '/');
+        }
+      }
+    } catch {
+      // Ignore history errors in restricted hosts
+    }
 
     if (page === 'product-detail') {
       if (entityId) {

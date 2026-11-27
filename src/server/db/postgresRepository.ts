@@ -6613,6 +6613,7 @@ export class PostgresRepository implements DatabaseRepository {
     currency?: string | null;
     payload?: Record<string, unknown>;
     allowRetryFailed?: boolean;
+    maxAttempts?: number;
   }): Promise<{ claimed: boolean; record: BillingEmailDeliveryRecord }> {
     return this.withTransaction(async (client) => {
       const existingRes = await client.query<any>(
@@ -6632,7 +6633,14 @@ export class PostgresRepository implements DatabaseRepository {
       if (existingRes.rows.length > 0) {
         const existing = this.mapBillingEmailRow(existingRes.rows[0]);
         const stalePending = existing.status === 'pending' && Date.now() - new Date(existing.updatedAt).getTime() > 120_000;
-        const retryableFailed = existing.status === 'failed' && Boolean(params.allowRetryFailed);
+        const maxAllowed = typeof params.maxAttempts === 'number' && params.maxAttempts > 0 ? params.maxAttempts : undefined;
+        const underMaxAttempts = maxAllowed === undefined || existing.attemptCount < maxAllowed;
+        const retryDue = !existing.nextRetryAt || new Date(existing.nextRetryAt).getTime() <= Date.now();
+        const retryableFailed =
+          existing.status === 'failed' &&
+          Boolean(params.allowRetryFailed) &&
+          underMaxAttempts &&
+          retryDue;
         if (!stalePending && !retryableFailed) {
           return { claimed: false, record: existing };
         }
@@ -6780,7 +6788,8 @@ export class PostgresRepository implements DatabaseRepository {
     return res.rows.map((r: any) => this.mapBillingEmailRow(r));
   }
 
-  async listFailedBillingEmailDeliveries(limit = 50): Promise<BillingEmailDeliveryRecord[]> {
+  async listFailedBillingEmailDeliveries(limitOrOptions: number | { limit?: number } = 50): Promise<BillingEmailDeliveryRecord[]> {
+    const limit = typeof limitOrOptions === 'number' ? limitOrOptions : (limitOrOptions?.limit ?? 50);
     const res = await this.query<any>(
       `SELECT id, workspace_id AS "workspaceId", delivery_key AS "deliveryKey", event_type AS "eventType",
               recipient_email AS "recipientEmail", tier, amount_cents AS "amountCents", currency,

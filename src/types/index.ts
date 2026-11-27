@@ -9,7 +9,10 @@ export type NavigationPage =
   | 'feed-readiness'
   | 'business-profile'
   | 'ai-visibility'
-  | 'settings';
+  | 'settings'
+  | 'privacy'
+  | 'terms'
+  | 'not-found';
 
 export type PrimaryMerchantPage = 'home' | 'audit' | 'products' | 'actions';
 

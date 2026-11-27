@@ -66,8 +66,13 @@ export const AppShell: React.FC<AppShellProps> = ({ children }) => {
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [workspaceDropdownOpen, setWorkspaceDropdownOpen] = useState(false);
 
-  // If currently on Landing page, we render landing page with its own specialized top/footer layout
-  if (currentPage === 'landing') {
+  // Public pages (landing, legal drafts, 404) use standalone layout without workspace sidebar
+  if (
+    currentPage === 'landing' ||
+    currentPage === 'privacy' ||
+    currentPage === 'terms' ||
+    currentPage === 'not-found'
+  ) {
     return (
       <div className="min-h-screen bg-[#FAF8F5] text-stone-900 flex flex-col font-sans">
         {children}

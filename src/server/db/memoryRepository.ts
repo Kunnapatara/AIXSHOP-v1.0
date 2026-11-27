@@ -3478,6 +3478,7 @@ export class MemoryRepository implements DatabaseRepository {
     currency?: string | null;
     payload?: Record<string, unknown>;
     allowRetryFailed?: boolean;
+    maxAttempts?: number;
   }): Promise<{ claimed: boolean; record: BillingEmailDeliveryRecord }> {
     const nowIso = new Date().toISOString();
     let existing: BillingEmailDeliveryRecord | undefined;
@@ -3491,11 +3492,21 @@ export class MemoryRepository implements DatabaseRepository {
     if (existing) {
       const updatedMs = new Date(existing.updatedAt).getTime();
       const stalePending = existing.status === 'pending' && Date.now() - updatedMs > 120_000;
-      const retryableFailed = existing.status === 'failed' && Boolean(params.allowRetryFailed);
-      if (existing.status === 'sent' || (existing.status === 'pending' && !stalePending) || (!retryableFailed && existing.status === 'failed')) {
-        return { claimed: false, record: JSON.parse(JSON.stringify(existing)) };
-      }
-      if (existing.status === 'skipped') {
+      const maxAllowed = typeof params.maxAttempts === 'number' && params.maxAttempts > 0 ? params.maxAttempts : undefined;
+      const underMaxAttempts = maxAllowed === undefined || (existing.attemptCount || 1) < maxAllowed;
+      const retryDue = !existing.nextRetryAt || new Date(existing.nextRetryAt).getTime() <= Date.now();
+      const retryableFailed =
+        existing.status === 'failed' &&
+        Boolean(params.allowRetryFailed) &&
+        underMaxAttempts &&
+        retryDue;
+      if (
+        existing.status === 'sent' ||
+        existing.status === 'skipped' ||
+        existing.status === 'permanently_failed' ||
+        (existing.status === 'pending' && !stalePending) ||
+        (existing.status === 'failed' && !retryableFailed)
+      ) {
         return { claimed: false, record: JSON.parse(JSON.stringify(existing)) };
       }
       existing.status = 'pending';
@@ -3581,7 +3592,8 @@ export class MemoryRepository implements DatabaseRepository {
       .map((r) => JSON.parse(JSON.stringify(r)));
   }
 
-  async listFailedBillingEmailDeliveries(limit = 50): Promise<BillingEmailDeliveryRecord[]> {
+  async listFailedBillingEmailDeliveries(limitOrOptions: number | { limit?: number } = 50): Promise<BillingEmailDeliveryRecord[]> {
+    const limit = typeof limitOrOptions === 'number' ? limitOrOptions : (limitOrOptions?.limit ?? 50);
     const now = Date.now();
     return Array.from(this.billingEmailDeliveries.values())
       .filter((r) => r.status === 'failed' && (!r.nextRetryAt || new Date(r.nextRetryAt).getTime() <= now))

@@ -14,10 +14,12 @@
     "test:unit": "tsx --test \"src/domain/**/*.test.ts\" \"src/api/**/*.test.ts\" \"src/context/**/*.test.ts\" \"src/pages/**/*.test.ts\"",
     "test:contracts": "tsx --test \"src/server/commercialVerificationHarness.test.ts\" \"src/server/customerJourney.e2e.test.ts\" \"src/server/stripeAndSmtpReadiness.test.ts\"",
     "test:postgres": "tsx --test \"src/server/postgresEntitlements.test.ts\" \"src/server/shopifyWebhookStatusPostgres.test.ts\" \"src/server/db/migrate.test.ts\" \"src/server/shopifyAtomicProvenance.test.ts\"",
+    "test:e2e:browser": "tsx --test \"e2e/*.test.ts\"",
     "db:migrate": "tsx src/server/db/migrate.ts",
     "db:status": "tsx src/server/db/migrate.ts --status",
     "migrate": "tsx src/server/db/migrate.ts",
     "billing:recover": "tsx src/server/billing/recoverWebhooks.ts",
+    "billing:retry-emails": "tsx src/server/billing/recoverEmails.ts",
     "config:check": "tsx src/server/config/checkConfig.ts",
     "verify:config": "tsx src/server/verification/checkCommercialEnv.ts",
     "verify:shopify": "tsx scripts/verify/run-shopify.ts",
@@ -44,14 +46,15 @@
     "vite": "^8.3.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
+    "playwright": "^1.65.1",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.21.0",
-    "typescript": "^7.0.2",
-    "@types/express": "^4.17.21"
+    "typescript": "^7.0.2"
   }
 }

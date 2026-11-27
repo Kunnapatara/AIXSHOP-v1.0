@@ -349,6 +349,24 @@ export const LandingPage: React.FC = () => {
               AI shopping assistants and search agents require structured facts, unambiguous specifications, and verifiable evidence. AIXSHOP pinpoints missing attributes, conflicting claims, and catalog discrepancies before they limit customer discovery.
             </p>
 
+            {/* Hero Primary & Secondary CTA Above the Fold */}
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <a
+                href="#store-check"
+                className="px-5 py-3 text-sm font-semibold text-white bg-orange-600 hover:bg-orange-700 rounded-xl transition-colors shadow-xs inline-flex items-center gap-2 min-h-[44px]"
+              >
+                <span>Start Free Store Check</span>
+                <ArrowRight className="w-4 h-4" />
+              </a>
+              <button
+                type="button"
+                onClick={() => navigateTo('home')}
+                className="px-5 py-3 text-sm font-semibold text-stone-800 bg-white border border-stone-300 hover:bg-stone-100 rounded-xl transition-colors inline-flex items-center gap-2 min-h-[44px] cursor-pointer"
+              >
+                <span>Open Merchant Workspace</span>
+              </button>
+            </div>
+
             {/* Quick Proof Strip */}
             <div className="pt-2 grid grid-cols-3 gap-4 border-t border-stone-200/80">
               <div>
@@ -1083,12 +1101,14 @@ export const LandingPage: React.FC = () => {
             <span className="font-bold text-stone-900">AIXSHOP v1.0</span>
             <span>· AI Commerce Visibility & Product Catalog Intelligence</span>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center justify-center sm:justify-end gap-4">
             <button onClick={() => navigateTo('home')} className="hover:text-stone-900">Merchant Home</button>
             <button onClick={() => navigateTo('audit')} className="hover:text-stone-900">Audit</button>
             <button onClick={() => navigateTo('products')} className="hover:text-stone-900">Products</button>
             <button onClick={() => navigateTo('actions')} className="hover:text-stone-900">Actions</button>
             <button onClick={() => navigateTo('settings')} className="hover:text-stone-900">Settings</button>
+            <button onClick={() => navigateTo('privacy')} className="hover:text-stone-900">Privacy (Draft)</button>
+            <button onClick={() => navigateTo('terms')} className="hover:text-stone-900">Terms (Draft)</button>
           </div>
         </div>
       </footer>

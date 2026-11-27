@@ -430,6 +430,7 @@ export interface DatabaseRepository {
     currency?: string | null;
     payload?: Record<string, unknown>;
     allowRetryFailed?: boolean;
+    maxAttempts?: number;
   }): Promise<{ claimed: boolean; record: BillingEmailDeliveryRecord }>;
   updateBillingEmailDeliveryStatus(
     id: string,
@@ -446,7 +447,7 @@ export interface DatabaseRepository {
   ): Promise<BillingEmailDeliveryRecord>;
   getBillingEmailDeliveryByKey(deliveryKey: string): Promise<BillingEmailDeliveryRecord | null>;
   listBillingEmailDeliveries(workspaceId: string, limit?: number): Promise<BillingEmailDeliveryRecord[]>;
-  listFailedBillingEmailDeliveries(limit?: number): Promise<BillingEmailDeliveryRecord[]>;
+  listFailedBillingEmailDeliveries(limitOrOptions?: number | { limit?: number }): Promise<BillingEmailDeliveryRecord[]>;
 
   // Catalog Audit Runs
   createAuditRun(data: CreateAuditRunData): Promise<AuditRunRecord>;

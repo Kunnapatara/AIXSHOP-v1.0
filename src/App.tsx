@@ -19,6 +19,9 @@ import { AiDiscoveryPage } from './pages/AiDiscoveryPage';
 import { FeedReadinessPage } from './pages/FeedReadinessPage';
 import { BusinessProfilePage } from './pages/BusinessProfilePage';
 import { AiVisibilityPage } from './pages/AiVisibilityPage';
+import { PrivacyPolicyPage } from './pages/PrivacyPolicyPage';
+import { TermsOfServicePage } from './pages/TermsOfServicePage';
+import { NotFoundPage } from './pages/NotFoundPage';
 
 const AppContent: React.FC = () => {
   const { currentPage } = useApp();
@@ -47,8 +50,13 @@ const AppContent: React.FC = () => {
         return <AiVisibilityPage />;
       case 'settings':
         return <SettingsPage />;
+      case 'privacy':
+        return <PrivacyPolicyPage />;
+      case 'terms':
+        return <TermsOfServicePage />;
+      case 'not-found':
       default:
-        return <HomePage />;
+        return <NotFoundPage />;
     }
   };
 

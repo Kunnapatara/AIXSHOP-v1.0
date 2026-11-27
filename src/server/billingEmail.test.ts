@@ -4,7 +4,17 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
-import { BillingService, retryFailedBillingEmails } from './services/billingService';
+import {
+  BillingService,
+  computeNextRetryAt,
+  retryFailedBillingEmails,
+  resolveBillingEmailRetryPolicy,
+  startBillingEmailRetryScheduler,
+} from './services/billingService';
+import {
+  parseEmailRetryCliArgs,
+  resolveBillingEmailRetryCliExitCode,
+} from './billing/recoverEmails';
 import { SandboxBillingProvider } from './billing/providerAdapter';
 import {
   OutgoingEmail,
@@ -412,6 +422,269 @@ describe('Task D: Checkout Confirmation & Billing Lifecycle Emails (PASS — SIM
       assert.equal(afterLogs[0].status, 'sent');
       assert.equal(afterLogs[0].attemptCount, 2);
       assert.equal(afterLogs[0].smtpMessageAccepted, true);
+    } finally {
+      setCustomEmailTransport(null);
+    }
+  });
+
+  test('5. Exponential backoff & maxAttempts: failed retries back off exponentially until permanently_failed with nextRetryAt=null', async () => {
+    const fixedNow = Date.now();
+    assert.equal(
+      computeNextRetryAt(1, 60_000, 3_600_000, fixedNow),
+      new Date(fixedNow + 60_000).toISOString()
+    );
+    assert.equal(
+      computeNextRetryAt(2, 60_000, 3_600_000, fixedNow),
+      new Date(fixedNow + 120_000).toISOString()
+    );
+    assert.equal(
+      computeNextRetryAt(3, 60_000, 3_600_000, fixedNow),
+      new Date(fixedNow + 240_000).toISOString()
+    );
+    assert.equal(
+      computeNextRetryAt(10, 60_000, 3_600_000, fixedNow),
+      new Date(fixedNow + 3_600_000).toISOString(),
+      'Exponential backoff must be capped at maxBackoffMs'
+    );
+
+    const permanentAlerts: Array<{ deliveryId: string; attemptCount: number; errorMessage: string }> = [];
+    setCustomEmailTransport(async () => {
+      throw new Error('SMTP 421 upstream temporarily unavailable password=top_secret_val');
+    });
+
+    try {
+      const isoRepo = new MemoryRepository(false);
+      const createdUser = await isoRepo.createUser({
+        id: 'usr_backoff',
+        email: 'backoff@example.test',
+        passwordHash: 'hash',
+        fullName: 'Backoff Owner',
+      });
+      assert.equal(createdUser.id, 'usr_backoff');
+      const ws = await isoRepo.createWorkspace(
+        { id: 'ws_backoff', name: 'Backoff Store', slug: 'backoff-store' },
+        'usr_backoff'
+      );
+
+      // Initial failed claim (attemptCount = 1)
+      const claim1 = await isoRepo.createOrClaimBillingEmailDelivery({
+        id: 'bemail_backoff_1',
+        workspaceId: ws.workspace.id,
+        deliveryKey: 'billing_email:backoff:1',
+        eventType: 'initial_payment_confirmed',
+        recipientEmail: 'backoff@example.test',
+        tier: 'Starter',
+        amountCents: 4900,
+        currency: 'USD',
+        payload: { tier: 'Starter' },
+      });
+      assert.equal(claim1.claimed, true);
+      await isoRepo.updateBillingEmailDeliveryStatus(claim1.record.id, {
+        status: 'failed',
+        errorMessage: 'Initial failure',
+        nextRetryAt: new Date(Date.now() - 1000).toISOString(),
+      });
+
+      // Retry #1 (attemptCount -> 2) with maxAttempts=3 -> failed with 120s backoff
+      const sum1 = await retryFailedBillingEmails(isoRepo, {
+        maxAttempts: 3,
+        baseBackoffMs: 60_000,
+        maxBackoffMs: 3_600_000,
+        nowMs: fixedNow,
+        onPermanentFailure: (info) => {
+          permanentAlerts.push(info);
+        },
+      });
+      assert.equal(sum1.retried, 1);
+      assert.equal(sum1.failed, 1);
+      assert.equal(sum1.permanentlyFailed, 0);
+
+      let rec = await isoRepo.getBillingEmailDeliveryByKey('billing_email:backoff:1');
+      assert.equal(rec?.status, 'failed');
+      assert.equal(rec?.attemptCount, 2);
+      assert.equal(rec?.nextRetryAt, new Date(fixedNow + 120_000).toISOString());
+      assert.doesNotMatch(rec?.errorMessage || '', /top_secret_val/);
+
+      // Not due yet -> skipped by scheduler until nextRetryAt
+      const sumNotDue = await retryFailedBillingEmails(isoRepo, { maxAttempts: 3 });
+      assert.equal(sumNotDue.scanned, 0);
+      assert.equal(sumNotDue.retried, 0);
+
+      // Simulate time advancing past retry #2 -> attemptCount -> 3 -> permanently_failed
+      await isoRepo.updateBillingEmailDeliveryStatus(rec!.id, {
+        status: 'failed',
+        nextRetryAt: new Date(Date.now() - 1000).toISOString(),
+      });
+      const sum2 = await retryFailedBillingEmails(isoRepo, {
+        maxAttempts: 3,
+        baseBackoffMs: 60_000,
+        maxBackoffMs: 3_600_000,
+        nowMs: fixedNow + 200_000,
+        onPermanentFailure: (info) => {
+          permanentAlerts.push(info);
+        },
+      });
+      assert.equal(sum2.retried, 1);
+      assert.equal(sum2.failed, 1);
+      assert.equal(sum2.permanentlyFailed, 1);
+      assert.equal(permanentAlerts.length, 1);
+      assert.equal(permanentAlerts[0].attemptCount, 3);
+      assert.doesNotMatch(permanentAlerts[0].errorMessage, /top_secret_val/);
+
+      rec = await isoRepo.getBillingEmailDeliveryByKey('billing_email:backoff:1');
+      assert.equal(rec?.status, 'permanently_failed');
+      assert.equal(rec?.attemptCount, 3);
+      assert.equal(rec?.nextRetryAt, null);
+
+      // Permanently failed records are never retried or re-claimed automatically
+      const claimAfterPerm = await isoRepo.createOrClaimBillingEmailDelivery({
+        id: 'bemail_backoff_dup',
+        workspaceId: ws.workspace.id,
+        deliveryKey: 'billing_email:backoff:1',
+        eventType: 'initial_payment_confirmed',
+        recipientEmail: 'backoff@example.test',
+        allowRetryFailed: true,
+        maxAttempts: 10,
+      });
+      assert.equal(claimAfterPerm.claimed, false);
+      const sum3 = await retryFailedBillingEmails(isoRepo, { maxAttempts: 10 });
+      assert.equal(sum3.scanned, 0);
+    } finally {
+      setCustomEmailTransport(null);
+    }
+  });
+
+  test('6. Concurrency protection & deduplication: simultaneous retry sweeps deliver once and prevent duplicate sends', async () => {
+    let sendCalls = 0;
+    setCustomEmailTransport(async () => {
+      sendCalls += 1;
+      // Delay slightly so two parallel sweep workers overlap while first claim is pending
+      await new Promise((r) => setTimeout(r, 40));
+      return { delivered: true, mode: 'custom_transport', messageId: `<concurrent_${sendCalls}@test>` };
+    });
+
+    try {
+      const isoRepo = new MemoryRepository(false);
+      await isoRepo.createOrClaimBillingEmailDelivery({
+        id: 'bemail_concurrent_1',
+        workspaceId: 'ws_conc',
+        deliveryKey: 'billing_email:conc:1',
+        eventType: 'recurring_renewal',
+        recipientEmail: 'conc@example.test',
+        tier: 'Growth',
+        amountCents: 14900,
+        currency: 'USD',
+        payload: { tier: 'Growth' },
+      });
+      await isoRepo.updateBillingEmailDeliveryStatus('bemail_concurrent_1', {
+        status: 'failed',
+        errorMessage: 'Transient disconnect',
+        nextRetryAt: new Date(Date.now() - 1000).toISOString(),
+      });
+
+      const [sweepA, sweepB] = await Promise.all([
+        retryFailedBillingEmails(isoRepo, { maxAttempts: 5 }),
+        retryFailedBillingEmails(isoRepo, { maxAttempts: 5 }),
+      ]);
+
+      assert.equal(sendCalls, 1, 'Exactly one email transport call must occur across concurrent retry sweeps');
+      assert.equal(sweepA.sent + sweepB.sent, 1);
+      assert.equal(sweepA.skippedContended + sweepB.skippedContended, 1);
+
+      // Subsequent sweep or claim sees status=sent and skips cleanly
+      const sweepC = await retryFailedBillingEmails(isoRepo, { maxAttempts: 5 });
+      assert.equal(sweepC.scanned, 0);
+      assert.equal(sendCalls, 1);
+    } finally {
+      setCustomEmailTransport(null);
+    }
+  });
+
+  test('7. Scheduler & CLI recovery helper: startBillingEmailRetryScheduler enforces in-flight guard and CLI parses flags', async () => {
+    let transportCalls = 0;
+    setCustomEmailTransport(async () => {
+      transportCalls += 1;
+      await new Promise((r) => setTimeout(r, 30));
+      return { delivered: true, mode: 'custom_transport', messageId: '<sched_1@test>' };
+    });
+
+    try {
+      const isoRepo = new MemoryRepository(false);
+      await isoRepo.createOrClaimBillingEmailDelivery({
+        id: 'bemail_sched_1',
+        workspaceId: 'ws_sched',
+        deliveryKey: 'billing_email:sched:1',
+        eventType: 'plan_changed',
+        recipientEmail: 'sched@example.test',
+        tier: 'Enterprise',
+        amountCents: 49900,
+        currency: 'USD',
+        payload: { tier: 'Enterprise', previousTier: 'Growth' },
+      });
+      await isoRepo.updateBillingEmailDeliveryStatus('bemail_sched_1', {
+        status: 'failed',
+        errorMessage: 'Temporary DNS error',
+        nextRetryAt: new Date(Date.now() - 500).toISOString(),
+      });
+
+      const logged: Array<Record<string, unknown>> = [];
+      const scheduler = startBillingEmailRetryScheduler(isoRepo, {
+        intervalMs: 60_000,
+        maxAttempts: 5,
+        log: (_msg, meta) => {
+          if (meta) logged.push(meta);
+        },
+      });
+
+      try {
+        const [run1, run2] = await Promise.all([scheduler.runOnce(), scheduler.runOnce()]);
+        assert.ok(run1 || run2);
+        // Second overlapping runOnce returns null due to in-flight guard
+        assert.equal(run1 !== null && run2 !== null, false);
+        assert.equal(transportCalls, 1);
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0].sent, 1);
+      } finally {
+        scheduler.stop();
+      }
+
+      const policy = resolveBillingEmailRetryPolicy({ maxAttempts: 7, baseBackoffMs: 15_000, maxBackoffMs: 300_000 });
+      assert.deepEqual(policy, { maxAttempts: 7, baseBackoffMs: 15_000, maxBackoffMs: 300_000 });
+
+      const parsed = parseEmailRetryCliArgs([
+        '--limit=20',
+        '--max-attempts=4',
+        '--base-backoff-ms=5000',
+        '--max-backoff-ms=60000',
+      ]);
+      assert.deepEqual(parsed, {
+        limit: 20,
+        maxAttempts: 4,
+        baseBackoffMs: 5000,
+        maxBackoffMs: 60000,
+      });
+      assert.equal(
+        resolveBillingEmailRetryCliExitCode({
+          scanned: 1,
+          retried: 1,
+          sent: 1,
+          failed: 0,
+          permanentlyFailed: 0,
+          skippedContended: 0,
+        }),
+        0
+      );
+      assert.equal(
+        resolveBillingEmailRetryCliExitCode({
+          scanned: 1,
+          retried: 1,
+          sent: 0,
+          failed: 1,
+          permanentlyFailed: 1,
+          skippedContended: 0,
+        }),
+        1
+      );
     } finally {
       setCustomEmailTransport(null);
     }
