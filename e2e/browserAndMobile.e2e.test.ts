@@ -1,9 +1,53 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { spawn, ChildProcess } from 'node:child_process';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
+
+const require = createRequire(import.meta.url);
+
+function resolveNodeExecutable(): string {
+  const execBase = path.basename(process.execPath).toLowerCase();
+  if (execBase === 'node' || execBase === 'node.exe') {
+    return process.execPath;
+  }
+  return 'node';
+}
+
+function resolveTsxLoaderUrl(): string {
+  const tsxEntryPath = require.resolve('tsx');
+  return pathToFileURL(tsxEntryPath).href;
+}
+
+function formatServerLogsTail(serverLogs: string[], maxLines: number = 40): string {
+  const joined = serverLogs.join('').trim();
+  if (!joined) return '(no server logs captured)';
+  const lines = joined.split(/\r?\n/);
+  return lines.slice(-maxLines).join('\n');
+}
+
+function signalProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+  if (!proc.pid) return;
+  if (process.platform !== 'win32') {
+    try {
+      process.kill(-proc.pid, signal);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ESRCH') return;
+    }
+  }
+  try {
+    proc.kill(signal);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== 'ESRCH') throw err;
+  }
+}
 
 async function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -18,18 +62,93 @@ async function getFreePort(): Promise<number> {
   });
 }
 
-async function waitForServerReady(baseUrl: string, timeoutMs: number = 30_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${baseUrl}/api/health/live`);
-      if (res.ok) return;
-    } catch {
-      // Server still booting
-    }
-    await new Promise((r) => setTimeout(r, 250));
+async function waitForServerReady(
+  baseUrl: string,
+  proc: ChildProcess,
+  serverLogs: string[],
+  timeoutMs: number = 45_000
+): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    throw new Error(
+      `AIXSHOP server exited before becoming ready (exitCode=${proc.exitCode}, signal=${proc.signalCode}).\nServer logs:\n${formatServerLogsTail(serverLogs)}`
+    );
   }
-  throw new Error(`Timed out waiting for AIXSHOP server at ${baseUrl}`);
+
+  let settled = false;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      settled = true;
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      proc.off('error', onError);
+      proc.off('exit', onEarlyExit);
+    };
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      cleanup();
+      reject(err);
+    };
+
+    const onError = (err: Error) => {
+      fail(
+        new Error(
+          `AIXSHOP server process failed to start: ${err.message}\nServer logs:\n${formatServerLogsTail(serverLogs)}`
+        )
+      );
+    };
+
+    const onEarlyExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      fail(
+        new Error(
+          `AIXSHOP server exited before health check succeeded (exitCode=${code}, signal=${signal}).\nServer logs:\n${formatServerLogsTail(serverLogs)}`
+        )
+      );
+    };
+
+    proc.once('error', onError);
+    proc.once('exit', onEarlyExit);
+
+    timeoutTimer = setTimeout(() => {
+      fail(
+        new Error(
+          `Timed out waiting for AIXSHOP server at ${baseUrl} after ${timeoutMs}ms.\nServer logs:\n${formatServerLogsTail(serverLogs)}`
+        )
+      );
+    }, timeoutMs);
+
+    const poll = async () => {
+      if (settled) return;
+      try {
+        const res = await fetch(`${baseUrl}/api/health/live`);
+        if (res.ok) {
+          if (!settled) {
+            cleanup();
+            resolve();
+          }
+          return;
+        }
+      } catch {
+        // Server still booting
+      }
+      if (!settled) {
+        pollTimer = setTimeout(() => {
+          void poll();
+        }, 250);
+      }
+    };
+
+    void poll();
+  });
 }
 
 async function assertNoHorizontalOverflow(page: Page, label: string): Promise<void> {
@@ -48,12 +167,104 @@ describe('Approved Group 5: Real Browser & Mobile E2E Verification (Playwright C
   let browser: Browser | null = null;
   let baseUrl = '';
   const serverLogs: string[] = [];
+  let onStdoutData: ((chunk: Buffer | string) => void) | null = null;
+  let onStderrData: ((chunk: Buffer | string) => void) | null = null;
+
+  async function stopServerProcess(
+    gracefulTimeoutMs: number = 5_000,
+    killTimeoutMs: number = 3_000
+  ): Promise<void> {
+    const proc = serverProc;
+    serverProc = null;
+    if (!proc) return;
+
+    const detachStreams = (destroyIfOpen: boolean) => {
+      if (onStdoutData && proc.stdout) {
+        proc.stdout.off('data', onStdoutData);
+      }
+      if (onStderrData && proc.stderr) {
+        proc.stderr.off('data', onStderrData);
+      }
+      onStdoutData = null;
+      onStderrData = null;
+
+      if (destroyIfOpen) {
+        if (proc.stdout && !proc.stdout.destroyed) {
+          proc.stdout.destroy();
+        }
+        if (proc.stderr && !proc.stderr.destroyed) {
+          proc.stderr.destroy();
+        }
+      }
+    };
+
+    const waitForCloseOrTimeout = (timeoutMs: number): Promise<boolean> => {
+      const streamsClosed =
+        (!proc.stdout || proc.stdout.closed || proc.stdout.destroyed) &&
+        (!proc.stderr || proc.stderr.closed || proc.stderr.destroyed);
+      const alreadyExited = proc.exitCode !== null || proc.signalCode !== null;
+      if (alreadyExited && streamsClosed) {
+        return Promise.resolve(true);
+      }
+
+      return new Promise<boolean>((resolve) => {
+        let done = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+
+        const finish = (closed: boolean) => {
+          if (done) return;
+          done = true;
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          proc.off('close', onClose);
+          proc.off('error', onError);
+          resolve(closed);
+        };
+
+        const onClose = () => finish(true);
+        const onError = () => finish(true);
+
+        proc.once('close', onClose);
+        proc.once('error', onError);
+
+        timer = setTimeout(() => finish(false), timeoutMs);
+      });
+    };
+
+    const alreadyExited = proc.exitCode !== null || proc.signalCode !== null;
+    if (!alreadyExited) {
+      signalProcessTree(proc, 'SIGTERM');
+    }
+
+    let closedCleanly = await waitForCloseOrTimeout(alreadyExited ? 1_000 : gracefulTimeoutMs);
+    if (!closedCleanly) {
+      signalProcessTree(proc, 'SIGKILL');
+      closedCleanly = await waitForCloseOrTimeout(killTimeoutMs);
+    }
+
+    detachStreams(!closedCleanly);
+  }
+
+  async function cleanupResources(): Promise<void> {
+    if (browser) {
+      const activeBrowser = browser;
+      browser = null;
+      await activeBrowser.close().catch(() => {});
+    }
+    await stopServerProcess();
+  }
 
   before(async () => {
+    serverLogs.length = 0;
     const port = await getFreePort();
     baseUrl = `http://127.0.0.1:${port}`;
-    serverProc = spawn('npx', ['tsx', 'server.ts'], {
+    const nodeExec = resolveNodeExecutable();
+    const tsxLoaderUrl = resolveTsxLoaderUrl();
+    const proc = spawn(nodeExec, ['--import', tsxLoaderUrl, 'server.ts'], {
       cwd: process.cwd(),
+      detached: process.platform !== 'win32',
       env: {
         ...process.env,
         PORT: String(port),
@@ -63,31 +274,24 @@ describe('Approved Group 5: Real Browser & Mobile E2E Verification (Playwright C
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    serverProc.stdout?.on('data', (chunk) => serverLogs.push(chunk.toString()));
-    serverProc.stderr?.on('data', (chunk) => serverLogs.push(chunk.toString()));
+    serverProc = proc;
 
-    await waitForServerReady(baseUrl, 45_000);
-    browser = await chromium.launch({ headless: true });
+    onStdoutData = (chunk: Buffer | string) => serverLogs.push(chunk.toString());
+    onStderrData = (chunk: Buffer | string) => serverLogs.push(chunk.toString());
+    proc.stdout?.on('data', onStdoutData);
+    proc.stderr?.on('data', onStderrData);
+
+    try {
+      await waitForServerReady(baseUrl, proc, serverLogs, 45_000);
+      browser = await chromium.launch({ headless: true });
+    } catch (err) {
+      await cleanupResources();
+      throw err;
+    }
   });
 
   after(async () => {
-    if (browser) {
-      await browser.close().catch(() => {});
-      browser = null;
-    }
-    if (serverProc && !serverProc.killed) {
-      serverProc.kill('SIGTERM');
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          serverProc?.kill('SIGKILL');
-          resolve();
-        }, 5000);
-        serverProc?.once('exit', () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-    }
+    await cleanupResources();
   });
 
   function attachErrorCollectors(page: Page, options: { allow404ConsoleError?: boolean } = {}) {
