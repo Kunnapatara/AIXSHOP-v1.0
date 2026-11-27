@@ -80,16 +80,66 @@ async function start() {
 
   if (!isProd) {
     console.log('[AIXSHOP] Starting development server with Vite middleware...');
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
       server: { 
         middlewareMode: true,
         host: '0.0.0.0',
         port: PORT,
-        hmr: process.env.DISABLE_HMR !== 'true',
-        watch: process.env.DISABLE_HMR === 'true' ? null : {},
+        hmr: !disableHmr,
+        ...(disableHmr ? { ws: false } : {}),
+        watch: disableHmr ? null : {},
       },
       appType: 'spa',
     });
+
+    if (disableHmr) {
+      app.get('/@vite/client', (_req, res) => {
+        res.type('application/javascript; charset=utf-8').send(`
+const sheetsMap = new Map();
+export function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    style.textContent = content;
+    document.head.appendChild(style);
+  } else if (style.textContent !== content) {
+    style.textContent = content;
+  }
+  sheetsMap.set(id, style);
+}
+export function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    dispose() {},
+    prune() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+    decline() {},
+  };
+}
+export function injectQuery(url, queryToInject) {
+  if (url[0] !== '.' && url[0] !== '/') return url;
+  const pathname = url.replace(/[?#].*$/, '');
+  const { search, hash } = new URL(url, 'http://vite.dev');
+  return pathname + '?' + queryToInject + (search ? '&' + search.slice(1) : '') + (hash || '');
+}
+export class ErrorOverlay extends HTMLElement {}
+`);
+      });
+    }
 
     // Return genuine HTTP 404 status for unknown frontend HTML routes while rendering the SPA Custom 404 page
     app.get('*', async (req, res, next) => {

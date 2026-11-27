@@ -374,7 +374,11 @@ describe('Approved Group 5: Real Browser & Mobile E2E Verification (Playwright C
       // 5. Desktop Workspace Navigation (Demo mode initially)
       await page.getByRole('button', { name: /^Products$/i }).first().click();
       await assertNoHorizontalOverflow(page, 'Desktop Products');
-      await page.getByRole('button', { name: /^Actions$/i }).first().click();
+      await page
+        .getByRole('navigation', { name: 'Merchant Navigation' })
+        .getByRole('button', { name: /^Actions(?:\s+\d+)?$/i })
+        .click();
+      await page.getByText(/Merchant Action Center/i).first().waitFor({ state: 'visible' });
       await assertNoHorizontalOverflow(page, 'Desktop Actions');
 
       // 6. Auth Flow: Register new user & isolated Free Audit Cloud Workspace
@@ -414,7 +418,7 @@ describe('Approved Group 5: Real Browser & Mobile E2E Verification (Playwright C
       await page.getByRole('button', { name: /Sign Out/i }).click();
       await page.getByText(/Demo Mode · Enable Cloud/i).waitFor({ state: 'visible' });
 
-      await page.getByRole('button', { name: /Sign In/i }).click();
+      await page.getByRole('button', { name: /^Sign In$/i }).click();
       await page.getByPlaceholder('merchant@example.com').fill(uniqueEmail);
       await page.getByPlaceholder('••••••••').fill('StrongPass!2026');
       await page.locator('form button[type="submit"]').click();
