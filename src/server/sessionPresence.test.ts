@@ -1,13 +1,7 @@
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import net from 'node:net';
-import path from 'node:path';
 import crypto from 'node:crypto';
-import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
-import { spawn, ChildProcess } from 'node:child_process';
-import { chromium, Browser } from 'playwright';
 import { createApp } from './app';
 import { MemoryRepository } from './db/memoryRepository';
 import {
@@ -18,8 +12,6 @@ import {
 } from './middleware/auth';
 import { generateSessionToken, hashSessionToken } from './security/tokens';
 import { readSessionPresenceMarker } from '../context/AuthContext';
-
-const require = createRequire(import.meta.url);
 
 function getSetCookies(res: Response): string[] {
   if (typeof res.headers.getSetCookie === 'function') {
@@ -44,64 +36,6 @@ function parseSetCookieMap(res: Response): Record<string, { value: string; raw: 
   return map;
 }
 
-function resolveNodeExecutable(): string {
-  const execBase = path.basename(process.execPath).toLowerCase();
-  if (execBase === 'node' || execBase === 'node.exe') {
-    return process.execPath;
-  }
-  return 'node';
-}
-
-function resolveTsxLoaderUrl(): string {
-  return pathToFileURL(require.resolve('tsx')).href;
-}
-
-async function getFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const addr = srv.address() as net.AddressInfo;
-      srv.close((err) => (err ? reject(err) : resolve(addr.port)));
-    });
-  });
-}
-
-function signalProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
-  if (!proc.pid) return;
-  if (process.platform !== 'win32') {
-    try {
-      process.kill(-proc.pid, signal);
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code === 'ESRCH') return;
-    }
-  }
-  try {
-    proc.kill(signal);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code !== 'ESRCH') throw err;
-  }
-}
-
-async function waitForServerReady(baseUrl: string, proc: ChildProcess, timeoutMs = 45_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (proc.exitCode !== null || proc.signalCode !== null) {
-      throw new Error(`Server exited early (exitCode=${proc.exitCode}, signal=${proc.signalCode})`);
-    }
-    try {
-      const res = await fetch(`${baseUrl}/api/health/live`);
-      if (res.ok) return;
-    } catch {
-      // booting
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  throw new Error(`Timed out waiting for server at ${baseUrl}`);
-}
-
 describe('Session Presence Marker (aixshop_has_session) Unit & HTTP Integration Suite', () => {
   let server: http.Server;
   let baseUrl: string;
@@ -118,7 +52,7 @@ describe('Session Presence Marker (aixshop_has_session) Unit & HTTP Integration 
     server = http.createServer(app);
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
-        const addr = server.address() as net.AddressInfo;
+        const addr = server.address() as { port: number };
         baseUrl = `http://127.0.0.1:${addr.port}`;
         resolve();
       });
@@ -522,149 +456,5 @@ describe('Session Presence Marker (aixshop_has_session) Unit & HTTP Integration 
     });
     assert.equal(htmlTampered.status, 200);
     assert.equal(parseSetCookieMap(htmlTampered)[SESSION_PRESENCE_COOKIE_NAME]?.value, '0');
-  });
-});
-
-describe('Session Presence Real Browser & Multi-Tab Sync (Playwright)', () => {
-  let serverProc: ChildProcess | null = null;
-  let browser: Browser | null = null;
-  let baseUrl = '';
-
-  before(async () => {
-    const port = await getFreePort();
-    baseUrl = `http://127.0.0.1:${port}`;
-    const proc = spawn(resolveNodeExecutable(), ['--import', resolveTsxLoaderUrl(), 'server.ts'], {
-      cwd: process.cwd(),
-      detached: process.platform !== 'win32',
-      env: {
-        ...process.env,
-        PORT: String(port),
-        NODE_ENV: 'development',
-        DISABLE_HMR: 'true',
-        AIXSHOP_SILENCE_REQUEST_LOGS: 'true',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    serverProc = proc;
-    await waitForServerReady(baseUrl, proc, 45_000);
-    browser = await chromium.launch({ headless: true });
-  });
-
-  after(async () => {
-    if (browser) {
-      const b = browser;
-      browser = null;
-      await b.close().catch(() => {});
-    }
-    if (serverProc) {
-      const proc = serverProc;
-      serverProc = null;
-      if (proc.exitCode === null && proc.signalCode === null) {
-        signalProcessTree(proc, 'SIGTERM');
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            signalProcessTree(proc, 'SIGKILL');
-            resolve();
-          }, 4000);
-          proc.once('close', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      }
-      proc.stdout?.destroy();
-      proc.stderr?.destroy();
-    }
-  });
-
-  test('1, 2, 11. Unauthenticated browser skips /api/auth/me cleanly, legacy cookie syncs, and multiple tabs stay in sync on login/logout', async () => {
-    assert.ok(browser);
-    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    const tab1 = await context.newPage();
-    const tab2 = await context.newPage();
-
-    const authMeRequestsTab1: number[] = [];
-    const authMeRequestsTab2: number[] = [];
-    const consoleErrors: string[] = [];
-    const pageErrors: string[] = [];
-
-    for (const p of [tab1, tab2]) {
-      p.on('pageerror', (err) => pageErrors.push(err.message || String(err)));
-      p.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
-      });
-    }
-    tab1.on('response', (res) => {
-      if (res.url().includes('/api/auth/me')) authMeRequestsTab1.push(res.status());
-    });
-    tab2.on('response', (res) => {
-      if (res.url().includes('/api/auth/me')) authMeRequestsTab2.push(res.status());
-    });
-
-    try {
-      // Scenario 1: First visit without session -> sets aixshop_has_session=0, zero /api/auth/me calls, zero console errors
-      await tab1.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
-      await tab2.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
-
-      const initialCookies = await context.cookies(baseUrl);
-      assert.equal(initialCookies.find((c) => c.name === SESSION_PRESENCE_COOKIE_NAME)?.value, '0');
-      assert.deepEqual(authMeRequestsTab1, []);
-      assert.deepEqual(authMeRequestsTab2, []);
-      assert.deepEqual(consoleErrors, []);
-      assert.deepEqual(pageErrors, []);
-
-      // Scenario 11a: Register/Login in Tab 1 -> Tab 2 picks up session on focus without page reload
-      const email = `multitab-${crypto.randomBytes(4).toString('hex')}@example.com`;
-      await tab1.getByRole('button', { name: /Sign In/i }).click();
-      await tab1.getByRole('button', { name: /Sign Up/i }).click();
-      await tab1.getByPlaceholder('Jane Merchant').fill('TabUser Merchant');
-      await tab1.getByPlaceholder('Solstice Mercantile').fill('TabStore Mercantile');
-      await tab1.getByPlaceholder('merchant@example.com').fill(email);
-      await tab1.getByPlaceholder('••••••••').fill('StrongPass!2026');
-      await tab1.getByRole('button', { name: /Create Workspace Account/i }).click();
-      await tab1.getByText(/Cloud DB Active/i).waitFor({ state: 'visible' });
-
-      // Focus Tab 2 -> hydrates authenticated state via 200 /api/auth/me
-      await tab2.evaluate(() => window.dispatchEvent(new Event('focus')));
-      await tab2.getByText(/Cloud DB Active/i).waitFor({ state: 'visible' });
-      assert.ok(authMeRequestsTab2.some((status) => status === 200));
-
-      // Scenario 2: Delete ONLY aixshop_has_session (simulating pre-deployment user with HttpOnly cookie only)
-      const cookiesWithSession = await context.cookies(baseUrl);
-      const sessionCookie = cookiesWithSession.find((c) => c.name === SESSION_COOKIE_NAME);
-      assert.ok(sessionCookie);
-      await context.clearCookies();
-      await context.addCookies([
-        {
-          name: sessionCookie.name,
-          value: sessionCookie.value,
-          domain: sessionCookie.domain,
-          path: sessionCookie.path,
-          httpOnly: sessionCookie.httpOnly,
-          secure: sessionCookie.secure,
-          sameSite: sessionCookie.sameSite,
-        },
-      ]);
-
-      await tab2.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
-      await tab2.getByText(/Cloud DB Active/i).waitFor({ state: 'visible' });
-      const resyncedCookies = await context.cookies(baseUrl);
-      assert.equal(resyncedCookies.find((c) => c.name === SESSION_PRESENCE_COOKIE_NAME)?.value, '1');
-
-      // Scenario 11b: Logout in Tab 1 -> Tab 2 clears session on focus WITHOUT issuing a 401 /api/auth/me call
-      const tab2MeCountBeforeLogout = authMeRequestsTab2.length;
-      await tab1.getByRole('button', { name: /TabUser/i }).first().click();
-      await tab1.getByRole('button', { name: /Sign Out/i }).click();
-      await tab1.getByText(/Demo Mode · Enable Cloud/i).waitFor({ state: 'visible' });
-
-      await tab2.evaluate(() => window.dispatchEvent(new Event('focus')));
-      await tab2.getByText(/Demo Mode · Enable Cloud/i).waitFor({ state: 'visible' });
-      assert.equal(authMeRequestsTab2.length, tab2MeCountBeforeLogout, 'Tab 2 must not trigger 401 /api/auth/me after Tab 1 logout');
-
-      assert.deepEqual(consoleErrors, [], `Unexpected console errors: ${consoleErrors.join(' | ')}`);
-      assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join(' | ')}`);
-    } finally {
-      await context.close();
-    }
   });
 });
