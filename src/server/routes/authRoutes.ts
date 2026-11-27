@@ -3,7 +3,15 @@ import { Router, Request, Response } from 'express';
 import { DatabaseRepository } from '../db/repository';
 import { hashPassword, verifyPassword } from '../security/passwords';
 import { generateSessionToken, hashSessionToken } from '../security/tokens';
-import { createAuthMiddleware, authRateLimiter } from '../middleware/auth';
+import {
+  createAuthMiddleware,
+  authRateLimiter,
+  SESSION_COOKIE_NAME,
+  SESSION_PRESENCE_COOKIE_NAME,
+  SESSION_COOKIE_MAX_AGE_MS,
+  setSessionPresenceCookie,
+  clearSessionCookies,
+} from '../middleware/auth';
 import { AuthRequest } from '../types';
 import { getTrustedBaseUrl } from '../config/productionConfig';
 import {
@@ -37,8 +45,8 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
   });
   const requireAuth = createAuthMiddleware(repo);
 
-  const COOKIE_NAME = 'aixshop_session';
-  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  const COOKIE_NAME = SESSION_COOKIE_NAME;
+  const THIRTY_DAYS_MS = SESSION_COOKIE_MAX_AGE_MS;
 
   const extractIncomingToken = (req: Request): string | undefined => {
     let token: string | undefined = req.cookies?.[COOKIE_NAME];
@@ -64,15 +72,11 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
       maxAge: THIRTY_DAYS_MS,
       path: '/',
     });
+    setSessionPresenceCookie(res, true);
   };
 
   const clearSessionCookie = (res: Response) => {
-    res.clearCookie(COOKIE_NAME, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      path: '/',
-    });
+    clearSessionCookies(res);
   };
 
   // POST /api/auth/register
@@ -410,6 +414,14 @@ export function createAuthRoutes(repo: DatabaseRepository): Router {
       const user = req.user!;
       const workspace = req.workspace!;
       const workspaces = await repo.getUserWorkspaces(user.id);
+
+      // Ensure existing HttpOnly cookie sessions without the presence marker get synchronized
+      if (
+        req.cookies?.[COOKIE_NAME] &&
+        req.cookies?.[SESSION_PRESENCE_COOKIE_NAME] !== '1'
+      ) {
+        setSessionPresenceCookie(res, true);
+      }
 
       return res.json({
         user,

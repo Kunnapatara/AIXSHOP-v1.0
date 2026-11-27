@@ -112,11 +112,97 @@ export function _getRateLimiterSize(): number {
   return loginAttempts.size;
 }
 
+export const SESSION_COOKIE_NAME = 'aixshop_session';
+export const SESSION_PRESENCE_COOKIE_NAME = 'aixshop_has_session';
+export const SESSION_COOKIE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+export function setSessionPresenceCookie(res: Response, hasSession: boolean): void {
+  res.cookie(SESSION_PRESENCE_COOKIE_NAME, hasSession ? '1' : '0', {
+    httpOnly: false,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: SESSION_COOKIE_MAX_AGE_MS,
+    path: '/',
+  });
+}
+
+export function clearSessionCookies(res: Response): void {
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+  setSessionPresenceCookie(res, false);
+}
+
+/**
+ * Initializes or reconciles the non-security `aixshop_has_session` presence marker
+ * on HTML document requests without weakening server-side authentication.
+ * - Unauthenticated first visits receive `aixshop_has_session=0`.
+ * - Pre-existing valid HttpOnly `aixshop_session` cookies without a marker receive `aixshop_has_session=1`.
+ * - Expired/revoked `aixshop_session` cookies are cleared and marked `aixshop_has_session=0`.
+ */
+export function createSessionPresenceHtmlMiddleware(repo: DatabaseRepository) {
+  return async function sessionPresenceHtmlMiddleware(req: any, res: Response, next: NextFunction) {
+    if (req.method !== 'GET') return next();
+
+    const rawPath = String(req.path || req.originalUrl?.split('?')[0] || '/').toLowerCase();
+    const isNonHtmlOrAsset =
+      rawPath.startsWith('/api') ||
+      rawPath.startsWith('/src/') ||
+      rawPath.startsWith('/@') ||
+      rawPath.startsWith('/node_modules/') ||
+      rawPath.startsWith('/assets/') ||
+      rawPath === '/robots.txt' ||
+      rawPath === '/sitemap.xml' ||
+      rawPath === '/favicon.svg' ||
+      /\.[a-z0-9]{1,8}$/i.test(rawPath);
+
+    if (isNonHtmlOrAsset || !req.accepts('html')) {
+      return next();
+    }
+
+    const sessionToken: string | undefined = req.cookies?.[SESSION_COOKIE_NAME];
+    const currentMarker: string | undefined = req.cookies?.[SESSION_PRESENCE_COOKIE_NAME];
+
+    if (!sessionToken) {
+      if (currentMarker !== '0') {
+        setSessionPresenceCookie(res, false);
+      }
+      return next();
+    }
+
+    try {
+      const session = await repo.getSessionByTokenHash(hashSessionToken(sessionToken));
+      const expiresAtMs = session ? new Date(session.expiresAt).getTime() : NaN;
+      const isValidSession = Boolean(session && !Number.isNaN(expiresAtMs) && expiresAtMs > Date.now());
+
+      if (isValidSession) {
+        if (currentMarker !== '1') {
+          setSessionPresenceCookie(res, true);
+        }
+      } else {
+        clearSessionCookies(res);
+      }
+    } catch {
+      // On transient storage error, do not mark unauthenticated if an HttpOnly cookie is present
+      if (currentMarker !== '1') {
+        setSessionPresenceCookie(res, true);
+      }
+    }
+
+    return next();
+  };
+}
+
 export function createAuthMiddleware(repo: DatabaseRepository) {
   return async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
     try {
       // 1. Extract session token from HTTP-only cookie or Authorization Bearer header
-      let token: string | undefined = req.cookies?.aixshop_session;
+      // Never accept aixshop_has_session as authentication evidence.
+      const cookieToken: string | undefined = req.cookies?.[SESSION_COOKIE_NAME];
+      let token: string | undefined = cookieToken;
       
       const authHeader = req.headers.authorization;
       if (!token && authHeader?.startsWith('Bearer ')) {
@@ -124,6 +210,9 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
       }
 
       if (!token) {
+        if (req.cookies?.[SESSION_PRESENCE_COOKIE_NAME] === '1') {
+          setSessionPresenceCookie(res, false);
+        }
         return res.status(401).json({ 
           error: 'Authentication required: missing session token',
           code: 'UNAUTHORIZED' 
@@ -135,6 +224,9 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
       const session = await repo.getSessionByTokenHash(tokenHash);
 
       if (!session) {
+        if (cookieToken) {
+          clearSessionCookies(res);
+        }
         return res.status(401).json({ 
           error: 'Authentication required: invalid or expired session',
           code: 'SESSION_EXPIRED' 
@@ -144,6 +236,9 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
       // Explicit server-side session expiry verification
       const expiresAtDate = new Date(session.expiresAt);
       if (isNaN(expiresAtDate.getTime()) || expiresAtDate.getTime() <= Date.now()) {
+        if (cookieToken) {
+          clearSessionCookies(res);
+        }
         return res.status(401).json({ 
           error: 'Authentication required: session has expired',
           code: 'SESSION_EXPIRED' 
@@ -153,6 +248,9 @@ export function createAuthMiddleware(repo: DatabaseRepository) {
       // 3. Look up user
       const user = await repo.getUserById(session.userId);
       if (!user) {
+        if (cookieToken) {
+          clearSessionCookies(res);
+        }
         return res.status(401).json({ 
           error: 'Authentication failed: user record not found',
           code: 'USER_NOT_FOUND' 

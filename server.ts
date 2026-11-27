@@ -7,6 +7,7 @@ import { createApp } from './src/server/app';
 import { getDatabaseRepository } from './src/server/db/index';
 import { validateProductionConfig } from './src/server/config/productionConfig';
 import { getBillingProvider } from './src/server/billing/providerAdapter';
+import { createSessionPresenceHtmlMiddleware } from './src/server/middleware/auth';
 import {
   BillingEmailRetrySchedulerHandle,
   BillingService,
@@ -77,6 +78,7 @@ async function start() {
   }
 
   const app = createApp(repo);
+  app.use(createSessionPresenceHtmlMiddleware(repo));
 
   if (!isProd) {
     console.log('[AIXSHOP] Starting development server with Vite middleware...');

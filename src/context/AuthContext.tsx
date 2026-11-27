@@ -1,7 +1,41 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, ReactNode } from 'react';
 import { apiClient, AuthUser, WorkspaceSummary } from '../api/client';
 
 export type AuthModalMode = 'login' | 'register' | 'forgot' | 'reset';
+
+const SESSION_PRESENCE_COOKIE_NAME = 'aixshop_has_session';
+
+export function readSessionPresenceMarker(cookieSource?: string): '1' | '0' | 'missing' {
+  const rawCookie =
+    typeof cookieSource === 'string'
+      ? cookieSource
+      : typeof document !== 'undefined' && typeof document.cookie === 'string'
+      ? document.cookie
+      : '';
+
+  if (!rawCookie) return 'missing';
+
+  const parts = rawCookie.split(';');
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex <= 0) continue;
+    const name = trimmed.slice(0, eqIndex).trim();
+    if (name !== SESSION_PRESENCE_COOKIE_NAME) continue;
+    let value = trimmed.slice(eqIndex + 1).trim();
+    try {
+      value = decodeURIComponent(value).trim();
+    } catch {
+      // Keep raw value if malformed
+    }
+    if (value === '1') return '1';
+    if (value === '0') return '0';
+    return 'missing';
+  }
+
+  return 'missing';
+}
 
 interface AuthContextType {
   user: AuthUser | null;
@@ -33,6 +67,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [authModalOpen, setAuthModalOpen] = useState<boolean>(false);
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('login');
   const [pendingResetToken, setPendingResetToken] = useState<string | null>(null);
+  const userRef = useRef<AuthUser | null>(null);
+  const syncInFlightRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   const stripResetTokenFromUrl = () => {
     if (typeof window !== 'undefined' && window.location && typeof window.history?.replaceState === 'function') {
@@ -89,7 +129,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   useEffect(() => {
     let isMounted = true;
-    async function checkSession() {
+
+    async function verifyServerSession() {
+      if (syncInFlightRef.current) return;
+      syncInFlightRef.current = true;
       try {
         const session = await apiClient.getSession();
         if (isMounted) {
@@ -106,15 +149,60 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       } catch (err) {
         console.warn('[AIXSHOP Auth] Session check encountered error:', err);
       } finally {
+        syncInFlightRef.current = false;
         if (isMounted) {
           setIsLoading(false);
         }
       }
     }
 
-    checkSession();
+    const initialMarker = readSessionPresenceMarker();
+    if (initialMarker === '0') {
+      setUser(null);
+      setActiveWorkspace(null);
+      setWorkspaces([]);
+      setIsLoading(false);
+    } else {
+      void verifyServerSession();
+    }
+
+    const syncAcrossTabs = () => {
+      if (!isMounted || syncInFlightRef.current) return;
+      const marker = readSessionPresenceMarker();
+      if (marker === '0') {
+        if (userRef.current !== null) {
+          setUser(null);
+          setActiveWorkspace(null);
+          setWorkspaces([]);
+        }
+        return;
+      }
+      if (marker === '1') {
+        void verifyServerSession();
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        syncAcrossTabs();
+      }
+    };
+
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('focus', syncAcrossTabs);
+    }
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+
     return () => {
       isMounted = false;
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('focus', syncAcrossTabs);
+      }
+      if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
     };
   }, []);
 
