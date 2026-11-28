@@ -78,9 +78,10 @@ function main() {
 
   for (const def of SIMULATED_SUITE_DEFINITIONS) {
     const absSuite = path.resolve(process.cwd(), def.suiteFile);
-    const sha256 = fs.existsSync(absSuite)
-      ? crypto.createHash('sha256').update(fs.readFileSync(absSuite)).digest('hex')
-      : undefined;
+    if (!fs.existsSync(absSuite)) {
+      throw new Error(`Required simulated suite file missing on disk: ${def.suiteFile}`);
+    }
+    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(absSuite)).digest('hex');
 
     const invocation = resolveTsxInvocation(def.suiteFile);
     const startedAt = new Date().toISOString();
@@ -130,7 +131,7 @@ function main() {
       totalCount,
       status: ok ? 'PASS' : 'FAIL',
       command: invocation.label,
-      ...(sha256 ? { sha256 } : {}),
+      sha256,
     });
 
     if (!quiet) {

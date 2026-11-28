@@ -1261,7 +1261,10 @@ describe('[HARNESS ACCURACY] Phase B Verifier Corrections (Shopify, Stripe, SMTP
 });
 
 describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact Binding', () => {
-  const buildValidArtifact = () => ({
+  const computeFileSha256 = (suiteFile: string, repoRoot = process.cwd()): string =>
+    crypto.createHash('sha256').update(fs.readFileSync(path.resolve(repoRoot, suiteFile))).digest('hex');
+
+  const buildValidArtifact = (repoRoot = process.cwd()) => ({
     schemaVersion: '1.0' as const,
     runId: 'sim_test_run_001',
     generatedAt: '2026-11-28T10:00:00.000Z',
@@ -1278,10 +1281,11 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
       skippedCount: 0,
       totalCount: 4 + idx,
       status: 'PASS' as const,
+      sha256: computeFileSha256(def.suiteFile, repoRoot),
     })),
   });
 
-  test('A1: Valid passing artifact yields PASS — SIMULATED with traceable counts, runId, and non-live flag', () => {
+  test('A1: Valid passing artifact with matching SHA-256 digests yields PASS — SIMULATED with traceable counts, runId, sha256Verified, and non-live flag', () => {
     const res = evaluateSimulatedChecksFromArtifact(buildValidArtifact(), {
       artifactPath: 'reports/simulated-test-results.json',
     });
@@ -1291,6 +1295,8 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
       assert.equal(chk.status, 'PASS — SIMULATED');
       assert.equal(chk.evidence?.artifactRunId, 'sim_test_run_001');
       assert.equal(chk.evidence?.liveProviderVerified, false);
+      assert.equal(chk.evidence?.sha256Verified, true);
+      assert.match(String(chk.evidence?.sha256 || ''), /^[0-9a-f]{64}$/);
       assert.equal(typeof chk.durationMs, 'number');
     }
   });
@@ -1365,18 +1371,24 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
     }
   });
 
-  test('A5: Mismatched suiteFile (NOT RUN) and mismatched suiteId (FAIL) cannot report PASS — SIMULATED', () => {
-    const mismatch = buildValidArtifact();
-    // Change suiteFile on entry 0 -> expected suite is missing -> NOT RUN
-    mismatch.suites[0].suiteFile = 'src/server/otherFakeSuite.test.ts';
-    // Keep suiteFile on entry 1, tamper suiteId -> FAIL
-    mismatch.suites[1].suiteId = 'SIM-WRONG-ID';
+  test('A5: Omitted suite reports NOT RUN while tampered suiteFile/suiteId mappings strictly FAIL (never PASS — SIMULATED)', () => {
+    const partial = buildValidArtifact();
+    partial.suites = partial.suites.slice(1); // omit entry 0 -> NOT RUN
+    const partialRes = evaluateSimulatedChecksFromArtifact(partial);
+    assert.equal(partialRes.checks.find((c) => c.testId === 'SIM-CUSTOMER-JOURNEY-30')?.status, 'NOT RUN');
+    assert.equal(partialRes.checks.find((c) => c.testId === 'SIM-SHOPIFY-WRITEBACK')?.status, 'PASS — SIMULATED');
 
-    const res = evaluateSimulatedChecksFromArtifact(mismatch);
-    assert.equal(res.checks.find((c) => c.testId === 'SIM-CUSTOMER-JOURNEY-30')?.status, 'NOT RUN');
-    const idMismatch = res.checks.find((c) => c.testId === 'SIM-SHOPIFY-WRITEBACK');
-    assert.equal(idMismatch?.status, 'FAIL');
-    assert.match(idMismatch?.blockerOrFailure || '', /suiteId mismatch/i);
+    const badFileMapping = buildValidArtifact();
+    badFileMapping.suites[0].suiteFile = 'src/server/otherFakeSuite.test.ts';
+    const badFileRes = evaluateSimulatedChecksFromArtifact(badFileMapping);
+    assert.ok(badFileRes.checks.every((c) => c.status === 'FAIL'));
+    assert.match(badFileRes.checks[0].blockerOrFailure || '', /mapped to incorrect file/i);
+
+    const unknownId = buildValidArtifact();
+    unknownId.suites[1].suiteId = 'SIM-WRONG-ID';
+    const unknownIdRes = evaluateSimulatedChecksFromArtifact(unknownId);
+    assert.ok(unknownIdRes.checks.every((c) => c.status === 'FAIL'));
+    assert.match(unknownIdRes.checks[1].blockerOrFailure || '', /unknown suiteId/i);
   });
 
   test('A6: TAP output parser accurately extracts top-level suite totals and ignores indented subtests', () => {
@@ -1404,5 +1416,160 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
     assert.equal(totals.durationMs, 432.6);
   });
 });
+
+describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Consistency Guards', () => {
+  const setupTempRepo = () => {
+    const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-taskb-repo-'));
+    for (const def of SIMULATED_SUITE_DEFINITIONS) {
+      const dst = path.join(tmpRepo, def.suiteFile);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(path.resolve(process.cwd(), def.suiteFile), dst);
+    }
+    return tmpRepo;
+  };
+
+  const buildTempArtifact = (repoRoot: string) => ({
+    schemaVersion: '1.0' as const,
+    runId: 'sim_taskb_run_001',
+    generatedAt: '2026-11-28T11:00:00.000Z',
+    runner: 'tsx --test --test-reporter=tap',
+    nodeVersion: process.version,
+    suites: SIMULATED_SUITE_DEFINITIONS.map((def, idx) => ({
+      suiteFile: def.suiteFile,
+      suiteId: def.testId,
+      executedAt: '2026-11-28T10:59:50.000Z',
+      durationMs: 100 + idx * 5,
+      exitCode: 0,
+      passedCount: 5 + idx,
+      failedCount: 0,
+      skippedCount: 0,
+      totalCount: 5 + idx,
+      status: 'PASS' as 'PASS' | 'FAIL',
+      sha256: crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(path.join(repoRoot, def.suiteFile)))
+        .digest('hex'),
+    })),
+  });
+
+  test('B1: Valid artifact with matching current disk SHA-256 passes end-to-end buildCommercialVerificationReport cleanly', async () => {
+    const tmpRepo = setupTempRepo();
+    try {
+      const artifactPath = path.join(tmpRepo, 'reports', 'simulated-test-results.json');
+      fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+      fs.writeFileSync(artifactPath, JSON.stringify(buildTempArtifact(tmpRepo), null, 2), 'utf8');
+
+      await withEnvOverrides(
+        {
+          COMMERCIAL_VERIFY_EXTERNAL: undefined,
+          STAGING_BASE_URL: undefined,
+          STAGING_ALLOWED_HOSTS: undefined,
+          PRODUCTION_HOSTS: undefined,
+          PRODUCTION_APP_URL: undefined,
+        },
+        async () => {
+          const report = await buildCommercialVerificationReport({
+            simulatedArtifactPath: artifactPath,
+            repoRoot: tmpRepo,
+          });
+          assert.equal(report.simulatedArtifactRunId, 'sim_taskb_run_001');
+          assert.equal(report.simulatedChecks?.length, 4);
+          for (const c of report.simulatedChecks || []) {
+            assert.equal(c.status, 'PASS — SIMULATED');
+            assert.equal(c.evidence?.sha256Verified, true);
+            assert.equal(c.evidence?.liveProviderVerified, false);
+          }
+          // External stages remain truthfully BLOCKED without live credentials
+          assert.equal(report.overallExternalStatus, 'BLOCKED');
+        }
+      );
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B2: Modifying a test file after artifact creation causes SHA-256 verification to FAIL', () => {
+    const tmpRepo = setupTempRepo();
+    try {
+      const artifact = buildTempArtifact(tmpRepo);
+      const targetSuite = SIMULATED_SUITE_DEFINITIONS[0];
+      fs.appendFileSync(path.join(tmpRepo, targetSuite.suiteFile), '\n// post-artifact edit\n', 'utf8');
+
+      const res = evaluateSimulatedChecksFromArtifact(artifact, { repoRoot: tmpRepo });
+      const modifiedCheck = res.checks.find((c) => c.testId === targetSuite.testId);
+      assert.equal(modifiedCheck?.status, 'FAIL');
+      assert.match(modifiedCheck?.blockerOrFailure || '', /SHA-256 digest mismatch/i);
+      // Unmodified suites remain PASS — SIMULATED
+      assert.equal(res.checks.find((c) => c.testId === SIMULATED_SUITE_DEFINITIONS[1].testId)?.status, 'PASS — SIMULATED');
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B3: Digest mismatch, missing digest, and malformed digest are strictly rejected as FAIL', () => {
+    const tmpRepo = setupTempRepo();
+    try {
+      const mismatch = buildTempArtifact(tmpRepo);
+      mismatch.suites[0].sha256 = '0'.repeat(64);
+      const mismatchRes = evaluateSimulatedChecksFromArtifact(mismatch, { repoRoot: tmpRepo });
+      assert.equal(mismatchRes.checks[0].status, 'FAIL');
+      assert.match(mismatchRes.checks[0].blockerOrFailure || '', /SHA-256 digest mismatch/i);
+
+      const missingDigest = buildTempArtifact(tmpRepo);
+      delete (missingDigest.suites[1] as any).sha256;
+      const missingRes = evaluateSimulatedChecksFromArtifact(missingDigest, { repoRoot: tmpRepo });
+      assert.equal(missingRes.checks[1].status, 'FAIL');
+      assert.match(missingRes.checks[1].blockerOrFailure || '', /missing sha256 digest/i);
+
+      const badFormatDigest = buildTempArtifact(tmpRepo);
+      badFormatDigest.suites[2].sha256 = 'not-a-valid-hex-digest';
+      const badFormatRes = evaluateSimulatedChecksFromArtifact(badFormatDigest, { repoRoot: tmpRepo });
+      assert.equal(badFormatRes.checks[2].status, 'FAIL');
+      assert.match(badFormatRes.checks[2].blockerOrFailure || '', /malformed sha256 digest/i);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B4: Contradictory exitCode != 0 (even with failedCount=0 and status=PASS), failedCount > 0, and missing suiteId cannot pass', () => {
+    const tmpRepo = setupTempRepo();
+    try {
+      // Non-zero exitCode with failedCount === 0 and contradictory status === 'PASS'
+      const nonZeroExitPass = buildTempArtifact(tmpRepo);
+      nonZeroExitPass.suites[0].exitCode = 1;
+      nonZeroExitPass.suites[0].failedCount = 0;
+      nonZeroExitPass.suites[0].status = 'PASS';
+      const nzPassRes = evaluateSimulatedChecksFromArtifact(nonZeroExitPass, { repoRoot: tmpRepo });
+      assert.equal(nzPassRes.checks[0].status, 'FAIL');
+      assert.match(nzPassRes.checks[0].blockerOrFailure || '', /inconsistent suite status "PASS"/i);
+
+      // Non-zero exitCode with failedCount === 0 and status === 'FAIL'
+      const nonZeroExitFail = buildTempArtifact(tmpRepo);
+      nonZeroExitFail.suites[0].exitCode = 1;
+      nonZeroExitFail.suites[0].failedCount = 0;
+      nonZeroExitFail.suites[0].status = 'FAIL';
+      const nzFailRes = evaluateSimulatedChecksFromArtifact(nonZeroExitFail, { repoRoot: tmpRepo });
+      assert.equal(nzFailRes.checks[0].status, 'FAIL');
+
+      // failedCount > 0 even if status claims 'PASS'
+      const failedCountPass = buildTempArtifact(tmpRepo);
+      failedCountPass.suites[1].failedCount = 1;
+      failedCountPass.suites[1].passedCount -= 1;
+      failedCountPass.suites[1].status = 'PASS';
+      const fcRes = evaluateSimulatedChecksFromArtifact(failedCountPass, { repoRoot: tmpRepo });
+      assert.equal(fcRes.checks[1].status, 'FAIL');
+
+      // Missing suiteId rejected
+      const missingId = buildTempArtifact(tmpRepo);
+      delete (missingId.suites[2] as any).suiteId;
+      const missingIdRes = evaluateSimulatedChecksFromArtifact(missingId, { repoRoot: tmpRepo });
+      assert.ok(missingIdRes.checks.every((c) => c.status === 'FAIL'));
+      assert.match(missingIdRes.checks[0].blockerOrFailure || '', /missing required suiteId/i);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+});
+
 
 

@@ -20,6 +20,7 @@ import { runSecretSafeConfigCheck } from '../../src/server/config/checkConfig';
 
 export interface BuildCommercialReportOptions {
   simulatedArtifactPath?: string;
+  repoRoot?: string;
 }
 
 function getCliArgValue(prefix: string): string | undefined {
@@ -82,7 +83,9 @@ export async function buildCommercialVerificationReport(
     process.env.SIMULATED_TEST_ARTIFACT_PATH?.trim() ||
     path.resolve(process.cwd(), DEFAULT_SIMULATED_ARTIFACT_PATH);
 
-  const simulatedEval = loadAndEvaluateSimulatedArtifact(artifactPath, nowIso);
+  const simulatedEval = loadAndEvaluateSimulatedArtifact(artifactPath, nowIso, {
+    repoRoot: options.repoRoot,
+  });
   const relArtifactPath = path.relative(process.cwd(), simulatedEval.artifactPath);
   const displayArtifactPath =
     relArtifactPath && !relArtifactPath.startsWith('..') ? relArtifactPath : simulatedEval.artifactPath;

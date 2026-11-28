@@ -308,17 +308,26 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
   const stagingMissing: string[] = [];
   const stagingNotes: string[] = [];
   if (!externalActivated) stagingMissing.push('COMMERCIAL_VERIFY_EXTERNAL=true');
+  const prodDenylist = resolveProductionDenylist();
+  if (!prodDenylist.valid && prodDenylist.reason) {
+    stagingMissing.push(prodDenylist.reason);
+  }
   const stagingUrl = process.env.STAGING_BASE_URL?.trim() || '';
   const stagingUrlCheck = validateStagingBaseUrlNonProduction(stagingUrl);
   if (!stagingUrlCheck.valid) {
-    stagingMissing.push(stagingUrlCheck.reason || 'STAGING_BASE_URL');
+    if (!stagingMissing.includes(stagingUrlCheck.reason || 'STAGING_BASE_URL')) {
+      stagingMissing.push(stagingUrlCheck.reason || 'STAGING_BASE_URL');
+    }
   }
   const allowLocalMode = (process.env.STAGING_ALLOW_LOCAL || '').trim().toLowerCase() === 'true';
   if (!allowLocalMode) {
     const allowlist = parseStagingAllowedHosts();
     if (!allowlist.valid) {
       const msg = allowlist.reason || 'STAGING_ALLOWED_HOSTS';
-      if (!stagingMissing.some((m) => m.includes('STAGING_ALLOWED_HOSTS'))) {
+      if (
+        !stagingMissing.includes(msg) &&
+        !stagingMissing.some((m) => m.includes('STAGING_ALLOWED_HOSTS'))
+      ) {
         stagingMissing.push(msg);
       }
     }
@@ -409,28 +418,232 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
 const STRICT_REMOTE_HOSTNAME_RE =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-function isProductionDomainHostname(host: string): boolean {
-  const normalized = host.trim().toLowerCase().replace(/\.+$/, '');
-  if (!normalized) return false;
-  if (
-    /^(?:www\.|app\.|api\.)?aixshop\.(?:io|com|app)$/.test(normalized) ||
-    /^prod(?:uction)?\./.test(normalized)
-  ) {
-    return true;
+export function normalizeHostname(rawHostname: string): string {
+  return rawHostname.trim().toLowerCase().replace(/\.+$/, '');
+}
+
+export interface ProductionHostDenylistOptions {
+  productionHosts?: string;
+  productionAppUrl?: string;
+  nodeEnv?: string;
+  appUrl?: string;
+}
+
+export function parseProductionHosts(rawProductionHosts?: string): {
+  valid: boolean;
+  hosts: Set<string>;
+  reason?: string;
+} {
+  const raw = rawProductionHosts !== undefined ? rawProductionHosts : process.env.PRODUCTION_HOSTS;
+  const trimmed = (raw || '').trim();
+  if (!trimmed) {
+    return { valid: true, hosts: new Set<string>() };
   }
-  const prodAppUrl = process.env.APP_URL?.trim();
-  if (process.env.NODE_ENV === 'production' && prodAppUrl && prodAppUrl !== 'MY_APP_URL') {
+
+  const hosts = new Set<string>();
+  const parts = trimmed.split(',');
+  for (const part of parts) {
+    const candidate = normalizeHostname(part);
+    if (!candidate) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: 'PRODUCTION_HOSTS contains an empty entry',
+      };
+    }
+    if (
+      candidate.includes('*') ||
+      candidate.includes('://') ||
+      candidate.includes('/') ||
+      candidate.includes('?') ||
+      candidate.includes('#') ||
+      candidate.includes('@') ||
+      candidate.includes(':') ||
+      /\s/.test(candidate)
+    ) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: `PRODUCTION_HOSTS contains invalid host format "${part.trim()}" (expected plain DNS hostname without scheme, port, path, userinfo, or wildcard)`,
+      };
+    }
+    if (!STRICT_REMOTE_HOSTNAME_RE.test(candidate)) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: `PRODUCTION_HOSTS contains malformed hostname "${part.trim()}"`,
+      };
+    }
+    hosts.add(candidate);
+  }
+
+  return { valid: true, hosts };
+}
+
+export function parseProductionAppUrlHost(rawProductionAppUrl?: string): {
+  valid: boolean;
+  host?: string;
+  reason?: string;
+} {
+  const raw =
+    rawProductionAppUrl !== undefined ? rawProductionAppUrl : process.env.PRODUCTION_APP_URL;
+  const trimmed = (raw || '').trim();
+  if (!trimmed || trimmed === 'MY_APP_URL') {
+    return { valid: true };
+  }
+
+  if (/[\s\r\n\0\\]/.test(trimmed)) {
+    return {
+      valid: false,
+      reason: 'PRODUCTION_APP_URL contains invalid whitespace, control character, or backslash',
+    };
+  }
+
+  const withoutScheme = trimmed.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '');
+  const authority = withoutScheme.split(/[/?#]/)[0] || '';
+  if (authority.includes('@')) {
+    return {
+      valid: false,
+      reason: 'PRODUCTION_APP_URL must not contain embedded credentials or userinfo',
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { valid: false, reason: 'PRODUCTION_APP_URL is not a valid URL' };
+  }
+
+  if (parsed.protocol !== 'https:') {
+    return {
+      valid: false,
+      reason: `PRODUCTION_APP_URL must use https:// (got "${parsed.protocol}")`,
+    };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      valid: false,
+      reason: 'PRODUCTION_APP_URL must not contain embedded credentials',
+    };
+  }
+
+  if (parsed.search || parsed.hash) {
+    return {
+      valid: false,
+      reason: 'PRODUCTION_APP_URL must not contain query parameters or fragments',
+    };
+  }
+
+  const host = normalizeHostname(parsed.hostname);
+  if (!host || !STRICT_REMOTE_HOSTNAME_RE.test(host)) {
+    return {
+      valid: false,
+      reason: `PRODUCTION_APP_URL contains invalid hostname "${parsed.hostname}"`,
+    };
+  }
+
+  if (isLoopbackOrLocalHostname(host) || isPrivateOrLinkLocalIpHostname(host)) {
+    return {
+      valid: false,
+      reason: `PRODUCTION_APP_URL cannot target loopback or private address "${host}"`,
+    };
+  }
+
+  return { valid: true, host };
+}
+
+export function resolveProductionDenylist(options: ProductionHostDenylistOptions = {}): {
+  valid: boolean;
+  hosts: Map<string, string>;
+  reason?: string;
+} {
+  const hosts = new Map<string, string>();
+
+  const explicitHosts = parseProductionHosts(options.productionHosts);
+  if (!explicitHosts.valid) {
+    return { valid: false, hosts: new Map(), reason: explicitHosts.reason };
+  }
+  for (const h of explicitHosts.hosts) {
+    hosts.set(h, 'PRODUCTION_HOSTS');
+  }
+
+  const prodAppUrl = parseProductionAppUrlHost(options.productionAppUrl);
+  if (!prodAppUrl.valid) {
+    return { valid: false, hosts: new Map(), reason: prodAppUrl.reason };
+  }
+  if (prodAppUrl.host && !hosts.has(prodAppUrl.host)) {
+    hosts.set(prodAppUrl.host, 'PRODUCTION_APP_URL');
+  }
+
+  const effectiveEnv = options.nodeEnv !== undefined ? options.nodeEnv : process.env.NODE_ENV;
+  const rawAppUrl = (options.appUrl !== undefined ? options.appUrl : process.env.APP_URL)?.trim();
+  if (effectiveEnv === 'production' && rawAppUrl && rawAppUrl !== 'MY_APP_URL') {
     try {
-      const parsedProd = new URL(prodAppUrl);
-      const prodHost = parsedProd.hostname.toLowerCase().replace(/\.+$/, '');
-      if (prodHost === normalized) {
-        return true;
+      const parsedProd = new URL(rawAppUrl);
+      const prodHost = normalizeHostname(parsedProd.hostname);
+      if (prodHost && !hosts.has(prodHost)) {
+        hosts.set(prodHost, 'APP_URL (NODE_ENV=production)');
       }
     } catch {
-      // ignore malformed APP_URL
+      // ignore malformed APP_URL in non-strict path
     }
   }
-  return false;
+
+  return { valid: true, hosts };
+}
+
+function isBuiltInProductionHostname(normalizedHost: string): boolean {
+  return (
+    /^(?:www\.|app\.|api\.)?aixshop\.(?:io|com|app)$/.test(normalizedHost) ||
+    /^prod(?:uction)?\./.test(normalizedHost)
+  );
+}
+
+export function checkProductionDomainHostname(
+  host: string,
+  options: ProductionHostDenylistOptions = {}
+): {
+  valid: boolean;
+  isProductionTarget: boolean;
+  matchedSource?: string;
+  reason?: string;
+} {
+  const normalized = normalizeHostname(host);
+  if (!normalized) {
+    return { valid: false, isProductionTarget: false, reason: 'Missing hostname' };
+  }
+
+  const denylist = resolveProductionDenylist(options);
+  if (!denylist.valid) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      reason: denylist.reason,
+    };
+  }
+
+  const explicitSource = denylist.hosts.get(normalized);
+  if (explicitSource) {
+    return {
+      valid: false,
+      isProductionTarget: true,
+      matchedSource: explicitSource,
+      reason: `STAGING_BASE_URL (${normalized}) matches production denylist (${explicitSource}) and is refused for destructive staging tests`,
+    };
+  }
+
+  if (isBuiltInProductionHostname(normalized)) {
+    return {
+      valid: false,
+      isProductionTarget: true,
+      matchedSource: 'built-in production domain pattern',
+      reason: `STAGING_BASE_URL (${normalized}) appears to be a production domain and is refused for destructive staging tests`,
+    };
+  }
+
+  return { valid: true, isProductionTarget: false };
 }
 
 function isPrivateOrLinkLocalIpHostname(rawHostname: string): boolean {
@@ -452,11 +665,23 @@ function isPrivateOrLinkLocalIpHostname(rawHostname: string): boolean {
   return false;
 }
 
-export function parseStagingAllowedHosts(rawAllowedHosts?: string): {
+export function parseStagingAllowedHosts(
+  rawAllowedHosts?: string,
+  options: ProductionHostDenylistOptions = {}
+): {
   valid: boolean;
   hosts: Set<string>;
   reason?: string;
 } {
+  const denylist = resolveProductionDenylist(options);
+  if (!denylist.valid) {
+    return {
+      valid: false,
+      hosts: new Set(),
+      reason: denylist.reason,
+    };
+  }
+
   const raw = rawAllowedHosts !== undefined ? rawAllowedHosts : process.env.STAGING_ALLOWED_HOSTS;
   const trimmed = (raw || '').trim();
   if (!trimmed) {
@@ -470,7 +695,7 @@ export function parseStagingAllowedHosts(rawAllowedHosts?: string): {
   const hosts = new Set<string>();
   const parts = trimmed.split(',');
   for (const part of parts) {
-    const candidate = part.trim().toLowerCase().replace(/\.+$/, '');
+    const candidate = normalizeHostname(part);
     if (!candidate) {
       return {
         valid: false,
@@ -508,11 +733,12 @@ export function parseStagingAllowedHosts(rawAllowedHosts?: string): {
         reason: `STAGING_ALLOWED_HOSTS cannot include loopback or private address "${candidate}"`,
       };
     }
-    if (isProductionDomainHostname(candidate)) {
+    const prodOverlap = checkProductionDomainHostname(candidate, options);
+    if (!prodOverlap.valid) {
       return {
         valid: false,
         hosts: new Set(),
-        reason: `STAGING_ALLOWED_HOSTS cannot include production domain "${candidate}"`,
+        reason: `STAGING_ALLOWED_HOSTS cannot include production domain "${candidate}" (${prodOverlap.matchedSource || 'production denylist'})`,
       };
     }
     hosts.add(candidate);
@@ -531,7 +757,14 @@ export function parseStagingAllowedHosts(rawAllowedHosts?: string): {
 
 export function validateStagingBaseUrlNonProduction(
   rawUrl: string | undefined,
-  options: { allowedHosts?: string; allowLocalMode?: boolean } = {}
+  options: {
+    allowedHosts?: string;
+    allowLocalMode?: boolean;
+    productionHosts?: string;
+    productionAppUrl?: string;
+    nodeEnv?: string;
+    appUrl?: string;
+  } = {}
 ): {
   valid: boolean;
   isProductionTarget: boolean;
@@ -540,6 +773,16 @@ export function validateStagingBaseUrlNonProduction(
   normalizedUrl?: string;
   reason?: string;
 } {
+  // Always fail closed if explicit production denylist configuration is malformed
+  const denylist = resolveProductionDenylist(options);
+  if (!denylist.valid) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      reason: denylist.reason,
+    };
+  }
+
   const trimmed = rawUrl?.trim() || '';
   if (!trimmed) {
     return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL' };
@@ -587,17 +830,19 @@ export function validateStagingBaseUrlNonProduction(
     };
   }
 
-  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  const host = normalizeHostname(parsed.hostname);
   if (!host) {
     return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (missing hostname)' };
   }
 
-  // 1. Strict production domain / production APP_URL check runs before anything else
-  if (isProductionDomainHostname(host)) {
+  // 1. Strict production denylist (PRODUCTION_HOSTS, PRODUCTION_APP_URL, built-in patterns, APP_URL in prod)
+  // Runs regardless of NODE_ENV and BEFORE STAGING_ALLOWED_HOSTS / allowLocalMode
+  const prodCheck = checkProductionDomainHostname(host, options);
+  if (!prodCheck.valid) {
     return {
       valid: false,
-      isProductionTarget: true,
-      reason: `STAGING_BASE_URL (${host}) appears to be a production domain and is refused for destructive staging tests`,
+      isProductionTarget: prodCheck.isProductionTarget,
+      reason: prodCheck.reason,
     };
   }
 
@@ -643,8 +888,8 @@ export function validateStagingBaseUrlNonProduction(
     };
   }
 
-  // 4. Remote host MUST match explicit STAGING_ALLOWED_HOSTS allowlist (STAGING_CONFIRM_NON_PRODUCTION=true alone never permits unknown hosts)
-  const allowlist = parseStagingAllowedHosts(options.allowedHosts);
+  // 4. Remote host MUST match explicit STAGING_ALLOWED_HOSTS allowlist (and allowlist must not contradict denylist)
+  const allowlist = parseStagingAllowedHosts(options.allowedHosts, options);
   if (!allowlist.valid) {
     return {
       valid: false,
@@ -732,15 +977,23 @@ function normalizeSuitePath(raw: unknown): string {
     : '';
 }
 
+export interface EvaluateSimulatedArtifactOptions {
+  artifactPath?: string;
+  parseError?: string;
+  fallbackTimestamp?: string;
+  repoRoot?: string;
+}
+
 export function evaluateSimulatedChecksFromArtifact(
   artifactInput: unknown,
-  options: { artifactPath?: string; parseError?: string; fallbackTimestamp?: string } = {}
+  options: EvaluateSimulatedArtifactOptions = {}
 ): {
   checks: VerificationCheckResult[];
   artifactRunId?: string;
 } {
   const fallbackTs = options.fallbackTimestamp || new Date().toISOString();
   const artifactLabel = options.artifactPath || DEFAULT_SIMULATED_ARTIFACT_PATH;
+  const repoRoot = path.resolve(options.repoRoot || process.cwd());
 
   if (options.parseError) {
     return {
@@ -825,11 +1078,69 @@ export function evaluateSimulatedChecksFromArtifact(
   }
 
   const artifact = art as unknown as SimulatedTestResultsArtifact;
+  const expectedFileById = new Map(SIMULATED_SUITE_DEFINITIONS.map((d) => [d.testId, d.suiteFile]));
+  const expectedIdByFile = new Map(SIMULATED_SUITE_DEFINITIONS.map((d) => [d.suiteFile, d.testId]));
+
+  // Verify every entry in artifact.suites maps strictly to an expected (suiteId <-> suiteFile) pair
+  const structuralErrors: string[] = [];
+  for (let i = 0; i < artifact.suites.length; i++) {
+    const rawEntry: any = artifact.suites[i];
+    if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+      structuralErrors.push(`suites[${i}] is not an object`);
+      continue;
+    }
+    const sId =
+      typeof rawEntry.suiteId === 'string' && rawEntry.suiteId.trim()
+        ? rawEntry.suiteId.trim()
+        : typeof rawEntry.testId === 'string' && rawEntry.testId.trim()
+        ? rawEntry.testId.trim()
+        : '';
+    const sFile = normalizeSuitePath(rawEntry.suiteFile);
+    if (!sId) {
+      structuralErrors.push(`suites[${i}] is missing required suiteId (suiteFile="${sFile || 'unknown'}")`);
+      continue;
+    }
+    const expectedFile = expectedFileById.get(sId);
+    if (!expectedFile) {
+      structuralErrors.push(`unknown suiteId "${sId}" in artifact`);
+      continue;
+    }
+    if (!sFile) {
+      structuralErrors.push(`suiteId "${sId}" is missing suiteFile`);
+      continue;
+    }
+    if (sFile !== expectedFile || expectedIdByFile.get(sFile) !== sId) {
+      structuralErrors.push(
+        `suiteId "${sId}" mapped to incorrect file "${sFile}" (expected "${expectedFile}")`
+      );
+    }
+  }
+
+  if (structuralErrors.length > 0) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Artifact integrity check failed (${artifactLabel}): ${structuralErrors.join('; ')}`,
+      })),
+    };
+  }
+
   const checks: VerificationCheckResult[] = [];
 
   for (const def of SIMULATED_SUITE_DEFINITIONS) {
     const matches = artifact.suites.filter(
-      (s) => s && typeof s === 'object' && normalizeSuitePath((s as any).suiteFile) === def.suiteFile
+      (s) =>
+        s &&
+        typeof s === 'object' &&
+        normalizeSuitePath((s as any).suiteFile) === def.suiteFile &&
+        ((s as any).suiteId || (s as any).testId) === def.testId
     );
 
     if (matches.length === 0) {
@@ -864,8 +1175,10 @@ export function evaluateSimulatedChecksFromArtifact(
 
     const entry = matches[0];
     const entryErrors: string[] = [];
-    const declaredId = entry.suiteId || (entry as any).testId;
-    if (declaredId && declaredId !== def.testId) {
+    const declaredId = (entry.suiteId || (entry as any).testId || '').trim();
+    if (!declaredId) {
+      entryErrors.push(`missing required suiteId (expected ${def.testId})`);
+    } else if (declaredId !== def.testId) {
       entryErrors.push(`suiteId mismatch (expected ${def.testId}, got ${String(declaredId)})`);
     }
     if (!isValidIsoTimestamp(entry.executedAt)) {
@@ -904,6 +1217,46 @@ export function evaluateSimulatedChecksFromArtifact(
         `test count mismatch (${entry.passedCount} passed + ${entry.failedCount} failed + ${skippedCount} skipped != ${entry.totalCount} total)`
       );
     }
+    if (
+      entryErrors.length === 0 &&
+      entry.status === 'PASS' &&
+      (entry.exitCode !== 0 || entry.failedCount > 0 || entry.passedCount <= 0)
+    ) {
+      entryErrors.push(
+        `inconsistent suite status "PASS" with exitCode=${entry.exitCode}, failedCount=${entry.failedCount}, passedCount=${entry.passedCount}`
+      );
+    }
+
+    // Recalculate and verify SHA-256 against the actual current test suite file on disk
+    let actualSha256: string | undefined;
+    const rawDigest = typeof entry.sha256 === 'string' ? entry.sha256.trim().toLowerCase() : '';
+    if (!rawDigest) {
+      entryErrors.push(`missing sha256 digest for "${def.suiteFile}"`);
+    } else if (!/^[0-9a-f]{64}$/.test(rawDigest)) {
+      entryErrors.push(`malformed sha256 digest for "${def.suiteFile}"`);
+    } else {
+      const absSuitePath = path.resolve(repoRoot, def.suiteFile);
+      if (
+        !absSuitePath.startsWith(repoRoot + path.sep) ||
+        !fsSync.existsSync(absSuitePath)
+      ) {
+        entryErrors.push(`suite file "${def.suiteFile}" missing on disk for SHA-256 verification`);
+      } else {
+        try {
+          const content = fsSync.readFileSync(absSuitePath);
+          actualSha256 = crypto.createHash('sha256').update(content).digest('hex');
+          const recordedBuf = Buffer.from(rawDigest, 'hex');
+          const actualBuf = Buffer.from(actualSha256, 'hex');
+          if (recordedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(recordedBuf, actualBuf)) {
+            entryErrors.push(
+              `SHA-256 digest mismatch for "${def.suiteFile}" (artifact=${rawDigest}, current=${actualSha256})`
+            );
+          }
+        } catch (hashErr: any) {
+          entryErrors.push(`failed hashing "${def.suiteFile}": ${redactSecrets(hashErr)}`);
+        }
+      }
+    }
 
     if (entryErrors.length > 0) {
       checks.push({
@@ -915,7 +1268,7 @@ export function evaluateSimulatedChecksFromArtifact(
         executionMode: def.executionMode,
         targetEnvironment: def.targetEnvironment,
         executedAt: isValidIsoTimestamp(entry.executedAt) ? entry.executedAt : fallbackTs,
-        blockerOrFailure: `Incomplete or invalid suite result for "${def.suiteFile}": ${entryErrors.join('; ')}`,
+        blockerOrFailure: `Incomplete or tampered suite result for "${def.suiteFile}": ${entryErrors.join('; ')}`,
       });
       continue;
     }
@@ -930,6 +1283,8 @@ export function evaluateSimulatedChecksFromArtifact(
       skippedCount,
       totalCount: entry.totalCount,
       exitCode: entry.exitCode,
+      sha256: actualSha256,
+      sha256Verified: true,
       liveProviderVerified: false,
     };
 
@@ -938,7 +1293,8 @@ export function evaluateSimulatedChecksFromArtifact(
       entry.exitCode === 0 &&
       entry.failedCount === 0 &&
       entry.passedCount > 0 &&
-      entry.passedCount + skippedCount === entry.totalCount;
+      entry.passedCount + skippedCount === entry.totalCount &&
+      Boolean(actualSha256);
 
     if (genuinelyPassed) {
       checks.push({
@@ -975,7 +1331,8 @@ export function evaluateSimulatedChecksFromArtifact(
 
 export function loadAndEvaluateSimulatedArtifact(
   artifactPath = path.resolve(process.cwd(), DEFAULT_SIMULATED_ARTIFACT_PATH),
-  fallbackTimestamp?: string
+  fallbackTimestamp?: string,
+  options: { repoRoot?: string } = {}
 ): {
   checks: VerificationCheckResult[];
   artifactPath: string;
@@ -986,6 +1343,7 @@ export function loadAndEvaluateSimulatedArtifact(
     const res = evaluateSimulatedChecksFromArtifact(null, {
       artifactPath: resolvedPath,
       fallbackTimestamp,
+      repoRoot: options.repoRoot,
     });
     return { ...res, artifactPath: resolvedPath };
   }
@@ -996,6 +1354,7 @@ export function loadAndEvaluateSimulatedArtifact(
     const res = evaluateSimulatedChecksFromArtifact(parsed, {
       artifactPath: resolvedPath,
       fallbackTimestamp,
+      repoRoot: options.repoRoot,
     });
     return { ...res, artifactPath: resolvedPath };
   } catch (err: any) {
@@ -1003,6 +1362,7 @@ export function loadAndEvaluateSimulatedArtifact(
       artifactPath: resolvedPath,
       parseError: err?.message || String(err),
       fallbackTimestamp,
+      repoRoot: options.repoRoot,
     });
     return { ...res, artifactPath: resolvedPath };
   }

@@ -9,6 +9,7 @@ import {
   redactSecrets,
   isStripeLiveKey,
   isStripeTestKey,
+  resolveProductionDenylist,
   validateStagingBaseUrlNonProduction,
 } from './statusModel';
 
@@ -323,6 +324,41 @@ export async function runStagingE2EVerification(
       'Stage 4 — Staging End-to-End Customer Journey',
       failedChecks,
       ['STRIPE_SECRET_KEY (must be sk_test_...)']
+    );
+    summary.cleanupReport = {
+      enabled: cleanupEnabled,
+      status: 'NONE_CREATED',
+      trackedResources: { userIds: [], workspaceIds: [], checkoutSessionIds: [], testEmails: [] },
+      deletedUserIds: [],
+      deletedWorkspaceIds: [],
+      preservedSharedWorkspaceIds: [],
+      warnings: [],
+      errors: [],
+    };
+    return summary;
+  }
+
+  const prodDenylist = resolveProductionDenylist();
+  if (!prodDenylist.valid) {
+    const failedChecks: VerificationCheckResult[] = ALL_STAGING_CHECK_DEFS.map((def, idx) => ({
+      testId: def.testId,
+      stage: 'stage_4_staging_e2e',
+      name: def.name,
+      purpose: def.purpose,
+      status: idx === 0 ? 'FAIL' : 'BLOCKED',
+      executionMode: 'staging_e2e',
+      targetEnvironment: targetEnv,
+      executedAt: nowIso(),
+      blockerOrFailure:
+        idx === 0
+          ? `STAGING_TARGET_REJECTED: ${prodDenylist.reason}`
+          : 'Blocked by malformed PRODUCTION_HOSTS / PRODUCTION_APP_URL configuration.',
+    }));
+    const summary = summarizeStage(
+      'stage_4_staging_e2e',
+      'Stage 4 — Staging End-to-End Customer Journey',
+      failedChecks,
+      [prodDenylist.reason || 'PRODUCTION_HOSTS / PRODUCTION_APP_URL']
     );
     summary.cleanupReport = {
       enabled: cleanupEnabled,

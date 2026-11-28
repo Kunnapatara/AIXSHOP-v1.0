@@ -8,10 +8,12 @@ Use this template to record verifiable evidence when executing commercial verifi
 
 - **Run ID:** `<e.g. cv_20261125_01>`
 - **Simulated Artifact Run ID (`reports/simulated-test-results.json`):** `<e.g. sim_20261125_01 or NOT RUN>`
+- **Simulated Suite SHA-256 Digests Verified (`sha256Verified=true` on all 4 suites):** `<Yes/No/NOT RUN>`
 - **Date / Time (UTC):** `<YYYY-MM-DDTHH:MM:SSZ>`
 - **Operator:** `<Name>`
 - **Git Commit SHA:** `<SHA or "No git repo">`
 - **Target Environment:** `<e.g. staging.aixshop.example.com>`
+- **Production Denylist & Allowlist Confirmed (`PRODUCTION_HOSTS`/`PRODUCTION_APP_URL` exclude target; `STAGING_ALLOWED_HOSTS` matches exact staging host):** `<Yes/No>`
 - **Command Executed:** `<exact command>`
 
 ---
