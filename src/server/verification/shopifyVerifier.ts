@@ -14,6 +14,11 @@ import {
   verifyShopifyConnection,
 } from '../shopify/client';
 import { initiateShopifyConnect, verifyShopifyCallbackHmac } from '../shopify/oauthService';
+import {
+  DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+  getShopifyWebhookSubscriptionsWithStatus,
+} from '../shopify/webhookService';
+import { validateShopifyUrlConfig } from '../config/productionConfig';
 import { verifyShopifyWebhookHmac } from '../security/encryption';
 import { syncShopifyCatalog, resumeShopifySync } from '../shopify/syncService';
 import { MemoryRepository } from '../db/memoryRepository';
@@ -21,6 +26,7 @@ import { MemoryRepository } from '../db/memoryRepository';
 export interface ShopifyExternalVerifyOptions {
   targetEnvironment?: string;
   allowTestProductMutation?: boolean;
+  customFetch?: typeof fetch;
 }
 
 const ALL_SHOPIFY_CHECK_DEFS: Array<{ testId: string; name: string; purpose: string }> = [
@@ -40,16 +46,77 @@ const ALL_SHOPIFY_CHECK_DEFS: Array<{ testId: string; name: string; purpose: str
     purpose: 'Read Dev Store products across pages (pageSize=5), check zero duplicates, and verify termination',
   },
   {
-    testId: 'S1-WEBHOOK-HMAC-DEDUP',
-    name: 'Shopify webhook HMAC verification & subscription audit',
-    purpose: 'Verify live webhook registrations on Dev Store and reject invalid webhook HMAC signatures',
+    testId: 'S1-WEBHOOK-SUBSCRIPTIONS',
+    name: 'Shopify webhook subscription topic & callback URL audit',
+    purpose: 'Compare registered Dev Store webhook topics and callbackUrls against required app topics and SHOPIFY_WEBHOOK_URL / app URL',
+  },
+  {
+    testId: 'S1-WEBHOOK-HMAC-SIMULATION',
+    name: 'Shopify webhook HMAC signature validation (local simulation)',
+    purpose: 'Verify local X-Shopify-Hmac-Sha256 calculation and invalid HMAC rejection (does not prove live Shopify delivery)',
+  },
+  {
+    testId: 'S1-WEBHOOK-LIVE-DELIVERY',
+    name: 'Shopify real external webhook delivery verification',
+    purpose: 'Verify Shopify actually delivered a live webhook event to the deployed callback URL',
   },
   {
     testId: 'S1-TEST-PRODUCT-LIFECYCLE',
-    name: 'Shopify safe test product create & cleanup (opt-in)',
-    purpose: 'Verify product mutation + cleanup when SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION=true',
+    name: 'Shopify safe test product create, delete & read-back cleanup (opt-in)',
+    purpose: 'Verify product mutation + verified deletion via API response and follow-up read when SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION=true',
   },
 ];
+
+function normalizeWebhookUrl(raw?: string): string {
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw.trim());
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`.toLowerCase();
+  } catch {
+    return raw.trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function resolveExpectedShopifyWebhookUrl(): {
+  configured: boolean;
+  url: string | null;
+  source: string;
+  error?: string;
+} {
+  const rawWebhookUrl = process.env.SHOPIFY_WEBHOOK_URL?.trim() || '';
+  const rawShopifyAppUrl = process.env.SHOPIFY_APP_URL?.trim() || '';
+  const rawAppUrl = process.env.APP_URL?.trim() || '';
+  const hasExplicit = Boolean(
+    rawWebhookUrl ||
+      (rawShopifyAppUrl && rawShopifyAppUrl !== 'MY_APP_URL') ||
+      (rawAppUrl && rawAppUrl !== 'MY_APP_URL')
+  );
+
+  if (!hasExplicit) {
+    return {
+      configured: false,
+      url: null,
+      source: 'none',
+      error: 'No SHOPIFY_WEBHOOK_URL, SHOPIFY_APP_URL, or APP_URL is configured to validate webhook callback URLs.',
+    };
+  }
+
+  const urlCheck = validateShopifyUrlConfig();
+  if (!urlCheck.valid) {
+    return {
+      configured: false,
+      url: null,
+      source: rawWebhookUrl ? 'SHOPIFY_WEBHOOK_URL' : rawShopifyAppUrl ? 'SHOPIFY_APP_URL' : 'APP_URL',
+      error: urlCheck.error,
+    };
+  }
+
+  return {
+    configured: true,
+    url: urlCheck.webhookUrl,
+    source: rawWebhookUrl ? 'SHOPIFY_WEBHOOK_URL' : rawShopifyAppUrl ? 'SHOPIFY_APP_URL' : 'APP_URL',
+  };
+}
 
 export async function runShopifyExternalVerification(
   options: ShopifyExternalVerifyOptions = {}
@@ -66,7 +133,7 @@ export async function runShopifyExternalVerification(
       name: def.name,
       purpose: def.purpose,
       status: 'BLOCKED',
-      executionMode: 'external_provider',
+      executionMode: def.testId === 'S1-WEBHOOK-HMAC-SIMULATION' ? 'contract_fixture' : 'external_provider',
       targetEnvironment: targetEnv,
       executedAt: nowIso(),
       blockerOrFailure: `Missing prerequisites: ${stageReadiness.missingEnvVars.join(', ')}`,
@@ -87,6 +154,7 @@ export async function runShopifyExternalVerification(
   const allowMutation =
     options.allowTestProductMutation ??
     (process.env.SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION || '').trim().toLowerCase() === 'true';
+  const graphqlOpts = options.customFetch ? { customFetch: options.customFetch } : undefined;
 
   const checks: VerificationCheckResult[] = [];
   const tempRepo = new MemoryRepository(false);
@@ -141,6 +209,7 @@ export async function runShopifyExternalVerification(
         evidence: {
           shopDomain,
           authorizeHost: parsed.hostname,
+          redirectUri: parsed.searchParams.get('redirect_uri'),
           stateLength: connect.state.length,
           callbackHmacVerified: hmacOk,
           invalidHmacRejected: badHmacRejected,
@@ -166,7 +235,7 @@ export async function runShopifyExternalVerification(
   {
     const t0 = Date.now();
     try {
-      const conn = await verifyShopifyConnection(shopDomain, accessToken);
+      const conn = await verifyShopifyConnection(shopDomain, accessToken, graphqlOpts);
       if (!conn.valid) {
         throw new Error(conn.error || 'Shopify Admin GraphQL verification failed');
       }
@@ -214,7 +283,7 @@ export async function runShopifyExternalVerification(
       const maxSafetyPages = 20;
 
       while (hasNextPage && pagesFetched < maxSafetyPages) {
-        const page = await fetchProductsPage(shopDomain, accessToken, cursor, 5);
+        const page = await fetchProductsPage(shopDomain, accessToken, cursor, 5, graphqlOpts);
         pagesFetched++;
         for (const p of page.products) {
           if (seenProductIds.has(p.id)) duplicateCount++;
@@ -248,13 +317,18 @@ export async function runShopifyExternalVerification(
         updatedAt: nowIso(),
       });
 
-      const syncRes = await syncShopifyCatalog(tempRepo, ws.id, { pageSize: 5, maxPages: 1 });
+      const syncRes = await syncShopifyCatalog(tempRepo, ws.id, {
+        pageSize: 5,
+        maxPages: 1,
+        customFetch: options.customFetch,
+      });
       let finalSyncStatus = syncRes.status;
       if (syncRes.status === 'partially_completed' && seenProductIds.size > 5) {
         const resumeRes = await resumeShopifySync(tempRepo, ws.id, {
           syncRunId: syncRes.syncRun.id,
           pageSize: 5,
           maxPages: 10,
+          customFetch: options.customFetch,
         });
         finalSyncStatus = resumeRes.status;
       }
@@ -294,64 +368,126 @@ export async function runShopifyExternalVerification(
     }
   }
 
-  // Check 4: Live Webhook Subscription Audit + HMAC verification
+  // Check 4: Live Webhook Subscription Audit (required topics + callbackUrl verification)
   {
     const t0 = Date.now();
     try {
-      const subsQuery = `
-        query listWebhookSubs {
-          webhookSubscriptions(first: 25) {
-            edges {
-              node {
-                id
-                topic
-                endpoint {
-                  __typename
-                  ... on WebhookHttpEndpoint {
-                    callbackUrl
-                  }
-                }
-              }
-            }
-          }
-        }
-      `;
-      const res = await executeShopifyGraphQL<{
-        webhookSubscriptions: {
-          edges: Array<{ node: { id: string; topic: string; endpoint?: { callbackUrl?: string } } }>;
-        };
-      }>(shopDomain, accessToken, subsQuery);
-
-      const sampleRawBody = JSON.stringify({ id: 123456, title: 'Webhook Verification Check' });
-      const validHmac = crypto.createHmac('sha256', apiSecret).update(sampleRawBody, 'utf8').digest('base64');
-      const validOk = verifyShopifyWebhookHmac(sampleRawBody, apiSecret, validHmac);
-      const invalidRejected = !verifyShopifyWebhookHmac(sampleRawBody, apiSecret, 'aW52YWxpZA==');
-
-      if (!validOk || !invalidRejected) {
-        throw new Error('Shopify webhook HMAC verification check failed.');
+      const subResult = await getShopifyWebhookSubscriptionsWithStatus(shopDomain, accessToken, graphqlOpts);
+      if (subResult.status === 'failed_api_error' || !subResult.isComplete) {
+        throw new Error(subResult.error || subResult.reason || 'Failed to inspect Shopify webhook subscriptions completely.');
       }
 
-      const registeredTopics = (res.data?.webhookSubscriptions?.edges || []).map((e) => e.node.topic);
-      checks.push({
-        testId: 'S1-WEBHOOK-HMAC-DEDUP',
-        stage: 'stage_1_shopify',
-        name: ALL_SHOPIFY_CHECK_DEFS[3].name,
-        purpose: ALL_SHOPIFY_CHECK_DEFS[3].purpose,
-        status: 'PASS',
-        executionMode: 'external_provider',
-        targetEnvironment: shopDomain,
-        executedAt: nowIso(),
-        durationMs: Date.now() - t0,
-        evidence: {
-          registeredSubscriptionsCount: registeredTopics.length,
-          registeredTopics,
-          webhookHmacValidVerified: validOk,
-          webhookInvalidHmacRejected: invalidRejected,
-        },
-      });
+      const expectedUrlInfo = resolveExpectedShopifyWebhookUrl();
+      const expectedNormalized = expectedUrlInfo.url ? normalizeWebhookUrl(expectedUrlInfo.url) : '';
+
+      const registeredTopics = subResult.subscriptions.map((s) => s.topic.toUpperCase().replace(/\//g, '_'));
+      const matchedTopics: string[] = [];
+      const missingTopics: string[] = [];
+      const mismatchedSubscriptions: Array<{ id: string; topic: string; callbackUrl?: string; expectedUrl: string }> = [];
+
+      for (const requiredTopic of DEFAULT_SHOPIFY_WEBHOOK_TOPICS) {
+        const matching = subResult.subscriptions.filter(
+          (s) => s.topic.toUpperCase().replace(/\//g, '_') === requiredTopic
+        );
+        if (matching.length === 0) {
+          missingTopics.push(requiredTopic);
+        } else if (expectedNormalized) {
+          const hasMatchingUrl = matching.some((m) => normalizeWebhookUrl(m.callbackUrl) === expectedNormalized);
+          if (hasMatchingUrl) {
+            matchedTopics.push(requiredTopic);
+          } else {
+            for (const m of matching) {
+              mismatchedSubscriptions.push({
+                id: m.id,
+                topic: m.topic,
+                callbackUrl: m.callbackUrl,
+                expectedUrl: expectedUrlInfo.url!,
+              });
+            }
+          }
+        } else {
+          matchedTopics.push(requiredTopic);
+        }
+      }
+
+      if (!expectedUrlInfo.configured) {
+        checks.push({
+          testId: 'S1-WEBHOOK-SUBSCRIPTIONS',
+          stage: 'stage_1_shopify',
+          name: ALL_SHOPIFY_CHECK_DEFS[3].name,
+          purpose: ALL_SHOPIFY_CHECK_DEFS[3].purpose,
+          status: 'BLOCKED',
+          executionMode: 'external_provider',
+          targetEnvironment: shopDomain,
+          executedAt: nowIso(),
+          durationMs: Date.now() - t0,
+          evidence: {
+            requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+            registeredSubscriptionsCount: subResult.subscriptions.length,
+            registeredTopics,
+            missingTopics,
+            expectedUrlSource: expectedUrlInfo.source,
+          },
+          blockerOrFailure: expectedUrlInfo.error || 'SHOPIFY_WEBHOOK_URL (or SHOPIFY_APP_URL / APP_URL) is required to verify callback URLs.',
+        });
+      } else if (missingTopics.length > 0 || mismatchedSubscriptions.length > 0) {
+        const problems: string[] = [];
+        if (missingTopics.length > 0) {
+          problems.push(`Missing required webhook topics: ${missingTopics.join(', ')}`);
+        }
+        if (mismatchedSubscriptions.length > 0) {
+          problems.push(
+            `Callback URL mismatch for topics [${mismatchedSubscriptions.map((m) => m.topic).join(', ')}] (expected ${expectedUrlInfo.url})`
+          );
+        }
+        checks.push({
+          testId: 'S1-WEBHOOK-SUBSCRIPTIONS',
+          stage: 'stage_1_shopify',
+          name: ALL_SHOPIFY_CHECK_DEFS[3].name,
+          purpose: ALL_SHOPIFY_CHECK_DEFS[3].purpose,
+          status: 'FAIL',
+          executionMode: 'external_provider',
+          targetEnvironment: shopDomain,
+          executedAt: nowIso(),
+          durationMs: Date.now() - t0,
+          evidence: {
+            requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+            expectedCallbackUrl: expectedUrlInfo.url,
+            expectedUrlSource: expectedUrlInfo.source,
+            registeredSubscriptionsCount: subResult.subscriptions.length,
+            registeredTopics,
+            matchedTopics,
+            missingTopics,
+            mismatchedSubscriptions,
+          },
+          blockerOrFailure: problems.join('; '),
+        });
+      } else {
+        checks.push({
+          testId: 'S1-WEBHOOK-SUBSCRIPTIONS',
+          stage: 'stage_1_shopify',
+          name: ALL_SHOPIFY_CHECK_DEFS[3].name,
+          purpose: ALL_SHOPIFY_CHECK_DEFS[3].purpose,
+          status: 'PASS',
+          executionMode: 'external_provider',
+          targetEnvironment: shopDomain,
+          executedAt: nowIso(),
+          durationMs: Date.now() - t0,
+          evidence: {
+            requiredTopics: DEFAULT_SHOPIFY_WEBHOOK_TOPICS,
+            expectedCallbackUrl: expectedUrlInfo.url,
+            expectedUrlSource: expectedUrlInfo.source,
+            registeredSubscriptionsCount: subResult.subscriptions.length,
+            registeredTopics,
+            matchedTopics,
+            missingTopics: [],
+            mismatchedSubscriptions: [],
+          },
+        });
+      }
     } catch (err: any) {
       checks.push({
-        testId: 'S1-WEBHOOK-HMAC-DEDUP',
+        testId: 'S1-WEBHOOK-SUBSCRIPTIONS',
         stage: 'stage_1_shopify',
         name: ALL_SHOPIFY_CHECK_DEFS[3].name,
         purpose: ALL_SHOPIFY_CHECK_DEFS[3].purpose,
@@ -365,24 +501,96 @@ export async function runShopifyExternalVerification(
     }
   }
 
-  // Check 5: Safe test product lifecycle (opt-in only, with guaranteed cleanup)
+  // Check 5: Local Webhook HMAC Simulation (explicitly separated from real delivery)
+  {
+    const t0 = Date.now();
+    try {
+      const sampleRawBody = JSON.stringify({ id: 123456, title: 'Webhook Verification Check' });
+      const validHmac = crypto.createHmac('sha256', apiSecret).update(sampleRawBody, 'utf8').digest('base64');
+      const validOk = verifyShopifyWebhookHmac(sampleRawBody, apiSecret, validHmac);
+      const invalidRejected = !verifyShopifyWebhookHmac(sampleRawBody, apiSecret, 'aW52YWxpZA==');
+
+      if (!validOk || !invalidRejected) {
+        throw new Error('Local Shopify webhook HMAC verification check failed.');
+      }
+
+      checks.push({
+        testId: 'S1-WEBHOOK-HMAC-SIMULATION',
+        stage: 'stage_1_shopify',
+        name: ALL_SHOPIFY_CHECK_DEFS[4].name,
+        purpose: ALL_SHOPIFY_CHECK_DEFS[4].purpose,
+        status: 'PASS — SIMULATED',
+        executionMode: 'contract_fixture',
+        targetEnvironment: 'local-hmac-verifier',
+        executedAt: nowIso(),
+        durationMs: Date.now() - t0,
+        evidence: {
+          webhookHmacValidVerified: validOk,
+          webhookInvalidHmacRejected: invalidRejected,
+          realExternalDeliveryProved: false,
+          note: 'Local HMAC calculation only; does not prove Shopify delivered a real webhook.',
+        },
+      });
+    } catch (err: any) {
+      checks.push({
+        testId: 'S1-WEBHOOK-HMAC-SIMULATION',
+        stage: 'stage_1_shopify',
+        name: ALL_SHOPIFY_CHECK_DEFS[4].name,
+        purpose: ALL_SHOPIFY_CHECK_DEFS[4].purpose,
+        status: 'FAIL',
+        executionMode: 'contract_fixture',
+        targetEnvironment: 'local-hmac-verifier',
+        executedAt: nowIso(),
+        durationMs: Date.now() - t0,
+        blockerOrFailure: redactSecrets(err),
+      });
+    }
+  }
+
+  // Check 6: Real External Webhook Delivery (NOT RUN by CLI inspection alone)
+  {
+    checks.push({
+      testId: 'S1-WEBHOOK-LIVE-DELIVERY',
+      stage: 'stage_1_shopify',
+      name: ALL_SHOPIFY_CHECK_DEFS[5].name,
+      purpose: ALL_SHOPIFY_CHECK_DEFS[5].purpose,
+      status: 'NOT RUN',
+      executionMode: 'external_provider',
+      targetEnvironment: shopDomain,
+      executedAt: nowIso(),
+      evidence: {
+        realExternalDeliveryVerified: false,
+      },
+      blockerOrFailure:
+        'Real Shopify webhook delivery is not verified by CLI Admin GraphQL inspection; trigger a live product/app event on the Dev Store targeting the deployed SHOPIFY_WEBHOOK_URL and confirm receipt.',
+    });
+  }
+
+  // Check 7: Safe test product lifecycle (opt-in only, with verified deletion & read-back)
   {
     if (!allowMutation) {
       checks.push({
         testId: 'S1-TEST-PRODUCT-LIFECYCLE',
         stage: 'stage_1_shopify',
-        name: ALL_SHOPIFY_CHECK_DEFS[4].name,
-        purpose: ALL_SHOPIFY_CHECK_DEFS[4].purpose,
+        name: ALL_SHOPIFY_CHECK_DEFS[6].name,
+        purpose: ALL_SHOPIFY_CHECK_DEFS[6].purpose,
         status: 'NOT RUN',
         executionMode: 'external_provider',
         targetEnvironment: shopDomain,
         executedAt: nowIso(),
-        blockerOrFailure: 'Skipped write check (set SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION=true with write_products scope to enable create+delete check)',
+        blockerOrFailure:
+          'Skipped write check (set SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION=true with write_products scope to enable create+delete check)',
       });
     } else {
       const t0 = Date.now();
       const prefix = process.env.SHOPIFY_TEST_PRODUCT_PREFIX?.trim() || 'AIXSHOP-VERIFY-';
       let createdProductId: string | null = null;
+      let deletedProductId: string | null = null;
+      let followUpReadConfirmedDeleted = false;
+      let cleanedUp = false;
+      let createError: string | null = null;
+      let cleanupError: string | null = null;
+
       try {
         const createMutation = `
           mutation productCreate($product: ProductCreateInput!) {
@@ -394,12 +602,18 @@ export async function runShopifyExternalVerification(
         `;
         const createRes = await executeShopifyGraphQL<{
           productCreate: { product: { id: string; title: string } | null; userErrors: Array<{ message: string }> };
-        }>(shopDomain, accessToken, createMutation, {
-          product: {
-            title: `${prefix}${Date.now()}`,
-            status: 'DRAFT',
+        }>(
+          shopDomain,
+          accessToken,
+          createMutation,
+          {
+            product: {
+              title: `${prefix}${Date.now()}`,
+              status: 'DRAFT',
+            },
           },
-        });
+          graphqlOpts
+        );
         if (createRes.data?.productCreate?.userErrors?.length) {
           throw new Error(createRes.data.productCreate.userErrors.map((e) => e.message).join('; '));
         }
@@ -407,46 +621,103 @@ export async function runShopifyExternalVerification(
         if (!createdProductId) {
           throw new Error('productCreate did not return a product ID.');
         }
+      } catch (err: any) {
+        createError = redactSecrets(err);
+      } finally {
+        if (createdProductId) {
+          try {
+            const deleteMutation = `
+              mutation productDelete($input: ProductDeleteInput!) {
+                productDelete(input: $input) {
+                  deletedProductId
+                  userErrors { field message }
+                }
+              }
+            `;
+            const delRes = await executeShopifyGraphQL<{
+              productDelete: { deletedProductId: string | null; userErrors: Array<{ message: string }> };
+            }>(
+              shopDomain,
+              accessToken,
+              deleteMutation,
+              { input: { id: createdProductId } },
+              graphqlOpts
+            );
 
+            const delErrors = delRes.data?.productDelete?.userErrors || [];
+            if (delErrors.length > 0) {
+              throw new Error(`productDelete userErrors: ${delErrors.map((e) => e.message).join('; ')}`);
+            }
+            deletedProductId = delRes.data?.productDelete?.deletedProductId || null;
+            if (!deletedProductId) {
+              throw new Error('productDelete did not return deletedProductId.');
+            }
+
+            // Follow-up read to confirm deletion in Shopify Admin API
+            const readQuery = `
+              query verifyProductDeleted($id: ID!) {
+                product(id: $id) {
+                  id
+                }
+              }
+            `;
+            const readRes = await executeShopifyGraphQL<{ product: { id: string } | null }>(
+              shopDomain,
+              accessToken,
+              readQuery,
+              { id: createdProductId },
+              graphqlOpts
+            );
+            if (readRes.data?.product !== null && readRes.data?.product !== undefined) {
+              throw new Error(`Follow-up read confirmed temporary product ${createdProductId} still exists after deletion.`);
+            }
+            followUpReadConfirmedDeleted = true;
+            cleanedUp = true;
+          } catch (delErr: any) {
+            cleanupError = redactSecrets(delErr);
+            cleanedUp = false;
+          }
+        }
+      }
+
+      if (!createError && cleanedUp && followUpReadConfirmedDeleted) {
         checks.push({
           testId: 'S1-TEST-PRODUCT-LIFECYCLE',
           stage: 'stage_1_shopify',
-          name: ALL_SHOPIFY_CHECK_DEFS[4].name,
-          purpose: ALL_SHOPIFY_CHECK_DEFS[4].purpose,
+          name: ALL_SHOPIFY_CHECK_DEFS[6].name,
+          purpose: ALL_SHOPIFY_CHECK_DEFS[6].purpose,
           status: 'PASS',
           executionMode: 'external_provider',
           targetEnvironment: shopDomain,
           executedAt: nowIso(),
           durationMs: Date.now() - t0,
-          evidence: { createdProductId, cleanedUp: true },
+          evidence: {
+            createdProductId,
+            deletedProductId,
+            followUpReadConfirmedDeleted,
+            cleanedUp: true,
+          },
         });
-      } catch (err: any) {
+      } else {
+        const failureReasons = [createError, cleanupError ? `Cleanup failed: ${cleanupError}` : null].filter(Boolean);
         checks.push({
           testId: 'S1-TEST-PRODUCT-LIFECYCLE',
           stage: 'stage_1_shopify',
-          name: ALL_SHOPIFY_CHECK_DEFS[4].name,
-          purpose: ALL_SHOPIFY_CHECK_DEFS[4].purpose,
+          name: ALL_SHOPIFY_CHECK_DEFS[6].name,
+          purpose: ALL_SHOPIFY_CHECK_DEFS[6].purpose,
           status: 'FAIL',
           executionMode: 'external_provider',
           targetEnvironment: shopDomain,
           executedAt: nowIso(),
           durationMs: Date.now() - t0,
-          blockerOrFailure: redactSecrets(err),
+          evidence: {
+            createdProductId,
+            deletedProductId,
+            followUpReadConfirmedDeleted,
+            cleanedUp,
+          },
+          blockerOrFailure: failureReasons.join(' | ') || 'Temporary product lifecycle or cleanup verification failed.',
         });
-      } finally {
-        if (createdProductId) {
-          const deleteMutation = `
-            mutation productDelete($input: ProductDeleteInput!) {
-              productDelete(input: $input) {
-                deletedProductId
-                userErrors { message }
-              }
-            }
-          `;
-          await executeShopifyGraphQL(shopDomain, accessToken, deleteMutation, {
-            input: { id: createdProductId },
-          }).catch(() => {});
-        }
       }
     }
   }

@@ -6,7 +6,7 @@ function printSummary(summary: StageVerificationSummary): void {
   console.log(`\n=== ${summary.title} ===`);
   console.log(`Status: ${summary.status}`);
   console.log(
-    `Counts: PASS=${summary.counts.pass} FAIL=${summary.counts.fail} BLOCKED=${summary.counts.blocked} NOT_RUN=${summary.counts.notRun}`
+    `Counts: PASS=${summary.counts.pass} SIMULATED=${summary.counts.simulated ?? 0} FAIL=${summary.counts.fail} BLOCKED=${summary.counts.blocked} NOT_RUN=${summary.counts.notRun}`
   );
   if (summary.missingEnvVars.length > 0) {
     console.log(`Missing Prerequisites: ${summary.missingEnvVars.join(', ')}`);

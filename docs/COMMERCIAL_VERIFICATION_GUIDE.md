@@ -11,6 +11,7 @@ This guide documents how to prepare, execute, record evidence for, and clean up 
 | Status | Meaning |
 | --- | --- |
 | `PASS` | Executed against the intended real target with verifiable evidence |
+| `PASS — SIMULATED` | Executed end-to-end using local mocks, fixtures, or test doubles only (never live external providers) |
 | `FAIL` | Executed and failed |
 | `BLOCKED` | Cannot execute because credentials, configuration, or external resources are missing |
 | `NOT RUN` | Not yet executed |
@@ -64,8 +65,9 @@ npm run verify:shopify
 ```
 
 ### Safe Test Data & Cleanup
-- By default, `verify:shopify` runs read-only GraphQL catalog pagination (`pageSize=5`), OAuth state/HMAC checks, and webhook subscription inspection without mutating store products.
-- If `SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION=true`, it creates one `DRAFT` product prefixed `AIXSHOP-VERIFY-` and deletes it inside a `finally` block.
+- By default, `verify:shopify` runs read-only GraphQL catalog pagination (`pageSize=5`), OAuth state/HMAC checks, and webhook subscription inspection (comparing registered topics and `callbackUrl` values against `DEFAULT_SHOPIFY_WEBHOOK_TOPICS` and `SHOPIFY_WEBHOOK_URL` / `SHOPIFY_APP_URL` / `APP_URL`).
+- Local HMAC signature verification (`S1-WEBHOOK-HMAC-SIMULATION`) is reported separately as `PASS — SIMULATED` and does not prove real Shopify webhook delivery (`S1-WEBHOOK-LIVE-DELIVERY` remains `NOT RUN` until verified against a deployed endpoint).
+- If `SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION=true`, it creates one `DRAFT` product prefixed `AIXSHOP-VERIFY-`, deletes it inside a `finally` block, verifies the `productDelete` response, and performs a follow-up GraphQL `product(id)` read to confirm deletion before reporting `cleanedUp=true`.
 - If interrupted abnormally, delete any leftover `AIXSHOP-VERIFY-*` draft products in Shopify Admin > Products and revoke/rotate test credentials if no longer needed.
 
 ---
@@ -98,18 +100,20 @@ npm run verify:shopify
 - `STRIPE_SECRET_KEY` (`sk_test_...`)
 - `STRIPE_WEBHOOK_SECRET` (`whsec_...`)
 - `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_GROWTH`, `STRIPE_PRICE_ENTERPRISE`
-- Optional: `STRIPE_TEST_CUSTOMER_EMAIL`, `STRIPE_TEST_CLOCK_ENABLED="true"` (exercises real Stripe Test Clock plan upgrades, `cancel_at_period_end`, and immediate cancellation)
+- Optional: `STRIPE_TEST_CUSTOMER_EMAIL`, `STRIPE_TEST_CLOCK_ENABLED="true"` (creates and advances a real Stripe Test Clock via `testHelpers.testClocks.advance()`, verifies `subscription_cycle` paid invoice renewal, upgrade to Growth, `cancel_at_period_end`, and immediate cancellation)
 
 ### Execution & Test Cards
 ```bash
 npm run verify:stripe
 ```
+- `S2-CHECKOUT-SESSION` creates and retrieves real Checkout Sessions for both **Starter** and **Growth**, verifying customer association, URL, `workspaceId`, and `tier` metadata.
+- `S2-WEBHOOK-LOCAL-SIMULATION` exercises local HMAC signing and `BillingService` against `MemoryRepository` (`PASS — SIMULATED`), kept strictly separate from real deployed Stripe webhook delivery (`S2-WEBHOOK-LIVE-DELIVERY`, `NOT RUN`).
 For interactive Stripe Checkout testing in Stage 4:
 - Successful payment: `4242 4242 4242 4242` (any future expiry/CVC)
 - Declined / failed payment: `4000 0000 0000 0002` (or `pm_card_chargeDeclined` in API tests)
 
 ### Cleanup
-- `verify:stripe` expires temporary Checkout Sessions, deletes temporary Test Customers (`aixshop_verification=true`), and deletes created Test Clocks in a `finally` block.
+- `verify:stripe` expires uncompleted temporary Checkout Sessions, deletes temporary Test Customers (`aixshop_verification=true`), and deletes created Test Clocks in a `finally` block (`S2-STRIPE-CLEANUP`), verifying each outcome and failing if cleanup fails.
 - Inspect Stripe Dashboard (Test mode) > Customers / Test Clocks after manual runs to remove any remaining test objects.
 
 ---
@@ -165,7 +169,7 @@ All transactional email rendering and SMTP/transport dispatch live in `src/serve
 3. Never point `STAGING_BASE_URL` at production or supply a live Stripe key.
 
 ### Multi-Step Customer Journey & Negative Scenarios
-Automated runner (`npm run verify:staging-e2e`) verifies API readiness, isolated merchant registration/workspace creation, initial Free Audit state, Shopify OAuth connect initiation, Checkout Session creation, negative webhook/HMAC/unauthenticated/cross-tenant isolation checks, transactional password-reset SMTP triggering, and deterministic cleanup (`DELETE /api/auth/account`).
+Automated runner (`npm run verify:staging-e2e`) verifies API readiness (strictly refusing production `STAGING_BASE_URL` hostnames or `sk_live_` keys), isolated merchant registration/workspace creation, initial Free Audit state, Shopify OAuth connect initiation, Checkout Session creation, negative webhook/HMAC/invalid-tier/unauthenticated/cross-tenant isolation checks, transactional password-reset SMTP triggering (including non-enumeration), and deterministic cleanup (expiring `cs_test_` Checkout Sessions, deleting test accounts via `DELETE /api/auth/account`, and verifying post-delete `/api/auth/me` + `/api/auth/login` 401 rejections).
 
 Interactive browser completion in staging verifies the remaining hosted-UI redirects and live inbox delivery:
 1. Complete Shopify Admin OAuth consent in browser -> verify `/api/shopify/callback` stores encrypted token & redirects to Settings.

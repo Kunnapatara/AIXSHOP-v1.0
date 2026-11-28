@@ -18,6 +18,9 @@ import { MemoryRepository } from '../db/memoryRepository';
 
 export interface StripeExternalVerifyOptions {
   targetEnvironment?: string;
+  stripeClient?: Stripe;
+  testClockPollIntervalMs?: number;
+  testClockTimeoutMs?: number;
 }
 
 const ALL_STRIPE_CHECK_DEFS: Array<{ testId: string; name: string; purpose: string }> = [
@@ -29,24 +32,56 @@ const ALL_STRIPE_CHECK_DEFS: Array<{ testId: string; name: string; purpose: stri
   {
     testId: 'S2-PRICE-INTEGRITY',
     name: 'Stripe Test Mode authoritative Price ID verification',
-    purpose: 'Verify Starter ($49), Growth ($149), Enterprise ($499) prices are active, USD monthly, and distinct',
+    purpose: 'Verify Starter ($49/mo), Growth ($149/mo), Enterprise ($499/mo) prices are active, USD monthly, and distinct',
   },
   {
     testId: 'S2-CHECKOUT-SESSION',
-    name: 'Stripe Test Mode Checkout Session creation & metadata mapping',
-    purpose: 'Create real Checkout Sessions for Starter & Growth and verify URL, metadata, and customer association',
+    name: 'Stripe Test Mode Checkout Sessions (Starter & Growth) & metadata mapping',
+    purpose: 'Create & retrieve real Checkout Sessions for both Starter & Growth and verify URL, customer association, workspace & tier metadata',
   },
   {
-    testId: 'S2-WEBHOOK-SIGNATURE-EVENTS',
-    name: 'Stripe webhook HMAC signature & supported event lifecycle processing',
-    purpose: 'Verify real signed webhook payloads through StripeBillingProvider + BillingService idempotency',
+    testId: 'S2-WEBHOOK-LOCAL-SIMULATION',
+    name: 'Stripe webhook HMAC signature & lifecycle simulation (local contract)',
+    purpose: 'Verify local HMAC signing, signature rejection, idempotency, and BillingService transitions against MemoryRepository (not live Stripe delivery)',
   },
   {
-    testId: 'S2-SUBSCRIPTION-LIFECYCLE',
-    name: 'Stripe Test Mode Subscription creation, plan change, cancel & cleanup',
-    purpose: 'Verify test customer + test clock/subscription lifecycle & clean teardown in Stripe Test Mode',
+    testId: 'S2-WEBHOOK-LIVE-DELIVERY',
+    name: 'Stripe real deployed webhook delivery verification',
+    purpose: 'Verify Stripe actually delivered signed webhook events to the deployed /api/billing/webhook endpoint',
+  },
+  {
+    testId: 'S2-TEST-CLOCK-RENEWAL',
+    name: 'Stripe Test Clock advancement, recurring renewal, upgrade & cancellation (opt-in)',
+    purpose: 'Advance a real Stripe Test Clock to verify recurring invoice renewal, plan upgrade, cancel_at_period_end, and cancellation',
+  },
+  {
+    testId: 'S2-STRIPE-CLEANUP',
+    name: 'Stripe Test Mode temporary object expiration & deletion verification',
+    purpose: 'Expire uncompleted Checkout Sessions, delete temporary Customers & Test Clocks, and verify cleanup outcomes',
   },
 ];
+
+async function waitForTestClockReady(
+  stripe: Stripe,
+  clockId: string,
+  pollIntervalMs = 1500,
+  timeoutMs = 30000
+): Promise<Stripe.TestHelpers.TestClock> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const clock = await stripe.testHelpers.testClocks.retrieve(clockId);
+    if (clock.status === 'ready') {
+      return clock;
+    }
+    if (clock.status === 'internal_failure') {
+      throw new Error(`Stripe Test Clock ${clockId} entered internal_failure state.`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for Stripe Test Clock ${clockId} to become ready (last status: ${clock.status}).`);
+    }
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+}
 
 export async function runStripeExternalVerification(
   options: StripeExternalVerifyOptions = {}
@@ -65,7 +100,7 @@ export async function runStripeExternalVerification(
       name: def.name,
       purpose: def.purpose,
       status: idx === 0 ? 'FAIL' : 'BLOCKED',
-      executionMode: 'external_provider',
+      executionMode: def.testId === 'S2-WEBHOOK-LOCAL-SIMULATION' ? 'contract_fixture' : 'external_provider',
       targetEnvironment: 'REJECTED_LIVE_MODE',
       executedAt: nowIso(),
       blockerOrFailure:
@@ -85,7 +120,7 @@ export async function runStripeExternalVerification(
       name: def.name,
       purpose: def.purpose,
       status: 'BLOCKED',
-      executionMode: 'external_provider',
+      executionMode: def.testId === 'S2-WEBHOOK-LOCAL-SIMULATION' ? 'contract_fixture' : 'external_provider',
       targetEnvironment: targetEnv,
       executedAt: nowIso(),
       blockerOrFailure: `Missing prerequisites: ${stageReadiness.missingEnvVars.join(', ')}`,
@@ -100,12 +135,22 @@ export async function runStripeExternalVerification(
   }
 
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!.trim();
-  const stripe = new Stripe(stripeKey);
+  const stripe = options.stripeClient || new Stripe(stripeKey);
   const provider = new StripeBillingProvider(stripeKey, webhookSecret, stripe);
   const checks: VerificationCheckResult[] = [];
   const createdCustomerIds: string[] = [];
   const createdSessionIds: string[] = [];
   const createdClockIds: string[] = [];
+
+  const cleanupSummary = {
+    trackedSessionIds: [] as string[],
+    trackedCustomerIds: [] as string[],
+    trackedClockIds: [] as string[],
+    expiredSessionIds: [] as string[],
+    deletedCustomerIds: [] as string[],
+    deletedClockIds: [] as string[],
+    errors: [] as string[],
+  };
 
   try {
     // Check 1: Test Mode Safety Guard
@@ -121,7 +166,7 @@ export async function runStripeExternalVerification(
       evidence: { keyMode: 'test', prefixVerified: 'sk_test_' },
     });
 
-    // Check 2: Price verification against Stripe API
+    // Check 2: Price verification against Stripe API (Starter $49, Growth $149, Enterprise $499)
     {
       const t0 = Date.now();
       const priceRes = await verifyStripeConfiguredPrices(stripe);
@@ -154,9 +199,11 @@ export async function runStripeExternalVerification(
             plansVerified: priceRes.plans.map((p) => ({
               tier: p.tier,
               priceId: p.priceId,
+              active: p.active,
               unitAmount: p.unitAmount,
               currency: p.currency,
               interval: p.interval,
+              intervalCount: p.intervalCount,
             })),
           },
         });
@@ -173,7 +220,7 @@ export async function runStripeExternalVerification(
     });
     createdCustomerIds.push(testCustomer.id);
 
-    // Check 3: Checkout Session Creation (Starter + Growth)
+    // Check 3: Checkout Session Creation & Retrieval for BOTH Starter & Growth
     {
       const t0 = Date.now();
       try {
@@ -182,23 +229,62 @@ export async function runStripeExternalVerification(
           ? process.env.APP_URL.replace(/\/+$/, '')
           : 'https://staging.aixshop.example.com';
 
-        const starterSession = await provider.createCheckoutSession({
-          workspaceId: wsId,
-          tier: 'Starter',
-          customerId: testCustomer.id,
-          successUrl: `${baseApp}/?page=settings&tab=subscription&checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-          cancelUrl: `${baseApp}/?page=settings&tab=subscription&checkout=canceled`,
-        });
-        createdSessionIds.push(starterSession.sessionId);
+        const verifiedSessions: Array<{
+          tier: 'Starter' | 'Growth';
+          sessionId: string;
+          checkoutHost: string;
+          customerId: string;
+          metadataVerified: Record<string, string>;
+        }> = [];
 
-        const retrieved = await provider.retrieveCheckoutSession(starterSession.sessionId);
-        const sessionHost = new URL(starterSession.checkoutUrl).hostname;
-        if (
-          !retrieved ||
-          retrieved.metadata?.workspaceId !== wsId ||
-          retrieved.metadata?.tier !== 'Starter'
-        ) {
-          throw new Error('Checkout session metadata mismatch in Stripe Test Mode.');
+        for (const tier of ['Starter', 'Growth'] as const) {
+          const session = await provider.createCheckoutSession({
+            workspaceId: wsId,
+            tier,
+            customerId: testCustomer.id,
+            successUrl: `${baseApp}/?page=settings&tab=subscription&checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+            cancelUrl: `${baseApp}/?page=settings&tab=subscription&checkout=canceled`,
+          });
+          createdSessionIds.push(session.sessionId);
+
+          const parsedUrl = new URL(session.checkoutUrl);
+          if (parsedUrl.protocol !== 'https:') {
+            throw new Error(`Checkout URL for ${tier} must be HTTPS (got ${parsedUrl.protocol}).`);
+          }
+
+          const retrieved = await provider.retrieveCheckoutSession(session.sessionId);
+          if (!retrieved || retrieved.id !== session.sessionId) {
+            throw new Error(`Failed to retrieve Stripe Checkout Session for ${tier} (${session.sessionId}).`);
+          }
+
+          const retrievedCustomerId =
+            typeof retrieved.customer === 'string'
+              ? retrieved.customer
+              : retrieved.customer?.id || null;
+
+          if (retrievedCustomerId !== testCustomer.id) {
+            throw new Error(
+              `Checkout session customer mismatch for ${tier}: expected ${testCustomer.id}, got ${retrievedCustomerId}`
+            );
+          }
+
+          if (
+            retrieved.metadata?.workspaceId !== wsId ||
+            retrieved.metadata?.tier !== tier
+          ) {
+            throw new Error(`Checkout session metadata mismatch for ${tier} in Stripe Test Mode.`);
+          }
+
+          verifiedSessions.push({
+            tier,
+            sessionId: session.sessionId,
+            checkoutHost: parsedUrl.hostname,
+            customerId: retrievedCustomerId,
+            metadataVerified: {
+              workspaceId: retrieved.metadata.workspaceId,
+              tier: retrieved.metadata.tier,
+            },
+          });
         }
 
         checks.push({
@@ -212,10 +298,8 @@ export async function runStripeExternalVerification(
           executedAt: nowIso(),
           durationMs: Date.now() - t0,
           evidence: {
-            sessionId: starterSession.sessionId,
-            checkoutHost: sessionHost,
             customerId: testCustomer.id,
-            metadataVerified: retrieved.metadata,
+            sessionsVerified: verifiedSessions,
           },
         });
       } catch (err: any) {
@@ -234,7 +318,7 @@ export async function runStripeExternalVerification(
       }
     }
 
-    // Check 4: Signed webhook verification & BillingService lifecycle transitions
+    // Check 4: Local Signed-Event Simulation (NOT real Stripe webhook delivery)
     {
       const t0 = Date.now();
       try {
@@ -284,7 +368,6 @@ export async function runStripeExternalVerification(
         const rDup = await billingSvc.handleWebhook(checkoutPayload, signPayload(checkoutPayload));
         const storeAfterUpgrade = await repo.getStoreByWorkspace(wsId);
 
-        // Failed payment -> past_due -> invoice.payment_succeeded -> active -> deleted -> Free Audit
         const failPayload = JSON.stringify({
           id: `evt_verify_fail_${Date.now()}`,
           type: 'invoice.payment_failed',
@@ -324,16 +407,17 @@ export async function runStripeExternalVerification(
         }
 
         checks.push({
-          testId: 'S2-WEBHOOK-SIGNATURE-EVENTS',
+          testId: 'S2-WEBHOOK-LOCAL-SIMULATION',
           stage: 'stage_2_stripe',
           name: ALL_STRIPE_CHECK_DEFS[3].name,
           purpose: ALL_STRIPE_CHECK_DEFS[3].purpose,
-          status: 'PASS',
-          executionMode: 'external_provider',
-          targetEnvironment: 'stripe-test-mode',
+          status: 'PASS — SIMULATED',
+          executionMode: 'contract_fixture',
+          targetEnvironment: 'local-memory-repo-webhook-sim',
           executedAt: nowIso(),
           durationMs: Date.now() - t0,
           evidence: {
+            realExternalWebhookDeliveryProved: false,
             invalidSignatureRejected: badSigRejected,
             duplicateWebhookAction: rDup.action,
             upgradedTier: storeAfterUpgrade?.tier,
@@ -344,13 +428,13 @@ export async function runStripeExternalVerification(
         });
       } catch (err: any) {
         checks.push({
-          testId: 'S2-WEBHOOK-SIGNATURE-EVENTS',
+          testId: 'S2-WEBHOOK-LOCAL-SIMULATION',
           stage: 'stage_2_stripe',
           name: ALL_STRIPE_CHECK_DEFS[3].name,
           purpose: ALL_STRIPE_CHECK_DEFS[3].purpose,
           status: 'FAIL',
-          executionMode: 'external_provider',
-          targetEnvironment: 'stripe-test-mode',
+          executionMode: 'contract_fixture',
+          targetEnvironment: 'local-memory-repo-webhook-sim',
           executedAt: nowIso(),
           durationMs: Date.now() - t0,
           blockerOrFailure: redactSecrets(err),
@@ -358,12 +442,10 @@ export async function runStripeExternalVerification(
       }
     }
 
-    // Check 5: Live Test Clock / Subscription API lifecycle (opt-in via STRIPE_TEST_CLOCK_ENABLED=true)
-    const testClockEnabled =
-      (process.env.STRIPE_TEST_CLOCK_ENABLED || '').trim().toLowerCase() === 'true';
-    if (!testClockEnabled) {
+    // Check 5: Actual Deployed Webhook Delivery (explicitly separated from local simulation)
+    {
       checks.push({
-        testId: 'S2-SUBSCRIPTION-LIFECYCLE',
+        testId: 'S2-WEBHOOK-LIVE-DELIVERY',
         stage: 'stage_2_stripe',
         name: ALL_STRIPE_CHECK_DEFS[4].name,
         purpose: ALL_STRIPE_CHECK_DEFS[4].purpose,
@@ -371,7 +453,29 @@ export async function runStripeExternalVerification(
         executionMode: 'external_provider',
         targetEnvironment: 'stripe-test-mode',
         executedAt: nowIso(),
-        blockerOrFailure: 'Skipped Stripe Test Clock lifecycle mutation (set STRIPE_TEST_CLOCK_ENABLED=true to execute live Test Clock renewal & cancellation checks)',
+        evidence: {
+          realExternalWebhookDeliveryVerified: false,
+        },
+        blockerOrFailure:
+          'Actual deployed Stripe webhook delivery cannot be proved by local signed-event simulation; trigger a real Checkout/invoice event via Stripe CLI or Staging Checkout targeting /api/billing/webhook.',
+      });
+    }
+
+    // Check 6: Live Test Clock advancement & Subscription Renewal/Lifecycle (opt-in via STRIPE_TEST_CLOCK_ENABLED=true)
+    const testClockEnabled =
+      (process.env.STRIPE_TEST_CLOCK_ENABLED || '').trim().toLowerCase() === 'true';
+    if (!testClockEnabled) {
+      checks.push({
+        testId: 'S2-TEST-CLOCK-RENEWAL',
+        stage: 'stage_2_stripe',
+        name: ALL_STRIPE_CHECK_DEFS[5].name,
+        purpose: ALL_STRIPE_CHECK_DEFS[5].purpose,
+        status: 'NOT RUN',
+        executionMode: 'external_provider',
+        targetEnvironment: 'stripe-test-mode',
+        executedAt: nowIso(),
+        blockerOrFailure:
+          'Skipped Stripe Test Clock advancement & renewal verification (set STRIPE_TEST_CLOCK_ENABLED=true to execute Test Clock renewal, upgrade, and cancellation checks)',
       });
     } else {
       const t0 = Date.now();
@@ -400,8 +504,40 @@ export async function runStripeExternalVerification(
           items: [{ price: starterPriceId }],
           metadata: { tier: 'Starter', aixshop_verification: 'true' },
         });
-        const itemId = sub.items.data[0].id;
+        const initialPeriodEnd =
+          (sub as any).current_period_end ??
+          sub.items.data[0]?.current_period_end ??
+          nowSec + 31 * 86400;
 
+        // Advance Test Clock past initial billing period to exercise real recurring renewal
+        const advanceTarget = initialPeriodEnd + 3600;
+        await stripe.testHelpers.testClocks.advance(clock.id, {
+          frozen_time: advanceTarget,
+        });
+        const readyClock = await waitForTestClockReady(
+          stripe,
+          clock.id,
+          options.testClockPollIntervalMs,
+          options.testClockTimeoutMs
+        );
+
+        const renewedSub = await stripe.subscriptions.retrieve(sub.id);
+        const renewedPeriodEnd =
+          (renewedSub as any).current_period_end ??
+          renewedSub.items.data[0]?.current_period_end ??
+          0;
+        const invoices = await stripe.invoices.list({ subscription: sub.id, limit: 10 });
+        const renewalInvoice = invoices.data.find(
+          (inv) => inv.billing_reason === 'subscription_cycle' && inv.status === 'paid'
+        );
+
+        if (!renewalInvoice || renewedPeriodEnd <= initialPeriodEnd) {
+          throw new Error(
+            `Test Clock advancement did not produce a paid subscription_cycle renewal invoice (initialPeriodEnd=${initialPeriodEnd}, renewedPeriodEnd=${renewedPeriodEnd}).`
+          );
+        }
+
+        const itemId = renewedSub.items.data[0].id;
         const upgraded = await stripe.subscriptions.update(sub.id, {
           items: [{ id: itemId, price: growthPriceId }],
           metadata: { tier: 'Growth' },
@@ -412,10 +548,10 @@ export async function runStripeExternalVerification(
         const canceled = await stripe.subscriptions.cancel(sub.id);
 
         checks.push({
-          testId: 'S2-SUBSCRIPTION-LIFECYCLE',
+          testId: 'S2-TEST-CLOCK-RENEWAL',
           stage: 'stage_2_stripe',
-          name: ALL_STRIPE_CHECK_DEFS[4].name,
-          purpose: ALL_STRIPE_CHECK_DEFS[4].purpose,
+          name: ALL_STRIPE_CHECK_DEFS[5].name,
+          purpose: ALL_STRIPE_CHECK_DEFS[5].purpose,
           status: 'PASS',
           executionMode: 'external_provider',
           targetEnvironment: 'stripe-test-mode',
@@ -423,8 +559,13 @@ export async function runStripeExternalVerification(
           durationMs: Date.now() - t0,
           evidence: {
             testClockId: clock.id,
+            clockAdvancedTo: readyClock.frozen_time,
             subscriptionId: sub.id,
             initialStatus: sub.status,
+            initialPeriodEnd,
+            renewedPeriodEnd,
+            renewalInvoiceId: renewalInvoice.id,
+            renewalInvoiceStatus: renewalInvoice.status,
             upgradedPriceId: upgraded.items.data[0]?.price?.id,
             cancelAtPeriodEnd: cancelAtEnd.cancel_at_period_end,
             canceledStatus: canceled.status,
@@ -432,10 +573,10 @@ export async function runStripeExternalVerification(
         });
       } catch (err: any) {
         checks.push({
-          testId: 'S2-SUBSCRIPTION-LIFECYCLE',
+          testId: 'S2-TEST-CLOCK-RENEWAL',
           stage: 'stage_2_stripe',
-          name: ALL_STRIPE_CHECK_DEFS[4].name,
-          purpose: ALL_STRIPE_CHECK_DEFS[4].purpose,
+          name: ALL_STRIPE_CHECK_DEFS[5].name,
+          purpose: ALL_STRIPE_CHECK_DEFS[5].purpose,
           status: 'FAIL',
           executionMode: 'external_provider',
           targetEnvironment: 'stripe-test-mode',
@@ -446,16 +587,85 @@ export async function runStripeExternalVerification(
       }
     }
   } finally {
-    // Safe teardown of Stripe test artifacts created during this run
+    const tClean = Date.now();
+    cleanupSummary.trackedSessionIds = [...createdSessionIds];
+    cleanupSummary.trackedCustomerIds = [...createdCustomerIds];
+    cleanupSummary.trackedClockIds = [...createdClockIds];
+
     for (const sid of createdSessionIds) {
-      await stripe.checkout.sessions.expire(sid).catch(() => {});
+      try {
+        const exp = await stripe.checkout.sessions.expire(sid);
+        if (exp.status !== 'expired') {
+          cleanupSummary.errors.push(`Checkout session ${sid} returned status=${exp.status} after expire().`);
+        } else {
+          cleanupSummary.expiredSessionIds.push(sid);
+        }
+      } catch (err: any) {
+        // If already expired, verify via retrieve
+        try {
+          const current = await stripe.checkout.sessions.retrieve(sid);
+          if (current.status === 'expired') {
+            cleanupSummary.expiredSessionIds.push(sid);
+          } else {
+            cleanupSummary.errors.push(`Failed expiring session ${sid} (status=${current.status}): ${redactSecrets(err)}`);
+          }
+        } catch (retErr: any) {
+          cleanupSummary.errors.push(`Failed expiring session ${sid}: ${redactSecrets(retErr)}`);
+        }
+      }
     }
+
     for (const cid of createdCustomerIds) {
-      await stripe.customers.del(cid).catch(() => {});
+      try {
+        const delRes = await stripe.customers.del(cid);
+        if (!delRes.deleted) {
+          cleanupSummary.errors.push(`Customer ${cid} del() returned deleted=${String(delRes.deleted)}.`);
+        } else {
+          cleanupSummary.deletedCustomerIds.push(cid);
+        }
+      } catch (err: any) {
+        cleanupSummary.errors.push(`Failed deleting customer ${cid}: ${redactSecrets(err)}`);
+      }
     }
+
     for (const clockId of createdClockIds) {
-      await stripe.testHelpers.testClocks.del(clockId).catch(() => {});
+      try {
+        const delClock = await stripe.testHelpers.testClocks.del(clockId);
+        if (!delClock.deleted) {
+          cleanupSummary.errors.push(`Test Clock ${clockId} del() returned deleted=${String(delClock.deleted)}.`);
+        } else {
+          cleanupSummary.deletedClockIds.push(clockId);
+        }
+      } catch (err: any) {
+        cleanupSummary.errors.push(`Failed deleting Test Clock ${clockId}: ${redactSecrets(err)}`);
+      }
     }
+
+    const totalTracked =
+      cleanupSummary.trackedSessionIds.length +
+      cleanupSummary.trackedCustomerIds.length +
+      cleanupSummary.trackedClockIds.length;
+
+    checks.push({
+      testId: 'S2-STRIPE-CLEANUP',
+      stage: 'stage_2_stripe',
+      name: ALL_STRIPE_CHECK_DEFS[6].name,
+      purpose: ALL_STRIPE_CHECK_DEFS[6].purpose,
+      status: cleanupSummary.errors.length === 0 ? 'PASS' : 'FAIL',
+      executionMode: 'external_provider',
+      targetEnvironment: 'stripe-test-mode',
+      executedAt: nowIso(),
+      durationMs: Date.now() - tClean,
+      evidence: {
+        trackedCount: totalTracked,
+        expiredSessions: cleanupSummary.expiredSessionIds,
+        deletedCustomers: cleanupSummary.deletedCustomerIds,
+        deletedClocks: cleanupSummary.deletedClockIds,
+      },
+      ...(cleanupSummary.errors.length > 0
+        ? { blockerOrFailure: cleanupSummary.errors.join('; ') }
+        : {}),
+    });
   }
 
   return summarizeStage('stage_2_stripe', 'Stage 2 — Stripe Test Mode', checks, []);

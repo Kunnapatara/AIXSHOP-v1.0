@@ -320,4 +320,145 @@ describe('Tasks A & B — Staging E2E Resource Cleanup & Strict Tenant Isolation
       await srv.close();
     }
   });
+
+  test('6. Non-production guard refuses production STAGING_BASE_URL hostnames and APP_URL match in production', async () => {
+    await withEnvOverrides(
+      buildLocalStagingEnv('https://app.aixshop.io'),
+      async () => {
+        const summary = await runStagingE2EVerification();
+        assert.equal(summary.status, 'FAIL');
+        assert.equal(summary.checks[0].testId, 'S4-STAGING-HEALTH-ISOLATION');
+        assert.equal(summary.checks[0].status, 'FAIL');
+        assert.match(summary.checks[0].blockerOrFailure || '', /PRODUCTION_TARGET_REJECTED/);
+        assert.ok(summary.checks.slice(1).every((c) => c.status === 'BLOCKED'));
+      }
+    );
+
+    await withEnvOverrides(
+      buildLocalStagingEnv('https://staging.example.com', {
+        NODE_ENV: 'production',
+        APP_URL: 'https://staging.example.com',
+      }),
+      async () => {
+        const summary = await runStagingE2EVerification();
+        assert.equal(summary.status, 'FAIL');
+        assert.match(summary.checks[0].blockerOrFailure || '', /PRODUCTION_TARGET_REJECTED/);
+      }
+    );
+  });
+
+  test('7. Cleanup expires cs_test_ Stripe Checkout Sessions and surfaces PARTIAL_CLEANUP if expiration fails', async () => {
+    const repo = new MemoryRepository(false);
+    const srv = await startEphemeralServer(repo, (req, res) => {
+      if (req.url === '/api/billing/checkout-session' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}');
+          if (parsed.tier === 'InvalidTier') {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Invalid tier' }));
+            return;
+          }
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              success: true,
+              provider: 'stripe',
+              sessionId: 'cs_test_staging_expire_1',
+              checkoutUrl: 'https://checkout.stripe.com/c/pay/cs_test_staging_expire_1',
+            })
+          );
+        });
+        return true;
+      }
+      return false;
+    });
+
+    try {
+      const expiredCalled: string[] = [];
+      const mockStripeOk: any = {
+        checkout: {
+          sessions: {
+            expire: async (id: string) => {
+              expiredCalled.push(id);
+              return { id, status: 'expired' };
+            },
+            retrieve: async (id: string) => ({ id, status: 'expired' }),
+          },
+        },
+      };
+
+      await withMockEmailTransport(() =>
+        withEnvOverrides(buildLocalStagingEnv(srv.baseUrl), async () => {
+          const summary = await runStagingE2EVerification({ stripeClient: mockStripeOk });
+          assert.equal(summary.status, 'PASS');
+          assert.deepEqual(expiredCalled, ['cs_test_staging_expire_1']);
+          assert.deepEqual(summary.cleanupReport?.expiredCheckoutSessionIds, ['cs_test_staging_expire_1']);
+          assert.deepEqual(summary.cleanupReport?.failedCheckoutSessionIds, []);
+          assert.equal(summary.cleanupReport?.status, 'CLEANED');
+        })
+      );
+
+      // Failure to expire Stripe checkout session must fail cleanup honestly (never silently report CLEANED)
+      const mockStripeFail: any = {
+        checkout: {
+          sessions: {
+            expire: async () => {
+              throw new Error('Stripe session expire timeout');
+            },
+            retrieve: async (id: string) => ({ id, status: 'open' }),
+          },
+        },
+      };
+
+      await withMockEmailTransport(() =>
+        withEnvOverrides(buildLocalStagingEnv(srv.baseUrl), async () => {
+          const summary = await runStagingE2EVerification({ stripeClient: mockStripeFail });
+          assert.equal(summary.status, 'FAIL');
+          assert.equal(summary.cleanupReport?.status, 'PARTIAL_CLEANUP');
+          assert.deepEqual(summary.cleanupReport?.failedCheckoutSessionIds, ['cs_test_staging_expire_1']);
+          const cleanupCheck = summary.checks.find((c) => c.testId === 'S4-STAGING-CLEANUP');
+          assert.equal(cleanupCheck?.status, 'FAIL');
+        })
+      );
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test('8. Cleanup fails S4-STAGING-CLEANUP if /api/auth/me does not return 401 after account deletion', async () => {
+    const repo = new MemoryRepository(false);
+    let accountDeleted = false;
+    const srv = await startEphemeralServer(repo, (req, res) => {
+      if (req.url === '/api/auth/account' && req.method === 'DELETE') {
+        accountDeleted = true;
+      }
+      if (accountDeleted && req.url === '/api/auth/me' && req.method === 'GET') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ user: { id: 'still_alive' } }));
+        return true;
+      }
+      return false;
+    });
+
+    try {
+      await withMockEmailTransport(() =>
+        withEnvOverrides(buildLocalStagingEnv(srv.baseUrl), async () => {
+          const summary = await runStagingE2EVerification();
+          assert.equal(summary.status, 'FAIL');
+          assert.equal(summary.cleanupReport?.status, 'PARTIAL_CLEANUP');
+          assert.ok(summary.cleanupReport?.errors.some((e) => e.includes('returned HTTP 200 instead of 401')));
+          const cleanupCheck = summary.checks.find((c) => c.testId === 'S4-STAGING-CLEANUP');
+          assert.equal(cleanupCheck?.status, 'FAIL');
+        })
+      );
+    } finally {
+      await srv.close();
+    }
+  });
 });
+

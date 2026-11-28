@@ -832,3 +832,421 @@ describe('[CONTRACT / SIMULATED — NOT EXTERNAL PROVIDER] Stage 3 SMTP & Stage 
     }
   });
 });
+
+describe('[HARNESS ACCURACY] Phase B Verifier Corrections (Shopify, Stripe, SMTP)', () => {
+  test('B1: Shopify verifier checks topics + callback URLs, separates local HMAC from live delivery, and verifies productDelete read-back', async () => {
+    const testEncKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+    const buildShopifyFetch = (opts: {
+      missingTopic?: boolean;
+      wrongUrl?: boolean;
+      readAfterDeleteExists?: boolean;
+      deleteThrows?: boolean;
+    }): typeof fetch => {
+      return async (_url, init) => {
+        const body = JSON.parse(String(init?.body || '{}'));
+        const q = String(body.query || '');
+        if (q.includes('shop {')) {
+          return new Response(
+            JSON.stringify({
+              data: { shop: { name: 'Dev Store', myshopifyDomain: 'dev-verify.myshopify.com', currencyCode: 'USD' } },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (q.includes('webhookSubscriptions')) {
+          const allTopics = ['PRODUCTS_CREATE', 'PRODUCTS_UPDATE', 'PRODUCTS_DELETE', 'APP_UNINSTALLED'];
+          const topics = opts.missingTopic ? allTopics.slice(0, 3) : allTopics;
+          const cbUrl = opts.wrongUrl
+            ? 'https://wrong-host.example.com/api/shopify/webhooks'
+            : 'https://staging.aixshop.example.com/api/shopify/webhooks';
+          return new Response(
+            JSON.stringify({
+              data: {
+                webhookSubscriptions: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  edges: topics.map((t, idx) => ({
+                    node: { id: `gid://shopify/WebhookSubscription/${idx + 1}`, topic: t, endpoint: { callbackUrl: cbUrl } },
+                  })),
+                },
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (q.includes('productCreate')) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                productCreate: {
+                  product: { id: 'gid://shopify/Product/999001', title: 'AIXSHOP-VERIFY-1', status: 'DRAFT' },
+                  userErrors: [],
+                },
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (q.includes('productDelete')) {
+          if (opts.deleteThrows) {
+            return new Response('Internal Server Error', { status: 500 });
+          }
+          return new Response(
+            JSON.stringify({
+              data: { productDelete: { deletedProductId: 'gid://shopify/Product/999001', userErrors: [] } },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (q.includes('verifyProductDeleted')) {
+          return new Response(
+            JSON.stringify({
+              data: { product: opts.readAfterDeleteExists ? { id: 'gid://shopify/Product/999001' } : null },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        // products pagination query
+        return new Response(
+          JSON.stringify({
+            data: {
+              products: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                edges: [{ cursor: 'c1', node: makeMockProductNode(1) }],
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      };
+    };
+
+    await withEnvOverrides(
+      {
+        COMMERCIAL_VERIFY_EXTERNAL: 'true',
+        SHOPIFY_API_KEY: 'key_verify',
+        SHOPIFY_API_SECRET: 'secret_verify_123456',
+        SHOPIFY_TOKEN_ENCRYPTION_KEY: testEncKey,
+        SHOPIFY_DEV_STORE_DOMAIN: 'dev-verify.myshopify.com',
+        SHOPIFY_DEV_ACCESS_TOKEN: 'shpat_verify_test_1234',
+        SHOPIFY_WEBHOOK_URL: 'https://staging.aixshop.example.com/api/shopify/webhooks',
+        SHOPIFY_ALLOW_TEST_PRODUCT_MUTATION: 'true',
+      },
+      async () => {
+        // 1. Happy path with verified delete + null read-back
+        const okSummary = await runShopifyExternalVerification({
+          customFetch: buildShopifyFetch({}),
+        });
+        assert.equal(okSummary.checks.find((c) => c.testId === 'S1-WEBHOOK-SUBSCRIPTIONS')?.status, 'PASS');
+        const hmacSim = okSummary.checks.find((c) => c.testId === 'S1-WEBHOOK-HMAC-SIMULATION');
+        assert.equal(hmacSim?.status, 'PASS — SIMULATED');
+        assert.equal(hmacSim?.executionMode, 'contract_fixture');
+        assert.equal(hmacSim?.evidence?.realExternalDeliveryProved, false);
+        assert.equal(okSummary.checks.find((c) => c.testId === 'S1-WEBHOOK-LIVE-DELIVERY')?.status, 'NOT RUN');
+        const prodCheck = okSummary.checks.find((c) => c.testId === 'S1-TEST-PRODUCT-LIFECYCLE');
+        assert.equal(prodCheck?.status, 'PASS');
+        assert.equal(prodCheck?.evidence?.cleanedUp, true);
+        assert.equal(prodCheck?.evidence?.followUpReadConfirmedDeleted, true);
+
+        // 2. Missing topic + wrong callback URL fail S1-WEBHOOK-SUBSCRIPTIONS; non-null read-back fails S1-TEST-PRODUCT-LIFECYCLE
+        const failSummary = await runShopifyExternalVerification({
+          customFetch: buildShopifyFetch({ missingTopic: true, wrongUrl: true, readAfterDeleteExists: true }),
+        });
+        const whFail = failSummary.checks.find((c) => c.testId === 'S1-WEBHOOK-SUBSCRIPTIONS');
+        assert.equal(whFail?.status, 'FAIL');
+        assert.match(whFail?.blockerOrFailure || '', /APP_UNINSTALLED/);
+        assert.match(whFail?.blockerOrFailure || '', /Callback URL mismatch/);
+
+        const cleanFail = failSummary.checks.find((c) => c.testId === 'S1-TEST-PRODUCT-LIFECYCLE');
+        assert.equal(cleanFail?.status, 'FAIL');
+        assert.equal(cleanFail?.evidence?.cleanedUp, false);
+        assert.match(cleanFail?.blockerOrFailure || '', /still exists after deletion/);
+      }
+    );
+  });
+
+  test('B2: Stripe verifier checks Starter & Growth sessions, separates local webhook sim, advances Test Clock, and verifies cleanup', async () => {
+    const createStubStripe = (opts: { failCustomerDelete?: boolean } = {}) => {
+      const calls: string[] = [];
+      let sessionCounter = 0;
+      const client: any = {
+        prices: {
+          retrieve: async (id: string) => {
+            const amounts: Record<string, number> = {
+              price_starter_t: 4900,
+              price_growth_t: 14900,
+              price_enterprise_t: 49900,
+            };
+            return {
+              id,
+              active: true,
+              currency: 'usd',
+              unit_amount: amounts[id] ?? 0,
+              recurring: { interval: 'month' },
+            };
+          },
+        },
+        customers: {
+          create: async (params: any) => ({ id: params.test_clock ? 'cus_clock_1' : 'cus_verify_1' }),
+          del: async (id: string) => {
+            calls.push(`customers.del:${id}`);
+            if (opts.failCustomerDelete) {
+              return { id, deleted: false };
+            }
+            return { id, deleted: true };
+          },
+        },
+        checkout: {
+          sessions: {
+            create: async (params: any) => {
+              sessionCounter++;
+              const sid = `cs_test_stub_${sessionCounter}`;
+              calls.push(`sessions.create:${params.metadata.tier}:${sid}`);
+              return {
+                id: sid,
+                url: `https://checkout.stripe.com/c/pay/${sid}`,
+                customer: params.customer,
+                metadata: params.metadata,
+              };
+            },
+            retrieve: async (sid: string) => ({
+              id: sid,
+              customer: 'cus_verify_1',
+              metadata: {
+                workspaceId: sid.endsWith('_1')
+                  ? calls.find((c) => c.includes(sid))?.includes('Starter')
+                    ? undefined
+                    : undefined
+                  : undefined,
+              },
+            }),
+            expire: async (sid: string) => {
+              calls.push(`sessions.expire:${sid}`);
+              return { id: sid, status: 'expired' };
+            },
+          },
+        },
+        webhooks: {
+          signature: {
+            verifyHeaderAsync: async (payload: string, header: string, secret: string) => {
+              const parts = Object.fromEntries(header.split(',').map((p) => p.split('=')));
+              const expected = crypto.createHmac('sha256', secret).update(`${parts.t}.${payload}`).digest('hex');
+              if (parts.v1 !== expected) throw new Error('Invalid signature');
+              return true;
+            },
+          },
+        },
+        testHelpers: {
+          testClocks: {
+            create: async () => {
+              calls.push('testClocks.create');
+              return { id: 'clock_test_1', status: 'ready', frozen_time: 1000 };
+            },
+            advance: async (id: string, params: any) => {
+              calls.push(`testClocks.advance:${id}:${params.frozen_time}`);
+              return { id, status: 'advancing', frozen_time: params.frozen_time };
+            },
+            retrieve: async (id: string) => {
+              calls.push(`testClocks.retrieve:${id}`);
+              return { id, status: 'ready', frozen_time: 5000 };
+            },
+            del: async (id: string) => {
+              calls.push(`testClocks.del:${id}`);
+              return { id, deleted: true };
+            },
+          },
+        },
+        subscriptions: {
+          create: async () => ({
+            id: 'sub_clock_1',
+            status: 'active',
+            current_period_end: 2000,
+            items: { data: [{ id: 'si_1', current_period_end: 2000 }] },
+          }),
+          retrieve: async (id: string) => ({
+            id,
+            status: 'active',
+            current_period_end: 6000,
+            items: { data: [{ id: 'si_1', current_period_end: 6000 }] },
+          }),
+          update: async (id: string, params: any) => ({
+            id,
+            cancel_at_period_end: Boolean(params.cancel_at_period_end),
+            items: { data: [{ id: 'si_1', price: { id: 'price_growth_t' } }] },
+          }),
+          cancel: async (id: string) => ({ id, status: 'canceled' }),
+        },
+        invoices: {
+          list: async () => ({
+            data: [{ id: 'in_renew_1', billing_reason: 'subscription_cycle', status: 'paid' }],
+          }),
+        },
+      };
+
+      // Record created session metadata so retrieve() returns exact workspaceId & tier
+      const sessionMetaMap = new Map<string, any>();
+      client.checkout.sessions.create = async (params: any) => {
+        sessionCounter++;
+        const sid = `cs_test_stub_${sessionCounter}`;
+        sessionMetaMap.set(sid, { customer: params.customer, metadata: params.metadata });
+        calls.push(`sessions.create:${params.metadata.tier}:${sid}`);
+        return {
+          id: sid,
+          url: `https://checkout.stripe.com/c/pay/${sid}`,
+          customer: params.customer,
+          metadata: params.metadata,
+        };
+      };
+      client.checkout.sessions.retrieve = async (sid: string) => {
+        const stored = sessionMetaMap.get(sid);
+        return { id: sid, customer: stored.customer, metadata: stored.metadata };
+      };
+
+      return { client, calls };
+    };
+
+    await withEnvOverrides(
+      {
+        COMMERCIAL_VERIFY_EXTERNAL: 'true',
+        STRIPE_SECRET_KEY: 'sk_test_stub_verifier_001',
+        STRIPE_WEBHOOK_SECRET: 'whsec_stub_verifier_001',
+        STRIPE_PRICE_STARTER: 'price_starter_t',
+        STRIPE_PRICE_GROWTH: 'price_growth_t',
+        STRIPE_PRICE_ENTERPRISE: 'price_enterprise_t',
+        STRIPE_TEST_CLOCK_ENABLED: 'true',
+      },
+      async () => {
+        const ok = createStubStripe();
+        const summary = await runStripeExternalVerification({
+          stripeClient: ok.client,
+          testClockPollIntervalMs: 1,
+          testClockTimeoutMs: 500,
+        });
+
+        const checkoutCheck = summary.checks.find((c) => c.testId === 'S2-CHECKOUT-SESSION');
+        assert.equal(checkoutCheck?.status, 'PASS');
+        assert.equal((checkoutCheck?.evidence?.sessionsVerified as any[])?.length, 2);
+
+        const whSim = summary.checks.find((c) => c.testId === 'S2-WEBHOOK-LOCAL-SIMULATION');
+        assert.equal(whSim?.status, 'PASS — SIMULATED');
+        assert.equal(whSim?.executionMode, 'contract_fixture');
+        assert.equal(whSim?.evidence?.realExternalWebhookDeliveryProved, false);
+        assert.equal(summary.checks.find((c) => c.testId === 'S2-WEBHOOK-LIVE-DELIVERY')?.status, 'NOT RUN');
+
+        const clockCheck = summary.checks.find((c) => c.testId === 'S2-TEST-CLOCK-RENEWAL');
+        assert.equal(clockCheck?.status, 'PASS');
+        assert.equal(clockCheck?.evidence?.renewalInvoiceId, 'in_renew_1');
+        assert.ok(ok.calls.some((c) => c.startsWith('testClocks.advance:clock_test_1:')));
+
+        const cleanCheck = summary.checks.find((c) => c.testId === 'S2-STRIPE-CLEANUP');
+        assert.equal(cleanCheck?.status, 'PASS');
+        assert.equal((cleanCheck?.evidence?.expiredSessions as string[]).length, 2);
+        assert.equal((cleanCheck?.evidence?.deletedCustomers as string[]).length, 2);
+        assert.equal((cleanCheck?.evidence?.deletedClocks as string[]).length, 1);
+
+        // Cleanup failure must fail S2-STRIPE-CLEANUP honestly
+        const failClean = createStubStripe({ failCustomerDelete: true });
+        const failSummary = await runStripeExternalVerification({
+          stripeClient: failClean.client,
+          testClockPollIntervalMs: 1,
+          testClockTimeoutMs: 500,
+        });
+        assert.equal(failSummary.status, 'FAIL');
+        assert.equal(failSummary.checks.find((c) => c.testId === 'S2-STRIPE-CLEANUP')?.status, 'FAIL');
+      }
+    );
+  });
+
+  test('B3: SMTP verifier validates recipient, records 250 + Message-ID, and keeps S3-INBOX-DELIVERY as NOT RUN', async () => {
+    const smtpServer = net.createServer((sock) => {
+      sock.write('220 smtp.local ESMTP ready\r\n');
+      let buf = '';
+      let inData = false;
+      sock.on('data', (chunk) => {
+        buf += chunk.toString('utf8');
+        if (inData) {
+          if (buf.includes('\r\n.\r\n')) {
+            inData = false;
+            buf = '';
+            sock.write('250 2.0.0 OK queued as msg-smtp-test-250\r\n');
+          }
+          return;
+        }
+        while (buf.includes('\r\n')) {
+          const idx = buf.indexOf('\r\n');
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          if (line.startsWith('EHLO')) sock.write('250-smtp.local\r\n250 AUTH PLAIN\r\n');
+          else if (line.startsWith('AUTH PLAIN')) sock.write('235 2.7.0 Authentication successful\r\n');
+          else if (line.startsWith('MAIL FROM')) sock.write('250 2.1.0 Originator ok\r\n');
+          else if (line.startsWith('RCPT TO')) sock.write('250 2.1.5 Recipient ok\r\n');
+          else if (line === 'DATA') {
+            inData = true;
+            sock.write('354 Start mail input\r\n');
+            break;
+          } else if (line.startsWith('QUIT')) {
+            sock.write('221 2.0.0 Bye\r\n');
+            sock.end();
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve) => smtpServer.listen(0, '127.0.0.1', () => resolve()));
+    const port = (smtpServer.address() as net.AddressInfo).port;
+
+    try {
+      // 1. Invalid SMTP_TEST_RECIPIENT fails S3-CONFIG-POLICY and blocks downstream
+      await withEnvOverrides(
+        {
+          COMMERCIAL_VERIFY_EXTERNAL: 'true',
+          SMTP_HOST: '127.0.0.1',
+          SMTP_PORT: String(port),
+          SMTP_SECURE: 'false',
+          SMTP_STARTTLS: 'false',
+          SMTP_USER: 'mailer@example.com',
+          SMTP_PASS: 'SmtpVerifyPass!99',
+          SMTP_FROM: 'no-reply@aixshop.example.com',
+          SMTP_TEST_RECIPIENT: 'not-an-email',
+        },
+        async () => {
+          const badRecip = await runSmtpExternalVerification();
+          assert.equal(badRecip.status, 'FAIL');
+          assert.equal(badRecip.checks.find((c) => c.testId === 'S3-CONFIG-POLICY')?.status, 'FAIL');
+          assert.equal(badRecip.checks.find((c) => c.testId === 'S3-SMOKE-SEND')?.status, 'BLOCKED');
+        }
+      );
+
+      // 2. Valid local SMTP smoke send records 250 + Message-ID while S3-INBOX-DELIVERY stays NOT RUN
+      await withEnvOverrides(
+        {
+          COMMERCIAL_VERIFY_EXTERNAL: 'true',
+          SMTP_HOST: '127.0.0.1',
+          SMTP_PORT: String(port),
+          SMTP_SECURE: 'false',
+          SMTP_STARTTLS: 'false',
+          SMTP_USER: 'mailer@example.com',
+          SMTP_PASS: 'SmtpVerifyPass!99',
+          SMTP_FROM: 'no-reply@aixshop.example.com',
+          SMTP_TEST_RECIPIENT: 'controlled-inbox@example.com',
+        },
+        async () => {
+          const okSmtp = await runSmtpExternalVerification();
+          assert.equal(okSmtp.checks.find((c) => c.testId === 'S3-CONFIG-POLICY')?.status, 'PASS');
+          assert.equal(okSmtp.checks.find((c) => c.testId === 'S3-HANDSHAKE-AUTH')?.status, 'PASS');
+          const smoke = okSmtp.checks.find((c) => c.testId === 'S3-SMOKE-SEND');
+          assert.equal(smoke?.status, 'PASS');
+          assert.equal(smoke?.evidence?.smtpResponseCode, 250);
+          assert.ok(smoke?.evidence?.messageId);
+          assert.equal(smoke?.evidence?.inbox_delivery_confirmed, false);
+
+          const inbox = okSmtp.checks.find((c) => c.testId === 'S3-INBOX-DELIVERY');
+          assert.equal(inbox?.status, 'NOT RUN');
+          assert.equal(inbox?.evidence?.inbox_delivery_confirmed, false);
+        }
+      );
+    } finally {
+      await new Promise<void>((resolve) => smtpServer.close(() => resolve()));
+    }
+  });
+});
+

@@ -26,6 +26,9 @@ export interface CleanupReport {
   deletedUserIds: string[];
   deletedWorkspaceIds: string[];
   preservedSharedWorkspaceIds: string[];
+  expiredCheckoutSessionIds?: string[];
+  failedCheckoutSessionIds?: string[];
+  verifiedSessionInvalidations?: string[];
   warnings: string[];
   errors: string[];
 }
@@ -64,6 +67,7 @@ export interface StageVerificationSummary {
   status: VerificationStatus;
   counts: {
     pass: number;
+    simulated?: number;
     fail: number;
     blocked: number;
     notRun: number;
@@ -147,6 +151,21 @@ export function redactSecrets(input: unknown): string {
     const val = process.env[name];
     if (val && val.trim().length >= 4) {
       text = text.split(val).join(`[REDACTED_${name}]`);
+    }
+  }
+
+  const smtpPass = process.env.SMTP_PASS || '';
+  const smtpUser = process.env.SMTP_USER?.trim() || '';
+  if (smtpPass) {
+    const loginB64 = Buffer.from(smtpPass, 'utf8').toString('base64');
+    if (loginB64) {
+      text = text.split(loginB64).join('[REDACTED_SMTP_AUTH]');
+    }
+    if (smtpUser) {
+      const plainB64 = Buffer.from(`\0${smtpUser}\0${smtpPass}`, 'utf8').toString('base64');
+      if (plainB64) {
+        text = text.split(plainB64).join('[REDACTED_SMTP_AUTH]');
+      }
     }
   }
 
@@ -258,17 +277,9 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
   const stagingNotes: string[] = [];
   if (!externalActivated) stagingMissing.push('COMMERCIAL_VERIFY_EXTERNAL=true');
   const stagingUrl = process.env.STAGING_BASE_URL?.trim() || '';
-  if (!stagingUrl) {
-    stagingMissing.push('STAGING_BASE_URL');
-  } else {
-    try {
-      const parsed = new URL(stagingUrl);
-      if (parsed.protocol !== 'https:' && process.env.STAGING_ALLOW_LOCAL !== 'true') {
-        stagingMissing.push('STAGING_BASE_URL (must be https:// unless STAGING_ALLOW_LOCAL=true)');
-      }
-    } catch {
-      stagingMissing.push('STAGING_BASE_URL (invalid URL)');
-    }
+  const stagingUrlCheck = validateStagingBaseUrlNonProduction(stagingUrl);
+  if (!stagingUrlCheck.valid) {
+    stagingMissing.push(stagingUrlCheck.reason || 'STAGING_BASE_URL');
   }
   if ((process.env.STAGING_CONFIRM_NON_PRODUCTION || '').trim().toLowerCase() !== 'true') {
     stagingMissing.push('STAGING_CONFIRM_NON_PRODUCTION=true');
@@ -353,6 +364,72 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
   };
 }
 
+export function validateStagingBaseUrlNonProduction(rawUrl: string | undefined): {
+  valid: boolean;
+  isProductionTarget: boolean;
+  normalizedUrl?: string;
+  reason?: string;
+} {
+  const trimmed = rawUrl?.trim() || '';
+  if (!trimmed) {
+    return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL' };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (invalid URL)' };
+  }
+
+  if (parsed.username || parsed.password) {
+    return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (must not contain embedded credentials)' };
+  }
+
+  if (parsed.protocol !== 'https:' && process.env.STAGING_ALLOW_LOCAL !== 'true') {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      reason: 'STAGING_BASE_URL (must be https:// unless STAGING_ALLOW_LOCAL=true)',
+    };
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const isProdHostname =
+    /^(?:www\.|app\.|api\.)?aixshop\.(?:io|com|app)$/.test(host) ||
+    /^prod(?:uction)?\./.test(host);
+
+  if (isProdHostname) {
+    return {
+      valid: false,
+      isProductionTarget: true,
+      reason: `STAGING_BASE_URL (${host}) appears to be a production domain and is refused for destructive staging tests`,
+    };
+  }
+
+  const prodAppUrl = process.env.APP_URL?.trim();
+  if (process.env.NODE_ENV === 'production' && prodAppUrl && prodAppUrl !== 'MY_APP_URL') {
+    try {
+      const parsedProd = new URL(prodAppUrl);
+      if (parsedProd.origin === parsed.origin) {
+        return {
+          valid: false,
+          isProductionTarget: true,
+          reason: `STAGING_BASE_URL matches production APP_URL origin (${parsed.origin})`,
+        };
+      }
+    } catch {
+      // ignore invalid APP_URL
+    }
+  }
+
+  return {
+    valid: true,
+    isProductionTarget: false,
+    normalizedUrl: trimmed.replace(/\/+$/, ''),
+  };
+}
+
 export function summarizeStage(
   stage: CommercialStageId,
   title: string,
@@ -360,6 +437,7 @@ export function summarizeStage(
   missingEnvVars: string[] = []
 ): StageVerificationSummary {
   const pass = checks.filter((c) => c.status === 'PASS').length;
+  const simulated = checks.filter((c) => c.status === 'PASS — SIMULATED').length;
   const fail = checks.filter((c) => c.status === 'FAIL').length;
   const blocked = checks.filter((c) => c.status === 'BLOCKED').length;
   const notRun = checks.filter((c) => c.status === 'NOT RUN').length;
@@ -367,19 +445,19 @@ export function summarizeStage(
   let status: VerificationStatus = 'NOT RUN';
   if (fail > 0) {
     status = 'FAIL';
-  } else if (blocked > 0 && pass === 0) {
-    status = 'BLOCKED';
   } else if (blocked > 0) {
     status = 'BLOCKED';
   } else if (pass > 0 && notRun === 0) {
     status = 'PASS';
+  } else if (pass === 0 && simulated > 0 && notRun === 0) {
+    status = 'PASS — SIMULATED';
   }
 
   return {
     stage,
     title,
     status,
-    counts: { pass, fail, blocked, notRun, total: checks.length },
+    counts: { pass, simulated, fail, blocked, notRun, total: checks.length },
     missingEnvVars,
     checks,
   };
@@ -388,7 +466,11 @@ export function summarizeStage(
 export function computeOverallStatus(stages: StageVerificationSummary[]): VerificationStatus {
   if (stages.some((s) => s.status === 'FAIL')) return 'FAIL';
   if (stages.some((s) => s.status === 'BLOCKED')) return 'BLOCKED';
+  if (stages.some((s) => s.status === 'NOT RUN')) return 'NOT RUN';
   if (stages.every((s) => s.status === 'PASS') && stages.length > 0) return 'PASS';
+  if (stages.every((s) => s.status === 'PASS' || s.status === 'PASS — SIMULATED') && stages.length > 0) {
+    return 'PASS — SIMULATED';
+  }
   return 'NOT RUN';
 }
 
@@ -408,7 +490,7 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   lines.push(`- **Cleanup Performed:** ${report.cleanupPerformed ? 'Yes' : 'No (no external test artifacts created or skipped)'}`);
   lines.push('');
   lines.push('## Status Model');
-  lines.push('- `PASS`: Executed against the intended target with verifiable evidence.');
+  lines.push('- `PASS`: Executed against the intended real target with verifiable evidence.');
   lines.push('- `PASS — SIMULATED`: Executed end-to-end using local mocks, fixtures, or test doubles only (never live external providers).');
   lines.push('- `FAIL`: Executed and failed.');
   lines.push('- `BLOCKED`: Cannot execute because required credentials, targets, or opt-in activation are missing.');
@@ -416,12 +498,12 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   lines.push('');
   lines.push('## Stage Readiness Summary');
   lines.push('');
-  lines.push('| Stage | Status | Pass | Fail | Blocked | Not Run | Missing / Blocking Prerequisites |');
-  lines.push('| --- | --- | ---: | ---: | ---: | ---: | --- |');
+  lines.push('| Stage | Status | Pass | Simulated | Fail | Blocked | Not Run | Missing / Blocking Prerequisites |');
+  lines.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |');
   for (const s of report.stages) {
     const missing = s.missingEnvVars.length > 0 ? s.missingEnvVars.map((v) => `\`${v}\``).join(', ') : 'None';
     lines.push(
-      `| ${s.title} | **${s.status}** | ${s.counts.pass} | ${s.counts.fail} | ${s.counts.blocked} | ${s.counts.notRun} | ${missing} |`
+      `| ${s.title} | **${s.status}** | ${s.counts.pass} | ${s.counts.simulated ?? 0} | ${s.counts.fail} | ${s.counts.blocked} | ${s.counts.notRun} | ${missing} |`
     );
   }
   lines.push('');
@@ -430,15 +512,19 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   for (const s of report.stages) {
     lines.push(`### ${s.title} (${s.status})`);
     lines.push('');
-    lines.push('| Test ID | Check | Execution Mode | Status | Blocker / Evidence |');
-    lines.push('| --- | --- | --- | --- | --- |');
+    lines.push('| Test ID | Check | Target Environment | Execution Mode | Timestamp (UTC) | Duration (ms) | Result | Evidence | Blocker / Failure |');
+    lines.push('| --- | --- | --- | --- | --- | ---: | --- | --- | --- |');
     for (const c of s.checks) {
-      const detail = c.blockerOrFailure
-        ? redactSecrets(c.blockerOrFailure)
-        : c.evidence
-        ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence)))
+      const evidenceText = c.evidence
+        ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence))).replace(/\|/g, '\\|')
         : '—';
-      lines.push(`| \`${c.testId}\` | ${c.name} | \`${c.executionMode}\` | **${c.status}** | ${detail.replace(/\|/g, '\\|')} |`);
+      const blockerText = c.blockerOrFailure
+        ? redactSecrets(c.blockerOrFailure).replace(/\|/g, '\\|')
+        : '—';
+      const durText = typeof c.durationMs === 'number' ? String(c.durationMs) : '—';
+      lines.push(
+        `| \`${c.testId}\` | ${c.name} | \`${c.targetEnvironment}\` | \`${c.executionMode}\` | \`${c.executedAt}\` | ${durText} | **${c.status}** | ${evidenceText} | ${blockerText} |`
+      );
     }
     lines.push('');
   }
@@ -446,15 +532,17 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   if (report.simulatedChecks && report.simulatedChecks.length > 0) {
     lines.push('## Simulated Integration & Customer Journey Checks (`PASS — SIMULATED`)');
     lines.push('');
-    lines.push('| Test ID | Check | Execution Mode | Status | Evidence |');
-    lines.push('| --- | --- | --- | --- | --- |');
+    lines.push('| Test ID | Check | Target Environment | Execution Mode | Timestamp (UTC) | Result | Evidence |');
+    lines.push('| --- | --- | --- | --- | --- | --- | --- |');
     for (const c of report.simulatedChecks) {
       const detail = c.blockerOrFailure
         ? redactSecrets(c.blockerOrFailure)
         : c.evidence
         ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence)))
         : '—';
-      lines.push(`| \`${c.testId}\` | ${c.name} | \`${c.executionMode}\` | **${c.status}** | ${detail.replace(/\|/g, '\\|')} |`);
+      lines.push(
+        `| \`${c.testId}\` | ${c.name} | \`${c.targetEnvironment}\` | \`${c.executionMode}\` | \`${c.executedAt}\` | **${c.status}** | ${detail.replace(/\|/g, '\\|')} |`
+      );
     }
     lines.push('');
   }
@@ -468,8 +556,17 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
     lines.push(`- **Tracked Users:** ${cleanup.trackedResources.userIds.length} (\`${cleanup.trackedResources.userIds.join(', ') || 'none'}\`)`);
     lines.push(`- **Tracked Workspaces:** ${cleanup.trackedResources.workspaceIds.length} (\`${cleanup.trackedResources.workspaceIds.join(', ') || 'none'}\`)`);
     lines.push(`- **Tracked Checkout Sessions:** ${cleanup.trackedResources.checkoutSessionIds.length}`);
+    if (cleanup.expiredCheckoutSessionIds) {
+      lines.push(`- **Expired Stripe Checkout Sessions:** ${cleanup.expiredCheckoutSessionIds.length} (\`${cleanup.expiredCheckoutSessionIds.join(', ') || 'none'}\`)`);
+    }
+    if (cleanup.failedCheckoutSessionIds && cleanup.failedCheckoutSessionIds.length > 0) {
+      lines.push(`- **Failed Checkout Session Expirations:** ${cleanup.failedCheckoutSessionIds.length} (\`${cleanup.failedCheckoutSessionIds.join(', ')}\`)`);
+    }
     lines.push(`- **Deleted Users:** ${cleanup.deletedUserIds.length} (\`${cleanup.deletedUserIds.join(', ') || 'none'}\`)`);
     lines.push(`- **Deleted Workspaces:** ${cleanup.deletedWorkspaceIds.length} (\`${cleanup.deletedWorkspaceIds.join(', ') || 'none'}\`)`);
+    if (cleanup.verifiedSessionInvalidations) {
+      lines.push(`- **Verified Session Invalidations:** ${cleanup.verifiedSessionInvalidations.length}`);
+    }
     if (cleanup.warnings.length > 0) {
       lines.push(`- **Warnings:** ${cleanup.warnings.map((w) => redactSecrets(w)).join('; ')}`);
     }

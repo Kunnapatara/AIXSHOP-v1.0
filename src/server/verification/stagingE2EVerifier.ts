@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import Stripe from 'stripe';
 import {
   VerificationCheckResult,
   StageVerificationSummary,
@@ -7,10 +8,13 @@ import {
   summarizeStage,
   redactSecrets,
   isStripeLiveKey,
+  isStripeTestKey,
+  validateStagingBaseUrlNonProduction,
 } from './statusModel';
 
 export interface StagingE2EOptions {
   targetEnvironment?: string;
+  stripeClient?: Stripe;
 }
 
 const ALL_STAGING_CHECK_DEFS: Array<{ testId: string; name: string; purpose: string }> = [
@@ -103,13 +107,48 @@ interface TrackedRunResources {
     userId: string;
     workspaceId: string;
     email: string;
+    password?: string;
     cookie: string;
   }>;
 }
 
+async function expireStripeCheckoutSession(
+  stripe: Stripe,
+  sessionId: string
+): Promise<{ expired: boolean; error?: string }> {
+  try {
+    const expired = await stripe.checkout.sessions.expire(sessionId);
+    if (expired.status === 'expired') {
+      return { expired: true };
+    }
+    return {
+      expired: false,
+      error: `Checkout Session ${sessionId} returned unexpected status ${expired.status} after expire()`,
+    };
+  } catch (err: any) {
+    // If already expired or completed, inspect current status cleanly
+    try {
+      const existing = await stripe.checkout.sessions.retrieve(sessionId);
+      if (existing.status === 'expired') {
+        return { expired: true };
+      }
+      return {
+        expired: false,
+        error: `Checkout Session ${sessionId} could not be expired (status=${existing.status}): ${redactSecrets(err)}`,
+      };
+    } catch (retrieveErr: any) {
+      return {
+        expired: false,
+        error: `Failed expiring Checkout Session ${sessionId}: ${redactSecrets(retrieveErr || err)}`,
+      };
+    }
+  }
+}
+
 async function executeStagingCleanup(
   stagingBase: string,
-  tracked: TrackedRunResources
+  tracked: TrackedRunResources,
+  options: StagingE2EOptions = {}
 ): Promise<CleanupReport> {
   const enabled = isCleanupEnabled();
   const report: CleanupReport = {
@@ -124,11 +163,18 @@ async function executeStagingCleanup(
     deletedUserIds: [],
     deletedWorkspaceIds: [],
     preservedSharedWorkspaceIds: [],
+    expiredCheckoutSessionIds: [],
+    failedCheckoutSessionIds: [],
+    verifiedSessionInvalidations: [],
     warnings: [],
     errors: [],
   };
 
-  if (tracked.accounts.length === 0 && tracked.userIds.length === 0) {
+  if (
+    tracked.accounts.length === 0 &&
+    tracked.userIds.length === 0 &&
+    tracked.checkoutSessionIds.length === 0
+  ) {
     report.status = enabled ? 'NONE_CREATED' : 'SKIPPED_DISABLED';
     return report;
   }
@@ -136,14 +182,42 @@ async function executeStagingCleanup(
   if (!enabled) {
     report.status = 'SKIPPED_DISABLED';
     report.warnings.push(
-      `STAGING_CLEANUP_ENABLED=false; left ${tracked.accounts.length} test account(s) intact for manual inspection.`
+      `STAGING_CLEANUP_ENABLED=false; left ${tracked.accounts.length} test account(s) and ${tracked.checkoutSessionIds.length} checkout session(s) intact for manual inspection.`
     );
     return report;
   }
 
+  // 1. Expire tracked real Stripe Checkout Sessions (cs_test_...); skip sandbox sbx_cs_... IDs cleanly
+  const stripeTestSessionIds = tracked.checkoutSessionIds.filter((id) => id.startsWith('cs_test_'));
+  if (stripeTestSessionIds.length > 0) {
+    const stripeKey = process.env.STRIPE_SECRET_KEY?.trim() || '';
+    const stripe =
+      options.stripeClient || (isStripeTestKey(stripeKey) ? new Stripe(stripeKey) : null);
+
+    if (!stripe) {
+      for (const sid of stripeTestSessionIds) {
+        report.failedCheckoutSessionIds!.push(sid);
+      }
+      report.errors.push(
+        `Unable to expire ${stripeTestSessionIds.length} Stripe Test Checkout Session(s): no sk_test_ Stripe client available.`
+      );
+    } else {
+      for (const sid of stripeTestSessionIds) {
+        const res = await expireStripeCheckoutSession(stripe, sid);
+        if (res.expired) {
+          report.expiredCheckoutSessionIds!.push(sid);
+        } else {
+          report.failedCheckoutSessionIds!.push(sid);
+          report.errors.push(res.error || `Failed expiring Checkout Session ${sid}`);
+        }
+      }
+    }
+  }
+
+  // 2. Delete created test accounts (never pre-existing users or shared workspaces) & verify invalidation
   for (const acct of tracked.accounts) {
     if (!acct.cookie) {
-      report.warnings.push(`Account ${acct.label} (${acct.userId}) had no session cookie for self-cleanup.`);
+      report.errors.push(`Account ${acct.label} (${acct.userId}) had no session cookie for self-cleanup.`);
       continue;
     }
     try {
@@ -165,15 +239,29 @@ async function executeStagingCleanup(
           report.preservedSharedWorkspaceIds.push(...delRes.body.preservedSharedWorkspaceIds);
         }
 
-        // Verify post-delete session invalidation (idempotent verification)
+        // Strictly verify post-delete session invalidation
         const postCheck = await httpJson(`${stagingBase}/api/auth/me`, { cookie: acct.cookie });
         if (postCheck.status !== 401) {
-          report.warnings.push(
-            `Account ${acct.label} (${acct.userId}) deleted, but /api/auth/me returned HTTP ${postCheck.status} instead of 401.`
+          report.errors.push(
+            `Account ${acct.label} (${acct.userId}) deleted, but GET /api/auth/me returned HTTP ${postCheck.status} instead of 401.`
           );
+        } else {
+          report.verifiedSessionInvalidations!.push(acct.userId);
+        }
+
+        // Verify deleted account can no longer authenticate via POST /api/auth/login
+        if (acct.password) {
+          const postLogin = await httpJson(`${stagingBase}/api/auth/login`, {
+            method: 'POST',
+            body: JSON.stringify({ email: acct.email, password: acct.password }),
+          });
+          if (postLogin.status !== 401) {
+            report.errors.push(
+              `Account ${acct.label} (${acct.userId}) deleted, but POST /api/auth/login returned HTTP ${postLogin.status} instead of 401.`
+            );
+          }
         }
       } else if (delRes.status === 401 || delRes.status === 404) {
-        // Idempotent cleanup: session/account may already have been deleted earlier
         report.warnings.push(
           `Account ${acct.label} (${acct.userId}) DELETE /api/auth/account returned HTTP ${delRes.status} (already deleted or session invalidated).`
         );
@@ -190,16 +278,19 @@ async function executeStagingCleanup(
     }
   }
 
-  if (report.errors.length === 0 && report.deletedUserIds.length === tracked.accounts.length) {
+  const allAccountsDeleted = report.deletedUserIds.length === tracked.accounts.length;
+  const allStripeExpired =
+    (report.failedCheckoutSessionIds?.length || 0) === 0 &&
+    (report.expiredCheckoutSessionIds?.length || 0) === stripeTestSessionIds.length;
+  const anyCleaned =
+    report.deletedUserIds.length > 0 || (report.expiredCheckoutSessionIds?.length || 0) > 0;
+
+  if (report.errors.length === 0 && allAccountsDeleted && allStripeExpired && report.warnings.length === 0) {
     report.status = 'CLEANED';
-  } else if (report.deletedUserIds.length > 0 && report.errors.length > 0) {
+  } else if (anyCleaned) {
     report.status = 'PARTIAL_CLEANUP';
-  } else if (report.errors.length > 0) {
-    report.status = 'FAILED';
-  } else if (report.warnings.length > 0 && report.deletedUserIds.length < tracked.accounts.length) {
-    report.status = report.deletedUserIds.length > 0 ? 'PARTIAL_CLEANUP' : 'CLEANED';
   } else {
-    report.status = 'CLEANED';
+    report.status = 'FAILED';
   }
 
   return report;
@@ -232,6 +323,41 @@ export async function runStagingE2EVerification(
       'Stage 4 — Staging End-to-End Customer Journey',
       failedChecks,
       ['STRIPE_SECRET_KEY (must be sk_test_...)']
+    );
+    summary.cleanupReport = {
+      enabled: cleanupEnabled,
+      status: 'NONE_CREATED',
+      trackedResources: { userIds: [], workspaceIds: [], checkoutSessionIds: [], testEmails: [] },
+      deletedUserIds: [],
+      deletedWorkspaceIds: [],
+      preservedSharedWorkspaceIds: [],
+      warnings: [],
+      errors: [],
+    };
+    return summary;
+  }
+
+  const baseUrlGuard = validateStagingBaseUrlNonProduction(process.env.STAGING_BASE_URL);
+  if (baseUrlGuard.isProductionTarget) {
+    const failedChecks: VerificationCheckResult[] = ALL_STAGING_CHECK_DEFS.map((def, idx) => ({
+      testId: def.testId,
+      stage: 'stage_4_staging_e2e',
+      name: def.name,
+      purpose: def.purpose,
+      status: idx === 0 ? 'FAIL' : 'BLOCKED',
+      executionMode: 'staging_e2e',
+      targetEnvironment: targetEnv,
+      executedAt: nowIso(),
+      blockerOrFailure:
+        idx === 0
+          ? `PRODUCTION_TARGET_REJECTED: ${baseUrlGuard.reason}`
+          : 'Blocked by non-production STAGING_BASE_URL safety guard.',
+    }));
+    const summary = summarizeStage(
+      'stage_4_staging_e2e',
+      'Stage 4 — Staging End-to-End Customer Journey',
+      failedChecks,
+      ['STAGING_BASE_URL (must point to a non-production staging target)']
     );
     summary.cleanupReport = {
       enabled: cleanupEnabled,
@@ -382,6 +508,7 @@ export async function runStagingE2EVerification(
           userId: userIdA,
           workspaceId: workspaceIdA,
           email: testEmailA,
+          password: testPassword,
           cookie: sessionCookieA,
         });
 
@@ -414,6 +541,7 @@ export async function runStagingE2EVerification(
           userId: userIdB,
           workspaceId: workspaceIdB,
           email: testEmailB,
+          password: testPassword,
           cookie: sessionCookieB,
         });
 
@@ -802,8 +930,23 @@ export async function runStagingE2EVerification(
           if (checkout.status !== 200 || !checkout.body?.checkoutUrl) {
             throw new Error(`Staging checkout-session returned HTTP ${checkout.status}`);
           }
+          try {
+            new URL(String(checkout.body.checkoutUrl));
+          } catch {
+            throw new Error(`Staging checkout-session returned invalid checkoutUrl: ${checkout.body.checkoutUrl}`);
+          }
           if (checkout.body?.sessionId) {
             tracked.checkoutSessionIds.push(String(checkout.body.sessionId));
+          }
+
+          // Negative: invalid/tampered tier must be rejected
+          const badTier = await httpJson(`${stagingBase}/api/billing/checkout-session`, {
+            method: 'POST',
+            cookie: sessionCookieA,
+            body: JSON.stringify({ tier: 'InvalidTier' }),
+          });
+          if (badTier.status !== 400) {
+            throw new Error(`Expected 400 for invalid checkout tier, got ${badTier.status}`);
           }
 
           // Negative: invalid Stripe webhook signature
@@ -869,6 +1012,7 @@ export async function runStagingE2EVerification(
             evidence: {
               checkoutProvider: checkout.body.provider,
               checkoutSessionId: checkout.body.sessionId,
+              invalidTierRejectedStatus: badTier.status,
               billingEmailDeliveriesStatus: emailLogRes.status,
               shopifyWriteBackHistoryStatus: wbHistRes.status,
               invalidStripeWebhookStatus: badStripeWh.status,
@@ -905,6 +1049,15 @@ export async function runStagingE2EVerification(
         if (forgot.status !== 200) {
           throw new Error(`Staging /api/auth/forgot-password returned HTTP ${forgot.status}`);
         }
+        const forgotUnknown = await httpJson(`${stagingBase}/api/auth/forgot-password`, {
+          method: 'POST',
+          body: JSON.stringify({ email: `nonexistent-${runSuffix}@example.com` }),
+        });
+        if (forgotUnknown.status !== 200) {
+          throw new Error(
+            `Staging /api/auth/forgot-password failed non-enumeration check for nonexistent email: HTTP ${forgotUnknown.status}`
+          );
+        }
         checks.push({
           testId: 'S4-SMTP-FORGOT-PASSWORD',
           stage: 'stage_4_staging_e2e',
@@ -917,6 +1070,7 @@ export async function runStagingE2EVerification(
           durationMs: Date.now() - t0,
           evidence: {
             forgotPasswordStatus: forgot.status,
+            nonexistentEmailStatus: forgotUnknown.status,
             nonEnumerationPreserved: true,
           },
         });
@@ -936,7 +1090,7 @@ export async function runStagingE2EVerification(
       }
     }
   } finally {
-    cleanupReport = await executeStagingCleanup(stagingBase, tracked);
+    cleanupReport = await executeStagingCleanup(stagingBase, tracked, options);
   }
 
   // Check 7: Deterministic Cleanup Check
@@ -971,6 +1125,9 @@ export async function runStagingE2EVerification(
               cleanupStatus: cleanupReport.status,
               deletedUserIds: cleanupReport.deletedUserIds,
               deletedWorkspaceIds: cleanupReport.deletedWorkspaceIds,
+              expiredCheckoutSessionIds: cleanupReport.expiredCheckoutSessionIds || [],
+              failedCheckoutSessionIds: cleanupReport.failedCheckoutSessionIds || [],
+              verifiedSessionInvalidations: cleanupReport.verifiedSessionInvalidations || [],
               checkoutSessionIdsTracked: cleanupReport.trackedResources.checkoutSessionIds.length,
             },
           }),

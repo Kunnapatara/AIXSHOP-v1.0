@@ -18,6 +18,11 @@ export interface EmailDeliveryResult {
   smtp_connection_verified?: boolean;
   smtp_message_accepted?: boolean;
   inbox_delivery_confirmed?: false;
+  tlsNegotiated?: boolean;
+  tlsProtocol?: string | null;
+  authMechanism?: string | null;
+  smtpResponseCode?: number | null;
+  smtpResponseText?: string | null;
 }
 
 export interface SentEmailRecord extends OutgoingEmail {
@@ -49,6 +54,9 @@ export interface SmtpReadinessReport {
   inbox_delivery_confirmed: false;
   checkedAt: string;
   config: SmtpConfigValidationResult;
+  tlsNegotiated?: boolean;
+  tlsProtocol?: string | null;
+  authMechanism?: string | null;
   connectionError?: string;
 }
 
@@ -274,6 +282,11 @@ interface SmtpSessionOutcome {
   connectionVerified: boolean;
   messageAccepted: boolean | null;
   messageId?: string;
+  tlsNegotiated?: boolean;
+  tlsProtocol?: string | null;
+  authMechanism?: string | null;
+  smtpResponseCode?: number | null;
+  smtpResponseText?: string | null;
   error?: string;
 }
 
@@ -315,6 +328,9 @@ async function runSmtpSession(
   return new Promise<SmtpSessionOutcome>((resolve) => {
     let settled = false;
     let connectionVerified = false;
+    let tlsNegotiated = secure;
+    let tlsProtocol: string | null = null;
+    let authMechanism: string | null = null;
     let socket: net.Socket | tls.TLSSocket = secure
       ? tls.connect({
           host,
@@ -497,6 +513,8 @@ async function runSmtpSession(
           });
 
           socket = upgraded;
+          tlsNegotiated = true;
+          tlsProtocol = typeof upgraded.getProtocol === 'function' ? upgraded.getProtocol() : null;
           socket.removeAllListeners('error');
           attachSocketListeners(socket);
 
@@ -509,6 +527,8 @@ async function runSmtpSession(
               error: `SMTP EHLO post-TLS failed: ${ehlo.code}`,
             });
           }
+        } else if (secure && typeof (socket as tls.TLSSocket).getProtocol === 'function') {
+          tlsProtocol = (socket as tls.TLSSocket).getProtocol();
         }
 
         if (user && pass) {
@@ -517,6 +537,7 @@ async function runSmtpSession(
           const supportsLogin = mechanisms.has('LOGIN');
 
           if (supportsLogin && !mechanisms.has('PLAIN')) {
+            authMechanism = 'LOGIN';
             const loginInit = await sendCommand('AUTH LOGIN');
             if (loginInit.code !== 334) {
               return finish({
@@ -545,6 +566,7 @@ async function runSmtpSession(
               });
             }
           } else if (supportsPlain) {
+            authMechanism = 'PLAIN';
             const authToken = Buffer.from(`\0${user}\0${pass}`, 'utf8').toString('base64');
             const authRes = await sendCommand(`AUTH PLAIN ${authToken}`);
             if (authRes.code >= 400) {
@@ -574,6 +596,9 @@ async function runSmtpSession(
             success: true,
             connectionVerified: true,
             messageAccepted: null,
+            tlsNegotiated,
+            tlsProtocol,
+            authMechanism,
           });
         }
 
@@ -630,6 +655,11 @@ async function runSmtpSession(
             success: false,
             connectionVerified,
             messageAccepted: false,
+            tlsNegotiated,
+            tlsProtocol,
+            authMechanism,
+            smtpResponseCode: dataDone.code,
+            smtpResponseText: sanitizeSmtpErrorMessage(dataDone.text),
             error: `SMTP message rejected: ${dataDone.code}`,
           });
         }
@@ -638,8 +668,13 @@ async function runSmtpSession(
         return finish({
           success: true,
           connectionVerified: true,
-          messageAccepted: true,
+          messageAccepted: dataDone.code >= 200 && dataDone.code < 300,
           messageId,
+          tlsNegotiated,
+          tlsProtocol,
+          authMechanism,
+          smtpResponseCode: dataDone.code,
+          smtpResponseText: sanitizeSmtpErrorMessage(dataDone.text),
         });
       } catch (err: any) {
         return finish({
@@ -686,6 +721,9 @@ export async function verifySmtpConnection(
     inbox_delivery_confirmed: false,
     checkedAt,
     config,
+    tlsNegotiated: outcome.tlsNegotiated,
+    tlsProtocol: outcome.tlsProtocol,
+    authMechanism: outcome.authMechanism,
     ...(outcome.success ? {} : { connectionError: outcome.error || 'SMTP connection verification failed.' }),
   };
 }
@@ -732,6 +770,11 @@ async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
       smtp_connection_verified: outcome.connectionVerified,
       smtp_message_accepted: false,
       inbox_delivery_confirmed: false,
+      tlsNegotiated: outcome.tlsNegotiated,
+      tlsProtocol: outcome.tlsProtocol,
+      authMechanism: outcome.authMechanism,
+      smtpResponseCode: outcome.smtpResponseCode,
+      smtpResponseText: outcome.smtpResponseText,
     };
   }
 
@@ -744,6 +787,11 @@ async function sendViaSmtp(email: OutgoingEmail): Promise<EmailDeliveryResult> {
     smtp_message_accepted: Boolean(outcome.messageAccepted),
     // Note: SMTP 250 OK proves relay acceptance only — never claims recipient inbox delivery.
     inbox_delivery_confirmed: false,
+    tlsNegotiated: outcome.tlsNegotiated,
+    tlsProtocol: outcome.tlsProtocol,
+    authMechanism: outcome.authMechanism,
+    smtpResponseCode: outcome.smtpResponseCode,
+    smtpResponseText: outcome.smtpResponseText,
   };
 }
 

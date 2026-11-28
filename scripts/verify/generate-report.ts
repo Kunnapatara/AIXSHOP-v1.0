@@ -120,11 +120,15 @@ async function main() {
         evidence: { suiteFile: 'src/server/commercialVerificationHarness.test.ts' },
       },
     ],
-    cleanupPerformed: stage4.cleanupReport?.status === 'CLEANED',
+    cleanupPerformed:
+      stage4.cleanupReport?.status === 'CLEANED' ||
+      stage1.checks.some((c) => c.testId === 'S1-TEST-PRODUCT-LIFECYCLE' && c.status === 'PASS') ||
+      stage2.checks.some((c) => c.testId === 'S2-STRIPE-CLEANUP' && c.status === 'PASS'),
     cleanupReport: stage4.cleanupReport,
     notes: [
       'Unit and contract tests using mocks/fixtures report PASS — SIMULATED and never count as live external provider verification.',
-      'SMTP relay acceptance (250 OK) is distinct from confirmed recipient inbox delivery.',
+      'Local Shopify/Stripe HMAC & MemoryRepository checks are separated from live external webhook delivery checks (NOT RUN until verified against a deployed callback URL).',
+      'SMTP relay acceptance (250 OK) is distinct from confirmed recipient inbox delivery (S3-INBOX-DELIVERY).',
       'When external credentials or COMMERCIAL_VERIFY_EXTERNAL=true are absent, live provider stages strictly report BLOCKED — never PASS.',
       'Manual browser & live external provider steps are documented in docs/MANUAL_EXTERNAL_VERIFICATION_CHECKLIST.md.',
     ],
@@ -143,7 +147,7 @@ async function main() {
     console.log(`Overall External Status: ${report.overallExternalStatus}`);
     for (const s of report.stages) {
       console.log(
-        `- [${s.status}] ${s.title} (pass=${s.counts.pass}, fail=${s.counts.fail}, blocked=${s.counts.blocked}, not_run=${s.counts.notRun})`
+        `- [${s.status}] ${s.title} (pass=${s.counts.pass}, simulated=${s.counts.simulated ?? 0}, fail=${s.counts.fail}, blocked=${s.counts.blocked}, not_run=${s.counts.notRun})`
       );
     }
   }

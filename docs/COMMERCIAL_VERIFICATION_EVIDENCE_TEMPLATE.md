@@ -37,9 +37,10 @@ Use this template to record verifiable evidence when executing commercial verifi
   - Callback HMAC verification & replay rejection: `<result>`
   - Admin GraphQL shop query response (`myshopifyDomain`, `currencyCode`): `<result>`
   - Paginated product read (`pagesFetched`, `uniqueProductsObserved`, `duplicateCount=0`, `terminatedCleanly`): `<result>`
-  - Live webhook subscriptions verified (`PRODUCTS_CREATE`, `PRODUCTS_UPDATE`, `PRODUCTS_DELETE`, `APP_UNINSTALLED`): `<result>`
-  - Invalid HMAC rejection status (`401`): `<result>`
-  - Cleanup confirmed (any temporary `AIXSHOP-VERIFY-*` products deleted): `<Yes/No/N/A>`
+  - Registered webhook topics & callback URL match (`S1-WEBHOOK-SUBSCRIPTIONS`): `<result>`
+  - Local webhook HMAC simulation (`S1-WEBHOOK-HMAC-SIMULATION` — `PASS — SIMULATED` only): `<result>`
+  - Real deployed Shopify webhook delivery (`S1-WEBHOOK-LIVE-DELIVERY` — `NOT RUN` unless delivered): `<result>`
+  - Cleanup confirmed (temporary `AIXSHOP-VERIFY-*` `productDelete` + follow-up `null` read): `<Yes/No/N/A>`
 
 ---
 
@@ -50,11 +51,11 @@ Use this template to record verifiable evidence when executing commercial verifi
 - **Command:** `npm run verify:stripe`
 - **Evidence IDs / Observed Outputs:**
   - Active Price IDs verified (`Starter`=$49, `Growth`=$149, `Enterprise`=$499): `<price_... IDs>`
-  - Test Checkout Session ID (`cs_test_...`) & host (`checkout.stripe.com`): `<id>`
-  - Webhook Event IDs delivered/processed (`evt_...`): `<checkout.session.completed, customer.subscription.updated, invoice.payment_failed, invoice.payment_succeeded, customer.subscription.deleted>`
-  - Duplicate event idempotency verified (`duplicate`): `<result>`
-  - Test Clock ID (if enabled) & lifecycle transitions: `<clock_... / N/A>`
-  - Cleanup confirmed (test customers/sessions/clocks deleted): `<Yes/No>`
+  - Test Checkout Sessions verified (`Starter` & `Growth` `cs_test_...`, customer, metadata, `checkout.stripe.com` URL): `<ids>`
+  - Local Webhook Simulation (`S2-WEBHOOK-LOCAL-SIMULATION` — `PASS — SIMULATED` only): `<result>`
+  - Real Deployed Stripe Webhook Delivery (`S2-WEBHOOK-LIVE-DELIVERY` — `NOT RUN` unless delivered): `<evt_... / NOT RUN>`
+  - Test Clock ID (if enabled), `testClocks.advance()` & renewal invoice + lifecycle transitions: `<clock_... / NOT RUN>`
+  - Cleanup confirmed (`S2-STRIPE-CLEANUP`: sessions expired, customers & test clocks deleted): `<Yes/No>`
 
 ---
 
@@ -97,4 +98,4 @@ Use this template to record verifiable evidence when executing commercial verifi
   9. Unauthenticated protected route rejection (`401`): `< >`
   10. Disconnected Shopify store behavior: `< >`
   11. Failed SMTP delivery (non-enumeration + no leaked secrets): `< >`
-- **Staging Cleanup Confirmed:** `<Yes/No>`
+- **Staging Cleanup Confirmed (test accounts deleted, `/api/auth/me` & `/api/auth/login` 401 verified, `cs_test_` sessions expired):** `<Yes/No>`
