@@ -43,10 +43,9 @@ jobs:
       - name: Run test suite
         run: bun run test
 
-      - name: Generate verifiable simulated test artifact & verify report integrity
+      - name: Generate signed simulated test artifact & verify HMAC/SHA-256 report integrity
         run: |
-          bun run test:simulated:artifact
-          bun run verify:commercial:report -- --json > /tmp/commercial-report.json
+          bun run verify:simulated -- --skip-markdown --json-out=/tmp/commercial-report.json
           bun -e '
             const fs = require("node:fs");
             const report = JSON.parse(fs.readFileSync("/tmp/commercial-report.json", "utf8"));
@@ -58,12 +57,22 @@ jobs:
               if (c.status !== "PASS — SIMULATED") {
                 throw new Error(`Simulated check ${c.testId} expected PASS — SIMULATED, got ${c.status}: ${c.blockerOrFailure || ""}`);
               }
+              if (c.evidence?.hmacVerified !== true) {
+                throw new Error(`Simulated check ${c.testId} missing verified HMAC flag`);
+              }
               if (c.evidence?.sha256Verified !== true || !/^[0-9a-f]{64}$/.test(c.evidence?.sha256 || "")) {
                 throw new Error(`Simulated check ${c.testId} missing verified SHA-256 evidence`);
+              }
+              if (!/^[0-9a-f]{64}$/.test(c.evidence?.outputSha256 || "")) {
+                throw new Error(`Simulated check ${c.testId} missing captured output SHA-256 digest`);
               }
             }
             if (report.overallExternalStatus !== "BLOCKED") {
               throw new Error(`Expected overallExternalStatus BLOCKED without external secrets, got ${report.overallExternalStatus}`);
+            }
+            const rawArtifact = fs.readFileSync("reports/simulated-test-results.json", "utf8");
+            if (!JSON.parse(rawArtifact).hmacSha256) {
+              throw new Error("Expected root hmacSha256 in simulated artifact");
             }
           '
 

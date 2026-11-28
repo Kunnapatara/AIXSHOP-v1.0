@@ -116,6 +116,9 @@ export interface SimulatedSuiteArtifactEntry {
   status: 'PASS' | 'FAIL';
   command?: string;
   sha256?: string;
+  outputSha256?: string;
+  sourceChangedDuringRun?: boolean;
+  hmacSha256?: string;
 }
 
 export interface SimulatedTestResultsArtifact {
@@ -125,6 +128,7 @@ export interface SimulatedTestResultsArtifact {
   runner: string;
   nodeVersion?: string;
   suites: SimulatedSuiteArtifactEntry[];
+  hmacSha256?: string;
 }
 
 export interface CommercialVerificationReport {
@@ -177,6 +181,7 @@ export function redactSecrets(input: unknown): string {
     'STAGING_TEST_USER_PASSWORD',
     'SQL_PASSWORD',
     'PGPASSWORD',
+    'SIMULATED_ARTIFACT_HMAC_KEY',
   ];
 
   for (const name of sensitiveEnvNames) {
@@ -312,6 +317,12 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
   if (!prodDenylist.valid && prodDenylist.reason) {
     stagingMissing.push(prodDenylist.reason);
   }
+  const allowLocalMode = (process.env.STAGING_ALLOW_LOCAL || '').trim().toLowerCase() === 'true';
+  if (!allowLocalMode && prodDenylist.valid && !prodDenylist.configured) {
+    stagingMissing.push(
+      'PRODUCTION_HOSTS or PRODUCTION_APP_URL (explicit production denylist required for remote staging)'
+    );
+  }
   const stagingUrl = process.env.STAGING_BASE_URL?.trim() || '';
   const stagingUrlCheck = validateStagingBaseUrlNonProduction(stagingUrl);
   if (!stagingUrlCheck.valid) {
@@ -319,7 +330,6 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
       stagingMissing.push(stagingUrlCheck.reason || 'STAGING_BASE_URL');
     }
   }
-  const allowLocalMode = (process.env.STAGING_ALLOW_LOCAL || '').trim().toLowerCase() === 'true';
   if (!allowLocalMode) {
     const allowlist = parseStagingAllowedHosts();
     if (!allowlist.valid) {
@@ -556,6 +566,7 @@ export function parseProductionAppUrlHost(rawProductionAppUrl?: string): {
 
 export function resolveProductionDenylist(options: ProductionHostDenylistOptions = {}): {
   valid: boolean;
+  configured: boolean;
   hosts: Map<string, string>;
   reason?: string;
 } {
@@ -563,7 +574,7 @@ export function resolveProductionDenylist(options: ProductionHostDenylistOptions
 
   const explicitHosts = parseProductionHosts(options.productionHosts);
   if (!explicitHosts.valid) {
-    return { valid: false, hosts: new Map(), reason: explicitHosts.reason };
+    return { valid: false, configured: false, hosts: new Map(), reason: explicitHosts.reason };
   }
   for (const h of explicitHosts.hosts) {
     hosts.set(h, 'PRODUCTION_HOSTS');
@@ -571,27 +582,15 @@ export function resolveProductionDenylist(options: ProductionHostDenylistOptions
 
   const prodAppUrl = parseProductionAppUrlHost(options.productionAppUrl);
   if (!prodAppUrl.valid) {
-    return { valid: false, hosts: new Map(), reason: prodAppUrl.reason };
+    return { valid: false, configured: false, hosts: new Map(), reason: prodAppUrl.reason };
   }
   if (prodAppUrl.host && !hosts.has(prodAppUrl.host)) {
     hosts.set(prodAppUrl.host, 'PRODUCTION_APP_URL');
   }
 
-  const effectiveEnv = options.nodeEnv !== undefined ? options.nodeEnv : process.env.NODE_ENV;
-  const rawAppUrl = (options.appUrl !== undefined ? options.appUrl : process.env.APP_URL)?.trim();
-  if (effectiveEnv === 'production' && rawAppUrl && rawAppUrl !== 'MY_APP_URL') {
-    try {
-      const parsedProd = new URL(rawAppUrl);
-      const prodHost = normalizeHostname(parsedProd.hostname);
-      if (prodHost && !hosts.has(prodHost)) {
-        hosts.set(prodHost, 'APP_URL (NODE_ENV=production)');
-      }
-    } catch {
-      // ignore malformed APP_URL in non-strict path
-    }
-  }
-
-  return { valid: true, hosts };
+  // Note: APP_URL identifies the currently deployed instance (which may be a staging deployment
+  // running with NODE_ENV=production), so APP_URL is NEVER inferred as production denylist identity.
+  return { valid: true, configured: hosts.size > 0, hosts };
 }
 
 function isBuiltInProductionHostname(normalizedHost: string): boolean {
@@ -835,7 +834,7 @@ export function validateStagingBaseUrlNonProduction(
     return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (missing hostname)' };
   }
 
-  // 1. Strict production denylist (PRODUCTION_HOSTS, PRODUCTION_APP_URL, built-in patterns, APP_URL in prod)
+  // 1. Strict production denylist (PRODUCTION_HOSTS, PRODUCTION_APP_URL, built-in patterns)
   // Runs regardless of NODE_ENV and BEFORE STAGING_ALLOWED_HOSTS / allowLocalMode
   const prodCheck = checkProductionDomainHostname(host, options);
   if (!prodCheck.valid) {
@@ -888,7 +887,18 @@ export function validateStagingBaseUrlNonProduction(
     };
   }
 
-  // 4. Remote host MUST match explicit STAGING_ALLOWED_HOSTS allowlist (and allowlist must not contradict denylist)
+  // 4. Remote staging REQUIRES an explicit production denylist (never interpret empty denylist as safe)
+  if (!denylist.configured) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      isAllowlistRejected: true,
+      reason:
+        'PRODUCTION_DENYLIST_MISSING: Remote staging verification requires an explicit production denylist via PRODUCTION_HOSTS or PRODUCTION_APP_URL',
+    };
+  }
+
+  // 5. Remote host MUST match explicit STAGING_ALLOWED_HOSTS allowlist (and allowlist must not contradict denylist)
   const allowlist = parseStagingAllowedHosts(options.allowedHosts, options);
   if (!allowlist.valid) {
     return {
@@ -977,11 +987,136 @@ function normalizeSuitePath(raw: unknown): string {
     : '';
 }
 
+export const MIN_SIMULATED_HMAC_KEY_LENGTH = 32;
+
+export function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalizeJson(item)).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalizeJson(obj[k])}`).join(',')}}`;
+}
+
+export function isValidSha256Hex(raw: unknown): raw is string {
+  return typeof raw === 'string' && /^[0-9a-f]{64}$/i.test(raw.trim());
+}
+
+export function verifySha256TimingSafe(expectedHex: string, providedHex: unknown): boolean {
+  if (!isValidSha256Hex(expectedHex) || !isValidSha256Hex(providedHex)) {
+    return false;
+  }
+  const a = Buffer.from(expectedHex.trim().toLowerCase(), 'hex');
+  const b = Buffer.from(providedHex.trim().toLowerCase(), 'hex');
+  return a.length === b.length && a.length === 32 && crypto.timingSafeEqual(a, b);
+}
+
+export interface SimulatedArtifactMetadata {
+  schemaVersion: '1.0';
+  runId: string;
+  generatedAt: string;
+  runner: string;
+  nodeVersion?: string;
+}
+
+export function buildSimulatedSuiteCanonicalPayload(
+  meta: SimulatedArtifactMetadata,
+  entry: SimulatedSuiteArtifactEntry
+): Record<string, unknown> {
+  return {
+    schemaVersion: meta.schemaVersion,
+    runId: meta.runId,
+    generatedAt: meta.generatedAt,
+    runner: meta.runner,
+    ...(meta.nodeVersion !== undefined ? { nodeVersion: meta.nodeVersion } : {}),
+    suiteId: entry.suiteId ?? '',
+    suiteFile: normalizeSuitePath(entry.suiteFile),
+    executedAt: entry.executedAt,
+    durationMs: entry.durationMs,
+    exitCode: entry.exitCode,
+    passedCount: entry.passedCount,
+    failedCount: entry.failedCount,
+    skippedCount: entry.skippedCount ?? 0,
+    totalCount: entry.totalCount,
+    status: entry.status,
+    sha256: typeof entry.sha256 === 'string' ? entry.sha256.trim().toLowerCase() : '',
+    outputSha256: typeof entry.outputSha256 === 'string' ? entry.outputSha256.trim().toLowerCase() : '',
+    ...(entry.sourceChangedDuringRun !== undefined
+      ? { sourceChangedDuringRun: entry.sourceChangedDuringRun }
+      : {}),
+  };
+}
+
+export function computeSimulatedSuiteHmac(
+  meta: SimulatedArtifactMetadata,
+  entry: SimulatedSuiteArtifactEntry,
+  hmacKey: string
+): string {
+  const canonical = canonicalizeJson(buildSimulatedSuiteCanonicalPayload(meta, entry));
+  return crypto.createHmac('sha256', hmacKey).update(canonical, 'utf8').digest('hex');
+}
+
+export function computeSimulatedArtifactHmac(
+  meta: SimulatedArtifactMetadata,
+  suites: SimulatedSuiteArtifactEntry[],
+  hmacKey: string
+): string {
+  const orderedSuites = [...suites]
+    .map((s) => buildSimulatedSuiteCanonicalPayload(meta, s))
+    .sort((a, b) => String(a.suiteId).localeCompare(String(b.suiteId)));
+
+  const rootPayload = {
+    schemaVersion: meta.schemaVersion,
+    runId: meta.runId,
+    generatedAt: meta.generatedAt,
+    runner: meta.runner,
+    ...(meta.nodeVersion !== undefined ? { nodeVersion: meta.nodeVersion } : {}),
+    suites: orderedSuites,
+  };
+  return crypto.createHmac('sha256', hmacKey).update(canonicalizeJson(rootPayload), 'utf8').digest('hex');
+}
+
+export function signSimulatedTestArtifact(
+  artifact: SimulatedTestResultsArtifact,
+  hmacKey: string
+): SimulatedTestResultsArtifact {
+  const trimmedKey = hmacKey.trim();
+  if (!trimmedKey || trimmedKey.length < MIN_SIMULATED_HMAC_KEY_LENGTH) {
+    throw new Error(
+      `Invalid ephemeral HMAC key (minimum ${MIN_SIMULATED_HMAC_KEY_LENGTH} characters required).`
+    );
+  }
+  const meta: SimulatedArtifactMetadata = {
+    schemaVersion: artifact.schemaVersion,
+    runId: artifact.runId,
+    generatedAt: artifact.generatedAt,
+    runner: artifact.runner,
+    ...(artifact.nodeVersion !== undefined ? { nodeVersion: artifact.nodeVersion } : {}),
+  };
+
+  const signedSuites: SimulatedSuiteArtifactEntry[] = artifact.suites.map((entry) => ({
+    ...entry,
+    hmacSha256: computeSimulatedSuiteHmac(meta, entry, trimmedKey),
+  }));
+
+  return {
+    ...artifact,
+    suites: signedSuites,
+    hmacSha256: computeSimulatedArtifactHmac(meta, signedSuites, trimmedKey),
+  };
+}
+
 export interface EvaluateSimulatedArtifactOptions {
   artifactPath?: string;
   parseError?: string;
   fallbackTimestamp?: string;
   repoRoot?: string;
+  hmacKey?: string;
 }
 
 export function evaluateSimulatedChecksFromArtifact(
@@ -994,6 +1129,9 @@ export function evaluateSimulatedChecksFromArtifact(
   const fallbackTs = options.fallbackTimestamp || new Date().toISOString();
   const artifactLabel = options.artifactPath || DEFAULT_SIMULATED_ARTIFACT_PATH;
   const repoRoot = path.resolve(options.repoRoot || process.cwd());
+  const hmacKey = (
+    options.hmacKey !== undefined ? options.hmacKey : process.env.SIMULATED_ARTIFACT_HMAC_KEY || ''
+  ).trim();
 
   if (options.parseError) {
     return {
@@ -1077,6 +1215,23 @@ export function evaluateSimulatedChecksFromArtifact(
     };
   }
 
+  // Require a valid ephemeral HMAC verification key whenever evaluating an artifact
+  if (!hmacKey || hmacKey.length < MIN_SIMULATED_HMAC_KEY_LENGTH) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Missing or invalid simulated artifact HMAC verification key for "${artifactLabel}". Run via the verified orchestration command ("npm run verify:simulated").`,
+      })),
+    };
+  }
+
   const artifact = art as unknown as SimulatedTestResultsArtifact;
   const expectedFileById = new Map(SIMULATED_SUITE_DEFINITIONS.map((d) => [d.testId, d.suiteFile]));
   const expectedIdByFile = new Map(SIMULATED_SUITE_DEFINITIONS.map((d) => [d.suiteFile, d.testId]));
@@ -1128,6 +1283,62 @@ export function evaluateSimulatedChecksFromArtifact(
         targetEnvironment: def.targetEnvironment,
         executedAt: fallbackTs,
         blockerOrFailure: `Artifact integrity check failed (${artifactLabel}): ${structuralErrors.join('; ')}`,
+      })),
+    };
+  }
+
+  // Verify root artifact HMAC signature in constant time before trusting any suite entry
+  const artifactMeta: SimulatedArtifactMetadata = {
+    schemaVersion: artifact.schemaVersion,
+    runId: artifact.runId,
+    generatedAt: artifact.generatedAt,
+    runner: artifact.runner,
+    ...(artifact.nodeVersion !== undefined ? { nodeVersion: artifact.nodeVersion } : {}),
+  };
+  const rawRootHmac = typeof artifact.hmacSha256 === 'string' ? artifact.hmacSha256.trim() : '';
+  if (!rawRootHmac) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Missing artifact-level HMAC signature on "${artifactLabel}".`,
+      })),
+    };
+  }
+  if (!isValidSha256Hex(rawRootHmac)) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Malformed artifact-level HMAC signature on "${artifactLabel}".`,
+      })),
+    };
+  }
+  const expectedRootHmac = computeSimulatedArtifactHmac(artifactMeta, artifact.suites, hmacKey);
+  if (!verifySha256TimingSafe(expectedRootHmac, rawRootHmac)) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Artifact HMAC signature mismatch on "${artifactLabel}": execution evidence could not be authenticated with the current verification key.`,
       })),
     };
   }
@@ -1209,6 +1420,9 @@ export function evaluateSimulatedChecksFromArtifact(
     if (entry.status !== 'PASS' && entry.status !== 'FAIL') {
       entryErrors.push(`invalid status "${String((entry as any).status)}"`);
     }
+    if (entry.sourceChangedDuringRun === true) {
+      entryErrors.push(`suite source "${def.suiteFile}" changed during execution`);
+    }
     if (
       entryErrors.length === 0 &&
       entry.passedCount + entry.failedCount + skippedCount !== entry.totalCount
@@ -1227,12 +1441,34 @@ export function evaluateSimulatedChecksFromArtifact(
       );
     }
 
+    // Require and verify captured execution output SHA-256 digest
+    const rawOutputDigest =
+      typeof entry.outputSha256 === 'string' ? entry.outputSha256.trim().toLowerCase() : '';
+    if (!rawOutputDigest) {
+      entryErrors.push(`missing outputSha256 digest for "${def.suiteFile}"`);
+    } else if (!isValidSha256Hex(rawOutputDigest)) {
+      entryErrors.push(`malformed outputSha256 digest for "${def.suiteFile}"`);
+    }
+
+    // Verify per-suite HMAC signature in constant time
+    const rawSuiteHmac = typeof entry.hmacSha256 === 'string' ? entry.hmacSha256.trim().toLowerCase() : '';
+    if (!rawSuiteHmac) {
+      entryErrors.push(`missing hmacSha256 signature for "${def.suiteFile}"`);
+    } else if (!isValidSha256Hex(rawSuiteHmac)) {
+      entryErrors.push(`malformed hmacSha256 signature for "${def.suiteFile}"`);
+    } else {
+      const expectedSuiteHmac = computeSimulatedSuiteHmac(artifactMeta, entry, hmacKey);
+      if (!verifySha256TimingSafe(expectedSuiteHmac, rawSuiteHmac)) {
+        entryErrors.push(`suite HMAC signature mismatch for "${def.suiteFile}"`);
+      }
+    }
+
     // Recalculate and verify SHA-256 against the actual current test suite file on disk
     let actualSha256: string | undefined;
     const rawDigest = typeof entry.sha256 === 'string' ? entry.sha256.trim().toLowerCase() : '';
     if (!rawDigest) {
       entryErrors.push(`missing sha256 digest for "${def.suiteFile}"`);
-    } else if (!/^[0-9a-f]{64}$/.test(rawDigest)) {
+    } else if (!isValidSha256Hex(rawDigest)) {
       entryErrors.push(`malformed sha256 digest for "${def.suiteFile}"`);
     } else {
       const absSuitePath = path.resolve(repoRoot, def.suiteFile);
@@ -1245,9 +1481,7 @@ export function evaluateSimulatedChecksFromArtifact(
         try {
           const content = fsSync.readFileSync(absSuitePath);
           actualSha256 = crypto.createHash('sha256').update(content).digest('hex');
-          const recordedBuf = Buffer.from(rawDigest, 'hex');
-          const actualBuf = Buffer.from(actualSha256, 'hex');
-          if (recordedBuf.length !== actualBuf.length || !crypto.timingSafeEqual(recordedBuf, actualBuf)) {
+          if (!verifySha256TimingSafe(actualSha256, rawDigest)) {
             entryErrors.push(
               `SHA-256 digest mismatch for "${def.suiteFile}" (artifact=${rawDigest}, current=${actualSha256})`
             );
@@ -1285,6 +1519,8 @@ export function evaluateSimulatedChecksFromArtifact(
       exitCode: entry.exitCode,
       sha256: actualSha256,
       sha256Verified: true,
+      outputSha256: rawOutputDigest,
+      hmacVerified: true,
       liveProviderVerified: false,
     };
 
@@ -1294,6 +1530,7 @@ export function evaluateSimulatedChecksFromArtifact(
       entry.failedCount === 0 &&
       entry.passedCount > 0 &&
       entry.passedCount + skippedCount === entry.totalCount &&
+      entry.sourceChangedDuringRun !== true &&
       Boolean(actualSha256);
 
     if (genuinelyPassed) {
@@ -1332,7 +1569,7 @@ export function evaluateSimulatedChecksFromArtifact(
 export function loadAndEvaluateSimulatedArtifact(
   artifactPath = path.resolve(process.cwd(), DEFAULT_SIMULATED_ARTIFACT_PATH),
   fallbackTimestamp?: string,
-  options: { repoRoot?: string } = {}
+  options: { repoRoot?: string; hmacKey?: string } = {}
 ): {
   checks: VerificationCheckResult[];
   artifactPath: string;
@@ -1344,6 +1581,7 @@ export function loadAndEvaluateSimulatedArtifact(
       artifactPath: resolvedPath,
       fallbackTimestamp,
       repoRoot: options.repoRoot,
+      hmacKey: options.hmacKey,
     });
     return { ...res, artifactPath: resolvedPath };
   }
@@ -1355,6 +1593,7 @@ export function loadAndEvaluateSimulatedArtifact(
       artifactPath: resolvedPath,
       fallbackTimestamp,
       repoRoot: options.repoRoot,
+      hmacKey: options.hmacKey,
     });
     return { ...res, artifactPath: resolvedPath };
   } catch (err: any) {
@@ -1363,6 +1602,7 @@ export function loadAndEvaluateSimulatedArtifact(
       parseError: err?.message || String(err),
       fallbackTimestamp,
       repoRoot: options.repoRoot,
+      hmacKey: options.hmacKey,
     });
     return { ...res, artifactPath: resolvedPath };
   }

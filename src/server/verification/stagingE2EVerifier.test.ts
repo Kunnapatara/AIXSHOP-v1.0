@@ -6,6 +6,7 @@ import { MemoryRepository } from '../db/memoryRepository';
 import { setCustomEmailTransport } from '../services/emailService';
 import { runStagingE2EVerification } from './stagingE2EVerifier';
 import {
+  evaluateCommercialReadiness,
   parseProductionAppUrlHost,
   parseProductionHosts,
   parseStagingAllowedHosts,
@@ -328,7 +329,7 @@ describe('Tasks A & B — Staging E2E Resource Cleanup & Strict Tenant Isolation
     }
   });
 
-  test('6. Non-production guard refuses production STAGING_BASE_URL hostnames and APP_URL match in production', async () => {
+  test('6. Non-production guard refuses production STAGING_BASE_URL hostnames and missing remote denylist while allowing staging APP_URL in NODE_ENV=production', async () => {
     await withEnvOverrides(
       buildLocalStagingEnv('https://app.aixshop.io'),
       async () => {
@@ -341,10 +342,29 @@ describe('Tasks A & B — Staging E2E Resource Cleanup & Strict Tenant Isolation
       }
     );
 
+    // Remote staging without explicit PRODUCTION_HOSTS / PRODUCTION_APP_URL fails closed even when NODE_ENV=production & APP_URL matches staging host
     await withEnvOverrides(
       buildLocalStagingEnv('https://staging.example.com', {
         NODE_ENV: 'production',
         APP_URL: 'https://staging.example.com',
+        STAGING_ALLOW_LOCAL: 'false',
+        STAGING_ALLOWED_HOSTS: 'staging.example.com',
+      }),
+      async () => {
+        const summary = await runStagingE2EVerification();
+        assert.equal(summary.status, 'FAIL');
+        assert.match(summary.checks[0].blockerOrFailure || '', /STAGING_TARGET_REJECTED.*PRODUCTION_DENYLIST_MISSING/);
+      }
+    );
+
+    // Explicit PRODUCTION_HOSTS rejects production hostname even in NODE_ENV=production, while staging APP_URL is allowed when denylist excludes it
+    await withEnvOverrides(
+      buildLocalStagingEnv('https://shop.customer.com', {
+        NODE_ENV: 'production',
+        APP_URL: 'https://staging.example.com',
+        STAGING_ALLOW_LOCAL: 'false',
+        STAGING_ALLOWED_HOSTS: 'staging.example.com',
+        PRODUCTION_HOSTS: 'shop.customer.com',
       }),
       async () => {
         const summary = await runStagingE2EVerification();
@@ -470,7 +490,7 @@ describe('Tasks A & B — Staging E2E Resource Cleanup & Strict Tenant Isolation
 });
 
 describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () => {
-  test('B1: Valid HTTPS host in STAGING_ALLOWED_HOSTS passes URL & allowlist validation cleanly', () => {
+  test('B1: Valid HTTPS host in STAGING_ALLOWED_HOSTS with explicit production denylist passes URL & allowlist validation cleanly', () => {
     const parsed = parseStagingAllowedHosts('staging.aixshop.example.com, QA-Staging.Example.org.');
     assert.equal(parsed.valid, true);
     assert.ok(parsed.hosts.has('staging.aixshop.example.com'));
@@ -478,6 +498,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
 
     const res = validateStagingBaseUrlNonProduction('https://STAGING.aixshop.example.com:8443/', {
       allowedHosts: 'staging.aixshop.example.com,qa-staging.example.org',
+      productionHosts: 'shop.customer.com',
       allowLocalMode: false,
     });
     assert.equal(res.valid, true);
@@ -489,6 +510,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
     // 1. Empty/unset allowlist rejected even when STAGING_CONFIRM_NON_PRODUCTION=true
     const noAllowlist = validateStagingBaseUrlNonProduction('https://staging.example.com', {
       allowedHosts: '',
+      productionHosts: 'shop.customer.com',
       allowLocalMode: false,
     });
     assert.equal(noAllowlist.valid, false);
@@ -497,6 +519,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
     // 2. Host not in allowlist rejected
     const notAllowed = validateStagingBaseUrlNonProduction('https://other-staging.example.com', {
       allowedHosts: 'staging.example.com',
+      productionHosts: 'shop.customer.com',
       allowLocalMode: false,
     });
     assert.equal(notAllowed.valid, false);
@@ -505,12 +528,14 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
     // 3. Lookalike suffix/prefix hosts rejected (exact match only)
     const lookalikeSuffix = validateStagingBaseUrlNonProduction('https://staging.example.com.attacker.com', {
       allowedHosts: 'staging.example.com',
+      productionHosts: 'shop.customer.com',
       allowLocalMode: false,
     });
     assert.equal(lookalikeSuffix.valid, false);
 
     const lookalikeSubdomain = validateStagingBaseUrlNonProduction('https://evil.staging.example.com', {
       allowedHosts: 'staging.example.com',
+      productionHosts: 'shop.customer.com',
       allowLocalMode: false,
     });
     assert.equal(lookalikeSubdomain.valid, false);
@@ -609,6 +634,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
             env: buildLocalStagingEnv('https://untrusted.example.com', {
               STAGING_ALLOW_LOCAL: 'false',
               STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              PRODUCTION_HOSTS: 'shop.customer.com',
               STAGING_CONFIRM_NON_PRODUCTION: 'true',
             }),
             expectedPattern: /STAGING_TARGET_REJECTED.*STAGING_HOST_NOT_ALLOWED/,
@@ -618,6 +644,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
             env: buildLocalStagingEnv('https://staging.example.com', {
               STAGING_ALLOW_LOCAL: 'false',
               STAGING_ALLOWED_HOSTS: '',
+              PRODUCTION_HOSTS: 'shop.customer.com',
               STAGING_CONFIRM_NON_PRODUCTION: 'true',
             }),
             expectedPattern: /STAGING_TARGET_REJECTED.*STAGING_ALLOWED_HOSTS/,
@@ -627,6 +654,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
             env: buildLocalStagingEnv('https://staging.example.com.attacker.com', {
               STAGING_ALLOW_LOCAL: 'false',
               STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              PRODUCTION_HOSTS: 'shop.customer.com',
               STAGING_CONFIRM_NON_PRODUCTION: 'true',
             }),
             expectedPattern: /STAGING_HOST_NOT_ALLOWED/,
@@ -673,7 +701,7 @@ describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () =
   });
 });
 
-describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HOSTS & PRODUCTION_APP_URL)', () => {
+describe('Task A — Staging Environment Separation & Explicit Production Host Denylist Protection', () => {
   test('A1: Rejects custom PRODUCTION_HOSTS hostname even when also listed in STAGING_ALLOWED_HOSTS', () => {
     const res = validateStagingBaseUrlNonProduction('https://shop.customer.com', {
       allowedHosts: 'shop.customer.com,staging-shop.customer.com',
@@ -692,11 +720,44 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
     assert.match(contradictoryAllowlist.reason || '', /cannot include production domain/i);
   });
 
-  test('A2: Enforces production denylist across NODE_ENV=development, test, and production', () => {
+  test('A2: NODE_ENV=production staging deployment with APP_URL matching STAGING_BASE_URL is ALLOWED when valid denylist & allowlist exclude it', async () => {
+    // 1. Valid staging target running under NODE_ENV=production where APP_URL is the staging deployment URL itself
+    const allowedInProdMode = validateStagingBaseUrlNonProduction('https://staging.customer.com', {
+      allowedHosts: 'staging.customer.com',
+      productionHosts: 'shop.customer.com',
+      productionAppUrl: 'https://checkout.customer.com',
+      appUrl: 'https://staging.customer.com',
+      nodeEnv: 'production',
+      allowLocalMode: false,
+    });
+    assert.equal(allowedInProdMode.valid, true);
+    assert.equal(allowedInProdMode.isProductionTarget, false);
+
+    // 2. Same check via evaluateCommercialReadiness() in NODE_ENV=production
+    await withEnvOverrides(
+      buildLocalStagingEnv('https://staging.customer.com', {
+        NODE_ENV: 'production',
+        APP_URL: 'https://staging.customer.com',
+        SHOPIFY_APP_URL: 'https://staging.customer.com',
+        STAGING_ALLOW_LOCAL: 'false',
+        STAGING_ALLOWED_HOSTS: 'staging.customer.com',
+        PRODUCTION_HOSTS: 'shop.customer.com',
+        PRODUCTION_APP_URL: 'https://checkout.customer.com',
+        SHOPIFY_TOKEN_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+      }),
+      () => {
+        const readiness = evaluateCommercialReadiness();
+        assert.equal(readiness.integrations.stage_4_staging_e2e.status, 'READY');
+        assert.deepEqual(readiness.integrations.stage_4_staging_e2e.missingEnvVars, []);
+      }
+    );
+
+    // 3. Explicit PRODUCTION_HOSTS and PRODUCTION_APP_URL still reject matching targets across ALL NODE_ENV values
     for (const nodeEnv of ['development', 'test', 'production']) {
       const fromProdHosts = validateStagingBaseUrlNonProduction('https://shop.customer.com', {
         allowedHosts: 'staging-shop.customer.com',
         productionHosts: 'shop.customer.com',
+        appUrl: 'https://staging-shop.customer.com',
         nodeEnv,
       });
       assert.equal(fromProdHosts.valid, false, `Expected rejection in NODE_ENV=${nodeEnv}`);
@@ -705,40 +766,87 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
       const fromProdAppUrl = validateStagingBaseUrlNonProduction('https://checkout.customer.com', {
         allowedHosts: 'staging-shop.customer.com',
         productionAppUrl: 'https://checkout.customer.com',
+        appUrl: 'https://staging-shop.customer.com',
         nodeEnv,
       });
       assert.equal(fromProdAppUrl.valid, false, `Expected PRODUCTION_APP_URL rejection in NODE_ENV=${nodeEnv}`);
       assert.equal(fromProdAppUrl.isProductionTarget, true);
     }
-
-    // APP_URL in NODE_ENV=production is also treated as a production host
-    const fromAppUrlInProd = validateStagingBaseUrlNonProduction('https://tenant.example.com', {
-      allowedHosts: 'tenant.example.com',
-      appUrl: 'https://tenant.example.com',
-      nodeEnv: 'production',
-    });
-    assert.equal(fromAppUrlInProd.valid, false);
-    assert.equal(fromAppUrlInProd.isProductionTarget, true);
   });
 
-  test('A3: Accepts legitimate HTTPS staging hostname in STAGING_ALLOWED_HOSTS when excluded from denylist, using exact match only', () => {
-    // Similar non-identical hostnames: production denylist "shop.customer.com" does not false-block "staging-shop.customer.com" or "staging.shop.customer.com"
-    const stagingHyphen = validateStagingBaseUrlNonProduction('https://staging-shop.customer.com', {
-      allowedHosts: 'staging-shop.customer.com,staging.shop.customer.com',
-      productionHosts: 'shop.customer.com',
-      productionAppUrl: 'https://checkout.customer.com',
-      nodeEnv: 'development',
+  test('A3: Remote staging with empty/unset PRODUCTION_HOSTS and PRODUCTION_APP_URL fails closed (PRODUCTION_DENYLIST_MISSING), while STAGING_ALLOW_LOCAL=true works cleanly', async () => {
+    // 1. Both empty in remote mode -> REJECTED even if STAGING_ALLOWED_HOSTS & STAGING_CONFIRM_NON_PRODUCTION=true are set
+    const missingDenylist = validateStagingBaseUrlNonProduction('https://staging.customer.com', {
+      allowedHosts: 'staging.customer.com',
+      productionHosts: '',
+      productionAppUrl: '',
+      allowLocalMode: false,
+      nodeEnv: 'production',
+      appUrl: 'https://staging.customer.com',
     });
-    assert.equal(stagingHyphen.valid, true);
-    assert.equal(stagingHyphen.isProductionTarget, false);
+    assert.equal(missingDenylist.valid, false);
+    assert.equal(missingDenylist.isProductionTarget, false);
+    assert.match(missingDenylist.reason || '', /PRODUCTION_DENYLIST_MISSING/);
 
-    const stagingSubdomain = validateStagingBaseUrlNonProduction('https://staging.shop.customer.com', {
-      allowedHosts: 'staging-shop.customer.com,staging.shop.customer.com',
-      productionHosts: 'shop.customer.com',
-      productionAppUrl: 'https://checkout.customer.com',
-      nodeEnv: 'test',
+    // 2. evaluateCommercialReadiness flags missing explicit production denylist for remote staging
+    await withEnvOverrides(
+      buildLocalStagingEnv('https://staging.customer.com', {
+        NODE_ENV: 'production',
+        APP_URL: 'https://staging.customer.com',
+        SHOPIFY_APP_URL: 'https://staging.customer.com',
+        STAGING_ALLOW_LOCAL: 'false',
+        STAGING_ALLOWED_HOSTS: 'staging.customer.com',
+        PRODUCTION_HOSTS: undefined,
+        PRODUCTION_APP_URL: undefined,
+      }),
+      () => {
+        const readiness = evaluateCommercialReadiness();
+        assert.equal(readiness.integrations.stage_4_staging_e2e.status, 'BLOCKED');
+        assert.ok(
+          readiness.integrations.stage_4_staging_e2e.missingEnvVars.some((m) =>
+            m.includes('PRODUCTION_HOSTS or PRODUCTION_APP_URL')
+          )
+        );
+      }
+    );
+
+    // 3. Only PRODUCTION_APP_URL set is accepted as an explicit production denylist
+    const prodAppUrlOnly = validateStagingBaseUrlNonProduction('https://staging.customer.com', {
+      allowedHosts: 'staging.customer.com',
+      productionAppUrl: 'https://shop.customer.com',
+      allowLocalMode: false,
+      nodeEnv: 'production',
     });
-    assert.equal(stagingSubdomain.valid, true);
+    assert.equal(prodAppUrlOnly.valid, true);
+
+    // 4. STAGING_ALLOW_LOCAL=true with loopback does NOT require remote denylist (existing local tests remain green)
+    const localStillAllowed = validateStagingBaseUrlNonProduction('http://127.0.0.1:45123', {
+      allowLocalMode: true,
+      productionHosts: '',
+      productionAppUrl: '',
+    });
+    assert.equal(localStillAllowed.valid, true);
+    assert.equal(localStillAllowed.isLocalTarget, true);
+  });
+
+  test('A4: Accepts legitimate HTTPS staging hostname in STAGING_ALLOWED_HOSTS when excluded from denylist, using exact match only (no substring heuristics)', () => {
+    // Non-identical similar hostnames: "shop.customer.com" does not false-block "staging-shop.customer.com", "staging.shop.customer.com", or neutral custom staging host "preview-1.customer-sandbox.net"
+    for (const candidate of [
+      'https://staging-shop.customer.com',
+      'https://staging.shop.customer.com',
+      'https://preview-1.customer-sandbox.net',
+    ]) {
+      const host = new URL(candidate).hostname;
+      const res = validateStagingBaseUrlNonProduction(candidate, {
+        allowedHosts: 'staging-shop.customer.com,staging.shop.customer.com,preview-1.customer-sandbox.net',
+        productionHosts: 'shop.customer.com',
+        productionAppUrl: 'https://checkout.customer.com',
+        nodeEnv: 'production',
+        appUrl: candidate,
+      });
+      assert.equal(res.valid, true, `Expected ${host} to pass exact-match validation`);
+      assert.equal(res.isProductionTarget, false);
+    }
 
     // Lookalike suffix/prefix domains are still rejected when not in STAGING_ALLOWED_HOSTS
     const lookalikeEvil = validateStagingBaseUrlNonProduction('https://shop.customer.com.evil.com', {
@@ -748,7 +856,7 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
     assert.equal(lookalikeEvil.valid, false);
   });
 
-  test('A4: Case normalization, trailing-dot normalization, and multiple comma-separated PRODUCTION_HOSTS + PRODUCTION_APP_URL', () => {
+  test('A5: Case normalization, trailing-dot normalization, and multiple comma-separated PRODUCTION_HOSTS + PRODUCTION_APP_URL', () => {
     const multiple = validateStagingBaseUrlNonProduction('https://Shop.Customer.COM.', {
       allowedHosts: 'staging-shop.customer.com',
       productionHosts: 'api.customer.com, SHOP.CUSTOMER.COM , checkout.customer.com.',
@@ -772,12 +880,13 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
       productionAppUrl: 'https://Storefront.Customer.COM.',
     });
     assert.equal(parsedDenylist.valid, true);
+    assert.equal(parsedDenylist.configured, true);
     assert.ok(parsedDenylist.hosts.has('api.customer.com'));
     assert.ok(parsedDenylist.hosts.has('checkout.customer.com'));
     assert.ok(parsedDenylist.hosts.has('storefront.customer.com'));
   });
 
-  test('A5: Malformed PRODUCTION_HOSTS and PRODUCTION_APP_URL fail closed', () => {
+  test('A6: Malformed PRODUCTION_HOSTS and PRODUCTION_APP_URL fail closed', () => {
     assert.equal(parseProductionHosts('*.customer.com').valid, false);
     assert.equal(parseProductionHosts('https://shop.customer.com').valid, false);
     assert.equal(parseProductionHosts('shop.customer.com,').valid, false);
@@ -806,7 +915,7 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
     assert.match(failClosedUrl.reason || '', /PRODUCTION_APP_URL/);
   });
 
-  test('A6: runStagingE2EVerification performs 0 HTTP requests on production denylist rejection or malformed denylist, while preserving STAGING_ALLOW_LOCAL=true for non-production local servers', async () => {
+  test('A7: runStagingE2EVerification performs 0 HTTP requests on production denylist rejection, missing remote denylist, or malformed denylist', async () => {
     let requestsObserved = 0;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
@@ -827,14 +936,27 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
           expectedPattern: /PRODUCTION_TARGET_REJECTED/,
         },
         {
-          label: 'PRODUCTION_APP_URL match with trailing dot in test env',
+          label: 'PRODUCTION_APP_URL match with trailing dot in NODE_ENV=production',
           env: buildLocalStagingEnv('https://Storefront.Customer.COM.', {
-            NODE_ENV: 'test',
+            NODE_ENV: 'production',
+            APP_URL: 'https://staging.customer.com',
             STAGING_ALLOW_LOCAL: 'false',
             STAGING_ALLOWED_HOSTS: 'staging.customer.com',
             PRODUCTION_APP_URL: 'https://storefront.customer.com',
           }),
           expectedPattern: /PRODUCTION_TARGET_REJECTED/,
+        },
+        {
+          label: 'Remote target missing explicit PRODUCTION_HOSTS and PRODUCTION_APP_URL',
+          env: buildLocalStagingEnv('https://staging.customer.com', {
+            NODE_ENV: 'production',
+            APP_URL: 'https://staging.customer.com',
+            STAGING_ALLOW_LOCAL: 'false',
+            STAGING_ALLOWED_HOSTS: 'staging.customer.com',
+            PRODUCTION_HOSTS: undefined,
+            PRODUCTION_APP_URL: undefined,
+          }),
+          expectedPattern: /STAGING_TARGET_REJECTED.*PRODUCTION_DENYLIST_MISSING/,
         },
         {
           label: 'Malformed PRODUCTION_HOSTS even with unset STAGING_BASE_URL',
@@ -870,18 +992,68 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
         });
       }
 
-      assert.equal(requestsObserved, 0, 'Expected zero outbound HTTP calls when rejected by production denylist');
+      assert.equal(requestsObserved, 0, 'Expected zero outbound HTTP requests when rejected before HTTP execution');
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
 
-    // Confirm STAGING_ALLOW_LOCAL=true still works cleanly when a non-conflicting PRODUCTION_HOSTS is set
-    const repo = new MemoryRepository(false);
-    const srv = await startEphemeralServer(repo);
+  test('A8: End-to-end runStagingE2EVerification executes cleanly when NODE_ENV=production and APP_URL equals staging host (remote HTTPS & local)', async () => {
+    const readyHealthIntercept = (req: http.IncomingMessage, res: http.ServerResponse) => {
+      if (req.url === '/api/health/ready' && req.method === 'GET') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ status: 'ok', probe: 'readiness', database: { connected: true, schemaReady: true } }));
+        return true;
+      }
+      return false;
+    };
+
+    // 1. Remote HTTPS staging deployment running with NODE_ENV=production & APP_URL=https://staging.customer.com (routed in-memory to ephemeral server)
+    const remoteRepo = new MemoryRepository(false);
+    const remoteSrv = await startEphemeralServer(remoteRepo, readyHealthIntercept);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const rewritten = rawUrl.startsWith('https://staging.customer.com')
+        ? rawUrl.replace('https://staging.customer.com', remoteSrv.baseUrl)
+        : rawUrl;
+      return originalFetch(rewritten, init);
+    }) as typeof fetch;
+
     try {
       await withMockEmailTransport(() =>
         withEnvOverrides(
-          buildLocalStagingEnv(srv.baseUrl, {
+          buildLocalStagingEnv('https://staging.customer.com', {
+            NODE_ENV: 'production',
+            APP_URL: 'https://staging.customer.com',
+            SHOPIFY_APP_URL: 'https://staging.customer.com',
+            STAGING_ALLOW_LOCAL: 'false',
+            STAGING_ALLOWED_HOSTS: 'staging.customer.com',
+            PRODUCTION_HOSTS: 'shop.customer.com,checkout.customer.com',
+            PRODUCTION_APP_URL: 'https://storefront.customer.com',
+          }),
+          async () => {
+            const summary = await runStagingE2EVerification({ targetEnvironment: 'staging-node-env-prod' });
+            assert.equal(summary.status, 'PASS');
+            assert.equal(summary.counts.fail, 0);
+            assert.equal(summary.cleanupReport?.status, 'CLEANED');
+          }
+        )
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      await remoteSrv.close();
+    }
+
+    // 2. Local server mode (STAGING_ALLOW_LOCAL=true) preserves non-production local testing cleanly
+    const localRepo = new MemoryRepository(false);
+    const localSrv = await startEphemeralServer(localRepo);
+    try {
+      await withMockEmailTransport(() =>
+        withEnvOverrides(
+          buildLocalStagingEnv(localSrv.baseUrl, {
+            NODE_ENV: 'test',
             PRODUCTION_HOSTS: 'shop.customer.com,checkout.customer.com',
             PRODUCTION_APP_URL: 'https://storefront.customer.com',
           }),
@@ -893,7 +1065,7 @@ describe('Task A — Explicit Production Host Denylist Protection (PRODUCTION_HO
         )
       );
     } finally {
-      await srv.close();
+      await localSrv.close();
     }
   });
 });

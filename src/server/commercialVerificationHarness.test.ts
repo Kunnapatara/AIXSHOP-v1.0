@@ -14,11 +14,13 @@ import {
   redactSecrets,
   renderVerificationMarkdown,
   computeOverallStatus,
+  signSimulatedTestArtifact,
   SIMULATED_SUITE_DEFINITIONS,
+  SimulatedTestResultsArtifact,
 } from './verification/statusModel';
 import { formatCommercialReadinessText } from './verification/checkCommercialEnv';
 import { buildCommercialVerificationReport } from '../../scripts/verify/generate-report';
-import { parseTapTotals } from '../../scripts/verify/run-simulated-tests';
+import { parseTapTotals, runSimulatedTestsAndSign } from '../../scripts/verify/run-simulated-tests';
 import { runShopifyExternalVerification } from './verification/shopifyVerifier';
 import { runStripeExternalVerification } from './verification/stripeVerifier';
 import { runSmtpExternalVerification } from './verification/smtpVerifier';
@@ -1264,8 +1266,11 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
   const computeFileSha256 = (suiteFile: string, repoRoot = process.cwd()): string =>
     crypto.createHash('sha256').update(fs.readFileSync(path.resolve(repoRoot, suiteFile))).digest('hex');
 
-  const buildValidArtifact = (repoRoot = process.cwd()) => ({
-    schemaVersion: '1.0' as const,
+  const makeOutputSha256 = (label: string): string =>
+    crypto.createHash('sha256').update(`TAP version 13\n# ${label}\n`, 'utf8').digest('hex');
+
+  const buildUnsignedArtifact = (repoRoot = process.cwd()): SimulatedTestResultsArtifact => ({
+    schemaVersion: '1.0',
     runId: 'sim_test_run_001',
     generatedAt: '2026-11-28T10:00:00.000Z',
     runner: 'tsx --test --test-reporter=tap',
@@ -1280,14 +1285,20 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
       failedCount: 0,
       skippedCount: 0,
       totalCount: 4 + idx,
-      status: 'PASS' as const,
+      status: 'PASS',
       sha256: computeFileSha256(def.suiteFile, repoRoot),
+      outputSha256: makeOutputSha256(def.testId),
     })),
   });
 
-  test('A1: Valid passing artifact with matching SHA-256 digests yields PASS — SIMULATED with traceable counts, runId, sha256Verified, and non-live flag', () => {
-    const res = evaluateSimulatedChecksFromArtifact(buildValidArtifact(), {
+  const buildValidArtifact = (hmacKey: string, repoRoot = process.cwd()): SimulatedTestResultsArtifact =>
+    signSimulatedTestArtifact(buildUnsignedArtifact(repoRoot), hmacKey);
+
+  test('A1: Valid passing signed artifact with matching SHA-256 digests & HMAC yields PASS — SIMULATED with traceable counts, runId, hmacVerified, outputSha256, and non-live flag', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
+    const res = evaluateSimulatedChecksFromArtifact(buildValidArtifact(hmacKey), {
       artifactPath: 'reports/simulated-test-results.json',
+      hmacKey,
     });
     assert.equal(res.artifactRunId, 'sim_test_run_001');
     assert.equal(res.checks.length, 4);
@@ -1296,22 +1307,25 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
       assert.equal(chk.evidence?.artifactRunId, 'sim_test_run_001');
       assert.equal(chk.evidence?.liveProviderVerified, false);
       assert.equal(chk.evidence?.sha256Verified, true);
+      assert.equal(chk.evidence?.hmacVerified, true);
       assert.match(String(chk.evidence?.sha256 || ''), /^[0-9a-f]{64}$/);
+      assert.match(String(chk.evidence?.outputSha256 || ''), /^[0-9a-f]{64}$/);
       assert.equal(typeof chk.durationMs, 'number');
     }
   });
 
-  test('A2: Failing suite in artifact (exitCode != 0, failedCount > 0, or status=FAIL) reports FAIL (never PASS — SIMULATED)', () => {
-    const failing = buildValidArtifact();
+  test('A2: Failing suite in signed artifact (exitCode != 0, failedCount > 0, or status=FAIL) reports FAIL (never PASS — SIMULATED)', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
+    const failing = buildUnsignedArtifact();
     failing.suites[1] = {
       ...failing.suites[1],
       exitCode: 1,
       passedCount: 3,
       failedCount: 2,
       totalCount: 5,
-      status: 'FAIL' as any,
+      status: 'FAIL',
     };
-    const res = evaluateSimulatedChecksFromArtifact(failing);
+    const res = evaluateSimulatedChecksFromArtifact(signSimulatedTestArtifact(failing, hmacKey), { hmacKey });
     const shopifySim = res.checks.find((c) => c.testId === 'SIM-SHOPIFY-WRITEBACK');
     assert.equal(shopifySim?.status, 'FAIL');
     assert.match(shopifySim?.blockerOrFailure || '', /failed/i);
@@ -1346,24 +1360,31 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
   });
 
   test('A4: Corrupted JSON, missing metadata, or inconsistent counts yields FAIL (never PASS)', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-sim-corrupt-'));
     try {
       const corruptPath = path.join(tmpDir, 'corrupt.json');
       fs.writeFileSync(corruptPath, '{ not valid json !!!', 'utf8');
-      const corruptEval = loadAndEvaluateSimulatedArtifact(corruptPath);
+      const corruptEval = loadAndEvaluateSimulatedArtifact(corruptPath, undefined, { hmacKey });
       assert.ok(corruptEval.checks.every((c) => c.status === 'FAIL'));
       assert.ok(corruptEval.checks.every((c) => (c.blockerOrFailure || '').includes('Malformed simulated test artifact')));
 
-      const missingMeta = evaluateSimulatedChecksFromArtifact({
-        schemaVersion: '1.0',
-        suites: [],
-      });
+      const missingMeta = evaluateSimulatedChecksFromArtifact(
+        {
+          schemaVersion: '1.0',
+          suites: [],
+        },
+        { hmacKey }
+      );
       assert.ok(missingMeta.checks.every((c) => c.status === 'FAIL'));
 
-      const inconsistentCounts = buildValidArtifact();
+      const inconsistentCounts = buildUnsignedArtifact();
       inconsistentCounts.suites[0].passedCount = 1;
       inconsistentCounts.suites[0].totalCount = 10;
-      const countRes = evaluateSimulatedChecksFromArtifact(inconsistentCounts);
+      const countRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(inconsistentCounts, hmacKey),
+        { hmacKey }
+      );
       assert.equal(countRes.checks[0].status, 'FAIL');
       assert.match(countRes.checks[0].blockerOrFailure || '', /count mismatch/i);
     } finally {
@@ -1372,21 +1393,24 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
   });
 
   test('A5: Omitted suite reports NOT RUN while tampered suiteFile/suiteId mappings strictly FAIL (never PASS — SIMULATED)', () => {
-    const partial = buildValidArtifact();
-    partial.suites = partial.suites.slice(1); // omit entry 0 -> NOT RUN
-    const partialRes = evaluateSimulatedChecksFromArtifact(partial);
+    const hmacKey = crypto.randomBytes(32).toString('hex');
+    const partial = buildUnsignedArtifact();
+    partial.suites = partial.suites.slice(1); // omit entry 0 cleanly in a 3-suite partial run -> NOT RUN
+    const partialRes = evaluateSimulatedChecksFromArtifact(signSimulatedTestArtifact(partial, hmacKey), {
+      hmacKey,
+    });
     assert.equal(partialRes.checks.find((c) => c.testId === 'SIM-CUSTOMER-JOURNEY-30')?.status, 'NOT RUN');
     assert.equal(partialRes.checks.find((c) => c.testId === 'SIM-SHOPIFY-WRITEBACK')?.status, 'PASS — SIMULATED');
 
-    const badFileMapping = buildValidArtifact();
+    const badFileMapping = buildValidArtifact(hmacKey);
     badFileMapping.suites[0].suiteFile = 'src/server/otherFakeSuite.test.ts';
-    const badFileRes = evaluateSimulatedChecksFromArtifact(badFileMapping);
+    const badFileRes = evaluateSimulatedChecksFromArtifact(badFileMapping, { hmacKey });
     assert.ok(badFileRes.checks.every((c) => c.status === 'FAIL'));
     assert.match(badFileRes.checks[0].blockerOrFailure || '', /mapped to incorrect file/i);
 
-    const unknownId = buildValidArtifact();
+    const unknownId = buildValidArtifact(hmacKey);
     unknownId.suites[1].suiteId = 'SIM-WRONG-ID';
-    const unknownIdRes = evaluateSimulatedChecksFromArtifact(unknownId);
+    const unknownIdRes = evaluateSimulatedChecksFromArtifact(unknownId, { hmacKey });
     assert.ok(unknownIdRes.checks.every((c) => c.status === 'FAIL'));
     assert.match(unknownIdRes.checks[1].blockerOrFailure || '', /unknown suiteId/i);
   });
@@ -1417,7 +1441,7 @@ describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact 
   });
 });
 
-describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Consistency Guards', () => {
+describe('[TASK B — EPHEMERAL HMAC & SHA-256 ARTIFACT INTEGRITY] Authentication, Consistency & Tamper Rejection', () => {
   const setupTempRepo = () => {
     const tmpRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-taskb-repo-'));
     for (const def of SIMULATED_SUITE_DEFINITIONS) {
@@ -1428,8 +1452,8 @@ describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Con
     return tmpRepo;
   };
 
-  const buildTempArtifact = (repoRoot: string) => ({
-    schemaVersion: '1.0' as const,
+  const buildTempUnsignedArtifact = (repoRoot: string): SimulatedTestResultsArtifact => ({
+    schemaVersion: '1.0',
     runId: 'sim_taskb_run_001',
     generatedAt: '2026-11-28T11:00:00.000Z',
     runner: 'tsx --test --test-reporter=tap',
@@ -1444,20 +1468,25 @@ describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Con
       failedCount: 0,
       skippedCount: 0,
       totalCount: 5 + idx,
-      status: 'PASS' as 'PASS' | 'FAIL',
+      status: 'PASS',
       sha256: crypto
         .createHash('sha256')
         .update(fs.readFileSync(path.join(repoRoot, def.suiteFile)))
         .digest('hex'),
+      outputSha256: crypto.createHash('sha256').update(`tap-output-${def.testId}`, 'utf8').digest('hex'),
     })),
   });
 
-  test('B1: Valid artifact with matching current disk SHA-256 passes end-to-end buildCommercialVerificationReport cleanly', async () => {
+  const buildTempArtifact = (repoRoot: string, hmacKey: string): SimulatedTestResultsArtifact =>
+    signSimulatedTestArtifact(buildTempUnsignedArtifact(repoRoot), hmacKey);
+
+  test('B1: Valid signed artifact with matching current disk SHA-256 & HMAC passes end-to-end buildCommercialVerificationReport cleanly', async () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
     const tmpRepo = setupTempRepo();
     try {
       const artifactPath = path.join(tmpRepo, 'reports', 'simulated-test-results.json');
       fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
-      fs.writeFileSync(artifactPath, JSON.stringify(buildTempArtifact(tmpRepo), null, 2), 'utf8');
+      fs.writeFileSync(artifactPath, JSON.stringify(buildTempArtifact(tmpRepo, hmacKey), null, 2), 'utf8');
 
       await withEnvOverrides(
         {
@@ -1466,19 +1495,26 @@ describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Con
           STAGING_ALLOWED_HOSTS: undefined,
           PRODUCTION_HOSTS: undefined,
           PRODUCTION_APP_URL: undefined,
+          SIMULATED_ARTIFACT_HMAC_KEY: undefined,
         },
         async () => {
           const report = await buildCommercialVerificationReport({
             simulatedArtifactPath: artifactPath,
             repoRoot: tmpRepo,
+            hmacKey,
           });
           assert.equal(report.simulatedArtifactRunId, 'sim_taskb_run_001');
           assert.equal(report.simulatedChecks?.length, 4);
           for (const c of report.simulatedChecks || []) {
             assert.equal(c.status, 'PASS — SIMULATED');
             assert.equal(c.evidence?.sha256Verified, true);
+            assert.equal(c.evidence?.hmacVerified, true);
+            assert.match(String(c.evidence?.outputSha256 || ''), /^[0-9a-f]{64}$/);
             assert.equal(c.evidence?.liveProviderVerified, false);
           }
+          // Ensure ephemeral HMAC key is never leaked into rendered report JSON or Markdown
+          assert.equal(JSON.stringify(report).includes(hmacKey), false);
+          assert.equal(renderVerificationMarkdown(report).includes(hmacKey), false);
           // External stages remain truthfully BLOCKED without live credentials
           assert.equal(report.overallExternalStatus, 'BLOCKED');
         }
@@ -1489,13 +1525,14 @@ describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Con
   });
 
   test('B2: Modifying a test file after artifact creation causes SHA-256 verification to FAIL', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
     const tmpRepo = setupTempRepo();
     try {
-      const artifact = buildTempArtifact(tmpRepo);
+      const artifact = buildTempArtifact(tmpRepo, hmacKey);
       const targetSuite = SIMULATED_SUITE_DEFINITIONS[0];
       fs.appendFileSync(path.join(tmpRepo, targetSuite.suiteFile), '\n// post-artifact edit\n', 'utf8');
 
-      const res = evaluateSimulatedChecksFromArtifact(artifact, { repoRoot: tmpRepo });
+      const res = evaluateSimulatedChecksFromArtifact(artifact, { repoRoot: tmpRepo, hmacKey });
       const modifiedCheck = res.checks.find((c) => c.testId === targetSuite.testId);
       assert.equal(modifiedCheck?.status, 'FAIL');
       assert.match(modifiedCheck?.blockerOrFailure || '', /SHA-256 digest mismatch/i);
@@ -1507,23 +1544,33 @@ describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Con
   });
 
   test('B3: Digest mismatch, missing digest, and malformed digest are strictly rejected as FAIL', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
     const tmpRepo = setupTempRepo();
     try {
-      const mismatch = buildTempArtifact(tmpRepo);
+      const mismatch = buildTempUnsignedArtifact(tmpRepo);
       mismatch.suites[0].sha256 = '0'.repeat(64);
-      const mismatchRes = evaluateSimulatedChecksFromArtifact(mismatch, { repoRoot: tmpRepo });
+      const mismatchRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(mismatch, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
       assert.equal(mismatchRes.checks[0].status, 'FAIL');
       assert.match(mismatchRes.checks[0].blockerOrFailure || '', /SHA-256 digest mismatch/i);
 
-      const missingDigest = buildTempArtifact(tmpRepo);
+      const missingDigest = buildTempUnsignedArtifact(tmpRepo);
       delete (missingDigest.suites[1] as any).sha256;
-      const missingRes = evaluateSimulatedChecksFromArtifact(missingDigest, { repoRoot: tmpRepo });
+      const missingRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(missingDigest, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
       assert.equal(missingRes.checks[1].status, 'FAIL');
       assert.match(missingRes.checks[1].blockerOrFailure || '', /missing sha256 digest/i);
 
-      const badFormatDigest = buildTempArtifact(tmpRepo);
+      const badFormatDigest = buildTempUnsignedArtifact(tmpRepo);
       badFormatDigest.suites[2].sha256 = 'not-a-valid-hex-digest';
-      const badFormatRes = evaluateSimulatedChecksFromArtifact(badFormatDigest, { repoRoot: tmpRepo });
+      const badFormatRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(badFormatDigest, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
       assert.equal(badFormatRes.checks[2].status, 'FAIL');
       assert.match(badFormatRes.checks[2].blockerOrFailure || '', /malformed sha256 digest/i);
     } finally {
@@ -1531,40 +1578,318 @@ describe('[TASK B — SHA-256 ARTIFACT INTEGRITY] File Digest Verification & Con
     }
   });
 
-  test('B4: Contradictory exitCode != 0 (even with failedCount=0 and status=PASS), failedCount > 0, and missing suiteId cannot pass', () => {
+  test('B4: Even with a valid HMAC signature, contradictory exitCode != 0, failedCount > 0, and missing suiteId cannot pass', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
     const tmpRepo = setupTempRepo();
     try {
       // Non-zero exitCode with failedCount === 0 and contradictory status === 'PASS'
-      const nonZeroExitPass = buildTempArtifact(tmpRepo);
+      const nonZeroExitPass = buildTempUnsignedArtifact(tmpRepo);
       nonZeroExitPass.suites[0].exitCode = 1;
       nonZeroExitPass.suites[0].failedCount = 0;
       nonZeroExitPass.suites[0].status = 'PASS';
-      const nzPassRes = evaluateSimulatedChecksFromArtifact(nonZeroExitPass, { repoRoot: tmpRepo });
+      const nzPassRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(nonZeroExitPass, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
       assert.equal(nzPassRes.checks[0].status, 'FAIL');
       assert.match(nzPassRes.checks[0].blockerOrFailure || '', /inconsistent suite status "PASS"/i);
 
       // Non-zero exitCode with failedCount === 0 and status === 'FAIL'
-      const nonZeroExitFail = buildTempArtifact(tmpRepo);
+      const nonZeroExitFail = buildTempUnsignedArtifact(tmpRepo);
       nonZeroExitFail.suites[0].exitCode = 1;
       nonZeroExitFail.suites[0].failedCount = 0;
       nonZeroExitFail.suites[0].status = 'FAIL';
-      const nzFailRes = evaluateSimulatedChecksFromArtifact(nonZeroExitFail, { repoRoot: tmpRepo });
+      const nzFailRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(nonZeroExitFail, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
       assert.equal(nzFailRes.checks[0].status, 'FAIL');
 
       // failedCount > 0 even if status claims 'PASS'
-      const failedCountPass = buildTempArtifact(tmpRepo);
+      const failedCountPass = buildTempUnsignedArtifact(tmpRepo);
       failedCountPass.suites[1].failedCount = 1;
       failedCountPass.suites[1].passedCount -= 1;
       failedCountPass.suites[1].status = 'PASS';
-      const fcRes = evaluateSimulatedChecksFromArtifact(failedCountPass, { repoRoot: tmpRepo });
+      const fcRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(failedCountPass, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
       assert.equal(fcRes.checks[1].status, 'FAIL');
 
       // Missing suiteId rejected
-      const missingId = buildTempArtifact(tmpRepo);
+      const missingId = buildTempArtifact(tmpRepo, hmacKey);
       delete (missingId.suites[2] as any).suiteId;
-      const missingIdRes = evaluateSimulatedChecksFromArtifact(missingId, { repoRoot: tmpRepo });
+      const missingIdRes = evaluateSimulatedChecksFromArtifact(missingId, { repoRoot: tmpRepo, hmacKey });
       assert.ok(missingIdRes.checks.every((c) => c.status === 'FAIL'));
       assert.match(missingIdRes.checks[0].blockerOrFailure || '', /missing required suiteId/i);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B5: Post-run tampering of passedCount/totalCount (even keeping counts consistent) or failedCount/skippedCount/exitCode/status fails HMAC verification even when source sha256 is valid', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
+    const tmpRepo = setupTempRepo();
+    try {
+      const mutators: Array<{ label: string; mutate: (art: SimulatedTestResultsArtifact) => void }> = [
+        {
+          label: 'tampered consistent passedCount + totalCount',
+          mutate: (a) => {
+            a.suites[0].passedCount = 99;
+            a.suites[0].totalCount = 99;
+          },
+        },
+        {
+          label: 'tampered failedCount + passedCount',
+          mutate: (a) => {
+            a.suites[1].failedCount = 1;
+            a.suites[1].passedCount -= 1;
+          },
+        },
+        {
+          label: 'tampered skippedCount',
+          mutate: (a) => {
+            a.suites[2].skippedCount = 1;
+            a.suites[2].totalCount += 1;
+          },
+        },
+        {
+          label: 'tampered exitCode',
+          mutate: (a) => {
+            a.suites[3].exitCode = 2;
+          },
+        },
+        {
+          label: 'tampered status',
+          mutate: (a) => {
+            a.suites[0].status = 'FAIL';
+          },
+        },
+        {
+          label: 'tampered runId',
+          mutate: (a) => {
+            a.runId = 'sim_forged_run_999';
+          },
+        },
+        {
+          label: 'tampered generatedAt',
+          mutate: (a) => {
+            a.generatedAt = '2026-11-29T00:00:00.000Z';
+          },
+        },
+        {
+          label: 'tampered outputSha256',
+          mutate: (a) => {
+            a.suites[1].outputSha256 = 'f'.repeat(64);
+          },
+        },
+      ];
+
+      for (const m of mutators) {
+        const artifact = buildTempArtifact(tmpRepo, hmacKey);
+        m.mutate(artifact);
+        const res = evaluateSimulatedChecksFromArtifact(artifact, { repoRoot: tmpRepo, hmacKey });
+        assert.ok(
+          res.checks.every((c) => c.status === 'FAIL'),
+          `Expected FAIL across artifact when ${m.label}`
+        );
+        assert.ok(
+          res.checks.some((c) => /HMAC signature mismatch/i.test(c.blockerOrFailure || '')),
+          `Expected HMAC mismatch error for ${m.label}`
+        );
+      }
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B6: Missing, malformed, or tampered root hmacSha256 or per-suite hmacSha256 rejects execution evidence cleanly', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
+    const tmpRepo = setupTempRepo();
+    try {
+      // 1. Missing root hmacSha256
+      const missingRoot = buildTempArtifact(tmpRepo, hmacKey);
+      delete missingRoot.hmacSha256;
+      const missingRootRes = evaluateSimulatedChecksFromArtifact(missingRoot, { repoRoot: tmpRepo, hmacKey });
+      assert.ok(missingRootRes.checks.every((c) => c.status === 'FAIL'));
+      assert.match(missingRootRes.checks[0].blockerOrFailure || '', /Missing artifact-level HMAC signature/i);
+
+      // 2. Malformed root hmacSha256
+      const malformedRoot = buildTempArtifact(tmpRepo, hmacKey);
+      malformedRoot.hmacSha256 = 'not-hex';
+      const malformedRootRes = evaluateSimulatedChecksFromArtifact(malformedRoot, { repoRoot: tmpRepo, hmacKey });
+      assert.ok(malformedRootRes.checks.every((c) => c.status === 'FAIL'));
+      assert.match(malformedRootRes.checks[0].blockerOrFailure || '', /Malformed artifact-level HMAC signature/i);
+
+      // 3. Tampered per-suite hmacSha256 (even if root hmacSha256 matches)
+      const badSuiteHmac = buildTempArtifact(tmpRepo, hmacKey);
+      badSuiteHmac.suites[2].hmacSha256 = 'a'.repeat(64);
+      const badSuiteHmacRes = evaluateSimulatedChecksFromArtifact(badSuiteHmac, { repoRoot: tmpRepo, hmacKey });
+      assert.equal(badSuiteHmacRes.checks[2].status, 'FAIL');
+      assert.match(badSuiteHmacRes.checks[2].blockerOrFailure || '', /suite HMAC signature mismatch/i);
+
+      // 4. Missing per-suite hmacSha256
+      const missingSuiteHmac = buildTempArtifact(tmpRepo, hmacKey);
+      delete missingSuiteHmac.suites[1].hmacSha256;
+      const missingSuiteHmacRes = evaluateSimulatedChecksFromArtifact(missingSuiteHmac, { repoRoot: tmpRepo, hmacKey });
+      assert.equal(missingSuiteHmacRes.checks[1].status, 'FAIL');
+      assert.match(missingSuiteHmacRes.checks[1].blockerOrFailure || '', /missing hmacSha256 signature/i);
+
+      // 5. Missing outputSha256 even if signed
+      const missingOutDigest = buildTempUnsignedArtifact(tmpRepo);
+      delete missingOutDigest.suites[0].outputSha256;
+      const missingOutRes = evaluateSimulatedChecksFromArtifact(
+        signSimulatedTestArtifact(missingOutDigest, hmacKey),
+        { repoRoot: tmpRepo, hmacKey }
+      );
+      assert.equal(missingOutRes.checks[0].status, 'FAIL');
+      assert.match(missingOutRes.checks[0].blockerOrFailure || '', /missing outputSha256 digest/i);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B7: Missing, too-short, or mismatched SIMULATED_ARTIFACT_HMAC_KEY NEVER produces PASS — SIMULATED', async () => {
+    const signingKey = crypto.randomBytes(32).toString('hex');
+    const wrongKey = crypto.randomBytes(32).toString('hex');
+    const tmpRepo = setupTempRepo();
+    try {
+      const artifact = buildTempArtifact(tmpRepo, signingKey);
+      const artifactPath = path.join(tmpRepo, 'reports', 'simulated-test-results.json');
+      fs.mkdirSync(path.dirname(artifactPath), { recursive: true });
+      fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2), 'utf8');
+
+      // 1. Missing key
+      await withEnvOverrides({ SIMULATED_ARTIFACT_HMAC_KEY: undefined }, async () => {
+        const res = evaluateSimulatedChecksFromArtifact(artifact, { repoRoot: tmpRepo });
+        assert.ok(res.checks.every((c) => c.status === 'FAIL'));
+        assert.match(res.checks[0].blockerOrFailure || '', /Missing or invalid simulated artifact HMAC verification key/i);
+
+        const report = await buildCommercialVerificationReport({
+          simulatedArtifactPath: artifactPath,
+          repoRoot: tmpRepo,
+        });
+        assert.ok(report.simulatedChecks?.every((c) => c.status === 'FAIL'));
+        assert.equal(report.simulatedChecks?.some((c) => c.status === 'PASS — SIMULATED'), false);
+      });
+
+      // 2. Too-short key (< 32 chars)
+      const shortRes = evaluateSimulatedChecksFromArtifact(artifact, {
+        repoRoot: tmpRepo,
+        hmacKey: 'short-key',
+      });
+      assert.ok(shortRes.checks.every((c) => c.status === 'FAIL'));
+      assert.match(shortRes.checks[0].blockerOrFailure || '', /Missing or invalid simulated artifact HMAC verification key/i);
+
+      // 3. Wrong key of valid length
+      const wrongRes = evaluateSimulatedChecksFromArtifact(artifact, {
+        repoRoot: tmpRepo,
+        hmacKey: wrongKey,
+      });
+      assert.ok(wrongRes.checks.every((c) => c.status === 'FAIL'));
+      assert.match(wrongRes.checks[0].blockerOrFailure || '', /Artifact HMAC signature mismatch/i);
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B8: Mid-run test file modification is detected via pre-run vs post-run SHA-256 check and rejected by both runner and evaluator', () => {
+    const hmacKey = crypto.randomBytes(32).toString('hex');
+    const tmpRepo = setupTempRepo();
+    try {
+      const outPath = path.join(tmpRepo, 'reports', 'simulated-test-results.json');
+      const mutatedSuite = SIMULATED_SUITE_DEFINITIONS[1];
+
+      const runResult = runSimulatedTestsAndSign({
+        repoRoot: tmpRepo,
+        outPath,
+        hmacKey,
+        quiet: true,
+        executeSuite: (def, absSuitePath) => {
+          if (def.testId === mutatedSuite.testId) {
+            // Mutate source file DURING suite execution despite returning exitCode=0 passing TAP!
+            fs.appendFileSync(absSuitePath, '\n// mutated mid-run\n', 'utf8');
+          }
+          return {
+            exitCode: 0,
+            stdout: ['TAP version 13', 'ok 1 - passing case', '1..1', '# tests 3', '# pass 3', '# fail 0', '# skipped 0', '# duration_ms 25'].join('\n'),
+            stderr: '',
+          };
+        },
+      });
+
+      assert.equal(runResult.anyFailed, true, 'Runner must fail when suite file changes mid-run');
+      const mutatedEntry = runResult.artifact.suites.find((s) => s.suiteId === mutatedSuite.testId);
+      assert.equal(mutatedEntry?.status, 'FAIL');
+      assert.equal(mutatedEntry?.sourceChangedDuringRun, true);
+
+      // Even though the artifact is validly signed and post-run disk sha256 matches the mutated file, evaluator MUST reject it!
+      const evalRes = loadAndEvaluateSimulatedArtifact(outPath, undefined, {
+        repoRoot: tmpRepo,
+        hmacKey,
+      });
+      const evalMutated = evalRes.checks.find((c) => c.testId === mutatedSuite.testId);
+      assert.equal(evalMutated?.status, 'FAIL');
+      assert.match(evalMutated?.blockerOrFailure || '', /changed during execution/i);
+      assert.equal(evalRes.checks.find((c) => c.testId === SIMULATED_SUITE_DEFINITIONS[0].testId)?.status, 'PASS — SIMULATED');
+    } finally {
+      fs.rmSync(tmpRepo, { recursive: true, force: true });
+    }
+  });
+
+  test('B9: Runner requires >=32-char ephemeral HMAC key, signs authentic passing runs, and redactSecrets masks SIMULATED_ARTIFACT_HMAC_KEY', () => {
+    const tmpRepo = setupTempRepo();
+    try {
+      const outPath = path.join(tmpRepo, 'reports', 'simulated-test-results.json');
+
+      // Runner rejects missing key
+      assert.throws(
+        () =>
+          runSimulatedTestsAndSign({
+            repoRoot: tmpRepo,
+            outPath,
+            hmacKey: '',
+            quiet: true,
+          }),
+        /Missing or invalid SIMULATED_ARTIFACT_HMAC_KEY/i
+      );
+
+      // Runner succeeds with valid ephemeral key and produces authentic verifiable artifact
+      const hmacKey = crypto.randomBytes(32).toString('hex');
+      const cleanRun = runSimulatedTestsAndSign({
+        repoRoot: tmpRepo,
+        outPath,
+        hmacKey,
+        quiet: true,
+        executeSuite: () => ({
+          exitCode: 0,
+          stdout: ['TAP version 13', 'ok 1 - simulated ok', '1..1', '# tests 4', '# pass 4', '# fail 0', '# skipped 0', '# duration_ms 42'].join('\n'),
+          stderr: '',
+        }),
+      });
+      assert.equal(cleanRun.anyFailed, false);
+      assert.match(cleanRun.artifact.hmacSha256 || '', /^[0-9a-f]{64}$/);
+      assert.equal(fs.readFileSync(outPath, 'utf8').includes(hmacKey), false);
+
+      const evalRes = loadAndEvaluateSimulatedArtifact(outPath, undefined, {
+        repoRoot: tmpRepo,
+        hmacKey,
+      });
+      assert.ok(evalRes.checks.every((c) => c.status === 'PASS — SIMULATED'));
+      assert.ok(evalRes.checks.every((c) => c.evidence?.hmacVerified === true));
+      assert.ok(evalRes.checks.every((c) => c.evidence?.sha256Verified === true));
+
+      // redactSecrets protects SIMULATED_ARTIFACT_HMAC_KEY if ever present in environment strings
+      const prevKey = process.env.SIMULATED_ARTIFACT_HMAC_KEY;
+      process.env.SIMULATED_ARTIFACT_HMAC_KEY = hmacKey;
+      try {
+        const redacted = redactSecrets(`error leaked key=${hmacKey}`);
+        assert.equal(redacted.includes(hmacKey), false);
+        assert.ok(redacted.includes('[REDACTED_SIMULATED_ARTIFACT_HMAC_KEY]'));
+      } finally {
+        if (prevKey === undefined) delete process.env.SIMULATED_ARTIFACT_HMAC_KEY;
+        else process.env.SIMULATED_ARTIFACT_HMAC_KEY = prevKey;
+      }
     } finally {
       fs.rmSync(tmpRepo, { recursive: true, force: true });
     }

@@ -21,6 +21,7 @@ import { runSecretSafeConfigCheck } from '../../src/server/config/checkConfig';
 export interface BuildCommercialReportOptions {
   simulatedArtifactPath?: string;
   repoRoot?: string;
+  hmacKey?: string;
 }
 
 function getCliArgValue(prefix: string): string | undefined {
@@ -85,6 +86,7 @@ export async function buildCommercialVerificationReport(
 
   const simulatedEval = loadAndEvaluateSimulatedArtifact(artifactPath, nowIso, {
     repoRoot: options.repoRoot,
+    hmacKey: options.hmacKey,
   });
   const relArtifactPath = path.relative(process.cwd(), simulatedEval.artifactPath);
   const displayArtifactPath =
@@ -102,7 +104,7 @@ export async function buildCommercialVerificationReport(
   const simNotRunCount = simulatedEval.checks.filter((c) => c.status === 'NOT RUN').length;
   if (simNotRunCount > 0) {
     notes.push(
-      `${simNotRunCount} simulated suite(s) reported NOT RUN because verifiable test results were missing at "${displayArtifactPath}". Run "npm run test:simulated:artifact" first.`
+      `${simNotRunCount} simulated suite(s) reported NOT RUN because verifiable test results were missing at "${displayArtifactPath}". Run "npm run verify:simulated" first.`
     );
   }
   if (simFailCount > 0) {

@@ -31,21 +31,17 @@ This guide documents how to prepare, execute, record evidence for, and clean up 
   - Stage 2 (Stripe Test Mode): `npm run verify:stripe`
   - Stage 3 (Real SMTP Provider): `npm run verify:smtp`
   - Stage 4 (Staging E2E): `npm run verify:staging-e2e`
-  - Generate verifiable simulated test artifact (`reports/simulated-test-results.json` with current suite SHA-256 digests): `npm run test:simulated:artifact` (or `bun run test:simulated:artifact`)
-  - Aggregate JSON/Markdown report (derives simulated checks strictly from the artifact, validates `suiteId <-> suiteFile` mapping, count consistency, and recalculates SHA-256 digests on disk before accepting `PASS — SIMULATED`; missing -> `NOT RUN`, failed/corrupt/tampered -> `FAIL`): `npm run verify:commercial:report -- --write`
+  - **Verified local simulated orchestration (recommended):** `npm run verify:simulated` (or `bun run verify:simulated`) — generates a fresh ephemeral 256-bit HMAC-SHA-256 signing key strictly in memory, runs all 4 simulated suites (`run-simulated-tests.ts`), checks source-file SHA-256 before and after each suite execution, signs canonical evidence payloads (including captured-output SHA-256), evaluates the signed `reports/simulated-test-results.json` with the same ephemeral key, writes `docs/COMMERCIAL_VERIFICATION_REPORT.md`, and discards the key.
+  - Low-level runner / report commands (require `SIMULATED_ARTIFACT_HMAC_KEY` from the orchestrator or CI shell when evaluating simulated evidence): `npm run test:simulated:artifact` and `npm run verify:commercial:report -- --write`.
 
 Add `--strict` to any `verify:*` command to exit non-zero (`2`) if any check is `BLOCKED` (useful as a pre-release gate).
 
 ### Simulated Artifact Integrity & Evidence Separation
 
-1. `npm run test:simulated:artifact` runs the 4 simulated suites (`SIM-CUSTOMER-JOURNEY-30`, `SIM-SHOPIFY-WRITEBACK`, `SIM-BILLING-EMAILS`, `SIM-COMMERCIAL-HARNESS`), parses TAP test totals, and writes `reports/simulated-test-results.json` containing each suite's `suiteId`, `suiteFile`, timestamps, counts, `exitCode`, `status`, and current file `sha256` digest.
-2. `npm run verify:commercial:report` loads `reports/simulated-test-results.json` and verifies:
-   - Schema metadata (`schemaVersion: "1.0"`, `runId`, `generatedAt`, `runner`, `suites`)
-   - Bidirectional `suiteId <-> suiteFile` mapping (rejects unknown `suiteId` or incorrect file mappings)
-   - Consistent test counts (`passedCount + failedCount + skippedCount === totalCount`) and `status === "PASS"` only when `exitCode === 0`, `failedCount === 0`, and `passedCount > 0`
-   - Current SHA-256 digest of each test suite file on disk recalculated and compared via constant-time `crypto.timingSafeEqual` against `entry.sha256`
-3. Missing artifacts remain `NOT RUN`; malformed, failed, or modified-file artifacts report `FAIL` and never become `PASS — SIMULATED`.
-4. `PASS — SIMULATED` proves local code/contract behavior using mocks/test doubles only (`liveProviderVerified: false`). It never satisfies external provider verification (`PASS`), which requires running Stages 1–4 against real external targets with explicit opt-in and required evidence.
+1. **Source SHA-256 verification (before, during, and after):** `run-simulated-tests.ts` computes each suite file's SHA-256 immediately before and immediately after execution. If a suite source file changes during execution, the suite is marked `FAIL` (`sourceChangedDuringRun: true`) and rejected. When evaluating `reports/simulated-test-results.json`, the evaluator recalculates each current test suite file's SHA-256 on disk and compares it via `crypto.timingSafeEqual` against `entry.sha256`.
+2. **Captured-output SHA-256 (`outputSha256`) & Ephemeral HMAC-SHA-256 verification:** The runner computes `outputSha256` over the captured runner stdout/stderr and signs canonical JSON payloads covering `schemaVersion`, `runId`, `generatedAt`, `runner`, `nodeVersion` (when present), `suiteId`, `suiteFile`, `executedAt`, `durationMs`, `exitCode`, `passedCount`, `failedCount`, `skippedCount`, `totalCount`, `status`, `sha256`, `outputSha256`, and `sourceChangedDuringRun` (if set) at both suite and root-artifact levels using a fresh per-run ephemeral `SIMULATED_ARTIFACT_HMAC_KEY`.
+3. **Key handling & fail-closed behavior:** The ephemeral key is never written into `reports/simulated-test-results.json`, printed to logs, or committed to Git. If the key is missing, invalid, or mismatched—or if counts, exit codes, signatures, digests, or `suiteId <-> suiteFile` mappings fail validation—the evaluator never emits `PASS — SIMULATED` (missing artifact -> `NOT RUN`; tampered/unsigned/corrupt/failed -> `FAIL`).
+4. **Trust boundaries & limits of simulated evidence:** Source SHA-256 detects changes to the suite file on disk (before/during/after the run). Ephemeral HMAC-SHA-256 authenticates that the recorded counts, statuses, timestamps, and output digest match what that run's runner produced under the in-memory ephemeral key. Neither proves that the mocked test logic covers real external provider behavior or that the runner environment itself was immune to compromise. `PASS — SIMULATED` (`liveProviderVerified: false`) remains strictly separate from live external verification (`PASS`) across Shopify, Stripe, SMTP, and staging E2E.
 
 ---
 
@@ -177,13 +173,21 @@ All transactional email rendering and SMTP/transport dispatch live in `src/serve
 
 ### Prerequisites & Safety Guardrails
 1. Deploy AIXSHOP to an **isolated staging environment** (`STAGING_BASE_URL`, `https://` required for remote targets) connected to a **staging PostgreSQL database** (migrations `001`–`019` applied).
-2. Explicitly allowlist the exact staging hostname in `STAGING_ALLOWED_HOSTS` (comma-separated exact DNS hostnames without schemes, ports, paths, or wildcards; e.g. `STAGING_ALLOWED_HOSTS="staging.aixshop.example.com"`). Local loopback (`http://127.0.0.1` / `localhost`) is rejected in remote mode and permitted only when `STAGING_ALLOW_LOCAL="true"` for isolated local test servers.
-3. Configure the explicit **production host denylist** via `PRODUCTION_HOSTS` (comma-separated exact production DNS hostnames, e.g. `PRODUCTION_HOSTS="shop.customer.com,checkout.customer.com"`) and/or `PRODUCTION_APP_URL` (your authoritative `https://` production URL). Production host rejection applies **regardless of `NODE_ENV`** (`development`, `test`, or `production`), runs **before** `STAGING_ALLOWED_HOSTS`, rejects any staging target or allowlist containing a production host (`PRODUCTION_TARGET_REJECTED`), and fails closed on malformed or contradictory configuration.
+2. **Understand `NODE_ENV`, `APP_URL`, `PRODUCTION_HOSTS`, and `PRODUCTION_APP_URL`:**
+   - `NODE_ENV` selects runtime configuration (a staging deployment commonly runs `NODE_ENV=production` to match production runtime policies).
+   - `APP_URL` identifies the URL of **the currently deployed instance** (which may be a staging deployment running `NODE_ENV=production`), so `APP_URL` is **never** automatically treated as production denylist identity.
+   - `PRODUCTION_HOSTS` (comma-separated exact DNS hostnames, e.g. `PRODUCTION_HOSTS="shop.customer.com,checkout.customer.com"`) and `PRODUCTION_APP_URL` (your authoritative `https://` customer-facing production URL) form the **explicit authoritative production denylist**.
+3. **Explicit Denylist + Explicit Allowlist for Remote Staging:**
+   - Remote staging verification **requires** a valid, non-empty production denylist (`PRODUCTION_HOSTS` and/or `PRODUCTION_APP_URL`). If both are empty, remote staging **fails closed** before any HTTP call (`PRODUCTION_DENYLIST_MISSING`).
+   - Explicitly allowlist the exact staging hostname in `STAGING_ALLOWED_HOSTS` (comma-separated exact DNS hostnames without schemes, ports, paths, or wildcards; e.g. `STAGING_ALLOWED_HOSTS="staging.aixshop.example.com"`). No substring heuristics (such as matching `"staging"` or `"dev"` in a hostname) are used.
+   - Local loopback (`http://127.0.0.1` / `localhost`) is rejected in remote mode and permitted only when `STAGING_ALLOW_LOCAL="true"` for isolated local test servers.
+   - Production host rejection applies **regardless of `NODE_ENV`**, runs **before** `STAGING_ALLOWED_HOSTS` / `STAGING_ALLOW_LOCAL`, rejects any staging target or allowlist containing a production host (`PRODUCTION_TARGET_REJECTED`), and fails closed on malformed or contradictory configuration.
+   - A staging instance running `NODE_ENV=production` with `APP_URL=https://staging.aixshop.example.com` is accepted when `STAGING_BASE_URL` matches `STAGING_ALLOWED_HOSTS`, is excluded from the production denylist, and a valid explicit production denylist is configured.
 4. Set `STAGING_CONFIRM_NON_PRODUCTION="true"` and configure Shopify Dev Store, Stripe Test Mode (`sk_test_...`), and Real SMTP env vars on both the staging deployment and verification runner.
 5. Never point `STAGING_BASE_URL` at production, include embedded URL credentials (`user:pass@`), use remote `http://`, or supply a live Stripe key (`STAGING_CONFIRM_NON_PRODUCTION=true` and `STAGING_ALLOWED_HOSTS` never bypass the production denylist).
 
 ### Required Evidence Before Staging or Production Verification
-- Fresh `reports/simulated-test-results.json` matching current suite file SHA-256 digests (`sha256Verified: true`) and all 4 simulated checks in `PASS — SIMULATED`
+- Fresh `reports/simulated-test-results.json` verified via `npm run verify:simulated` (`hmacVerified: true`, `sha256Verified: true`, valid `outputSha256`, and all 4 simulated checks in `PASS — SIMULATED`)
 - Secret-safe environment audit (`npm run config:check` and `npm run verify:config`) confirming non-production staging target, explicit `PRODUCTION_HOSTS` / `PRODUCTION_APP_URL` denylist, `STAGING_ALLOWED_HOSTS`, and `sk_test_...` only
 - Stage 1–3 evidence logs (Shopify Dev Store GraphQL read + webhook registration, Stripe Test Mode checkout/prices + cleanup, Real SMTP `250 OK` + manual inbox receipt) and Stage 4 cleanup confirmation before claiming staging/commercial readiness.
 

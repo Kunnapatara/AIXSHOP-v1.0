@@ -8,12 +8,13 @@ Use this template to record verifiable evidence when executing commercial verifi
 
 - **Run ID:** `<e.g. cv_20261125_01>`
 - **Simulated Artifact Run ID (`reports/simulated-test-results.json`):** `<e.g. sim_20261125_01 or NOT RUN>`
-- **Simulated Suite SHA-256 Digests Verified (`sha256Verified=true` on all 4 suites):** `<Yes/No/NOT RUN>`
+- **Simulated Evidence Verified (`npm run verify:simulated`: `hmacVerified=true`, `sha256Verified=true`, valid `outputSha256` on all 4 suites):** `<Yes/No/NOT RUN>`
 - **Date / Time (UTC):** `<YYYY-MM-DDTHH:MM:SSZ>`
 - **Operator:** `<Name>`
 - **Git Commit SHA:** `<SHA or "No git repo">`
-- **Target Environment:** `<e.g. staging.aixshop.example.com>`
-- **Production Denylist & Allowlist Confirmed (`PRODUCTION_HOSTS`/`PRODUCTION_APP_URL` exclude target; `STAGING_ALLOWED_HOSTS` matches exact staging host):** `<Yes/No>`
+- **Target Environment (`STAGING_BASE_URL`):** `<e.g. https://staging.aixshop.example.com>`
+- **Runtime `NODE_ENV` & `APP_URL` of Target:** `<e.g. NODE_ENV=production, APP_URL=https://staging.aixshop.example.com>`
+- **Explicit Production Denylist & Staging Allowlist Confirmed (`PRODUCTION_HOSTS`/`PRODUCTION_APP_URL` configured and exclude target; `STAGING_ALLOWED_HOSTS` matches exact staging host):** `<Yes/No>`
 - **Command Executed:** `<exact command>`
 
 ---

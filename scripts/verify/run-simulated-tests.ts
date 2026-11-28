@@ -6,6 +6,8 @@ import path from 'node:path';
 import {
   createRunId,
   DEFAULT_SIMULATED_ARTIFACT_PATH,
+  MIN_SIMULATED_HMAC_KEY_LENGTH,
+  signSimulatedTestArtifact,
   SIMULATED_SUITE_DEFINITIONS,
   SimulatedSuiteArtifactEntry,
   SimulatedTestResultsArtifact,
@@ -47,12 +49,23 @@ function getCliArgValue(prefix: string): string | undefined {
   return found ? found.slice(prefix.length).trim() : undefined;
 }
 
-function resolveTsxInvocation(suiteFile: string): { cmd: string; args: string[]; label: string } {
-  const tsxCli = path.resolve(process.cwd(), 'node_modules/tsx/dist/cli.mjs');
+function resolveTsxInvocation(
+  suiteFile: string,
+  repoRoot = process.cwd()
+): { cmd: string; args: string[]; label: string } {
+  const tsxCli = path.resolve(repoRoot, 'node_modules/tsx/dist/cli.mjs');
   if (fs.existsSync(tsxCli)) {
     return {
       cmd: 'node',
       args: [tsxCli, '--test', '--test-reporter=tap', suiteFile],
+      label: `node node_modules/tsx/dist/cli.mjs --test --test-reporter=tap ${suiteFile}`,
+    };
+  }
+  const localTsxCli = path.resolve(process.cwd(), 'node_modules/tsx/dist/cli.mjs');
+  if (fs.existsSync(localTsxCli)) {
+    return {
+      cmd: 'node',
+      args: [localTsxCli, '--test', '--test-reporter=tap', suiteFile],
       label: `node node_modules/tsx/dist/cli.mjs --test --test-reporter=tap ${suiteFile}`,
     };
   }
@@ -64,38 +77,87 @@ function resolveTsxInvocation(suiteFile: string): { cmd: string; args: string[];
   };
 }
 
-function main() {
+export interface SuiteExecutionResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+export interface RunSimulatedTestsOptions {
+  repoRoot?: string;
+  outPath?: string;
+  hmacKey?: string;
+  quiet?: boolean;
+  executeSuite?: (suite: (typeof SIMULATED_SUITE_DEFINITIONS)[number], absSuitePath: string) => SuiteExecutionResult;
+}
+
+export function runSimulatedTestsAndSign(options: RunSimulatedTestsOptions = {}): {
+  artifact: SimulatedTestResultsArtifact;
+  outPath: string;
+  anyFailed: boolean;
+} {
+  const repoRoot = path.resolve(options.repoRoot || process.cwd());
   const outArg =
+    options.outPath ||
     getCliArgValue('--out=') ||
     process.env.SIMULATED_TEST_ARTIFACT_PATH?.trim() ||
     DEFAULT_SIMULATED_ARTIFACT_PATH;
-  const outPath = path.resolve(process.cwd(), outArg);
-  const quiet = process.argv.includes('--quiet');
+  const outPath = path.resolve(repoRoot, outArg);
+  const quiet = options.quiet ?? process.argv.includes('--quiet');
+
+  const hmacKey = (
+    options.hmacKey !== undefined ? options.hmacKey : process.env.SIMULATED_ARTIFACT_HMAC_KEY || ''
+  ).trim();
+  if (!hmacKey || hmacKey.length < MIN_SIMULATED_HMAC_KEY_LENGTH) {
+    throw new Error(
+      'Missing or invalid SIMULATED_ARTIFACT_HMAC_KEY. Run via "npm run verify:simulated" (or provide an ephemeral >=32-char key from the orchestrator).'
+    );
+  }
 
   const runId = createRunId('sim');
   const suites: SimulatedSuiteArtifactEntry[] = [];
   let anyFailed = false;
 
   for (const def of SIMULATED_SUITE_DEFINITIONS) {
-    const absSuite = path.resolve(process.cwd(), def.suiteFile);
-    if (!fs.existsSync(absSuite)) {
+    const absSuite = path.resolve(repoRoot, def.suiteFile);
+    if (!absSuite.startsWith(repoRoot + path.sep) || !fs.existsSync(absSuite)) {
       throw new Error(`Required simulated suite file missing on disk: ${def.suiteFile}`);
     }
-    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(absSuite)).digest('hex');
 
-    const invocation = resolveTsxInvocation(def.suiteFile);
+    const sha256Before = crypto.createHash('sha256').update(fs.readFileSync(absSuite)).digest('hex');
+
+    const invocation = resolveTsxInvocation(def.suiteFile, repoRoot);
     const startedAt = new Date().toISOString();
     const t0 = Date.now();
-    const res = spawnSync(invocation.cmd, invocation.args, {
-      cwd: process.cwd(),
-      encoding: 'utf8',
-      env: process.env,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    let execRes: SuiteExecutionResult;
+    if (options.executeSuite) {
+      execRes = options.executeSuite(def, absSuite);
+    } else {
+      const res = spawnSync(invocation.cmd, invocation.args, {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env: process.env,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      execRes = {
+        exitCode: typeof res.status === 'number' ? res.status : 1,
+        stdout: res.stdout || '',
+        stderr: res.stderr || '',
+        error: res.error,
+      };
+    }
     const wallDurationMs = Date.now() - t0;
 
-    const exitCode = typeof res.status === 'number' ? res.status : 1;
-    const tapText = `${res.stdout || ''}\n${res.stderr || ''}`;
+    // Immediately re-hash the suite source file after execution to detect mid-run tampering
+    const fileStillExists = fs.existsSync(absSuite);
+    const sha256After = fileStillExists
+      ? crypto.createHash('sha256').update(fs.readFileSync(absSuite)).digest('hex')
+      : '';
+    const sourceChangedDuringRun = !fileStillExists || sha256Before !== sha256After;
+
+    const tapText = `${execRes.stdout || ''}\n${execRes.stderr || ''}`;
+    const outputSha256 = crypto.createHash('sha256').update(Buffer.from(tapText, 'utf8')).digest('hex');
     const totals = parseTapTotals(tapText);
 
     const passedCount = totals.pass ?? 0;
@@ -108,8 +170,9 @@ function main() {
         : wallDurationMs;
 
     const ok =
-      !res.error &&
-      exitCode === 0 &&
+      !sourceChangedDuringRun &&
+      !execRes.error &&
+      execRes.exitCode === 0 &&
       failedCount === 0 &&
       totalCount > 0 &&
       passedCount > 0 &&
@@ -124,27 +187,34 @@ function main() {
       suiteId: def.testId,
       executedAt: startedAt,
       durationMs,
-      exitCode,
+      exitCode: execRes.exitCode,
       passedCount,
       failedCount,
       skippedCount,
       totalCount,
       status: ok ? 'PASS' : 'FAIL',
       command: invocation.label,
-      sha256,
+      sha256: sha256After || sha256Before,
+      outputSha256,
+      ...(sourceChangedDuringRun ? { sourceChangedDuringRun: true } : {}),
     });
 
     if (!quiet) {
       console.log(
-        `[test:simulated:artifact] ${ok ? 'PASS' : 'FAIL'} ${def.testId} (${def.suiteFile}): passed=${passedCount}, failed=${failedCount}, skipped=${skippedCount}, total=${totalCount}, exitCode=${exitCode}, durationMs=${durationMs}`
+        `[test:simulated:artifact] ${ok ? 'PASS' : 'FAIL'} ${def.testId} (${def.suiteFile}): passed=${passedCount}, failed=${failedCount}, skipped=${skippedCount}, total=${totalCount}, exitCode=${execRes.exitCode}, durationMs=${durationMs}${sourceChangedDuringRun ? ' [SOURCE_CHANGED_DURING_RUN]' : ''}`
       );
-      if (!ok && res.stderr) {
-        console.error(res.stderr.trim());
+      if (sourceChangedDuringRun) {
+        console.error(
+          `[test:simulated:artifact] Suite source "${def.suiteFile}" changed during the run (before=${sha256Before}, after=${sha256After || 'missing'}).`
+        );
+      }
+      if (!ok && execRes.stderr) {
+        console.error(execRes.stderr.trim());
       }
     }
   }
 
-  const artifact: SimulatedTestResultsArtifact = {
+  const unsignedArtifact: SimulatedTestResultsArtifact = {
     schemaVersion: '1.0',
     runId,
     generatedAt: new Date().toISOString(),
@@ -153,13 +223,20 @@ function main() {
     suites,
   };
 
+  const signedArtifact = signSimulatedTestArtifact(unsignedArtifact, hmacKey);
+
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  fs.writeFileSync(outPath, JSON.stringify(artifact, null, 2), 'utf8');
+  fs.writeFileSync(outPath, JSON.stringify(signedArtifact, null, 2), 'utf8');
 
   if (!quiet) {
-    console.log(`[test:simulated:artifact] Wrote ${outPath} (runId=${runId})`);
+    console.log(`[test:simulated:artifact] Wrote ${outPath} (runId=${runId}, signed=true)`);
   }
 
+  return { artifact: signedArtifact, outPath, anyFailed };
+}
+
+function main() {
+  const { anyFailed } = runSimulatedTestsAndSign();
   if (anyFailed) {
     process.exitCode = 1;
   }
