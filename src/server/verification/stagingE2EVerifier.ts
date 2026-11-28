@@ -337,39 +337,49 @@ export async function runStagingE2EVerification(
     return summary;
   }
 
-  const baseUrlGuard = validateStagingBaseUrlNonProduction(process.env.STAGING_BASE_URL);
-  if (baseUrlGuard.isProductionTarget) {
-    const failedChecks: VerificationCheckResult[] = ALL_STAGING_CHECK_DEFS.map((def, idx) => ({
-      testId: def.testId,
-      stage: 'stage_4_staging_e2e',
-      name: def.name,
-      purpose: def.purpose,
-      status: idx === 0 ? 'FAIL' : 'BLOCKED',
-      executionMode: 'staging_e2e',
-      targetEnvironment: targetEnv,
-      executedAt: nowIso(),
-      blockerOrFailure:
-        idx === 0
-          ? `PRODUCTION_TARGET_REJECTED: ${baseUrlGuard.reason}`
-          : 'Blocked by non-production STAGING_BASE_URL safety guard.',
-    }));
-    const summary = summarizeStage(
-      'stage_4_staging_e2e',
-      'Stage 4 — Staging End-to-End Customer Journey',
-      failedChecks,
-      ['STAGING_BASE_URL (must point to a non-production staging target)']
-    );
-    summary.cleanupReport = {
-      enabled: cleanupEnabled,
-      status: 'NONE_CREATED',
-      trackedResources: { userIds: [], workspaceIds: [], checkoutSessionIds: [], testEmails: [] },
-      deletedUserIds: [],
-      deletedWorkspaceIds: [],
-      preservedSharedWorkspaceIds: [],
-      warnings: [],
-      errors: [],
-    };
-    return summary;
+  const rawStagingUrl = process.env.STAGING_BASE_URL?.trim();
+  if (rawStagingUrl) {
+    const baseUrlGuard = validateStagingBaseUrlNonProduction(rawStagingUrl);
+    if (!baseUrlGuard.valid) {
+      const prefix = baseUrlGuard.isProductionTarget
+        ? 'PRODUCTION_TARGET_REJECTED'
+        : 'STAGING_TARGET_REJECTED';
+      const missingVarHint = baseUrlGuard.isProductionTarget
+        ? 'STAGING_BASE_URL (must point to a non-production staging target)'
+        : baseUrlGuard.reason || 'STAGING_BASE_URL / STAGING_ALLOWED_HOSTS';
+
+      const failedChecks: VerificationCheckResult[] = ALL_STAGING_CHECK_DEFS.map((def, idx) => ({
+        testId: def.testId,
+        stage: 'stage_4_staging_e2e',
+        name: def.name,
+        purpose: def.purpose,
+        status: idx === 0 ? 'FAIL' : 'BLOCKED',
+        executionMode: 'staging_e2e',
+        targetEnvironment: targetEnv,
+        executedAt: nowIso(),
+        blockerOrFailure:
+          idx === 0
+            ? `${prefix}: ${baseUrlGuard.reason}`
+            : 'Blocked by STAGING_BASE_URL non-production & allowlist safety guard.',
+      }));
+      const summary = summarizeStage(
+        'stage_4_staging_e2e',
+        'Stage 4 — Staging End-to-End Customer Journey',
+        failedChecks,
+        [missingVarHint]
+      );
+      summary.cleanupReport = {
+        enabled: cleanupEnabled,
+        status: 'NONE_CREATED',
+        trackedResources: { userIds: [], workspaceIds: [], checkoutSessionIds: [], testEmails: [] },
+        deletedUserIds: [],
+        deletedWorkspaceIds: [],
+        preservedSharedWorkspaceIds: [],
+        warnings: [],
+        errors: [],
+      };
+      return summary;
+    }
   }
 
   if (stageReadiness.status !== 'READY') {

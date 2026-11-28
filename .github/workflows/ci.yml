@@ -43,6 +43,11 @@ jobs:
       - name: Run test suite
         run: bun run test
 
+      - name: Generate verifiable simulated test artifact & verify report integrity
+        run: |
+          bun run test:simulated:artifact
+          bun run verify:commercial:report -- --json > /tmp/commercial-report.json
+
       - name: Secret-safe config check
         run: bun run config:check
 

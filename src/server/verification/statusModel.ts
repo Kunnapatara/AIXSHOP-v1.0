@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
+import { isIP } from 'node:net';
 import path from 'node:path';
-import { validateProductionConfig, validateShopifyUrlConfig } from '../config/productionConfig';
+import {
+  isLoopbackOrLocalHostname,
+  validateProductionConfig,
+  validateShopifyUrlConfig,
+} from '../config/productionConfig';
 import { validateStripePriceConfiguration } from '../billing/providerAdapter';
 import { validateSmtpConfig } from '../services/emailService';
 
@@ -97,6 +103,30 @@ export interface CommercialEnvReadinessReport {
   summaryStatus: 'READY_FOR_ALL_STAGES' | 'PARTIAL_BLOCKED' | 'ALL_EXTERNAL_BLOCKED';
 }
 
+export interface SimulatedSuiteArtifactEntry {
+  suiteFile: string;
+  suiteId?: string;
+  executedAt: string;
+  durationMs: number;
+  exitCode: number;
+  passedCount: number;
+  failedCount: number;
+  skippedCount?: number;
+  totalCount: number;
+  status: 'PASS' | 'FAIL';
+  command?: string;
+  sha256?: string;
+}
+
+export interface SimulatedTestResultsArtifact {
+  schemaVersion: '1.0';
+  runId: string;
+  generatedAt: string;
+  runner: string;
+  nodeVersion?: string;
+  suites: SimulatedSuiteArtifactEntry[];
+}
+
 export interface CommercialVerificationReport {
   generatedAt: string;
   runId: string;
@@ -106,6 +136,8 @@ export interface CommercialVerificationReport {
   readiness: CommercialEnvReadinessReport;
   stages: StageVerificationSummary[];
   simulatedChecks?: VerificationCheckResult[];
+  simulatedArtifactPath?: string;
+  simulatedArtifactRunId?: string;
   cleanupPerformed: boolean;
   cleanupReport?: CleanupReport;
   notes: string[];
@@ -281,6 +313,16 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
   if (!stagingUrlCheck.valid) {
     stagingMissing.push(stagingUrlCheck.reason || 'STAGING_BASE_URL');
   }
+  const allowLocalMode = (process.env.STAGING_ALLOW_LOCAL || '').trim().toLowerCase() === 'true';
+  if (!allowLocalMode) {
+    const allowlist = parseStagingAllowedHosts();
+    if (!allowlist.valid) {
+      const msg = allowlist.reason || 'STAGING_ALLOWED_HOSTS';
+      if (!stagingMissing.some((m) => m.includes('STAGING_ALLOWED_HOSTS'))) {
+        stagingMissing.push(msg);
+      }
+    }
+  }
   if ((process.env.STAGING_CONFIRM_NON_PRODUCTION || '').trim().toLowerCase() !== 'true') {
     stagingMissing.push('STAGING_CONFIRM_NON_PRODUCTION=true');
   }
@@ -364,15 +406,162 @@ export function evaluateCommercialReadiness(): CommercialEnvReadinessReport {
   };
 }
 
-export function validateStagingBaseUrlNonProduction(rawUrl: string | undefined): {
+const STRICT_REMOTE_HOSTNAME_RE =
+  /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+function isProductionDomainHostname(host: string): boolean {
+  const normalized = host.trim().toLowerCase().replace(/\.+$/, '');
+  if (!normalized) return false;
+  if (
+    /^(?:www\.|app\.|api\.)?aixshop\.(?:io|com|app)$/.test(normalized) ||
+    /^prod(?:uction)?\./.test(normalized)
+  ) {
+    return true;
+  }
+  const prodAppUrl = process.env.APP_URL?.trim();
+  if (process.env.NODE_ENV === 'production' && prodAppUrl && prodAppUrl !== 'MY_APP_URL') {
+    try {
+      const parsedProd = new URL(prodAppUrl);
+      const prodHost = parsedProd.hostname.toLowerCase().replace(/\.+$/, '');
+      if (prodHost === normalized) {
+        return true;
+      }
+    } catch {
+      // ignore malformed APP_URL
+    }
+  }
+  return false;
+}
+
+function isPrivateOrLinkLocalIpHostname(rawHostname: string): boolean {
+  const unbracketed = rawHostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const ver = isIP(unbracketed);
+  if (ver === 4) {
+    const octets = unbracketed.split('.').map(Number);
+    if (octets[0] === 10) return true;
+    if (octets[0] === 169 && octets[1] === 254) return true;
+    if (octets[0] === 192 && octets[1] === 168) return true;
+    if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return true;
+    if (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) return true; // CGNAT
+  }
+  if (ver === 6) {
+    const firstWord = parseInt(unbracketed.split(':')[0] || '0', 16);
+    if ((firstWord & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
+    if ((firstWord & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  }
+  return false;
+}
+
+export function parseStagingAllowedHosts(rawAllowedHosts?: string): {
+  valid: boolean;
+  hosts: Set<string>;
+  reason?: string;
+} {
+  const raw = rawAllowedHosts !== undefined ? rawAllowedHosts : process.env.STAGING_ALLOWED_HOSTS;
+  const trimmed = (raw || '').trim();
+  if (!trimmed) {
+    return {
+      valid: false,
+      hosts: new Set(),
+      reason: 'STAGING_ALLOWED_HOSTS is empty or unset (explicit comma-separated staging hostname allowlist required)',
+    };
+  }
+
+  const hosts = new Set<string>();
+  const parts = trimmed.split(',');
+  for (const part of parts) {
+    const candidate = part.trim().toLowerCase().replace(/\.+$/, '');
+    if (!candidate) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: 'STAGING_ALLOWED_HOSTS contains an empty entry',
+      };
+    }
+    if (
+      candidate.includes('*') ||
+      candidate.includes('://') ||
+      candidate.includes('/') ||
+      candidate.includes('?') ||
+      candidate.includes('#') ||
+      candidate.includes('@') ||
+      candidate.includes(':') ||
+      /\s/.test(candidate)
+    ) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: `STAGING_ALLOWED_HOSTS contains invalid host format "${part.trim()}" (expected plain DNS hostname without scheme, port, path, userinfo, or wildcard)`,
+      };
+    }
+    if (!STRICT_REMOTE_HOSTNAME_RE.test(candidate)) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: `STAGING_ALLOWED_HOSTS contains malformed hostname "${part.trim()}"`,
+      };
+    }
+    if (isLoopbackOrLocalHostname(candidate) || isPrivateOrLinkLocalIpHostname(candidate)) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: `STAGING_ALLOWED_HOSTS cannot include loopback or private address "${candidate}"`,
+      };
+    }
+    if (isProductionDomainHostname(candidate)) {
+      return {
+        valid: false,
+        hosts: new Set(),
+        reason: `STAGING_ALLOWED_HOSTS cannot include production domain "${candidate}"`,
+      };
+    }
+    hosts.add(candidate);
+  }
+
+  if (hosts.size === 0) {
+    return {
+      valid: false,
+      hosts: new Set(),
+      reason: 'STAGING_ALLOWED_HOSTS has no valid hostnames',
+    };
+  }
+
+  return { valid: true, hosts };
+}
+
+export function validateStagingBaseUrlNonProduction(
+  rawUrl: string | undefined,
+  options: { allowedHosts?: string; allowLocalMode?: boolean } = {}
+): {
   valid: boolean;
   isProductionTarget: boolean;
+  isAllowlistRejected?: boolean;
+  isLocalTarget?: boolean;
   normalizedUrl?: string;
   reason?: string;
 } {
   const trimmed = rawUrl?.trim() || '';
   if (!trimmed) {
     return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL' };
+  }
+
+  if (/[\s\r\n\0\\]/.test(trimmed)) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      reason: 'STAGING_BASE_URL (contains invalid whitespace, control character, or backslash)',
+    };
+  }
+
+  // Explicitly detect '@' in the authority section before path/query/hash
+  const withoutScheme = trimmed.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '');
+  const authority = withoutScheme.split(/[/?#]/)[0] || '';
+  if (authority.includes('@')) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      reason: 'STAGING_BASE_URL (must not contain embedded credentials or userinfo)',
+    };
   }
 
   let parsed: URL;
@@ -382,24 +571,29 @@ export function validateStagingBaseUrlNonProduction(rawUrl: string | undefined):
     return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (invalid URL)' };
   }
 
-  if (parsed.username || parsed.password) {
-    return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (must not contain embedded credentials)' };
-  }
-
-  if (parsed.protocol !== 'https:' && process.env.STAGING_ALLOW_LOCAL !== 'true') {
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     return {
       valid: false,
       isProductionTarget: false,
-      reason: 'STAGING_BASE_URL (must be https:// unless STAGING_ALLOW_LOCAL=true)',
+      reason: `STAGING_BASE_URL (unsupported protocol "${parsed.protocol}")`,
     };
   }
 
-  const host = parsed.hostname.toLowerCase();
-  const isProdHostname =
-    /^(?:www\.|app\.|api\.)?aixshop\.(?:io|com|app)$/.test(host) ||
-    /^prod(?:uction)?\./.test(host);
+  if (parsed.username || parsed.password) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      reason: 'STAGING_BASE_URL (must not contain embedded credentials)',
+    };
+  }
 
-  if (isProdHostname) {
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  if (!host) {
+    return { valid: false, isProductionTarget: false, reason: 'STAGING_BASE_URL (missing hostname)' };
+  }
+
+  // 1. Strict production domain / production APP_URL check runs before anything else
+  if (isProductionDomainHostname(host)) {
     return {
       valid: false,
       isProductionTarget: true,
@@ -407,27 +601,411 @@ export function validateStagingBaseUrlNonProduction(rawUrl: string | undefined):
     };
   }
 
-  const prodAppUrl = process.env.APP_URL?.trim();
-  if (process.env.NODE_ENV === 'production' && prodAppUrl && prodAppUrl !== 'MY_APP_URL') {
-    try {
-      const parsedProd = new URL(prodAppUrl);
-      if (parsedProd.origin === parsed.origin) {
-        return {
-          valid: false,
-          isProductionTarget: true,
-          reason: `STAGING_BASE_URL matches production APP_URL origin (${parsed.origin})`,
-        };
-      }
-    } catch {
-      // ignore invalid APP_URL
+  const allowLocalMode =
+    options.allowLocalMode ??
+    ((process.env.STAGING_ALLOW_LOCAL || '').trim().toLowerCase() === 'true');
+  const isLocalHost = isLoopbackOrLocalHostname(host);
+
+  // 2. Localhost/loopback is ONLY allowed in explicit local ephemeral test mode
+  if (isLocalHost) {
+    if (!allowLocalMode) {
+      return {
+        valid: false,
+        isProductionTarget: false,
+        isAllowlistRejected: true,
+        reason: `STAGING_BASE_URL (${host}) uses localhost/loopback which is rejected for remote staging (set STAGING_ALLOW_LOCAL=true only for isolated local test servers)`,
+      };
     }
+    return {
+      valid: true,
+      isProductionTarget: false,
+      isLocalTarget: true,
+      normalizedUrl: trimmed.replace(/\/+$/, ''),
+    };
+  }
+
+  // 3. Remote staging targets MUST use HTTPS (STAGING_ALLOW_LOCAL never weakens remote targets)
+  if (parsed.protocol !== 'https:') {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      isAllowlistRejected: true,
+      reason: `STAGING_BASE_URL (${host}) must use https:// for remote staging targets`,
+    };
+  }
+
+  if (isPrivateOrLinkLocalIpHostname(host)) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      isAllowlistRejected: true,
+      reason: `STAGING_BASE_URL (${host}) targets a private or link-local IP address and is refused`,
+    };
+  }
+
+  // 4. Remote host MUST match explicit STAGING_ALLOWED_HOSTS allowlist (STAGING_CONFIRM_NON_PRODUCTION=true alone never permits unknown hosts)
+  const allowlist = parseStagingAllowedHosts(options.allowedHosts);
+  if (!allowlist.valid) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      isAllowlistRejected: true,
+      reason: `${allowlist.reason}; refusing staging target "${host}"`,
+    };
+  }
+
+  if (!allowlist.hosts.has(host)) {
+    return {
+      valid: false,
+      isProductionTarget: false,
+      isAllowlistRejected: true,
+      reason: `STAGING_HOST_NOT_ALLOWED: Host "${host}" is not present in STAGING_ALLOWED_HOSTS`,
+    };
   }
 
   return {
     valid: true,
     isProductionTarget: false,
+    isLocalTarget: false,
     normalizedUrl: trimmed.replace(/\/+$/, ''),
   };
+}
+
+export const DEFAULT_SIMULATED_ARTIFACT_PATH = 'reports/simulated-test-results.json';
+
+export const SIMULATED_SUITE_DEFINITIONS: ReadonlyArray<{
+  testId: string;
+  stage: CommercialStageId;
+  name: string;
+  purpose: string;
+  targetEnvironment: string;
+  executionMode: ExecutionMode;
+  suiteFile: string;
+}> = [
+  {
+    testId: 'SIM-CUSTOMER-JOURNEY-30',
+    stage: 'stage_4_staging_e2e',
+    name: '30-Step Full Customer Journey (Local HTTP + Sandbox Billing + Mocked Shopify + Loopback SMTP)',
+    purpose: 'Verify end-to-end customer journey with mocked Shopify, Sandbox Stripe, and local TCP SMTP',
+    targetEnvironment: 'local-ephemeral-memory-repo',
+    executionMode: 'unit_mock',
+    suiteFile: 'src/server/customerJourney30Step.e2e.test.ts',
+  },
+  {
+    testId: 'SIM-SHOPIFY-WRITEBACK',
+    stage: 'stage_1_shopify',
+    name: 'Shopify Write-Back Scope Gate, Mutation & Post-Mutation Read-Back Verification',
+    purpose: 'Verify write_products gating, allowlisted fields, GraphQL mutation, read-back match, and audit trail',
+    targetEnvironment: 'local-mock-shopify-graphql',
+    executionMode: 'contract_fixture',
+    suiteFile: 'src/server/shopifyWriteBack.test.ts',
+  },
+  {
+    testId: 'SIM-BILLING-EMAILS',
+    stage: 'stage_3_smtp',
+    name: 'Billing Lifecycle Emails (5 Events), Webhook/Checkout Deduplication & Retry Recovery',
+    purpose: 'Verify initial, renewal, plan_changed, payment_failed, and subscription_canceled email delivery',
+    targetEnvironment: 'local-mock-smtp-transport',
+    executionMode: 'unit_mock',
+    suiteFile: 'src/server/billingEmail.test.ts',
+  },
+  {
+    testId: 'SIM-COMMERCIAL-HARNESS',
+    stage: 'stage_2_stripe',
+    name: 'Commercial Integration Contract Harness (Shopify OAuth/Sync/Webhook + Stripe Lifecycle + SMTP)',
+    purpose: 'Verify signed contract fixtures, rate-limit retries, lease recovery, and cross-tenant guards',
+    targetEnvironment: 'local-contract-harness',
+    executionMode: 'contract_fixture',
+    suiteFile: 'src/server/commercialVerificationHarness.test.ts',
+  },
+];
+
+function isValidIsoTimestamp(raw: unknown): raw is string {
+  if (typeof raw !== 'string' || !raw.trim()) return false;
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts);
+}
+
+function normalizeSuitePath(raw: unknown): string {
+  return typeof raw === 'string'
+    ? raw.trim().replace(/\\/g, '/').replace(/^\.\//, '')
+    : '';
+}
+
+export function evaluateSimulatedChecksFromArtifact(
+  artifactInput: unknown,
+  options: { artifactPath?: string; parseError?: string; fallbackTimestamp?: string } = {}
+): {
+  checks: VerificationCheckResult[];
+  artifactRunId?: string;
+} {
+  const fallbackTs = options.fallbackTimestamp || new Date().toISOString();
+  const artifactLabel = options.artifactPath || DEFAULT_SIMULATED_ARTIFACT_PATH;
+
+  if (options.parseError) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Malformed simulated test artifact (${artifactLabel}): ${redactSecrets(options.parseError)}`,
+      })),
+    };
+  }
+
+  if (artifactInput === null || artifactInput === undefined) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'NOT RUN',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `No verifiable test execution artifact found at "${artifactLabel}". Run simulated suites to generate evidence.`,
+      })),
+    };
+  }
+
+  if (typeof artifactInput !== 'object' || Array.isArray(artifactInput)) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Invalid simulated test artifact root structure at "${artifactLabel}" (expected JSON object).`,
+      })),
+    };
+  }
+
+  const art = artifactInput as Record<string, unknown>;
+  const topErrors: string[] = [];
+  if (art.schemaVersion !== '1.0') {
+    topErrors.push(`unsupported or missing schemaVersion "${String(art.schemaVersion ?? '')}"`);
+  }
+  if (typeof art.runId !== 'string' || !art.runId.trim()) {
+    topErrors.push('missing runId');
+  }
+  if (!isValidIsoTimestamp(art.generatedAt)) {
+    topErrors.push('missing or invalid generatedAt timestamp');
+  }
+  if (typeof art.runner !== 'string' || !art.runner.trim()) {
+    topErrors.push('missing runner');
+  }
+  if (!Array.isArray(art.suites)) {
+    topErrors.push('missing suites array');
+  }
+
+  if (topErrors.length > 0) {
+    return {
+      checks: SIMULATED_SUITE_DEFINITIONS.map((def) => ({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Corrupted or incomplete simulated test artifact (${artifactLabel}): ${topErrors.join('; ')}`,
+      })),
+    };
+  }
+
+  const artifact = art as unknown as SimulatedTestResultsArtifact;
+  const checks: VerificationCheckResult[] = [];
+
+  for (const def of SIMULATED_SUITE_DEFINITIONS) {
+    const matches = artifact.suites.filter(
+      (s) => s && typeof s === 'object' && normalizeSuitePath((s as any).suiteFile) === def.suiteFile
+    );
+
+    if (matches.length === 0) {
+      checks.push({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'NOT RUN',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Suite "${def.suiteFile}" has no execution result in artifact run "${artifact.runId}".`,
+      });
+      continue;
+    }
+
+    if (matches.length > 1) {
+      checks.push({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: fallbackTs,
+        blockerOrFailure: `Duplicate suite entries for "${def.suiteFile}" in artifact run "${artifact.runId}".`,
+      });
+      continue;
+    }
+
+    const entry = matches[0];
+    const entryErrors: string[] = [];
+    const declaredId = entry.suiteId || (entry as any).testId;
+    if (declaredId && declaredId !== def.testId) {
+      entryErrors.push(`suiteId mismatch (expected ${def.testId}, got ${String(declaredId)})`);
+    }
+    if (!isValidIsoTimestamp(entry.executedAt)) {
+      entryErrors.push('missing or invalid executedAt');
+    }
+    if (typeof entry.durationMs !== 'number' || !Number.isFinite(entry.durationMs) || entry.durationMs < 0) {
+      entryErrors.push('missing or invalid durationMs');
+    }
+    if (typeof entry.exitCode !== 'number' || !Number.isInteger(entry.exitCode)) {
+      entryErrors.push('missing or invalid exitCode');
+    }
+    if (typeof entry.passedCount !== 'number' || !Number.isInteger(entry.passedCount) || entry.passedCount < 0) {
+      entryErrors.push('missing or invalid passedCount');
+    }
+    if (typeof entry.failedCount !== 'number' || !Number.isInteger(entry.failedCount) || entry.failedCount < 0) {
+      entryErrors.push('missing or invalid failedCount');
+    }
+    const skippedCount = entry.skippedCount ?? 0;
+    if (
+      entry.skippedCount !== undefined &&
+      (typeof entry.skippedCount !== 'number' || !Number.isInteger(entry.skippedCount) || entry.skippedCount < 0)
+    ) {
+      entryErrors.push('invalid skippedCount');
+    }
+    if (typeof entry.totalCount !== 'number' || !Number.isInteger(entry.totalCount) || entry.totalCount <= 0) {
+      entryErrors.push('missing or invalid totalCount (> 0 required)');
+    }
+    if (entry.status !== 'PASS' && entry.status !== 'FAIL') {
+      entryErrors.push(`invalid status "${String((entry as any).status)}"`);
+    }
+    if (
+      entryErrors.length === 0 &&
+      entry.passedCount + entry.failedCount + skippedCount !== entry.totalCount
+    ) {
+      entryErrors.push(
+        `test count mismatch (${entry.passedCount} passed + ${entry.failedCount} failed + ${skippedCount} skipped != ${entry.totalCount} total)`
+      );
+    }
+
+    if (entryErrors.length > 0) {
+      checks.push({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: isValidIsoTimestamp(entry.executedAt) ? entry.executedAt : fallbackTs,
+        blockerOrFailure: `Incomplete or invalid suite result for "${def.suiteFile}": ${entryErrors.join('; ')}`,
+      });
+      continue;
+    }
+
+    const evidence: Record<string, unknown> = {
+      suiteFile: def.suiteFile,
+      artifactRunId: artifact.runId,
+      artifactGeneratedAt: artifact.generatedAt,
+      runner: artifact.runner,
+      passedCount: entry.passedCount,
+      failedCount: entry.failedCount,
+      skippedCount,
+      totalCount: entry.totalCount,
+      exitCode: entry.exitCode,
+      liveProviderVerified: false,
+    };
+
+    const genuinelyPassed =
+      entry.status === 'PASS' &&
+      entry.exitCode === 0 &&
+      entry.failedCount === 0 &&
+      entry.passedCount > 0 &&
+      entry.passedCount + skippedCount === entry.totalCount;
+
+    if (genuinelyPassed) {
+      checks.push({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'PASS — SIMULATED',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: entry.executedAt,
+        durationMs: entry.durationMs,
+        evidence,
+      });
+    } else {
+      checks.push({
+        testId: def.testId,
+        stage: def.stage,
+        name: def.name,
+        purpose: def.purpose,
+        status: 'FAIL',
+        executionMode: def.executionMode,
+        targetEnvironment: def.targetEnvironment,
+        executedAt: entry.executedAt,
+        durationMs: entry.durationMs,
+        evidence,
+        blockerOrFailure: `Simulated suite "${def.suiteFile}" failed (status=${entry.status}, exitCode=${entry.exitCode}, failed=${entry.failedCount}, passed=${entry.passedCount}/${entry.totalCount}).`,
+      });
+    }
+  }
+
+  return { checks, artifactRunId: artifact.runId };
+}
+
+export function loadAndEvaluateSimulatedArtifact(
+  artifactPath = path.resolve(process.cwd(), DEFAULT_SIMULATED_ARTIFACT_PATH),
+  fallbackTimestamp?: string
+): {
+  checks: VerificationCheckResult[];
+  artifactPath: string;
+  artifactRunId?: string;
+} {
+  const resolvedPath = path.resolve(artifactPath);
+  if (!fsSync.existsSync(resolvedPath)) {
+    const res = evaluateSimulatedChecksFromArtifact(null, {
+      artifactPath: resolvedPath,
+      fallbackTimestamp,
+    });
+    return { ...res, artifactPath: resolvedPath };
+  }
+
+  try {
+    const raw = fsSync.readFileSync(resolvedPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const res = evaluateSimulatedChecksFromArtifact(parsed, {
+      artifactPath: resolvedPath,
+      fallbackTimestamp,
+    });
+    return { ...res, artifactPath: resolvedPath };
+  } catch (err: any) {
+    const res = evaluateSimulatedChecksFromArtifact(null, {
+      artifactPath: resolvedPath,
+      parseError: err?.message || String(err),
+      fallbackTimestamp,
+    });
+    return { ...res, artifactPath: resolvedPath };
+  }
 }
 
 export function summarizeStage(
@@ -487,14 +1065,19 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   lines.push(`- **Target Environment:** \`${report.targetEnvironment}\``);
   lines.push(`- **External Verification Opt-In (\`COMMERCIAL_VERIFY_EXTERNAL\`):** ${report.externalVerificationActivated ? 'ENABLED' : 'DISABLED (BLOCKED)'}`);
   lines.push(`- **Overall External Verification Status:** **${report.overallExternalStatus}**`);
+  if (report.simulatedArtifactPath) {
+    lines.push(
+      `- **Simulated Evidence Artifact:** \`${report.simulatedArtifactPath}\`${report.simulatedArtifactRunId ? ` (runId: \`${report.simulatedArtifactRunId}\`)` : ' (not present or unverified)'}`
+    );
+  }
   lines.push(`- **Cleanup Performed:** ${report.cleanupPerformed ? 'Yes' : 'No (no external test artifacts created or skipped)'}`);
   lines.push('');
   lines.push('## Status Model');
   lines.push('- `PASS`: Executed against the intended real target with verifiable evidence.');
-  lines.push('- `PASS — SIMULATED`: Executed end-to-end using local mocks, fixtures, or test doubles only (never live external providers).');
+  lines.push('- `PASS — SIMULATED`: Executed end-to-end using local mocks, fixtures, or test doubles only (never live external providers), backed by a verified test execution artifact.');
   lines.push('- `FAIL`: Executed and failed.');
   lines.push('- `BLOCKED`: Cannot execute because required credentials, targets, or opt-in activation are missing.');
-  lines.push('- `NOT RUN`: Not yet executed.');
+  lines.push('- `NOT RUN`: Not yet executed or no verifiable execution artifact present.');
   lines.push('');
   lines.push('## Stage Readiness Summary');
   lines.push('');
@@ -530,18 +1113,20 @@ export function renderVerificationMarkdown(report: CommercialVerificationReport)
   }
 
   if (report.simulatedChecks && report.simulatedChecks.length > 0) {
-    lines.push('## Simulated Integration & Customer Journey Checks (`PASS — SIMULATED`)');
+    lines.push('## Simulated Integration & Customer Journey Checks');
     lines.push('');
-    lines.push('| Test ID | Check | Target Environment | Execution Mode | Timestamp (UTC) | Result | Evidence |');
-    lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+    lines.push('| Test ID | Check | Target Environment | Execution Mode | Timestamp (UTC) | Duration (ms) | Result | Evidence | Blocker / Failure |');
+    lines.push('| --- | --- | --- | --- | --- | ---: | --- | --- | --- |');
     for (const c of report.simulatedChecks) {
-      const detail = c.blockerOrFailure
-        ? redactSecrets(c.blockerOrFailure)
-        : c.evidence
-        ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence)))
+      const evidenceText = c.evidence
+        ? redactSecrets(JSON.stringify(sanitizeEvidenceObject(c.evidence))).replace(/\|/g, '\\|')
         : '—';
+      const blockerText = c.blockerOrFailure
+        ? redactSecrets(c.blockerOrFailure).replace(/\|/g, '\\|')
+        : '—';
+      const durText = typeof c.durationMs === 'number' ? String(c.durationMs) : '—';
       lines.push(
-        `| \`${c.testId}\` | ${c.name} | \`${c.targetEnvironment}\` | \`${c.executionMode}\` | \`${c.executedAt}\` | **${c.status}** | ${detail.replace(/\|/g, '\\|')} |`
+        `| \`${c.testId}\` | ${c.name} | \`${c.targetEnvironment}\` | \`${c.executionMode}\` | \`${c.executedAt}\` | ${durText} | **${c.status}** | ${evidenceText} | ${blockerText} |`
       );
     }
     lines.push('');

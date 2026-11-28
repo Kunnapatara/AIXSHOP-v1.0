@@ -7,6 +7,7 @@ Use this template to record verifiable evidence when executing commercial verifi
 ## Run Metadata
 
 - **Run ID:** `<e.g. cv_20261125_01>`
+- **Simulated Artifact Run ID (`reports/simulated-test-results.json`):** `<e.g. sim_20261125_01 or NOT RUN>`
 - **Date / Time (UTC):** `<YYYY-MM-DDTHH:MM:SSZ>`
 - **Operator:** `<Name>`
 - **Git Commit SHA:** `<SHA or "No git repo">`

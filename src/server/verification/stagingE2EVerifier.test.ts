@@ -5,6 +5,7 @@ import { createApp } from '../app';
 import { MemoryRepository } from '../db/memoryRepository';
 import { setCustomEmailTransport } from '../services/emailService';
 import { runStagingE2EVerification } from './stagingE2EVerifier';
+import { parseStagingAllowedHosts, validateStagingBaseUrlNonProduction } from './statusModel';
 
 function withMockEmailTransport(fn: () => Promise<void>): Promise<void> {
   setCustomEmailTransport(async () => ({
@@ -461,4 +462,209 @@ describe('Tasks A & B — Staging E2E Resource Cleanup & Strict Tenant Isolation
     }
   });
 });
+
+describe('Fix B — Staging Environment Allowlist & URL Safety Protection', () => {
+  test('B1: Valid HTTPS host in STAGING_ALLOWED_HOSTS passes URL & allowlist validation cleanly', () => {
+    const parsed = parseStagingAllowedHosts('staging.aixshop.example.com, QA-Staging.Example.org.');
+    assert.equal(parsed.valid, true);
+    assert.ok(parsed.hosts.has('staging.aixshop.example.com'));
+    assert.ok(parsed.hosts.has('qa-staging.example.org'));
+
+    const res = validateStagingBaseUrlNonProduction('https://STAGING.aixshop.example.com:8443/', {
+      allowedHosts: 'staging.aixshop.example.com,qa-staging.example.org',
+      allowLocalMode: false,
+    });
+    assert.equal(res.valid, true);
+    assert.equal(res.isProductionTarget, false);
+    assert.equal(res.isLocalTarget, false);
+  });
+
+  test('B2: Rejects unallowlisted hosts, empty allowlist (even with STAGING_CONFIRM_NON_PRODUCTION=true), lookalike domains, userinfo, remote HTTP, wildcards, and loopback in remote mode', () => {
+    // 1. Empty/unset allowlist rejected even when STAGING_CONFIRM_NON_PRODUCTION=true
+    const noAllowlist = validateStagingBaseUrlNonProduction('https://staging.example.com', {
+      allowedHosts: '',
+      allowLocalMode: false,
+    });
+    assert.equal(noAllowlist.valid, false);
+    assert.match(noAllowlist.reason || '', /STAGING_ALLOWED_HOSTS/);
+
+    // 2. Host not in allowlist rejected
+    const notAllowed = validateStagingBaseUrlNonProduction('https://other-staging.example.com', {
+      allowedHosts: 'staging.example.com',
+      allowLocalMode: false,
+    });
+    assert.equal(notAllowed.valid, false);
+    assert.match(notAllowed.reason || '', /STAGING_HOST_NOT_ALLOWED/);
+
+    // 3. Lookalike suffix/prefix hosts rejected (exact match only)
+    const lookalikeSuffix = validateStagingBaseUrlNonProduction('https://staging.example.com.attacker.com', {
+      allowedHosts: 'staging.example.com',
+      allowLocalMode: false,
+    });
+    assert.equal(lookalikeSuffix.valid, false);
+
+    const lookalikeSubdomain = validateStagingBaseUrlNonProduction('https://evil.staging.example.com', {
+      allowedHosts: 'staging.example.com',
+      allowLocalMode: false,
+    });
+    assert.equal(lookalikeSubdomain.valid, false);
+
+    // 4. Production hosts rejected (including prod.* and aixshop.io/com/app)
+    const prodDomain = validateStagingBaseUrlNonProduction('https://prod.example.com', {
+      allowedHosts: 'prod.example.com',
+      allowLocalMode: false,
+    });
+    assert.equal(prodDomain.valid, false);
+    assert.equal(prodDomain.isProductionTarget, true);
+
+    // 5. Embedded credentials / userinfo rejected
+    const userinfo = validateStagingBaseUrlNonProduction('https://staging.example.com@evil.com', {
+      allowedHosts: 'staging.example.com,evil.com',
+      allowLocalMode: false,
+    });
+    assert.equal(userinfo.valid, false);
+    assert.match(userinfo.reason || '', /credentials|userinfo/i);
+
+    const userPass = validateStagingBaseUrlNonProduction('https://user:pass@staging.example.com', {
+      allowedHosts: 'staging.example.com',
+      allowLocalMode: false,
+    });
+    assert.equal(userPass.valid, false);
+
+    // 6. Remote HTTP rejected even if host is in allowlist AND even if allowLocalMode=true
+    const remoteHttp = validateStagingBaseUrlNonProduction('http://staging.example.com', {
+      allowedHosts: 'staging.example.com',
+      allowLocalMode: true,
+    });
+    assert.equal(remoteHttp.valid, false);
+    assert.match(remoteHttp.reason || '', /https:\/\//i);
+
+    // 7. Wildcards & URL-like entries in STAGING_ALLOWED_HOSTS rejected
+    assert.equal(parseStagingAllowedHosts('*.example.com').valid, false);
+    assert.equal(parseStagingAllowedHosts('https://staging.example.com').valid, false);
+    assert.equal(parseStagingAllowedHosts('staging.example.com:8443').valid, false);
+
+    // 8. Localhost / loopback rejected in remote mode (allowLocalMode=false)
+    for (const localUrl of [
+      'http://127.0.0.1:3000',
+      'http://localhost:3000',
+      'http://[::1]:3000',
+    ]) {
+      const localRejected = validateStagingBaseUrlNonProduction(localUrl, {
+        allowedHosts: 'staging.example.com',
+        allowLocalMode: false,
+      });
+      assert.equal(localRejected.valid, false, `Expected ${localUrl} to be rejected in remote mode`);
+    }
+
+    // 9. Malformed URLs & private IPs rejected
+    assert.equal(
+      validateStagingBaseUrlNonProduction('https://staging.example.com\\@evil.com', {
+        allowedHosts: 'staging.example.com',
+      }).valid,
+      false
+    );
+    assert.equal(
+      validateStagingBaseUrlNonProduction('https://169.254.169.254/latest/meta-data', {
+        allowedHosts: '169.254.169.254',
+      }).valid,
+      false
+    );
+  });
+
+  test('B3: runStagingE2EVerification rejects invalid/unallowlisted STAGING_BASE_URL BEFORE any HTTP request or account creation', async () => {
+    const repo = new MemoryRepository(false);
+    let requestsObserved = 0;
+    const srv = await startEphemeralServer(repo, () => {
+      requestsObserved++;
+      return false;
+    });
+
+    try {
+      const spyFetch: typeof fetch = async (...args) => {
+        requestsObserved++;
+        return originalFetch(...args);
+      };
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = spyFetch;
+      try {
+        const scenarios: Array<{ label: string; env: Record<string, string | undefined>; expectedPattern: RegExp }> = [
+          {
+            label: 'loopback when STAGING_ALLOW_LOCAL is false',
+            env: buildLocalStagingEnv(srv.baseUrl, {
+              STAGING_ALLOW_LOCAL: 'false',
+              STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              STAGING_CONFIRM_NON_PRODUCTION: 'true',
+            }),
+            expectedPattern: /STAGING_TARGET_REJECTED/,
+          },
+          {
+            label: 'unallowlisted remote host even with STAGING_CONFIRM_NON_PRODUCTION=true',
+            env: buildLocalStagingEnv('https://untrusted.example.com', {
+              STAGING_ALLOW_LOCAL: 'false',
+              STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              STAGING_CONFIRM_NON_PRODUCTION: 'true',
+            }),
+            expectedPattern: /STAGING_TARGET_REJECTED.*STAGING_HOST_NOT_ALLOWED/,
+          },
+          {
+            label: 'empty STAGING_ALLOWED_HOSTS with STAGING_CONFIRM_NON_PRODUCTION=true',
+            env: buildLocalStagingEnv('https://staging.example.com', {
+              STAGING_ALLOW_LOCAL: 'false',
+              STAGING_ALLOWED_HOSTS: '',
+              STAGING_CONFIRM_NON_PRODUCTION: 'true',
+            }),
+            expectedPattern: /STAGING_TARGET_REJECTED.*STAGING_ALLOWED_HOSTS/,
+          },
+          {
+            label: 'lookalike suffix host',
+            env: buildLocalStagingEnv('https://staging.example.com.attacker.com', {
+              STAGING_ALLOW_LOCAL: 'false',
+              STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              STAGING_CONFIRM_NON_PRODUCTION: 'true',
+            }),
+            expectedPattern: /STAGING_HOST_NOT_ALLOWED/,
+          },
+          {
+            label: 'embedded userinfo',
+            env: buildLocalStagingEnv('https://staging.example.com@evil.com', {
+              STAGING_ALLOW_LOCAL: 'false',
+              STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              STAGING_CONFIRM_NON_PRODUCTION: 'true',
+            }),
+            expectedPattern: /STAGING_TARGET_REJECTED/,
+          },
+          {
+            label: 'remote plain http',
+            env: buildLocalStagingEnv('http://staging.example.com', {
+              STAGING_ALLOW_LOCAL: 'false',
+              STAGING_ALLOWED_HOSTS: 'staging.example.com',
+              STAGING_CONFIRM_NON_PRODUCTION: 'true',
+            }),
+            expectedPattern: /STAGING_TARGET_REJECTED.*https:\/\//i,
+          },
+        ];
+
+        for (const sc of scenarios) {
+          await withEnvOverrides(sc.env, async () => {
+            const summary = await runStagingE2EVerification();
+            assert.equal(summary.status, 'FAIL', `Expected FAIL for scenario: ${sc.label}`);
+            assert.equal(summary.checks[0].status, 'FAIL', `Expected check 0 FAIL for: ${sc.label}`);
+            assert.match(summary.checks[0].blockerOrFailure || '', sc.expectedPattern, sc.label);
+            assert.ok(summary.checks.slice(1).every((c) => c.status === 'BLOCKED'), sc.label);
+            assert.equal(summary.cleanupReport?.status, 'NONE_CREATED', sc.label);
+            assert.deepEqual(summary.cleanupReport?.trackedResources.userIds, [], sc.label);
+          });
+        }
+
+        assert.equal(requestsObserved, 0, 'Expected ZERO HTTP requests or account creation calls');
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
 

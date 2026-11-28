@@ -31,7 +31,8 @@ This guide documents how to prepare, execute, record evidence for, and clean up 
   - Stage 2 (Stripe Test Mode): `npm run verify:stripe`
   - Stage 3 (Real SMTP Provider): `npm run verify:smtp`
   - Stage 4 (Staging E2E): `npm run verify:staging-e2e`
-  - Aggregate JSON/Markdown report: `npm run verify:commercial:report -- --write`
+  - Generate verifiable simulated test artifact (`reports/simulated-test-results.json`): `npm run test:simulated:artifact`
+  - Aggregate JSON/Markdown report (derives simulated checks strictly from the artifact; missing -> `NOT RUN`, failed/corrupt -> `FAIL`): `npm run verify:commercial:report -- --write`
 
 Add `--strict` to any `verify:*` command to exit non-zero (`2`) if any check is `BLOCKED` (useful as a pre-release gate).
 
@@ -164,9 +165,10 @@ All transactional email rendering and SMTP/transport dispatch live in `src/serve
 ## Stage 4 — Staging End-to-End Customer Journey
 
 ### Prerequisites & Safety Guardrails
-1. Deploy AIXSHOP to an **isolated staging environment** (`STAGING_BASE_URL`, HTTPS) connected to a **staging PostgreSQL database** (migrations `001`–`019` applied).
-2. Set `STAGING_CONFIRM_NON_PRODUCTION="true"` and configure Shopify Dev Store, Stripe Test Mode (`sk_test_...`), and Real SMTP env vars on both the staging deployment and verification runner.
-3. Never point `STAGING_BASE_URL` at production or supply a live Stripe key.
+1. Deploy AIXSHOP to an **isolated staging environment** (`STAGING_BASE_URL`, `https://` required for remote targets) connected to a **staging PostgreSQL database** (migrations `001`–`019` applied).
+2. Explicitly allowlist the exact hostname in `STAGING_ALLOWED_HOSTS` (comma-separated exact DNS hostnames without schemes, ports, paths, or wildcards; e.g. `STAGING_ALLOWED_HOSTS="staging.aixshop.example.com"`). Local loopback (`http://127.0.0.1` / `localhost`) is rejected in remote mode and permitted only when `STAGING_ALLOW_LOCAL="true"` for isolated local test servers.
+3. Set `STAGING_CONFIRM_NON_PRODUCTION="true"` and configure Shopify Dev Store, Stripe Test Mode (`sk_test_...`), and Real SMTP env vars on both the staging deployment and verification runner.
+4. Never point `STAGING_BASE_URL` at production, include embedded URL credentials (`user:pass@`), use remote `http://`, or supply a live Stripe key (`STAGING_CONFIRM_NON_PRODUCTION=true` alone never bypasses the allowlist).
 
 ### Multi-Step Customer Journey & Negative Scenarios
 Automated runner (`npm run verify:staging-e2e`) verifies API readiness (strictly refusing production `STAGING_BASE_URL` hostnames or `sk_live_` keys), isolated merchant registration/workspace creation, initial Free Audit state, Shopify OAuth connect initiation, Checkout Session creation, negative webhook/HMAC/invalid-tier/unauthenticated/cross-tenant isolation checks, transactional password-reset SMTP triggering (including non-enumeration), and deterministic cleanup (expiring `cs_test_` Checkout Sessions, deleting test accounts via `DELETE /api/auth/account`, and verifying post-delete `/api/auth/me` + `/api/auth/login` 401 rejections).

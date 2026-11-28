@@ -1,11 +1,14 @@
 import 'dotenv/config';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   CommercialVerificationReport,
   computeOverallStatus,
   createRunId,
+  DEFAULT_SIMULATED_ARTIFACT_PATH,
   evaluateCommercialReadiness,
   isExternalVerificationActivated,
+  loadAndEvaluateSimulatedArtifact,
   summarizeStage,
   writeVerificationArtifacts,
 } from '../../src/server/verification/statusModel';
@@ -15,11 +18,18 @@ import { runSmtpExternalVerification } from '../../src/server/verification/smtpV
 import { runStagingE2EVerification } from '../../src/server/verification/stagingE2EVerifier';
 import { runSecretSafeConfigCheck } from '../../src/server/config/checkConfig';
 
-async function main() {
-  const asJson = process.argv.includes('--json');
-  const strict = process.argv.includes('--strict');
-  const writeFiles = process.argv.includes('--write');
+export interface BuildCommercialReportOptions {
+  simulatedArtifactPath?: string;
+}
 
+function getCliArgValue(prefix: string): string | undefined {
+  const found = process.argv.find((a) => a.startsWith(prefix));
+  return found ? found.slice(prefix.length).trim() : undefined;
+}
+
+export async function buildCommercialVerificationReport(
+  options: BuildCommercialReportOptions = {}
+): Promise<CommercialVerificationReport> {
   const readiness = evaluateCommercialReadiness();
   const cfgCheck = runSecretSafeConfigCheck({ strict: false });
   const nowIso = new Date().toISOString();
@@ -66,7 +76,39 @@ async function main() {
   const externalStages = [stage1, stage2, stage3, stage4];
   const overallExternalStatus = computeOverallStatus(externalStages);
 
-  const report: CommercialVerificationReport = {
+  const artifactPath =
+    options.simulatedArtifactPath ||
+    getCliArgValue('--simulated-artifact=') ||
+    process.env.SIMULATED_TEST_ARTIFACT_PATH?.trim() ||
+    path.resolve(process.cwd(), DEFAULT_SIMULATED_ARTIFACT_PATH);
+
+  const simulatedEval = loadAndEvaluateSimulatedArtifact(artifactPath, nowIso);
+  const relArtifactPath = path.relative(process.cwd(), simulatedEval.artifactPath);
+  const displayArtifactPath =
+    relArtifactPath && !relArtifactPath.startsWith('..') ? relArtifactPath : simulatedEval.artifactPath;
+
+  const notes = [
+    'Simulated checks are derived strictly from the verifiable test runner artifact (never hardcoded or inferred from file existence) and never count as live external provider verification.',
+    'Local Shopify/Stripe HMAC & MemoryRepository checks are separated from live external webhook delivery checks (NOT RUN until verified against a deployed callback URL).',
+    'SMTP relay acceptance (250 OK) is distinct from confirmed recipient inbox delivery (S3-INBOX-DELIVERY).',
+    'When external credentials or COMMERCIAL_VERIFY_EXTERNAL=true are absent, live provider stages strictly report BLOCKED — never PASS.',
+    'Manual browser & live external provider steps are documented in docs/MANUAL_EXTERNAL_VERIFICATION_CHECKLIST.md.',
+  ];
+
+  const simFailCount = simulatedEval.checks.filter((c) => c.status === 'FAIL').length;
+  const simNotRunCount = simulatedEval.checks.filter((c) => c.status === 'NOT RUN').length;
+  if (simNotRunCount > 0) {
+    notes.push(
+      `${simNotRunCount} simulated suite(s) reported NOT RUN because verifiable test results were missing at "${displayArtifactPath}". Run "npm run test:simulated:artifact" first.`
+    );
+  }
+  if (simFailCount > 0) {
+    notes.push(
+      `${simFailCount} simulated suite(s) reported FAIL in "${displayArtifactPath}". Inspect the failure details above before relying on simulated coverage.`
+    );
+  }
+
+  return {
     generatedAt: nowIso,
     runId: createRunId(),
     targetEnvironment: process.env.STAGING_BASE_URL?.trim() || cfgCheck.environment,
@@ -74,65 +116,24 @@ async function main() {
     overallExternalStatus,
     readiness,
     stages: [configStage, ...externalStages],
-    simulatedChecks: [
-      {
-        testId: 'SIM-CUSTOMER-JOURNEY-30',
-        stage: 'stage_4_staging_e2e',
-        name: '30-Step Full Customer Journey (Local HTTP + Sandbox Billing + Mocked Shopify + Loopback SMTP)',
-        purpose: 'Verify end-to-end customer journey with mocked Shopify, Sandbox Stripe, and local TCP SMTP',
-        status: 'PASS — SIMULATED',
-        executionMode: 'unit_mock',
-        targetEnvironment: 'local-ephemeral-memory-repo',
-        executedAt: nowIso,
-        evidence: { suiteFile: 'src/server/customerJourney30Step.e2e.test.ts' },
-      },
-      {
-        testId: 'SIM-SHOPIFY-WRITEBACK',
-        stage: 'stage_1_shopify',
-        name: 'Shopify Write-Back Scope Gate, Mutation & Post-Mutation Read-Back Verification',
-        purpose: 'Verify write_products gating, allowlisted fields, GraphQL mutation, read-back match, and audit trail',
-        status: 'PASS — SIMULATED',
-        executionMode: 'contract_fixture',
-        targetEnvironment: 'local-mock-shopify-graphql',
-        executedAt: nowIso,
-        evidence: { suiteFile: 'src/server/shopifyWriteBack.test.ts' },
-      },
-      {
-        testId: 'SIM-BILLING-EMAILS',
-        stage: 'stage_3_smtp',
-        name: 'Billing Lifecycle Emails (5 Events), Webhook/Checkout Deduplication & Retry Recovery',
-        purpose: 'Verify initial, renewal, plan_changed, payment_failed, and subscription_canceled email delivery',
-        status: 'PASS — SIMULATED',
-        executionMode: 'unit_mock',
-        targetEnvironment: 'local-mock-smtp-transport',
-        executedAt: nowIso,
-        evidence: { suiteFile: 'src/server/billingEmail.test.ts' },
-      },
-      {
-        testId: 'SIM-COMMERCIAL-HARNESS',
-        stage: 'stage_2_stripe',
-        name: 'Commercial Integration Contract Harness (Shopify OAuth/Sync/Webhook + Stripe Lifecycle + SMTP)',
-        purpose: 'Verify signed contract fixtures, rate-limit retries, lease recovery, and cross-tenant guards',
-        status: 'PASS — SIMULATED',
-        executionMode: 'contract_fixture',
-        targetEnvironment: 'local-contract-harness',
-        executedAt: nowIso,
-        evidence: { suiteFile: 'src/server/commercialVerificationHarness.test.ts' },
-      },
-    ],
+    simulatedChecks: simulatedEval.checks,
+    simulatedArtifactPath: displayArtifactPath,
+    simulatedArtifactRunId: simulatedEval.artifactRunId,
     cleanupPerformed:
       stage4.cleanupReport?.status === 'CLEANED' ||
       stage1.checks.some((c) => c.testId === 'S1-TEST-PRODUCT-LIFECYCLE' && c.status === 'PASS') ||
       stage2.checks.some((c) => c.testId === 'S2-STRIPE-CLEANUP' && c.status === 'PASS'),
     cleanupReport: stage4.cleanupReport,
-    notes: [
-      'Unit and contract tests using mocks/fixtures report PASS — SIMULATED and never count as live external provider verification.',
-      'Local Shopify/Stripe HMAC & MemoryRepository checks are separated from live external webhook delivery checks (NOT RUN until verified against a deployed callback URL).',
-      'SMTP relay acceptance (250 OK) is distinct from confirmed recipient inbox delivery (S3-INBOX-DELIVERY).',
-      'When external credentials or COMMERCIAL_VERIFY_EXTERNAL=true are absent, live provider stages strictly report BLOCKED — never PASS.',
-      'Manual browser & live external provider steps are documented in docs/MANUAL_EXTERNAL_VERIFICATION_CHECKLIST.md.',
-    ],
+    notes,
   };
+}
+
+async function main() {
+  const asJson = process.argv.includes('--json');
+  const strict = process.argv.includes('--strict');
+  const writeFiles = process.argv.includes('--write');
+
+  const report = await buildCommercialVerificationReport();
 
   if (writeFiles) {
     const mdOut = path.resolve(process.cwd(), 'docs/COMMERCIAL_VERIFICATION_REPORT.md');
@@ -150,16 +151,29 @@ async function main() {
         `- [${s.status}] ${s.title} (pass=${s.counts.pass}, simulated=${s.counts.simulated ?? 0}, fail=${s.counts.fail}, blocked=${s.counts.blocked}, not_run=${s.counts.notRun})`
       );
     }
+    if (report.simulatedChecks) {
+      console.log(`Simulated Checks (artifact=${report.simulatedArtifactPath || 'none'}):`);
+      for (const c of report.simulatedChecks) {
+        console.log(`  - [${c.status}] ${c.testId}`);
+      }
+    }
   }
 
-  if (overallExternalStatus === 'FAIL') {
+  const anySimFail = Boolean(report.simulatedChecks?.some((c) => c.status === 'FAIL'));
+  const anySimNotRun = Boolean(report.simulatedChecks?.some((c) => c.status === 'NOT RUN'));
+  if (report.overallExternalStatus === 'FAIL' || anySimFail) {
     process.exitCode = 1;
-  } else if (strict && overallExternalStatus === 'BLOCKED') {
+  } else if (strict && (report.overallExternalStatus === 'BLOCKED' || anySimNotRun)) {
     process.exitCode = 2;
   }
 }
 
-main().catch((err) => {
-  console.error('[verify:commercial:report] Fatal error:', err?.message || err);
-  process.exitCode = 1;
-});
+const isDirectExecution =
+  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectExecution) {
+  main().catch((err) => {
+    console.error('[verify:commercial:report] Fatal error:', err?.message || err);
+    process.exitCode = 1;
+  });
+}

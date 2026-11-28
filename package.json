@@ -15,6 +15,7 @@
     "test:contracts": "tsx --test \"src/server/commercialVerificationHarness.test.ts\" \"src/server/customerJourney.e2e.test.ts\" \"src/server/stripeAndSmtpReadiness.test.ts\"",
     "test:postgres": "tsx --test \"src/server/postgresEntitlements.test.ts\" \"src/server/shopifyWebhookStatusPostgres.test.ts\" \"src/server/db/migrate.test.ts\" \"src/server/shopifyAtomicProvenance.test.ts\"",
     "test:e2e:browser": "tsx --test \"e2e/*.test.ts\"",
+    "test:simulated:artifact": "tsx scripts/verify/run-simulated-tests.ts",
     "db:migrate": "tsx src/server/db/migrate.ts",
     "db:status": "tsx src/server/db/migrate.ts --status",
     "migrate": "tsx src/server/db/migrate.ts",

@@ -1,16 +1,24 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   evaluateCommercialReadiness,
+  evaluateSimulatedChecksFromArtifact,
+  loadAndEvaluateSimulatedArtifact,
   redactSecrets,
   renderVerificationMarkdown,
   computeOverallStatus,
+  SIMULATED_SUITE_DEFINITIONS,
 } from './verification/statusModel';
 import { formatCommercialReadinessText } from './verification/checkCommercialEnv';
+import { buildCommercialVerificationReport } from '../../scripts/verify/generate-report';
+import { parseTapTotals } from '../../scripts/verify/run-simulated-tests';
 import { runShopifyExternalVerification } from './verification/shopifyVerifier';
 import { runStripeExternalVerification } from './verification/stripeVerifier';
 import { runSmtpExternalVerification } from './verification/smtpVerifier';
@@ -122,6 +130,8 @@ describe('[CONTRACT / HARNESS] Commercial Integration Verification Infrastructur
         SMTP_HOST: undefined,
         SMTP_TEST_RECIPIENT: undefined,
         STAGING_BASE_URL: undefined,
+        STAGING_ALLOWED_HOSTS: undefined,
+        STAGING_ALLOW_LOCAL: undefined,
         STAGING_CONFIRM_NON_PRODUCTION: undefined,
       },
       async () => {
@@ -1249,4 +1259,150 @@ describe('[HARNESS ACCURACY] Phase B Verifier Corrections (Shopify, Stripe, SMTP
     }
   });
 });
+
+describe('[FIX A — EVIDENCE INTEGRITY] Simulated Verification Report Artifact Binding', () => {
+  const buildValidArtifact = () => ({
+    schemaVersion: '1.0' as const,
+    runId: 'sim_test_run_001',
+    generatedAt: '2026-11-28T10:00:00.000Z',
+    runner: 'tsx --test --test-reporter=tap',
+    nodeVersion: process.version,
+    suites: SIMULATED_SUITE_DEFINITIONS.map((def, idx) => ({
+      suiteFile: def.suiteFile,
+      suiteId: def.testId,
+      executedAt: '2026-11-28T09:59:50.000Z',
+      durationMs: 120 + idx * 10,
+      exitCode: 0,
+      passedCount: 4 + idx,
+      failedCount: 0,
+      skippedCount: 0,
+      totalCount: 4 + idx,
+      status: 'PASS' as const,
+    })),
+  });
+
+  test('A1: Valid passing artifact yields PASS — SIMULATED with traceable counts, runId, and non-live flag', () => {
+    const res = evaluateSimulatedChecksFromArtifact(buildValidArtifact(), {
+      artifactPath: 'reports/simulated-test-results.json',
+    });
+    assert.equal(res.artifactRunId, 'sim_test_run_001');
+    assert.equal(res.checks.length, 4);
+    for (const chk of res.checks) {
+      assert.equal(chk.status, 'PASS — SIMULATED');
+      assert.equal(chk.evidence?.artifactRunId, 'sim_test_run_001');
+      assert.equal(chk.evidence?.liveProviderVerified, false);
+      assert.equal(typeof chk.durationMs, 'number');
+    }
+  });
+
+  test('A2: Failing suite in artifact (exitCode != 0, failedCount > 0, or status=FAIL) reports FAIL (never PASS — SIMULATED)', () => {
+    const failing = buildValidArtifact();
+    failing.suites[1] = {
+      ...failing.suites[1],
+      exitCode: 1,
+      passedCount: 3,
+      failedCount: 2,
+      totalCount: 5,
+      status: 'FAIL' as any,
+    };
+    const res = evaluateSimulatedChecksFromArtifact(failing);
+    const shopifySim = res.checks.find((c) => c.testId === 'SIM-SHOPIFY-WRITEBACK');
+    assert.equal(shopifySim?.status, 'FAIL');
+    assert.match(shopifySim?.blockerOrFailure || '', /failed/i);
+    assert.equal(res.checks.find((c) => c.testId === 'SIM-CUSTOMER-JOURNEY-30')?.status, 'PASS — SIMULATED');
+  });
+
+  test('A3: Missing artifact file yields NOT RUN even though the test files exist on disk', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-sim-missing-'));
+    try {
+      const missingPath = path.join(tmpDir, 'does-not-exist.json');
+      const loaded = loadAndEvaluateSimulatedArtifact(missingPath);
+      assert.equal(loaded.checks.length, 4);
+      assert.ok(loaded.checks.every((c) => c.status === 'NOT RUN'));
+      assert.ok(loaded.checks.every((c) => (c.blockerOrFailure || '').includes('No verifiable test execution artifact')));
+
+      // Verify generate-report's builder does NOT self-invent PASS — SIMULATED when artifact is missing
+      await withEnvOverrides(
+        {
+          COMMERCIAL_VERIFY_EXTERNAL: undefined,
+          STAGING_BASE_URL: undefined,
+          STAGING_ALLOWED_HOSTS: undefined,
+        },
+        async () => {
+          const report = await buildCommercialVerificationReport({ simulatedArtifactPath: missingPath });
+          assert.equal(report.simulatedArtifactRunId, undefined);
+          assert.ok(report.simulatedChecks?.every((c) => c.status === 'NOT RUN'));
+        }
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('A4: Corrupted JSON, missing metadata, or inconsistent counts yields FAIL (never PASS)', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aixshop-sim-corrupt-'));
+    try {
+      const corruptPath = path.join(tmpDir, 'corrupt.json');
+      fs.writeFileSync(corruptPath, '{ not valid json !!!', 'utf8');
+      const corruptEval = loadAndEvaluateSimulatedArtifact(corruptPath);
+      assert.ok(corruptEval.checks.every((c) => c.status === 'FAIL'));
+      assert.ok(corruptEval.checks.every((c) => (c.blockerOrFailure || '').includes('Malformed simulated test artifact')));
+
+      const missingMeta = evaluateSimulatedChecksFromArtifact({
+        schemaVersion: '1.0',
+        suites: [],
+      });
+      assert.ok(missingMeta.checks.every((c) => c.status === 'FAIL'));
+
+      const inconsistentCounts = buildValidArtifact();
+      inconsistentCounts.suites[0].passedCount = 1;
+      inconsistentCounts.suites[0].totalCount = 10;
+      const countRes = evaluateSimulatedChecksFromArtifact(inconsistentCounts);
+      assert.equal(countRes.checks[0].status, 'FAIL');
+      assert.match(countRes.checks[0].blockerOrFailure || '', /count mismatch/i);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('A5: Mismatched suiteFile (NOT RUN) and mismatched suiteId (FAIL) cannot report PASS — SIMULATED', () => {
+    const mismatch = buildValidArtifact();
+    // Change suiteFile on entry 0 -> expected suite is missing -> NOT RUN
+    mismatch.suites[0].suiteFile = 'src/server/otherFakeSuite.test.ts';
+    // Keep suiteFile on entry 1, tamper suiteId -> FAIL
+    mismatch.suites[1].suiteId = 'SIM-WRONG-ID';
+
+    const res = evaluateSimulatedChecksFromArtifact(mismatch);
+    assert.equal(res.checks.find((c) => c.testId === 'SIM-CUSTOMER-JOURNEY-30')?.status, 'NOT RUN');
+    const idMismatch = res.checks.find((c) => c.testId === 'SIM-SHOPIFY-WRITEBACK');
+    assert.equal(idMismatch?.status, 'FAIL');
+    assert.match(idMismatch?.blockerOrFailure || '', /suiteId mismatch/i);
+  });
+
+  test('A6: TAP output parser accurately extracts top-level suite totals and ignores indented subtests', () => {
+    const sampleTap = [
+      'TAP version 13',
+      'ok 1 - suite A',
+      '    # tests 2',
+      '    # pass 2',
+      '    # fail 0',
+      '1..1',
+      '# tests 12',
+      '# suites 3',
+      '# pass 11',
+      '# fail 1',
+      '# cancelled 0',
+      '# skipped 0',
+      '# todo 0',
+      '# duration_ms 432.6',
+    ].join('\n');
+    const totals = parseTapTotals(sampleTap);
+    assert.equal(totals.tests, 12);
+    assert.equal(totals.pass, 11);
+    assert.equal(totals.fail, 1);
+    assert.equal(totals.skipped, 0);
+    assert.equal(totals.durationMs, 432.6);
+  });
+});
+
 
